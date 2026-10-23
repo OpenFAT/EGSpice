@@ -1,12 +1,12 @@
 {
  "schema_version": 1,
  "analysis": "ac",
- "purpose": "#80: BSIM4 tnoiMod=1 noise against ngspice 45 (channel row waits on #119).",
+ "purpose": "#80: BSIM4 tnoiMod=1 noise against ngspice 45 (AD channel partials and source/drain conductances).",
  "oracle": {
   "kind": "ngspice-45",
   "derivation": "Independent ngspice-45 run of this deck. Stored binary raw doubles, selected by column name.",
   "command": "ngspice -n -b -r reference.raw circuit.sp",
-  "source_sha256": "23428ce23a4d4811e26fca5dad504623ca3b62d6f6487e5cc026c6712e21b30a"
+  "source_sha256": "414c1b0e687a1d063261c45687929b050962b29ccd27ab6d89309378a0625a65"
  },
  "origin": "tests/fixtures/noise/device_bsim4_noise_tnoimod1.sp",
  "expect": {
@@ -151,5 +151,5 @@
   "finite_values_required": true,
   "all_requested_analyses_must_complete": true
  },
- "netlist_sha256": "23428ce23a4d4811e26fca5dad504623ca3b62d6f6487e5cc026c6712e21b30a"
+ "netlist_sha256": "d98571e433d5ec89066fbd92032fef8ed0e0cb15110732a42b63c394c7b7ce9b"
 }

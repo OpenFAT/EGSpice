@@ -1,0 +1,52 @@
+{
+  "replicas": 64,
+  "backend": "cuda",
+  "complete": true,
+  "comparator": "both-native-grids-v2",
+  "selected": 7,
+  "completed": 7,
+  "results": [
+    {
+      "deck": "tests/fixtures/tran/bench_tran_rc_pulse.sp",
+      "status": "PASS",
+      "detail": "",
+      "worst": 0.0
+    },
+    {
+      "deck": "tests/fixtures/tran/rc_pulse_history_gear.sp",
+      "status": "PASS",
+      "detail": "",
+      "worst": 0.0
+    },
+    {
+      "deck": "tests/fixtures/tran/device_inductor.sp",
+      "status": "PASS",
+      "detail": "",
+      "worst": 0.0
+    },
+    {
+      "deck": "tests/fixtures/tran/device_mos1_large_signal.sp",
+      "status": "PASS",
+      "detail": "",
+      "worst": 0.0
+    },
+    {
+      "deck": "tests/fixtures/tran/device_mos6_simpleinv.sp",
+      "status": "PASS",
+      "detail": "",
+      "worst": 0.0
+    },
+    {
+      "deck": "tests/fixtures/tran/pwl_triangle.sp",
+      "status": "PASS",
+      "detail": "",
+      "worst": 0.0
+    },
+    {
+      "deck": "tests/fixtures/tran/bench_tran_exp_source.sp",
+      "status": "PASS",
+      "detail": "",
+      "worst": 0.0
+    }
+  ]
+}

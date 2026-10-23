@@ -1,0 +1,14 @@
+// LRM 4.6.4.3 noise_table over an array parameter: the knots are model
+// parameters, so the card's values, not the declared defaults, are the PSD.
+`include "disciplines.vams"
+module ntab_card(p, n);
+    inout p, n;
+    electrical p, n;
+
+    parameter real R = 1000.0 from (0:inf);
+    parameter real tbl[0:3] = '{1000.0, 1.0e-18, 9000.0, 9.0e-18};
+
+    analog begin
+        I(p, n) <+ V(p, n) / R + noise_table(tbl, "tbl");
+    end
+endmodule

@@ -270,6 +270,31 @@ pub const Builder = struct {
         try vt.proto_add(proto.ctx, self.gpa, @ptrCast(model), @ptrCast(instance), &all).unwrap();
     }
 
+    /// `addDevice` of an instance whose Model is row `row` of its type's
+    /// store and whose collapse map is `col`, both what an earlier
+    /// `addDevice` with the same card inputs gave (`NetBuilder.memo`).
+    pub fn addDeviceRow(
+        self: *Builder,
+        comptime D: type,
+        card: []const u8,
+        row: u32,
+        instance: *const D.Instance,
+        col: []const i32,
+        nodes: anytype,
+    ) !void {
+        const n_u = comptime @typeInfo(D.U).@"enum".field_names.len;
+        std.debug.assert(col.len == n_u);
+        var all: [n_u]u32 = undefined;
+        inline for (0..D.num_ports) |p| all[p] = nodes[p];
+        const t = comptime Library.builtin(device.modelName(D).?);
+        const vt = self.lib.vtable(t);
+        try self.countCard(t, card);
+        for (D.num_ports..n_u) |u|
+            all[u] = if (col[u] >= 0) all[@intCast(col[u])] else try self.addNode();
+        const proto = try self.protoOf(t);
+        try vt.proto_add_row.?(proto.ctx, row, @ptrCast(instance), &all).unwrap();
+    }
+
     /// Counts one instance of `t` and records its card name, if any.
     fn countCard(self: *Builder, t: DeviceType, card: []const u8) !void {
         const i = @backingInt(t);
@@ -381,6 +406,10 @@ fn setParam(comptime D: type, model: *D.Model, instance: *D.Instance, comptime f
 /// A model card bound once for device type `type`; `model` points at its `D.Model`.
 const BoundCard = struct { type: DeviceType, model: *const anyopaque };
 
+/// `NetBuilder.memo`'s value: Model row `row`, a `D.Instance` and the
+/// `n_u` entries of its collapse map, for the type the key names.
+const Memo = struct { row: u32, instance: *const anyopaque, col: []const i32 };
+
 /// Netlist to Builder: one pass over the cards, recording the source,
 /// branch and port tables the deck's queries resolve against. Rows it
 /// records are pre-permutation; `prepare.build` maps them after the freeze.
@@ -439,6 +468,12 @@ pub const NetBuilder = struct {
     /// card's pairs, its polarity), bound on first use and copied per
     /// instance: a BSIM4 bin card is ~270 pairs against ~1000 fields.
     bound_cards: []?BoundCard,
+    /// A device card's bound result by its inputs (`memoKey`): the Model
+    /// row its type's store holds, its Instance and collapse map. A later
+    /// card with the same inputs skips binding, `derive`, `collapse` and
+    /// the store's row hash and compare (7.5).
+    memo: std.StringHashMapUnmanaged(Memo) = .empty,
+    memo_key: std.ArrayList(u8) = .empty,
 
     /// The first `.tran` card's TSTEP and TSTOP, ngspice's TRANinit values
     /// for `resolvePulseDefaults`; 1 ns and 1e30 s without one.
@@ -715,7 +750,7 @@ pub const NetBuilder = struct {
         for ([_][]const []const u8{ self.v.items(.name), self.l.items(.name), self.br.items(.name) }, [_][]const u32{ self.v.items(.branch), self.l.items(.branch), self.br.items(.row) }) |names, rows| {
             for (names, rows) |name, br| {
                 probe_buf[n_probes] = br;
-                label_buf[n_probes] = try std.fmt.allocPrint(arena, "i({s})", .{name});
+                label_buf[n_probes] = try std.mem.concat(arena, u8, &.{ "i(", name, ")" });
                 n_probes += 1;
             }
         }
@@ -723,7 +758,7 @@ pub const NetBuilder = struct {
             const label = circuit.nodeName(@intCast(i));
             if (label.len != 0) {
                 probe_buf[n_probes] = @intCast(i);
-                label_buf[n_probes] = try std.fmt.allocPrint(arena, "v({s})", .{label});
+                label_buf[n_probes] = try std.mem.concat(arena, u8, &.{ "v(", label, ")" });
                 n_probes += 1;
             }
         }
@@ -2140,6 +2175,8 @@ fn addSingleDevice(self: *NetBuilder, comptime D: type, dev: Device) !void {
     if (comptime @hasField(D.Model, "sw_et")) {
         if (dev.pins.len < 5) model.sw_et = 0;
     }
+    const key = try memoKey(self, D, dev);
+    if (key) |k| if (self.memo.get(k)) |hit| return b.addDeviceRow(D, dev.name, hit.row, @ptrCast(@alignCast(hit.instance)), hit.col, try deviceNodes(self, D, dev));
     if (dev.model) |m| model = try boundCard(self, D, model, m, dev.model_row);
     _ = try setParam(D, &model, &instance, "gain", Value.numberAt(dev.positional, 0) orelse 0);
     // INP2Q/D/J/Z: a bare number after the model name is the area; area=
@@ -2178,6 +2215,47 @@ fn addSingleDevice(self: *NetBuilder, comptime D: type, dev: Device) !void {
     // values win through `__given`.
     deriveModel(D, &model, b, dev.pins.len);
     try b.addDevice(D, dev.name, &model, &instance, try deviceNodes(self, D, dev));
+    const k = key orelse return;
+    const t = comptime Library.builtin(device.modelName(D).?);
+    const vt = b.lib.vtable(t);
+    const last = vt.proto_last_row orelse return;
+    const n_u = comptime @typeInfo(D.U).@"enum".field_names.len;
+    const col = try self.arena.alloc(i32, n_u);
+    @memset(col, -1);
+    if (comptime n_u > D.num_ports) if (vt.collapse) |collapse| collapse(@ptrCast(&model), @ptrCast(&instance), col.ptr);
+    const kept = try self.arena.create(D.Instance);
+    kept.* = instance;
+    try self.memo.put(self.arena, try self.arena.dupe(u8, k), .{ .row = last((try b.protoOf(t)).ctx), .instance = kept, .col = col });
+}
+
+/// The bytes that decide what `addSingleDevice` binds for `dev`: its type,
+/// letter, pin count, model card row, the two positional numbers it reads
+/// and every pair (all numbers). Null, so nothing is memoized, for a card
+/// without a model row, a pair that is not a number, or a device that
+/// calls VPI applications or keeps a row per instance. Borrows
+/// `memo_key` until the next call.
+fn memoKey(self: *NetBuilder, comptime D: type, dev: Device) !?[]const u8 {
+    if (comptime device.modelName(D) == null) return null;
+    const t = comptime Library.builtin(device.modelName(D).?);
+    const vt = self.b.lib.vtable(t);
+    if (vt.proto_add_row == null or vt.systf_calls.len != 0) return null;
+    if (dev.model != null and dev.model_row == netlist.none) return null;
+    for (dev.kv) |item| if (item.value != .num) return null;
+    const k = &self.memo_key;
+    k.clearRetainingCapacity();
+    const head = [_]u64{
+        @backingInt(t),                                                         dev.kind,
+        dev.pins.len,                                                           if (dev.model == null) netlist.none else dev.model_row,
+        @bitCast(Value.numberAt(dev.positional, 0) orelse std.math.nan(f64)), @bitCast(Value.numberAt(dev.positional, 1) orelse std.math.nan(f64)),
+        dev.kv.len,
+    };
+    try k.appendSlice(self.arena, std.mem.asBytes(&head));
+    for (dev.kv) |item| {
+        const v: u64 = @bitCast(item.value.num);
+        try k.appendSlice(self.arena, std.mem.asBytes(&[_]u64{ item.key.len, v }));
+        try k.appendSlice(self.arena, item.key);
+    }
+    return k.items;
 }
 
 /// Refuses a card pair that neither `D.Model` nor `D.Instance` binds, as
@@ -2604,11 +2682,11 @@ fn compileTape(self: *NetBuilder, ops: []const Op, consts: []const f64, model: *
             n -= 1;
             if (e >= 0 and e <= 255 and e == @round(e)) {
                 n_consts -= 1;
-                // ngspice's pow() function is |x|^y whatever y is (ptfuncs.c
-                // PTpower); only the `^`/`**` operator keeps the sign of x
-                // for an integer exponent (PTpowerH). sky130's poly
-                // resistors cube a negative min(...) with pow().
-                if (op.code == .call and self.nl.deck.dialect == .ngspice) {
+                // ngspice 45's default PTpower AND PTpowerH use |x|^y.
+                // Keep constant-integer folding consistent with the general
+                // power and the frontend's constant evaluator. HSPICE keeps
+                // its signed integer power.
+                if (self.nl.deck.dialect == .ngspice) {
                     if (n + 1 == tape.max_ops) return error.TooManyOps;
                     model.op_code[n] = .abs;
                     n += 1;

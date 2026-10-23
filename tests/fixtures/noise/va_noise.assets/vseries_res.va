@@ -1,0 +1,14 @@
+// A 1 kOhm resistor written as a potential contribution with a series noise
+// voltage: V(p,n) <+ R*I(p,n) + white_noise(4e-18). The generator is a
+// voltage source in the branch (LRM 4.6.4), not a current between p and n.
+`include "disciplines.vams"
+module vseries_res(p, n);
+    inout p, n;
+    electrical p, n;
+
+    parameter real R = 1000.0 from (0:inf);
+
+    analog begin
+        V(p, n) <+ R * I(p, n) + white_noise(4.0e-18, "v");
+    end
+endmodule

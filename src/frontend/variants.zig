@@ -168,7 +168,7 @@ pub const Planner = struct {
     prefix: []const u8 = "",
     /// Set while a card's own sweep is planned: rebuilt points keep only it.
     card: ?u32 = null,
-    refs: []const ParamRef = &.{},
+    refs: Params = .{},
     stack: std.ArrayList(expr.Val) = .empty,
     labels: std.ArrayList([]const u8) = .empty,
     temps: std.ArrayList(?f64) = .empty,
@@ -453,7 +453,7 @@ pub const Planner = struct {
 
     /// `set`, unless parameter `ord` holds `x` in the nominal circuit.
     fn setMoved(p: *Planner, ord: u32, x: f64) !void {
-        if (@as(u64, @bitCast(x)) != @as(u64, @bitCast(p.refs[ord].get()))) try p.set(ord, x);
+        if (@as(u64, @bitCast(x)) != @as(u64, @bitCast(p.refs.get(ord)))) try p.set(ord, x);
     }
 
     /// Finds, with one rebuild at perturbed live values, whether every
@@ -480,7 +480,7 @@ pub const Planner = struct {
     /// are `at`, from one rebuild at values perturbed from `base`; null
     /// when some parameter neither holds a slot's value unchanged nor
     /// stays put. Leaves the live slots at the perturbed values.
-    fn probeAt(p: *Planner, base: []const f64, at: []const ParamRef) !?Map {
+    fn probeAt(p: *Planner, base: []const f64, at: Params) !?Map {
         std.debug.assert(at.len == p.refs.len);
         const probe_at = try p.scratch.alloc(f64, base.len);
         var by_bits: std.AutoHashMapUnmanaged(u64, u32) = .empty;
@@ -509,14 +509,18 @@ pub const Planner = struct {
         var refs: std.ArrayList(u32) = .empty;
         var slots: std.ArrayList(u32) = .empty;
         var values: std.ArrayList(f64) = .empty;
-        for (at, moved, p.refs, 0..) |a, b, nominal, i| {
-            const before = a.get();
-            const after = b.get();
+        var it_at = at.iterator();
+        var it_moved = moved.iterator();
+        var it_nominal = p.refs.iterator();
+        for (0..at.len) |i| {
+            const before = it_at.next().?.*;
+            const after = it_moved.next().?.*;
+            const nominal = it_nominal.next().?.*;
             var k: u32 = netlist.none;
             if (@as(u64, @bitCast(before)) != @as(u64, @bitCast(after))) {
                 k = by_bits.get(@bitCast(after)) orelse return null;
                 if (@as(u64, @bitCast(before)) != @as(u64, @bitCast(base[k]))) return null;
-            } else if (@as(u64, @bitCast(before)) == @as(u64, @bitCast(nominal.get()))) continue;
+            } else if (@as(u64, @bitCast(before)) == @as(u64, @bitCast(nominal))) continue;
             try refs.append(p.scratch, @intCast(i));
             try slots.append(p.scratch, k);
             try values.append(p.scratch, before);
@@ -544,10 +548,13 @@ pub const Planner = struct {
     }
 
     /// `diff` against parameters `moved`, collected in `p.refs` order.
-    fn diffAt(p: *Planner, moved: []const ParamRef) !void {
-        for (p.refs, moved, 0..) |a, b, i| {
-            const x = b.get();
-            if (@as(u64, @bitCast(a.get())) == @as(u64, @bitCast(x))) continue;
+    fn diffAt(p: *Planner, moved: Params) !void {
+        std.debug.assert(moved.len == p.refs.len);
+        var it_moved = moved.iterator();
+        var it_ref = p.refs.iterator();
+        for (0..p.refs.len) |i| {
+            const x = it_moved.next().?.*;
+            if (@as(u64, @bitCast(it_ref.next().?.*)) == @as(u64, @bitCast(x))) continue;
             try p.set(@intCast(i), x);
         }
     }
@@ -617,7 +624,7 @@ pub const Planner = struct {
             const ords = targets.ords[targets.starts[i]..targets.starts[i + 1]];
             if (ords.len == 0) continue;
             for (ords) |ord| {
-                const r = p.refs[ord];
+                const r = p.refs.at(ord);
                 const spread = try p.spreadOf(v, ord, r.get());
                 try params.append(p.sim, ord);
                 try sigmas.append(p.sim, if (v.dist == .unif) spread / @sqrt(3.0) else spread);
@@ -688,15 +695,18 @@ pub const Planner = struct {
                 var c = try circuitOf(p.lib, arena.allocator(), arena.allocator(), p.nl);
                 defer c.deinit();
                 if (!sameTopology(p.nominal, &c)) return p.refuse("", "a one-sigma mismatch draw that changes the topology");
-                for (base_refs, try collect(arena.allocator(), &c), 0..) |x, y, ord| {
-                    const step = y.get() - x.get();
+                const moved = try collect(arena.allocator(), &c);
+                var it_moved = moved.iterator();
+                var it_base = base_refs.iterator();
+                for (0..base_refs.len) |ord| {
+                    const step = it_moved.next().?.* - it_base.next().?.*;
                     if (step == 0) continue;
                     try params.append(p.sim, @intCast(ord));
                     try steps.append(p.sim, step);
                 }
             }
             if (params.items.len == first) continue;
-            const r = p.refs[params.items[first]];
+            const r = p.refs.at(params.items[first]);
             const card = names.get(r.type, r.index) orelse "?";
             try labels.append(p.sim, try std.fmt.allocPrint(p.sim, "{s}@{s}", .{ card, r.param_name }));
             try starts.append(p.sim, @intCast(params.items.len));
@@ -713,7 +723,7 @@ pub const Planner = struct {
     fn spreadOf(p: *Planner, v: netlist.Variation, ord: u32, base: f64) !f64 {
         var spread = v.value;
         if (v.sigma.len != 0) {
-            const r = p.refs[ord];
+            const r = p.refs.at(ord);
             var at: [netlist.Variation.sigma_names.len]f64 = undefined;
             for (netlist.Variation.sigma_names, &at) |name, *x| x.* = p.instanceValue(r, name) orelse
                 if (name[0] == 'm') p.instanceValue(r, "mfactor") orelse 1 else std.math.nan(f64);
@@ -724,15 +734,15 @@ pub const Planner = struct {
     }
 
     /// Instance parameter `name` of the device that owns `r`, or null.
-    fn instanceValue(p: *Planner, r: ParamRef, name: []const u8) ?f64 {
+    fn instanceValue(p: *Planner, r: Params.Ref, name: []const u8) ?f64 {
         const ord = p.paramRef(r.type, r.index, name) catch return null;
-        return p.refs[ord].get();
+        return p.refs.get(ord);
     }
 
     /// The value parameter `ord` has in the open row.
     fn current(p: *Planner, ord: u32) f64 {
         const at = p.row_at[ord];
-        return if (at != netlist.none) p.write_values.items[at] else p.refs[ord].get();
+        return if (at != netlist.none) p.write_values.items[at] else p.refs.get(ord);
     }
 
     /// Writes `value` to `ord` in the open row, once per parameter.
@@ -757,13 +767,12 @@ pub const Planner = struct {
     }
 
     fn paramRef(p: *Planner, t: core.DeviceType, index: u32, name: []const u8) !u32 {
-        if (p.by_name.count() == 0) for (p.refs, 0..) |r, i| {
-            const gop = try p.by_name.getOrPut(p.scratch, try refKey(p.scratch, r.type, r.param_name));
-            if (!gop.found_existing) gop.value_ptr.* = @intCast(i - r.index);
-        };
+        if (p.by_name.count() == 0) try p.refs.indexNames(p.scratch, &p.by_name);
         const first = p.by_name.get(try refKey(p.scratch, t, name)) orelse return error.UnknownParameter;
         const ord = first + index;
-        if (ord >= p.refs.len or p.refs[ord].index != index or p.refs[ord].type != t) return error.UnknownParameter;
+        if (ord >= p.refs.len) return error.UnknownParameter;
+        const r = p.refs.at(ord);
+        if (r.index != index or r.type != t) return error.UnknownParameter;
         return ord;
     }
 };
@@ -1286,20 +1295,139 @@ fn targetName(nl: *const Netlist, t: netlist.StepTarget) []const u8 {
 /// Every parameter of `c`'s batches, typed, in `Circuit.collectParams`
 /// order. Caller owns the returned slice and must free it with `gpa`; the
 /// refs point into `c`'s storage and die with it.
-pub fn collect(gpa: std.mem.Allocator, c: *const device.Circuit) ![]const ParamRef {
-    var list: std.ArrayList(ParamRef) = .empty;
-    for (c.batches, c.batch_types) |b, t| {
-        const first = list.items.len;
+pub fn collect(gpa: std.mem.Allocator, c: *const device.Circuit) !Params {
+    const n = c.batches.len;
+    const starts = try gpa.alloc(u32, n + 1);
+    const layouts = try gpa.alloc(?device.abi.ParamLayout, n);
+    const fallback = try gpa.alloc([]const ParamRef, n);
+    starts[0] = 0;
+    for (c.batches, c.batch_types, 0..) |b, t, i| {
+        fallback[i] = &.{};
+        layouts[i] = null;
+        if (b.hooks.param_layout) |layout| {
+            const l = try layout(b.ctx).unwrap();
+            layouts[i] = l;
+            starts[i + 1] = starts[i] + @as(u32, @intCast(l.count * l.fields.len));
+            continue;
+        }
+        var list: std.ArrayList(ParamRef) = .empty;
         try b.hooks.collect_params(b.ctx, gpa, &list).unwrap();
-        for (list.items[first..]) |*r| r.type = t;
+        for (list.items) |*r| r.type = t;
+        fallback[i] = list.items;
+        starts[i + 1] = starts[i] + @as(u32, @intCast(list.items.len));
     }
-    return list.toOwnedSlice(gpa);
+    return .{ .batches = c.batches, .types = c.batch_types, .starts = starts, .layouts = layouts, .fallback = fallback, .len = starts[n] };
 }
+
+/// Every parameter of a circuit's batches in `Circuit.collectParams` order,
+/// addressed through each batch's `param_layout` instead of a `ParamRef`
+/// per parameter: a sweep over 10k BSIM4 devices held 8.7M refs (555 MB)
+/// per table, and the planner builds several. Batches without the hook
+/// keep their `collect_params` refs. Dies with the circuit.
+pub const Params = struct {
+    /// The circuit's batch and type slices: heap storage, which stays put
+    /// when the `Circuit` value itself moves (`prepare` returns it).
+    batches: []const device.abi.Batch = &.{},
+    types: []const device.abi.DeviceType = &.{},
+    starts: []const u32 = &.{0},
+    layouts: []const ?device.abi.ParamLayout = &.{},
+    fallback: []const []const ParamRef = &.{},
+    len: usize = 0,
+
+    /// One parameter: where it lives and which device field it is.
+    pub const Ref = struct {
+        ptr: *f64,
+        type: core.DeviceType,
+        param_name: []const u8,
+        index: u32,
+        is_instance: bool,
+        primary: bool,
+
+        pub fn get(r: Ref) f64 {
+            return r.ptr.*;
+        }
+    };
+
+    fn batchOf(ps: Params, ord: usize) usize {
+        return std.sort.upperBound(u32, ps.starts, @as(u32, @intCast(ord)), orderU32) - 1;
+    }
+
+    fn orderU32(a: u32, b: u32) std.math.Order {
+        return std.math.order(a, b);
+    }
+
+    pub fn at(ps: Params, ord: usize) Ref {
+        const b = ps.batchOf(ord);
+        const local: u32 = @intCast(ord - ps.starts[b]);
+        if (ps.layouts[b]) |l| {
+            const field = l.fields[local / l.count];
+            return .{
+                .ptr = l.ptr(local),
+                .type = ps.types[b],
+                .param_name = field.name,
+                .index = local % l.count,
+                .is_instance = field.is_instance,
+                .primary = field.primary,
+            };
+        }
+        const r = ps.fallback[b][local];
+        return .{ .ptr = r.ptr, .type = r.type, .param_name = r.param_name, .index = r.index, .is_instance = r.is_instance, .primary = r.primary };
+    }
+
+    pub fn get(ps: Params, ord: usize) f64 {
+        return ps.ptrOf(ord).*;
+    }
+
+    fn ptrOf(ps: Params, ord: usize) *f64 {
+        const b = ps.batchOf(ord);
+        const local: u32 = @intCast(ord - ps.starts[b]);
+        return if (ps.layouts[b]) |l| l.ptr(local) else ps.fallback[b][local].ptr;
+    }
+
+    /// Every parameter's address in order, without a search per call.
+    pub fn iterator(ps: *const Params) Iterator {
+        return .{ .ps = ps };
+    }
+
+    pub const Iterator = struct {
+        ps: *const Params,
+        b: usize = 0,
+        ord: usize = 0,
+
+        pub fn next(it: *Iterator) ?*f64 {
+            const ps = it.ps;
+            if (it.ord >= ps.len) return null;
+            while (it.ord >= ps.starts[it.b + 1]) it.b += 1;
+            const local: u32 = @intCast(it.ord - ps.starts[it.b]);
+            it.ord += 1;
+            return if (ps.layouts[it.b]) |l| l.ptr(local) else ps.fallback[it.b][local].ptr;
+        }
+    };
+
+    /// `refKey(type, name)` to the ordinal of that field's index-0
+    /// parameter, the first entry winning, as a scan of the refs gave.
+    fn indexNames(ps: Params, a: std.mem.Allocator, map: *std.StringHashMapUnmanaged(u32)) !void {
+        for (ps.layouts, ps.fallback, 0..) |layout, refs, b| {
+            if (layout) |l| {
+                if (l.count == 0) continue;
+                for (l.fields, 0..) |f, k| {
+                    const gop = try map.getOrPut(a, try refKey(a, ps.types[b], f.name));
+                    if (!gop.found_existing) gop.value_ptr.* = ps.starts[b] + @as(u32, @intCast(k)) * l.count;
+                }
+                continue;
+            }
+            for (refs, 0..) |r, i| {
+                const gop = try map.getOrPut(a, try refKey(a, r.type, r.param_name));
+                if (!gop.found_existing) gop.value_ptr.* = @intCast(ps.starts[b] + i - r.index);
+            }
+        }
+    }
+};
 
 /// The frozen circuit `nl` binds to, as `prepare.build` constructs it, with
 /// `nl`'s live values as they stand. Caller owns the circuit and releases
 /// it with `deinit`; `scratch` holds the construction tables.
-pub fn circuitOf(lib: *const device.Library, gpa: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netlist) !device.Circuit {
+fn circuitOf(lib: *const device.Library, gpa: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netlist) !device.Circuit {
     const deck_opts = try analyses.deckOptions(nl.deck.config, nl.deck.dialect);
     var b = try builder.Builder.init(gpa, lib);
     var compiled = false;
@@ -1493,7 +1621,7 @@ const TrialDraw = struct {
 /// The standard normal quantile Φ⁻¹(u), u in (0, 1): Acklam's rational
 /// approximation, relative error below 1.2e-9. At 0 or 1 it returns NaN,
 /// so callers draw from the open interval.
-pub fn normalQuantile(u: f64) f64 {
+fn normalQuantile(u: f64) f64 {
     const a = [_]f64{ -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00 };
     const b = [_]f64{ -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01 };
     const c = [_]f64{ -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00 };

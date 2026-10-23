@@ -12,16 +12,24 @@ pub fn encode(w: *Io.Writer, plot: Plot) !void {
     assert(plot.result.varnames.len > 0);
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
     try rawfile.writeHeader(w, plot, false);
-    for (0..plot.result.npoints) |pt| {
-        const row = plot.point(pt);
+    try writeRows(w, plot.result.is_complex, plot.stride(), 0, plot.result.data);
+}
+
+/// The value lines of the points in `rows` (`stride` f64s each), the
+/// first numbered `first`: what `encode` writes after the header.
+pub fn writeRows(w: *Io.Writer, complex: bool, stride: usize, first: usize, rows: []const f64) !void {
+    assert(rows.len % stride == 0);
+    var pt = first;
+    var at: usize = 0;
+    while (at < rows.len) : ({
+        at += stride;
+        pt += 1;
+    }) {
+        const row = rows[at..][0..stride];
         try w.print("{d}", .{pt});
-        for (0..plot.result.varnames.len) |v| {
-            if (plot.result.is_complex) {
-                try w.print("\t{e},{e}\n", .{ row[2 * v], row[2 * v + 1] });
-            } else {
-                try w.print("\t{e}\n", .{row[v]});
-            }
-        }
+        if (complex) {
+            for (0..stride / 2) |v| try w.print("\t{e},{e}\n", .{ row[2 * v], row[2 * v + 1] });
+        } else for (row) |x| try w.print("\t{e}\n", .{x});
     }
 }
 

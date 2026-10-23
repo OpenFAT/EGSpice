@@ -191,6 +191,11 @@ fn sweepKrylov(
     }
     var fs = try FreqSolver.fromPlanes(allocator, @intCast(n), lin.col_ptr, lin.row_idx, g0, c0);
     defer fs.deinit();
+    // Complex held factors on the host; a device provider reads stacked tapes.
+    fs.complex_held = fs.complex_lanes and ckt.gpu == null;
+    var gpu_held: ?@import("../gpu/freq.zig").Held = null;
+    defer if (gpu_held) |*held| held.deinit();
+    var gpu_held_disabled = false;
     var gmres = try Gmres.init(allocator, @intCast(2 * nn), @intCast(@min(2 * nn, krylov_restart)));
     defer gmres.deinit(allocator);
     var op: ConversionOp(adjoint) = .{ .lin = lin, .n = n, .n_sb = n_sb, .omegas = omegas, .fs = &fs, .p_rhs = p_rhs, .p_x = p_x };
@@ -201,6 +206,8 @@ fn sweepKrylov(
         if (fi != 0) try ckt.checkpoint(.{ .phase = .frequency, .completed = fi, .total = freqs.len });
         sidebandOmegas(omegas, f_in, options.f_lo, n_harm);
         try fs.factorEach(omegas);
+        @import("../gpu/freq.zig").prepareHeld(&gpu_held, &gpu_held_disabled, ckt, &fs, omegas.len, allocator);
+        op.gpu_held = if (gpu_held) |*held| held else null;
         @memset(rhs, 0);
         if (drive.len != 0) {
             @memcpy(rhs[n_harm * n ..][0..n], drive[0..n]);
@@ -243,6 +250,7 @@ fn ConversionOp(comptime adjoint: bool) type {
         /// ω_p of every sideband at this input frequency.
         omegas: []const f64,
         fs: *FreqSolver,
+        gpu_held: ?*@import("../gpu/freq.zig").Held = null,
         p_rhs: []f64,
         p_x: []f64,
 
@@ -282,7 +290,8 @@ fn ConversionOp(comptime adjoint: bool) type {
                 @memcpy(self.p_rhs[2 * p * n ..][0..n], r[p * n ..][0..n]);
                 @memcpy(self.p_rhs[2 * p * n + n ..][0..n], r[nn + p * n ..][0..n]);
             }
-            self.fs.solveEach(self.p_rhs, self.p_x, adjoint);
+            const device_solved = if (self.gpu_held) |held| held.solve(self.p_rhs, self.p_x, adjoint) else false;
+            if (!device_solved) self.fs.solveEach(self.p_rhs, self.p_x, adjoint);
             for (0..self.n_sb) |p| {
                 @memcpy(r[p * n ..][0..n], self.p_x[2 * p * n ..][0..n]);
                 @memcpy(r[nn + p * n ..][0..n], self.p_x[2 * p * n + n ..][0..n]);

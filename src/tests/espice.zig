@@ -703,10 +703,10 @@ test "Problem: a final plan streams a lone transient but keeps one that .stim re
         });
         defer p.deinit();
         try p.run_all();
-        // The rows went to the raw file; the Result keeps only their count.
-        const r = try p.result(try find(p, .tran));
-        try t.expect(r.npoints > 1);
-        try t.expectEqual(@as(usize, 0), r.data.len);
+        // The rows went to the raw file, and the delivered result is
+        // released; its summary keeps the count.
+        try t.expect((try p.summary(try find(p, .tran))).npoints > 1);
+        try t.expectError(error.ResultUnavailable, p.result(try find(p, .tran)));
         const raw = try tmp.dir.readFileAlloc(io, "a.raw", t.allocator, .unlimited);
         defer t.allocator.free(raw);
         try t.expect(std.mem.indexOf(u8, raw, "Plotname: Transient Analysis\n") != null);
@@ -1647,6 +1647,9 @@ test "release_points: a Problem run batch after batch keeps a few KB per release
     // slack of the tables' doubling; an unreleased point keeps its circuit
     // and waveform, tens of KB.
     try t.expect(per_point < 4096);
+    // The query workers' share of that, as the Problem counts it.
+    const mem = p.queryMemory();
+    try t.expect(mem.peak > 0 and mem.live <= mem.peak and mem.live <= @as(usize, @intCast(live[live.len - 1])));
     try t.expectError(error.ResultUnavailable, p.point_measures(@fromBackingInt(@backingInt(p.session.outputs.items[p.session.outputs.items.len - 1])), &.{"tpd"}, values[0..1], why[0..1]));
 }
 
@@ -1685,7 +1688,7 @@ const LaneRun = struct {
     }
 
     fn addWith(r: *LaneRun, source: []const u8, lanes: bool) !void {
-        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "lane.sp" } }, .dialect = .hspice, .backend = .{ .lanes = lanes } });
+        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "lane.sp" } }, .dialect = .hspice, .backend = .{ .lanes = lanes, .knobs = .{ .bypass = false } } });
         defer p.deinit();
         try p.run_all();
         for (0..p.query_count()) |i| {
@@ -1758,6 +1761,26 @@ test "auto_point: a .meas-only deck without an output streams its measures; an o
     try t.expectEqualStrings(shapes[1].text, shapes[0].text);
     try t.expect(shapes[0].vars < shapes[1].vars); // measures_only
     try t.expect(shapes[0].points < shapes[1].points); // early_stop
+}
+
+test "auto_point: a deck of uic transients solves no warm operating point" {
+    // A uic transient starts from .ic and never reads Deck.warm_op; solving
+    // it anyway cost hours on chain_bsim4_100k before the transient began.
+    const source = "uic\nv1 a 0 1\nr1 a b 1k\nc1 b 0 1p\n.ic v(b)=0\n.tran 0.01n 1n uic\n.end\n";
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "uic.cir" } },
+        .auto_point = true,
+    });
+    defer p.deinit();
+    try t.expectEqual(@as(usize, 0), p.prepared.deck.warm_op.len);
+    try p.run_all();
+    // The same deck without uic does warm-start.
+    const warm = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = "warm\nv1 a 0 1\nr1 a b 1k\nc1 b 0 1p\n.tran 0.01n 1n\n.end\n", .origin = "warm.cir" } },
+        .auto_point = true,
+    });
+    defer warm.deinit();
+    try t.expect(warm.prepared.deck.warm_op.len != 0);
 }
 
 /// Every requested `.pss` result of `source`, in request order, with
@@ -1997,10 +2020,10 @@ const Points = struct {
     }
 
     fn collect(ps: *Points, source: []const u8, lanes: bool) !void {
-        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "chain.sp" } }, .dialect = .hspice, .backend = .{ .lanes = lanes } });
+        const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "chain.sp" } }, .dialect = .hspice, .backend = .{ .lanes = lanes, .knobs = .{ .bypass = false } } });
         defer p.deinit();
-        // CHECK: whether `run_all` fails when one point fails; if it does,
-        // catch and continue, the per-query results below still tell.
+        // One failed point does not hide its peers' results. Keep its
+        // actual failure below, not the result accessor's ResultUnavailable.
         p.run_all() catch {};
         for (0..p.query_count()) |i| {
             const id: api.QueryId = @fromBackingInt(@intCast(i));
@@ -2011,7 +2034,7 @@ const Points = struct {
                 try ps.errs.append(t.allocator, null);
             } else |e| {
                 try ps.data.append(t.allocator, &.{});
-                try ps.errs.append(t.allocator, e);
+                try ps.errs.append(t.allocator, @as(?anyerror, info.failure) orelse e);
             }
         }
     }
@@ -2045,7 +2068,366 @@ test "lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a fai
             try t.expectEqualSlices(u64, @ptrCast(alone.data.items[k]), @ptrCast(d));
         }
     }
-    // Some row must fail (the negative capacitance) or the failing-lane
-    // case tested nothing.
-    try t.expect(std.mem.indexOfNone(?anyerror, alone.errs.items, &.{null}) != null);
+    // The deliberately invalid final row must fail in the intended way,
+    // and every ordinary row must succeed. Avoid indexOfNone(?anyerror):
+    // Zig 0.18.0-dev.349's self-hosted backend miscompiles equality between
+    // two runtime optional errors (#215); null tests and unwraps are sound.
+    for (alone.errs.items[0 .. chain_rows.len - 1]) |err| try t.expect(err == null);
+    const failed = alone.errs.items[chain_rows.len - 1] orelse return error.TestUnexpectedResult;
+    try t.expectEqual(error.TimestepTooSmall, failed);
+}
+
+/// Keep the negative-capacitance row on the common pattern: a zero wire
+/// resistance changes the topology before scheduling and cannot test a
+/// failure inside the same GPU batch.
+fn gpuChainSource(order: []const usize) ![]u8 {
+    var rows: std.Io.Writer.Allocating = .init(t.allocator);
+    defer rows.deinit();
+    for (order) |k| {
+        var r = chain_rows[k];
+        if (k == chain_rows.len - 1) r[2] = 200;
+        try rows.writer.print("+ {e} {e} {e} {e} {e}\n", .{ r[0], r[1], r[2], r[3], r[4] });
+    }
+    return std.mem.replaceOwned(u8, t.allocator, chain_deck, "ROWS\n", rows.written());
+}
+
+const GpuPoint = struct {
+    data: []f64,
+    cols: usize,
+    failure: ?anyerror,
+};
+
+fn gpuChainPoints(source: []const u8, gpu: bool) ![]GpuPoint {
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "gpu-chain.sp" } },
+        .dialect = .hspice,
+        .backend = .{ .backend = if (gpu) .cuda else .cpu, .lanes = gpu },
+        .point = .{ .early_stop = true },
+    });
+    defer p.deinit();
+    p.run_all() catch {};
+    var points: std.ArrayList(GpuPoint) = .empty;
+    errdefer {
+        for (points.items) |v| t.allocator.free(v.data);
+        points.deinit(t.allocator);
+    }
+    for (0..p.query_count()) |i| {
+        const id: api.QueryId = @fromBackingInt(@intCast(i));
+        const info = try p.query_info(id);
+        if (!info.requested or info.kind != .tran) continue;
+        if (p.result(id)) |res| {
+            try points.append(t.allocator, .{ .data = try t.allocator.dupe(f64, res.data), .cols = res.varnames.len, .failure = null });
+        } else |err| try points.append(t.allocator, .{ .data = &.{}, .cols = 0, .failure = @as(?anyerror, info.failure) orelse err });
+    }
+    return points.toOwnedSlice(t.allocator);
+}
+
+fn freeGpuPoints(points: []GpuPoint) void {
+    for (points) |p| t.allocator.free(p.data);
+    t.allocator.free(points);
+}
+
+fn expectGpuPoint(cpu: GpuPoint, gpu: GpuPoint) !void {
+    // Do not compare runtime ?anyerror values: #215 is a compiler bug in
+    // that comparison. Test null and unwrap explicitly.
+    if (cpu.failure) |err| {
+        try t.expect(gpu.failure != null);
+        try t.expectEqual(err, gpu.failure.?);
+        try t.expectEqual(@as(usize, 0), gpu.data.len);
+        return;
+    }
+    try t.expect(gpu.failure == null);
+    try t.expectEqual(cpu.cols, gpu.cols);
+    const cols = cpu.cols;
+    for (cpu.data) |value| try t.expect(std.math.isFinite(value));
+    for (gpu.data) |value| try t.expect(std.math.isFinite(value));
+    const cn = cpu.data.len / cols;
+    const gn = gpu.data.len / cols;
+    try t.expect(cn > 1 and gn > 1);
+    const end_cpu = cpu.data[(cn - 1) * cols];
+    const end_gpu = gpu.data[(gn - 1) * cols];
+    const step = @max(end_cpu - cpu.data[(cn - 2) * cols], end_gpu - gpu.data[(gn - 2) * cols]);
+    try t.expect(@abs(end_cpu - end_gpu) <= 2 * step + 1e-24);
+    const peaks = try t.allocator.alloc(f64, cols);
+    defer t.allocator.free(peaks);
+    @memset(peaks, 0);
+    for (0..cn) |row| for (1..cols) |k| {
+        peaks[k] = @max(peaks[k], @abs(cpu.data[row * cols + k]));
+    };
+    // The early-stop crossing can land one accepted step apart. Every
+    // sample in the common time interval is checked; both runs must have
+    // completed the same successful measure-driven query.
+    var ci: usize = 1;
+    for (0..gn) |j| {
+        const time = gpu.data[j * cols];
+        try t.expect(std.math.isFinite(time));
+        if (j > 0) try t.expect(time >= gpu.data[(j - 1) * cols]);
+        if (time > cpu.data[(cn - 1) * cols]) break;
+        while (ci + 1 < cn and cpu.data[ci * cols] < time) ci += 1;
+        const t0 = cpu.data[(ci - 1) * cols];
+        const t1 = cpu.data[ci * cols];
+        const weight = if (t1 == t0) 1 else (time - t0) / (t1 - t0);
+        for (1..cols) |k| {
+            const a = cpu.data[(ci - 1) * cols + k];
+            const b = cpu.data[ci * cols + k];
+            const want = if (time == t1) b else a + weight * (b - a);
+            const got = gpu.data[j * cols + k];
+            try t.expect(std.math.isFinite(got) and std.math.isFinite(want));
+            try t.expect(@abs(got - want) <= 1e-3 * (@abs(want) + peaks[k]) + 1e-15);
+        }
+    }
+}
+
+/// Every `.op` and `.dc` result of `source`, in query order, as
+/// `gpuChainPoints` collects transients.
+fn staticPoints(source: []const u8, gpu: bool) ![]GpuPoint {
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "gpu-static.sp" } },
+        .dialect = .hspice,
+        .backend = .{ .backend = if (gpu) .cuda else .cpu, .lanes = gpu },
+    });
+    defer p.deinit();
+    try p.run_all();
+    var points: std.ArrayList(GpuPoint) = .empty;
+    errdefer {
+        for (points.items) |v| t.allocator.free(v.data);
+        points.deinit(t.allocator);
+    }
+    for (0..p.query_count()) |i| {
+        const id: api.QueryId = @fromBackingInt(@intCast(i));
+        const info = try p.query_info(id);
+        if (!info.requested or (info.kind != .op and info.kind != .dc)) continue;
+        const res = try p.result(id);
+        try points.append(t.allocator, .{ .data = try t.allocator.dupe(f64, res.data), .cols = res.varnames.len, .failure = null });
+    }
+    return points.toOwnedSlice(t.allocator);
+}
+
+test "GPU static lanes (06 6.9): operating points and .dc sweeps on the device match the CPU within tolerance" {
+    const gpu_lanes = @import("analysis").gpu_lanes;
+    if (comptime !gpu_lanes.available) return error.SkipZigTest;
+    const src =
+        \\* op and dc lanes
+        \\.param wn=1u
+        \\Vdd vdd 0 1.8
+        \\Vin in 0 0.9
+        \\.model nch NMOS(level=1 VTO=0.7 KP=110u)
+        \\.model pch PMOS(level=1 VTO=-0.7 KP=50u)
+        \\Mp0 s0 in vdd vdd pch W=2u L=0.18u
+        \\Mn0 s0 in 0 0 nch W='wn' L=0.18u
+        \\Mp1 s1 s0 vdd vdd pch W=2u L=0.18u
+        \\Mn1 s1 s0 0 0 nch W='wn' L=0.18u
+        \\R1 s1 0 100k
+        \\.op
+        \\.dc Vin 0 1.8 0.1
+        \\.step param wn 0.5u 3u 0.5u
+        \\.end
+    ;
+    const cpu = try staticPoints(src, false);
+    defer freeGpuPoints(cpu);
+    gpu_lanes.test_access.static = true;
+    defer gpu_lanes.test_access.static = false;
+    const before = gpu_lanes.test_access.admitted.load(.monotonic);
+    const gpu = try staticPoints(src, true);
+    defer freeGpuPoints(gpu);
+    // Six operating points and six sweeps, each batch on the device.
+    try t.expectEqual(@as(usize, 12), cpu.len);
+    try t.expectEqual(cpu.len, gpu.len);
+    try t.expect(gpu_lanes.test_access.admitted.load(.monotonic) - before >= 12);
+    for (cpu, gpu) |a, b| {
+        try t.expectEqual(a.cols, b.cols);
+        try t.expectEqual(a.data.len, b.data.len);
+        for (a.data, b.data) |x, y| try t.expect(@abs(x - y) <= 1e-6 * @abs(x) + 1e-9);
+    }
+}
+
+test "GPU lane colours (06 6.11): a thread per (instance colour, lane) gives the thread-per-lane points bit for bit" {
+    const gpu_lanes = @import("analysis").gpu_lanes;
+    if (comptime !gpu_lanes.available) return error.SkipZigTest;
+    var order: [chain_rows.len]usize = undefined;
+    for (&order, 0..) |*k, i| k.* = i;
+    const src = try gpuChainSource(&order);
+    defer t.allocator.free(src);
+    const plain = try gpuChainPoints(src, true);
+    defer freeGpuPoints(plain);
+    gpu_lanes.test_access.force_color = true;
+    defer gpu_lanes.test_access.force_color = false;
+    const colored = try gpuChainPoints(src, true);
+    defer freeGpuPoints(colored);
+    try t.expectEqual(plain.len, colored.len);
+    for (plain, colored) |a, b| {
+        try t.expectEqual(a.failure, b.failure);
+        try t.expectEqualSlices(u64, @ptrCast(a.data), @ptrCast(b.data));
+    }
+}
+
+/// The transients of `source` under `cuda` lanes with `point`.
+fn gpuBoundPoints(source: []const u8, point: @FieldType(api.Options, "point")) ![]GpuPoint {
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "gpu-chain.sp" } },
+        .dialect = .hspice,
+        .backend = .{ .backend = .cuda, .lanes = true },
+        .point = point,
+    });
+    defer p.deinit();
+    p.run_all() catch {};
+    var points: std.ArrayList(GpuPoint) = .empty;
+    errdefer {
+        for (points.items) |v| t.allocator.free(v.data);
+        points.deinit(t.allocator);
+    }
+    for (0..p.query_count()) |i| {
+        const id: api.QueryId = @fromBackingInt(@intCast(i));
+        const info = try p.query_info(id);
+        if (!info.requested or info.kind != .tran) continue;
+        if (p.result(id)) |res| {
+            try points.append(t.allocator, .{ .data = try t.allocator.dupe(f64, res.data), .cols = res.varnames.len, .failure = null });
+        } else |err| try points.append(t.allocator, .{ .data = &.{}, .cols = 0, .failure = @as(?anyerror, info.failure) orelse err });
+    }
+    return points.toOwnedSlice(t.allocator);
+}
+
+test "GPU lane measure bound (06 6.8): device passes under abort_after fail and finish the points the host measurer does, bit for bit" {
+    const gpu_lanes = @import("analysis").gpu_lanes;
+    if (comptime !gpu_lanes.available) return error.SkipZigTest;
+    var order: [chain_rows.len - 1]usize = undefined;
+    for (&order, 0..) |*k, i| k.* = i;
+    const src = try gpuChainSource(&order);
+    defer t.allocator.free(src);
+    // Over the bounds, some points must be cut and some spared.
+    var cut = false;
+    var spared = false;
+    for ([_]f64{ 150e-12, 250e-12, 350e-12 }) |bound| for ([_]bool{ false, true }) |early| {
+        const point: @FieldType(api.Options, "point") = .{ .early_stop = early, .abort_after = bound };
+        const dev = try gpuBoundPoints(src, point);
+        defer freeGpuPoints(dev);
+        gpu_lanes.test_access.host_meas = true;
+        defer gpu_lanes.test_access.host_meas = false;
+        const host = try gpuBoundPoints(src, point);
+        defer freeGpuPoints(host);
+        try t.expectEqual(host.len, dev.len);
+        var bounded: usize = 0;
+        for (host, dev) |a, b| {
+            if (a.failure) |e| {
+                try t.expect(b.failure != null);
+                try t.expectEqual(e, b.failure.?);
+                if (e == error.MeasureBoundExceeded) bounded += 1;
+                continue;
+            }
+            try t.expect(b.failure == null);
+            try t.expectEqualSlices(u64, @ptrCast(a.data), @ptrCast(b.data));
+        }
+        cut = cut or bounded > 0;
+        spared = spared or bounded < dev.len;
+    };
+    try t.expect(cut and spared);
+}
+
+/// The transients of `source` under `cuda` lanes with early stop on or
+/// off, and every card's printed value and error line.
+fn gpuMeasRun(source: []const u8, early: bool) !struct { points: []GpuPoint, text: []u8 } {
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "gpu-chain.sp" } },
+        .dialect = .hspice,
+        .backend = .{ .backend = .cuda, .lanes = true },
+        .point = .{ .early_stop = early },
+    });
+    defer p.deinit();
+    p.run_all() catch {};
+    var points: std.ArrayList(GpuPoint) = .empty;
+    errdefer {
+        for (points.items) |v| t.allocator.free(v.data);
+        points.deinit(t.allocator);
+    }
+    for (0..p.query_count()) |i| {
+        const id: api.QueryId = @fromBackingInt(@intCast(i));
+        const info = try p.query_info(id);
+        if (!info.requested or info.kind != .tran) continue;
+        const res = try p.result(id);
+        try points.append(t.allocator, .{ .data = try t.allocator.dupe(f64, res.data), .cols = res.varnames.len, .failure = null });
+    }
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    try p.print_measures(&text.writer, &text.writer);
+    return .{ .points = try points.toOwnedSlice(t.allocator), .text = try text.toOwnedSlice() };
+}
+
+test "GPU lane measures (06 6.8): FIND/DERIV ... WHEN and par() cards measure on the device as the host does, bit for bit" {
+    const gpu_lanes = @import("analysis").gpu_lanes;
+    if (comptime !gpu_lanes.available) return error.SkipZigTest;
+    var order: [chain_rows.len - 1]usize = undefined;
+    for (&order, 0..) |*k, i| k.* = i;
+    const chain = try gpuChainSource(&order);
+    defer t.allocator.free(chain);
+    const src = try std.mem.replaceOwned(u8, t.allocator, chain, ".end\n",
+        \\.meas tran fw find v(n4) when v(n8)=0.5 rise=1
+        \\.meas tran dw deriv v(n2) when v(n6)=0.5 cross=1
+        \\.meas tran pm max par('v(n8)+0.5*v(n4)') to=300p
+        \\.meas tran pa avg par('v(n2)*v(n2)-v(n3)') from=50p to=250p
+        \\.end
+        \\
+    );
+    defer t.allocator.free(src);
+    for ([_]bool{ false, true }) |early| {
+        const before = gpu_lanes.test_access.dev_meas.load(.monotonic);
+        const dev = try gpuMeasRun(src, early);
+        defer freeGpuPoints(dev.points);
+        defer t.allocator.free(dev.text);
+        // Every batch measured on the device.
+        try t.expect(gpu_lanes.test_access.dev_meas.load(.monotonic) > before);
+        gpu_lanes.test_access.host_meas = true;
+        defer gpu_lanes.test_access.host_meas = false;
+        const host = try gpuMeasRun(src, early);
+        defer freeGpuPoints(host.points);
+        defer t.allocator.free(host.text);
+        try t.expect(std.mem.indexOf(u8, host.text, "fw") != null and std.mem.indexOf(u8, host.text, "pa") != null);
+        try t.expectEqualStrings(host.text, dev.text);
+        try t.expectEqual(host.points.len, dev.points.len);
+        for (host.points, dev.points) |a, b| try t.expectEqualSlices(u64, @ptrCast(a.data), @ptrCast(b.data));
+    }
+}
+
+test "GPU lane lockstep (#208): mixed sizing, moved edge, extreme wire, failed peer and repeated point remain isolated" {
+    const gpu_lanes = @import("analysis").gpu_lanes;
+    if (comptime !gpu_lanes.available) return error.SkipZigTest;
+    const count = chain_rows.len;
+    var alone: [count]GpuPoint = undefined;
+    var done: usize = 0;
+    defer for (alone[0..done]) |p| t.allocator.free(p.data);
+    for (0..count) |k| {
+        const src = try gpuChainSource(&.{k});
+        defer t.allocator.free(src);
+        const result = try gpuChainPoints(src, false);
+        defer t.allocator.free(result);
+        try t.expectEqual(@as(usize, 1), result.len);
+        alone[k] = result[0];
+        done += 1;
+    }
+    for (alone[0 .. count - 1]) |p| try t.expect(p.failure == null);
+    try t.expect(alone[count - 1].failure != null);
+    try t.expectEqual(error.TimestepTooSmall, alone[count - 1].failure.?);
+    var order: [count + 1]usize = undefined;
+    for (order[0..count], 0..) |*k, i| k.* = i;
+    order[count] = 0;
+    var prng = std.Random.DefaultPrng.init(208);
+    for (0..3) |trial| {
+        if (trial == 1) std.mem.reverse(usize, &order);
+        if (trial == 2) prng.random().shuffle(usize, &order);
+        const src = try gpuChainSource(&order);
+        defer t.allocator.free(src);
+        const before = gpu_lanes.test_access.admitted.load(.monotonic);
+        const got = try gpuChainPoints(src, true);
+        defer freeGpuPoints(got);
+        try t.expectEqual(order.len, got.len);
+        try t.expectEqual(order.len, gpu_lanes.test_access.admitted.load(.monotonic) - before);
+        var first_replica: ?usize = null;
+        for (order, got, 0..) |k, p, j| {
+            try expectGpuPoint(alone[k], p);
+            if (k == 0) {
+                if (first_replica) |first| {
+                    try t.expectEqualSlices(u64, @ptrCast(got[first].data), @ptrCast(p.data));
+                } else first_replica = j;
+            }
+        }
+    }
 }

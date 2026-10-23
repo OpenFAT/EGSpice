@@ -34,6 +34,30 @@
         "type": "github"
       }
     },
+    "nix-bundle": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "utils": [
+          "flake-utils"
+        ]
+      },
+      "locked": {
+        "lastModified": 1756736056,
+        "narHash": "sha256-8YFhvulVX3iS4TYnKisA9zSImJeFN21G75HOUUFjzuE=",
+        "owner": "nix-community",
+        "repo": "nix-bundle",
+        "rev": "eff01593f62794d458ec714090091419194ab64d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "nix-bundle",
+        "rev": "eff01593f62794d458ec714090091419194ab64d",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1782948114,
@@ -53,6 +77,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
+        "nix-bundle": "nix-bundle",
         "nixpkgs": "nixpkgs",
         "zig-overlay": "zig-overlay"
       }

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "analysis": "noise",
+  "purpose": "LRM 4.6.4: a noise generator in a potential contribution is a voltage source in series with the branch",
+  "oracle": {
+    "kind": "analytic",
+    "derivation": "Only noise: white_noise(4e-18 V^2/Hz) in V(out,0) <+ 1k*I(out,0) + n, a source in series with Nv's 1k. Vin is an AC short, so out sits on a divider: Ns's 1k to the AC ground and Nv's 1k plus the source to ground. Transfer 1k/(1k + 1k) = 0.5, flat: onoise = 0.5*sqrt(4e-18) = 1e-9 V/sqrt(Hz). Injecting the generator as a current between out and 0 would give 500*2e-9 = 1e-6."
+  },
+  "expect": {
+    "status": "success",
+    "plots": [
+      {
+        "name": "Noise Spectral Density Curves",
+        "match": "exact",
+        "row_count": 2,
+        "axis": {
+          "name": "frequency",
+          "values": [
+            1000,
+            2000
+          ],
+          "rtol": 1e-09,
+          "atol": 1e-09
+        },
+        "columns": {
+          "onoise_spectrum": {
+            "unit": "V/sqrt(Hz)",
+            "rtol": 1e-09,
+            "atol": 1e-18,
+            "values": [
+              1e-09,
+              1e-09
+            ]
+          }
+        }
+      }
+    ],
+    "finite_values_required": true,
+    "all_requested_analyses_must_complete": true
+  },
+  "netlist_sha256": "3c47108f2d2a0a4caf096cdb19d6dec6be87b266cbd8be8648b774f4b57d9d59"
+}

@@ -1,0 +1,263 @@
+[
+  {
+    "fixture": "op/divider_default.sp",
+    "source": "tests/fixtures/op/divider_default.sp",
+    "sha256": "c4ee2e5ae00c65a66bd3677bca74c1f0672c551841170f413feff58d5f7fc9ec"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "source": "tests/fixtures/op/balanced_bridge.sp",
+    "sha256": "ee0c42c064a281a2a53275f6b0059cbb9383019c3031bf422d3267c0bcf3c87c"
+  },
+  {
+    "fixture": "op/parallel_resistors.sp",
+    "source": "tests/fixtures/op/parallel_resistors.sp",
+    "sha256": "a1733c2af0e676ea0f0b81a45ae7c295aee8a3e15f57016320b9d02c3dd431c4"
+  },
+  {
+    "fixture": "op/bench_bjt_cascode.sp",
+    "source": "tests/fixtures/op/bench_bjt_cascode.sp",
+    "sha256": "08b22a1d86e8b76ca56e6af163a76a7676e540a52edc39cb0b2a910ab9afd78f"
+  },
+  {
+    "fixture": "op/bench_mosfet_nand2.sp",
+    "source": "tests/fixtures/op/bench_mosfet_nand2.sp",
+    "sha256": "837a6c90aaaeb3e038435ba9244a039a4164f27a01965ccb0cb730d2bdcd9c2b"
+  },
+  {
+    "fixture": "op/bench_medium_resistor_mesh.sp",
+    "source": "tests/fixtures/op/bench_medium_resistor_mesh.sp",
+    "sha256": "6de35bd7a269a4351cfbceb4013c5bca62131d979d2677fe00ca42cf63b9d1b3"
+  },
+  {
+    "fixture": "dc/resistor_sweep.sp",
+    "source": "tests/fixtures/dc/resistor_sweep.sp",
+    "sha256": "52646a7f8322b13065fe39cc0cb63f099e7173d3d6ff39e1cd733a2b9a87954b"
+  },
+  {
+    "fixture": "dc/diode_forward.sp",
+    "source": "tests/fixtures/dc/diode_forward.sp",
+    "sha256": "b92357ee592ca8e403b94594ad32a91b6bb64b8b861b6d52c581c84706cf059e"
+  },
+  {
+    "fixture": "dc/device_diode_high_injection.sp",
+    "source": "tests/fixtures/dc/device_diode_high_injection.sp",
+    "sha256": "f7a4b4b5a974ac53c65f14d5c92a92c4b4e254146cd1c4ec82c6f012ddb2bcb1"
+  },
+  {
+    "fixture": "dc/device_bjt_npn_gummel.sp",
+    "source": "tests/fixtures/dc/device_bjt_npn_gummel.sp",
+    "sha256": "5b67e063f56a5637fe64583bc575a55769ef153b1ea42c404a3f214ba5bf487c"
+  },
+  {
+    "fixture": "dc/device_bjt_npn_output.sp",
+    "source": "tests/fixtures/dc/device_bjt_npn_output.sp",
+    "sha256": "1eb97b98ac28e46831e1f542f6b729aa6351880948ff02c68e93d5f6036b4dd9"
+  },
+  {
+    "fixture": "dc/device_jfet_transfer.sp",
+    "source": "tests/fixtures/dc/device_jfet_transfer.sp",
+    "sha256": "3fb2d9df9381aa8717a1e1db2fdfe4052aaeb1013f9e537ecf352dd804235172"
+  },
+  {
+    "fixture": "dc/device_mos1_transfer.sp",
+    "source": "tests/fixtures/dc/device_mos1_transfer.sp",
+    "sha256": "544095ba1dd1d027297ae9274e877464149225b07cb6b22257a7a532b7361e99"
+  },
+  {
+    "fixture": "dc/device_mos3_transfer.sp",
+    "source": "tests/fixtures/dc/device_mos3_transfer.sp",
+    "sha256": "04c29137f420c3254354307ecb3a08a075ffd63d206b21912d2856f6c647a445"
+  },
+  {
+    "fixture": "dc/device_bsim3_output.sp",
+    "source": "tests/fixtures/dc/device_bsim3_output.sp",
+    "sha256": "f43b4128a478b2420b5e482ae60007999fe2bb53ede62783ceccfe1e4905e880"
+  },
+  {
+    "fixture": "dc/device_bsim4_output.sp",
+    "source": "tests/fixtures/dc/device_bsim4_output.sp",
+    "sha256": "1300e2f71ff07b6f1e6bd9445a72fcfe699c6a8dc07b61b38c4b9a015efa4038"
+  },
+  {
+    "fixture": "ac/rc_highpass.sp",
+    "source": "tests/fixtures/ac/rc_highpass.sp",
+    "sha256": "8958e04bbe33e9b7bdbf969e82fb157764d2c14396a3d118bcdbd864dcfffebf"
+  },
+  {
+    "fixture": "ac/rlc_lowpass.sp",
+    "source": "tests/fixtures/ac/rlc_lowpass.sp",
+    "sha256": "69130502dbcf531bbedbfd9e24111d993ab5117a2832e5569aa85111b45589db"
+  },
+  {
+    "fixture": "ac/rlc_near_resonance_0p1.sp",
+    "source": "tests/fixtures/ac/rlc_near_resonance_0p1.sp",
+    "sha256": "d100e6a41254cdf54a941451e89efba321ffe92d8c89829a76c6f5b8561af078"
+  },
+  {
+    "fixture": "ac/unbuffered_rc_ladder.sp",
+    "source": "tests/fixtures/ac/unbuffered_rc_ladder.sp",
+    "sha256": "8fa0a5c7fd9fd94bf59e3669a345b4380ed4aca1d3fbde6fe083682a9a31a0fe"
+  },
+  {
+    "fixture": "ac/bench_bjt_common_emitter.sp",
+    "source": "tests/fixtures/ac/bench_bjt_common_emitter.sp",
+    "sha256": "be416fcdcc0281c576aaa31c8cfd447c51271f395289a3182ddbca97e3b7f35a"
+  },
+  {
+    "fixture": "ac/device_diode_capacitance.sp",
+    "source": "tests/fixtures/ac/device_diode_capacitance.sp",
+    "sha256": "7c27f0b77140ff656a38c58c9b477fd5d2083442cce5948e7df0d15bc99f793f"
+  },
+  {
+    "fixture": "ac/device_bsim4_capmod2.sp",
+    "source": "tests/fixtures/ac/device_bsim4_capmod2.sp",
+    "sha256": "1ab43bf10746e2d004a0eb943ccaa4792aa47a0772d80a5e6e88ff5fc8ec9c80"
+  },
+  {
+    "fixture": "ac/bench_medium_ladder_filter.sp",
+    "source": "tests/fixtures/ac/bench_medium_ladder_filter.sp",
+    "sha256": "debb45349297756695144f913547f433c07398b07809496d4514251139104f72"
+  },
+  {
+    "fixture": "tran/bench_tran_rc_pulse.sp",
+    "source": "tests/fixtures/tran/bench_tran_rc_pulse.sp",
+    "sha256": "67d691023e5f8b0afabda497b84267a1ffd08fc01fa4433c5ccd8e66b1b85e78"
+  },
+  {
+    "fixture": "tran/rc_sinusoidal_startup.sp",
+    "source": "tests/fixtures/tran/rc_sinusoidal_startup.sp",
+    "sha256": "a0b0a5ee8b1420375e97350effd8cd997ab17336d45fa060181445183259bfc0"
+  },
+  {
+    "fixture": "tran/bench_medium_rc_ladder_50.sp",
+    "source": "tests/fixtures/tran/bench_medium_rc_ladder_50.sp",
+    "sha256": "1911b59e0915e7df678d0a09fd3aadb3b3b82e5cfde733b6a614ef686baf072f"
+  },
+  {
+    "fixture": "tran/bench_digital_rc_filter_chain.sp",
+    "source": "tests/fixtures/tran/bench_digital_rc_filter_chain.sp",
+    "sha256": "b0a506879b2724016e4f3312f569326f05650b2cea62ebb71f3235a4d89ee602"
+  },
+  {
+    "fixture": "tran/bench_power_rectifier.sp",
+    "source": "tests/fixtures/tran/bench_power_rectifier.sp",
+    "sha256": "47be631553ea2523d07eb3652f2ca721928a1529bb7f2e4042538e23c7b09a67"
+  },
+  {
+    "fixture": "tran/device_mos1_large_signal.sp",
+    "source": "tests/fixtures/tran/device_mos1_large_signal.sp",
+    "sha256": "d2a296a60dc758c53204a78db9e384e2e9ecceb06c0c71a0a4004b7c9c5c6f47"
+  },
+  {
+    "fixture": "tran/bench_mosfet_nmos_cs.sp",
+    "source": "tests/fixtures/tran/bench_mosfet_nmos_cs.sp",
+    "sha256": "5608cedc03edeaa0bc8f6f93f5d7d0c325188a9083ee7ee9fdbbc5dc50ab8da4"
+  },
+  {
+    "fixture": "tran/bench_ngspice_mosamp.sp",
+    "source": "tests/fixtures/tran/bench_ngspice_mosamp.sp",
+    "sha256": "d8357eaf11f904364ce4c2e338658f9dbed3a61396bb1fe5fd1a845c531dd1fd"
+  },
+  {
+    "fixture": "tran/bench_ngspice_mosmem.sp",
+    "source": "tests/fixtures/tran/bench_ngspice_mosmem.sp",
+    "sha256": "3e1821992a07828ab6d4c056770363db0c34647450abda22f95b0631c66ac78e"
+  },
+  {
+    "fixture": "tran/pwl_triangle.sp",
+    "source": "tests/fixtures/tran/pwl_triangle.sp",
+    "sha256": "fb656b71ae1f02908d3ea3fffe843a95ed126c0ea665a0d4ba5c6b8a10c54200"
+  },
+  {
+    "fixture": "noise/rc_1e-06.sp",
+    "source": "tests/fixtures/noise/rc_1e-06.sp",
+    "sha256": "ae5d45d56cfed7ebf21bbcfabdf8660f3f0b2ce11ad6a0554852f2c77fd3c494"
+  },
+  {
+    "fixture": "noise/bench_noise_bjt_flicker.sp",
+    "source": "tests/fixtures/noise/bench_noise_bjt_flicker.sp",
+    "sha256": "ac5c95bc3245c9dc280485b80331c27211330f82e962698854aa6cd2be31d5b3"
+  },
+  {
+    "fixture": "stress/scaling_divider_chain.sp",
+    "source": "tests/fixtures/stress/scaling_divider_chain.sp",
+    "sha256": "3d82e9b81ea67fd0b452fbc204b67bd133706b71dc81a170f773ca0fa2ba402e"
+  },
+  {
+    "fixture": "stress/scaling_resistor_grid.sp",
+    "source": "tests/fixtures/stress/scaling_resistor_grid.sp",
+    "sha256": "603b11c9eecede0688ff13b657dece464b282f2e2be6436697f8dee72e1f121b"
+  },
+  {
+    "fixture": "stress/scaling_resistor_grid_32x32.sp",
+    "source": "tests/fixtures/stress/scaling_resistor_grid_32x32.sp",
+    "sha256": "acc52f260793510050c935a8a1cb8d9ddaf87ca109b2aa93341e3b2ef52defc3"
+  },
+  {
+    "fixture": "stress/scaling_resistor_grid_100x100.sp",
+    "source": "tests/fixtures/stress/scaling_resistor_grid_100x100.sp",
+    "sha256": "c82b6e45fdaa9eae67a5ae9a8aa128da44753e3d971a79f19bef23b5186f215c"
+  },
+  {
+    "fixture": "stress/scaling_rc_ladder_1k.sp",
+    "source": "tests/fixtures/stress/scaling_rc_ladder_1k.sp",
+    "sha256": "9b8bd517af24f66cf55a68a9ed68efb8967ddcc120b330ad62e410bc864cad25"
+  },
+  {
+    "fixture": "stress/scaling_parallel_inverters_100.sp",
+    "source": "tests/fixtures/stress/scaling_parallel_inverters_100.sp",
+    "sha256": "85a507f69a6b3c5de4e85f1e3c69e9e7863b11dcc2835d8d4bf76b9724a9d4a4"
+  },
+  {
+    "fixture": "stress/scaling_parallel_inverters_2000.sp",
+    "source": "tests/fixtures/stress/scaling_parallel_inverters_2000.sp",
+    "sha256": "b074e3098c470ceb71b5a431df6d4fa47d7a75523ddd6b320a4bf356387ad3b1"
+  },
+  {
+    "fixture": "stress/scaling_inverter_chain_256.sp",
+    "source": "tests/fixtures/stress/scaling_inverter_chain_256.sp",
+    "sha256": "cfd36ef00536a594bc196625624541868f9aa175cbb607a2c28ccf565186a2b5"
+  },
+  {
+    "fixture": "stress/scaling_inverter_chain_4k.sp",
+    "source": "tests/fixtures/stress/scaling_inverter_chain_4k.sp",
+    "sha256": "a6dd47986d5a60d3dde05d644544a75e7accce40a7a8a6d2bf15b4904dd38bd2"
+  },
+  {
+    "fixture": "postlayout/chain_bsim4_1k.sp",
+    "generator": "tests/benchmark/postlayout/gen.py",
+    "family": "chain",
+    "model": "bsim4",
+    "size": "1k",
+    "seed": 1,
+    "sha256": "dc2f7a86b40aafa78972f713e12818da4d086b329e9615a70b3da0ead003755f"
+  },
+  {
+    "fixture": "postlayout/chain_bsim4_10k.sp",
+    "generator": "tests/benchmark/postlayout/gen.py",
+    "family": "chain",
+    "model": "bsim4",
+    "size": "10k",
+    "seed": 1,
+    "sha256": "47e1ff872c53f41eb82204286bfa86ac16b2adc67270cbf549be691b037d5fed"
+  },
+  {
+    "fixture": "postlayout/ring_bsim4_1k.sp",
+    "generator": "tests/benchmark/postlayout/gen.py",
+    "family": "ring",
+    "model": "bsim4",
+    "size": "1k",
+    "seed": 1,
+    "sha256": "f194d722110e6d651d6a486b90bffc45b126f0188541cc853ba6c05263b5bc9b"
+  },
+  {
+    "fixture": "postlayout/logic_bsim4_1k.sp",
+    "generator": "tests/benchmark/postlayout/gen.py",
+    "family": "logic",
+    "model": "bsim4",
+    "size": "1k",
+    "seed": 1,
+    "sha256": "8c5bb9f8c1c4ed9b58c4fd0713c1ec71d55d25ff0fc8a65847b18b8b54211deb"
+  }
+]

@@ -1,4 +1,6 @@
 * NMOS Level 1 large-signal transient: CMOS inverter switching.
+* Reference-model difference: pinned VACASK drops gate overlap capacitance without TOX.
+* See docs/performance/comparison.md; keep this card's physical parameters unchanged.
 * Expected results: device_mos1_large_signal.expected.json
 * Origin: benchmark/fixtures/devices/mos1_large_signal/circuit.sp
 * Tests dynamic behavior with parasitic capacitances.

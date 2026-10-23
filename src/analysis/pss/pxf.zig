@@ -4,7 +4,6 @@
 //! feedthrough, conversion gain from every port at once).
 //!
 //! Cites: dev/analysis/pxf.md.
-const std = @import("std");
 const root = @import("../types.zig");
 const pac = @import("pac.zig");
 

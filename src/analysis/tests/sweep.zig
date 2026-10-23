@@ -96,9 +96,9 @@ const GroupsTests = struct {
 
     var values = [_]f64{ 1, 2, 3 };
     const refs = [_]root.ParamRef{
-        .{ .ptr = .{ .f64 = &values[0] }, .param_name = "a", .index = 0, .is_instance = false, .primary = true, .pelgrom_ap = 4e-3, .area_wl = 1e-12 },
-        .{ .ptr = .{ .f64 = &values[1] }, .param_name = "b", .index = 1, .is_instance = false, .primary = true },
-        .{ .ptr = .{ .f64 = &values[2] }, .param_name = "c", .index = 2, .is_instance = true, .primary = false },
+        .{ .ptr = &values[0], .param_name = "a", .index = 0, .is_instance = false, .primary = true, .pelgrom_ap = 4e-3, .area_wl = 1e-12 },
+        .{ .ptr = &values[1], .param_name = "b", .index = 1, .is_instance = false, .primary = true },
+        .{ .ptr = &values[2], .param_name = "c", .index = 2, .is_instance = true, .primary = false },
     };
     const grouped: Variations = .{
         .labels = &.{ "a+c", "b" },
@@ -670,11 +670,11 @@ const DividerTests = struct {
         nominal: f64,
         restores: u32 = 0,
 
-        pub fn apply(self: *R2Lanes, k: usize) void {
+        pub fn apply(self: *R2Lanes, k: usize) !void {
             self.ref.set(self.values[k]);
         }
 
-        pub fn restore(self: *R2Lanes) void {
+        pub fn restore(self: *R2Lanes) !void {
             self.ref.set(self.nominal);
             self.restores += 1;
         }
@@ -696,7 +696,7 @@ const DividerTests = struct {
         @memset(warm_x, 0);
         for ([_]?[]const f64{ null, warm_x }, &rows) |warm, *pass_rows| {
             var setup: R2Lanes = .{ .ref = refs[try paramIndex(refs, "r", 3000)], .values = &values, .nominal = 3000 };
-            try lanes.solveLanes(&ckt, &setup, 0, &probes, pass_rows, &results, converger.optionsFromTolerances(.{}, null), warm, gpa);
+            try lanes.solveLanes(&ckt, &setup, 0, &probes, pass_rows, &results, converger.optionsFromTolerances(.{}, null), .{}, warm, gpa);
             try t.expectEqual(@as(u32, 1), setup.restores);
             for (values, results, pass_rows) |r2, r, v| {
                 try t.expect(r.converged);
@@ -705,6 +705,30 @@ const DividerTests = struct {
             try expectNominals(&ckt);
         }
         for (rows[0], rows[1]) |cold, warm| try t.expectApproxEqAbs(cold, warm, 1e-9);
+    }
+
+    test "solveLanes: a lane whose plain Newton runs out of iterations takes the ladder" {
+        var lib = try Library.init(gpa);
+        defer lib.deinit();
+        var prepared = try build(&lib);
+        defer prepared.deinit();
+        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
+        defer ckt.deinit();
+        const refs = try ckt.collectParams();
+        const values = [_]f64{ 1000, 2000 };
+        var results: [values.len]converger.Result = undefined;
+        var rows: [values.len]f64 = undefined;
+        // One iteration cannot confirm convergence, so every plain Newton
+        // fails and only the ladder can converge the lanes.
+        var one = converger.optionsFromTolerances(.{}, null);
+        one.max_iter = 1;
+        var setup: R2Lanes = .{ .ref = refs[try paramIndex(refs, "r", 3000)], .values = &values, .nominal = 3000 };
+        try lanes.solveLanes(&ckt, &setup, 0, &probes, &rows, &results, one, .{}, null, gpa);
+        for (values, results, rows) |r2, r, v| {
+            try t.expect(r.converged);
+            try t.expectApproxEqRel(10 * r2 / (1000 + r2), v, 1e-9);
+        }
+        try expectNominals(&ckt);
     }
 
     test "mc: zero variation is the nominal; a seed reproduces its trials" {

@@ -1,0 +1,335 @@
+[
+  {
+    "fixture": "ac/rc_highpass.sp",
+    "engine": "espice",
+    "signal": "v(out)",
+    "max_abs": 3.332294980281256e-16,
+    "rms_abs": 1.3706680020456742e-16,
+    "points": 13,
+    "unit": "V"
+  },
+  {
+    "fixture": "ac/rc_highpass.sp",
+    "engine": "ngspice",
+    "signal": "v(out)",
+    "max_abs": 1.2412670766236366e-16,
+    "rms_abs": 8.847220550306022e-17,
+    "points": 13,
+    "unit": "V"
+  },
+  {
+    "fixture": "ac/rc_highpass.sp",
+    "engine": "VACASK",
+    "signal": "v(out)",
+    "max_abs": 2.2215299868541707e-16,
+    "rms_abs": 1.0910447475414032e-16,
+    "points": 13,
+    "unit": "V"
+  },
+  {
+    "fixture": "ac/rc_highpass.sp",
+    "engine": "Xyce",
+    "signal": "v(out)",
+    "max_abs": 2.482534153247273e-16,
+    "rms_abs": 1.1040446459757306e-16,
+    "points": 13,
+    "unit": "V"
+  },
+  {
+    "fixture": "ac/rlc_lowpass.sp",
+    "engine": "espice",
+    "signal": "v(out)",
+    "max_abs": 9.155133597044475e-16,
+    "rms_abs": 2.655064595664011e-16,
+    "points": 13,
+    "unit": "V"
+  },
+  {
+    "fixture": "ac/rlc_lowpass.sp",
+    "engine": "ngspice",
+    "signal": "v(out)",
+    "max_abs": 1.1957467920563633e-15,
+    "rms_abs": 3.57683256690641e-16,
+    "points": 13,
+    "unit": "V"
+  },
+  {
+    "fixture": "ac/rlc_lowpass.sp",
+    "engine": "VACASK",
+    "signal": "v(out)",
+    "max_abs": 1.1102230246251565e-15,
+    "rms_abs": 3.5207400293455817e-16,
+    "points": 13,
+    "unit": "V"
+  },
+  {
+    "fixture": "ac/rlc_lowpass.sp",
+    "engine": "Xyce",
+    "signal": "v(out)",
+    "max_abs": 9.155133597044475e-16,
+    "rms_abs": 2.773509657734462e-16,
+    "points": 13,
+    "unit": "V"
+  },
+  {
+    "fixture": "dc/device_diode_high_injection.sp",
+    "engine": "espice",
+    "signal": "i(v1)",
+    "max_abs": 2.0905643267942267e-09,
+    "rms_abs": 3.935469663130206e-10,
+    "points": 401,
+    "unit": "A"
+  },
+  {
+    "fixture": "dc/device_diode_high_injection.sp",
+    "engine": "ngspice",
+    "signal": "i(v1)",
+    "max_abs": 2.090564324951083e-09,
+    "rms_abs": 3.935469663114727e-10,
+    "points": 401,
+    "unit": "A"
+  },
+  {
+    "fixture": "dc/device_diode_high_injection.sp",
+    "engine": "VACASK",
+    "signal": "i(v1)",
+    "max_abs": 0.0007287398859343319,
+    "rms_abs": 0.0004184308238119235,
+    "points": 401,
+    "unit": "A"
+  },
+  {
+    "fixture": "dc/device_diode_high_injection.sp",
+    "engine": "Xyce",
+    "signal": "i(v1)",
+    "max_abs": 0.0002328551543529095,
+    "rms_abs": 0.00017052430741940075,
+    "points": 401,
+    "unit": "A"
+  },
+  {
+    "fixture": "noise/rc_1e-06.sp",
+    "engine": "espice",
+    "signal": "v(onoise_spectrum)",
+    "max_abs": 7.063390756863829e-16,
+    "rms_abs": 4.522753992859268e-16,
+    "points": 13,
+    "unit": "V/\u221aHz"
+  },
+  {
+    "fixture": "noise/rc_1e-06.sp",
+    "engine": "espice",
+    "signal": "v(inoise_spectrum)",
+    "max_abs": 7.0773196098395785e-16,
+    "rms_abs": 7.077319602204066e-16,
+    "points": 13,
+    "unit": "V/\u221aHz"
+  },
+  {
+    "fixture": "noise/rc_1e-06.sp",
+    "engine": "ngspice",
+    "signal": "v(onoise_spectrum)",
+    "max_abs": 7.063390756863829e-16,
+    "rms_abs": 4.522753993138205e-16,
+    "points": 13,
+    "unit": "V/\u221aHz"
+  },
+  {
+    "fixture": "noise/rc_1e-06.sp",
+    "engine": "ngspice",
+    "signal": "v(inoise_spectrum)",
+    "max_abs": 7.0773196098395785e-16,
+    "rms_abs": 7.077319602204066e-16,
+    "points": 13,
+    "unit": "V/\u221aHz"
+  },
+  {
+    "fixture": "noise/rc_1e-06.sp",
+    "engine": "VACASK",
+    "signal": "v(onoise_spectrum)",
+    "max_abs": 7.063390756863829e-16,
+    "rms_abs": 4.522753990630204e-16,
+    "points": 13,
+    "unit": "V/\u221aHz"
+  },
+  {
+    "fixture": "noise/rc_1e-06.sp",
+    "engine": "VACASK",
+    "signal": "v(inoise_spectrum)",
+    "max_abs": 7.0773196098395785e-16,
+    "rms_abs": 7.077319597750015e-16,
+    "points": 13,
+    "unit": "V/\u221aHz"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "espice",
+    "signal": "v(a)",
+    "max_abs": 0.0,
+    "rms_abs": 0.0,
+    "points": 1,
+    "unit": "V"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "espice",
+    "signal": "v(b)",
+    "max_abs": 0.0,
+    "rms_abs": 0.0,
+    "points": 1,
+    "unit": "V"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "espice",
+    "signal": "i(v1)",
+    "max_abs": 8.673617379884035e-19,
+    "rms_abs": 8.673617379884035e-19,
+    "points": 1,
+    "unit": "A"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "ngspice",
+    "signal": "v(a)",
+    "max_abs": 2.4868995751603507e-14,
+    "rms_abs": 2.4868995751603507e-14,
+    "points": 1,
+    "unit": "V"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "ngspice",
+    "signal": "v(b)",
+    "max_abs": 2.4868995751603507e-14,
+    "rms_abs": 2.4868995751603507e-14,
+    "points": 1,
+    "unit": "V"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "ngspice",
+    "signal": "i(v1)",
+    "max_abs": 3.8163916471489756e-17,
+    "rms_abs": 3.8163916471489756e-17,
+    "points": 1,
+    "unit": "A"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "VACASK",
+    "signal": "v(a)",
+    "max_abs": 1.2434497875801753e-14,
+    "rms_abs": 1.2434497875801753e-14,
+    "points": 1,
+    "unit": "V"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "VACASK",
+    "signal": "v(b)",
+    "max_abs": 1.2434497875801753e-14,
+    "rms_abs": 1.2434497875801753e-14,
+    "points": 1,
+    "unit": "V"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "VACASK",
+    "signal": "i(v1)",
+    "max_abs": 1.8214596497756474e-17,
+    "rms_abs": 1.8214596497756474e-17,
+    "points": 1,
+    "unit": "A"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "Xyce",
+    "signal": "v(a)",
+    "max_abs": 0.0,
+    "rms_abs": 0.0,
+    "points": 1,
+    "unit": "V"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "Xyce",
+    "signal": "v(b)",
+    "max_abs": 0.0,
+    "rms_abs": 0.0,
+    "points": 1,
+    "unit": "V"
+  },
+  {
+    "fixture": "op/balanced_bridge.sp",
+    "engine": "Xyce",
+    "signal": "i(v1)",
+    "max_abs": 0.0,
+    "rms_abs": 0.0,
+    "points": 1,
+    "unit": "A"
+  },
+  {
+    "fixture": "tran/bench_tran_rc_pulse.sp",
+    "engine": "espice",
+    "signal": "v(out)",
+    "max_abs": 0.001110949622400853,
+    "rms_abs": 0.0005516425872765688,
+    "points": 408,
+    "unit": "V"
+  },
+  {
+    "fixture": "tran/bench_tran_rc_pulse.sp",
+    "engine": "ngspice",
+    "signal": "v(out)",
+    "max_abs": 0.0011109496224032678,
+    "rms_abs": 0.000551642587273658,
+    "points": 408,
+    "unit": "V"
+  },
+  {
+    "fixture": "tran/bench_tran_rc_pulse.sp",
+    "engine": "VACASK",
+    "signal": "v(out)",
+    "max_abs": 0.014691820399914457,
+    "rms_abs": 0.0053863207003622075,
+    "points": 400,
+    "unit": "V"
+  },
+  {
+    "fixture": "tran/bench_tran_rc_pulse.sp",
+    "engine": "Xyce",
+    "signal": "v(out)",
+    "max_abs": 0.001015121830122645,
+    "rms_abs": 0.0004474684420229195,
+    "points": 385,
+    "unit": "V"
+  },
+  {
+    "fixture": "tran/rc_sinusoidal_startup.sp",
+    "engine": "espice",
+    "signal": "v(out)",
+    "max_abs": 3.304194273745509e-08,
+    "rms_abs": 1.6176341845841676e-08,
+    "points": 20015,
+    "unit": "V"
+  },
+  {
+    "fixture": "tran/rc_sinusoidal_startup.sp",
+    "engine": "ngspice",
+    "signal": "v(out)",
+    "max_abs": 3.30419207550392e-08,
+    "rms_abs": 1.6176335431678344e-08,
+    "points": 20015,
+    "unit": "V"
+  },
+  {
+    "fixture": "tran/rc_sinusoidal_startup.sp",
+    "engine": "VACASK",
+    "signal": "v(out)",
+    "max_abs": 2.3557621610928396e-08,
+    "rms_abs": 1.447890043429357e-08,
+    "points": 20006,
+    "unit": "V"
+  }
+]

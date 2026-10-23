@@ -77,9 +77,8 @@ Attribution-NonCommercial 4.0 International (CC-BY-NC 4.0)
 
 // For now, set NOISE to 0 to disable noise.
 `define NOISE 1
-// ponytail: tnoiMod=1 reads Gm/Gds/Gmb, which only this hand-derivative
-// path computes, and it is off from b4noi.c by up to 6x in PSD; ddx() would
-// do, once VerA's noisePsd seeds its lanes (#119).
+// Keep the legacy hand derivatives disabled. tnoiMod=1 instead reads AD
+// partials of cdrain after velocity limiting and NF scaling below.
 //`define NOISE_DERIVATIVES 1
 `define KboQ 8.617087e-5
 `define Charge_q 1.60219e-19
@@ -1229,7 +1228,8 @@ module bsim4va(d, g, s, b);
     `MPRnb( lvtl  ,0.0              ,""                                           ,"Length dependence of thermal velocity")
     `MPRnb( wvtl  ,0.0              ,""                                           ,"Width dependence of thermal velocity")
     `MPRnb( pvtl  ,0.0              ,""                                           ,"Cross-term dependence of thermal velocity")
-    `MPRcc( lc  ,0.0              ,"m"            ,0.0           ,1.0              ,"Velocity back scattering coefficient")
+    // ngspice 45 b4set.c: default back-scattering length; used only with explicit VTL.
+    `MPRcc( lc  ,5.0e-9           ,"m"            ,0.0           ,1.0              ,"Velocity back scattering coefficient")
 
     // New model BSIM4 version > 4.3
     `IPRcc( sc  ,0.0              ,"m"            ,0.0           ,1.0     ,"")
@@ -8013,7 +8013,11 @@ module bsim4va(d, g, s, b);
         /* Source End Velocity Limit  */
         // VA: Needs better FPE protection...
         if (($param_given(vtl)) && (BSIM4vtl > 0.0)) begin
-            T12 = 1.0 / Leff / CoxeffWovL;
+            // b4ld.c's source-velocity conductances hold this coefficient
+            // fixed: dvs = G*T11 - cdrain*T11/Vgsteff*dVgsteff.
+            // Differentiating CoxeffWovL here instead changes AC gain (and
+            // input-referred noise) under strong source-velocity limiting.
+            (* vera_nodiff *) T12 = 1.0 / Leff / CoxeffWovL;
             T11 = T12 / Vgsteff;
             vs = cdrain * T11;
             T0 = 2 * `MM;
@@ -8853,6 +8857,25 @@ module bsim4va(d, g, s, b);
             Igb = Igb * BSIM4nf;
         end
 
+        // ngspice 45 b4ld.c: the noise conductances are partials of the
+        // normalized channel current after source velocity limiting and NF,
+        // before reverse-mode negation. IdovVds deliberately remains Ids
+        // (floored before NF), without the velocity factor. Multiplicity is
+        // applied by the host to the resulting PSD, not to these partials.
+        // NoiseFamily seeds the independent internal-node voltages. Convert
+        // their signs to normalized voltages, swapping drain/source in
+        // reverse mode. These are coefficients, never second derivatives.
+        if ((BSIM4tnoiMod == 1) && analysis("noise") == `NOISE) begin
+            (* vera_nodiff *) Gm = BSIM4type * ddx(cdrain, V(gi));
+            (* vera_nodiff *) Gmb = BSIM4type * ddx(cdrain, V(bi));
+            if (BSIM4mode >= 0) begin
+                (* vera_nodiff *) Gds = BSIM4type * ddx(cdrain, V(di));
+            end
+            else begin
+                (* vera_nodiff *) Gds = BSIM4type * ddx(cdrain, V(si));
+            end
+        end
+
         if (BSIM4tnoiMod == 0) begin
             Abulk = Abulk0 * BSIM4abulkCVfactor;
             Vdsat = Vgsteff / Abulk;
@@ -9617,6 +9640,16 @@ module bsim4va(d, g, s, b);
         end
 
         // Noise
+        // These are bias-dependent conductances, not derivatives. Their
+        // legacy assignments were inside NOISE_DERIVATIVES and therefore
+        // left Rd/Rs noise at zero for rdsMod=1, including tnoiMod=0.
+        // Use the same series combination as the branch currents above
+        // (ngspice 45 b4ld.c); b4noi.c reads these for both noise modes.
+        BSIM4gstot = BSIM4sourceConductance /
+            (1.0 + Rs * BSIM4sourceConductance);
+        BSIM4gdtot = BSIM4drainConductance /
+            (1.0 + Rd * BSIM4drainConductance);
+
         if (BSIM4tnoiMod == 0) begin
             if (BSIM4rdsMod == 0) begin
                 if (BSIM4sourceConductance != 1000)
@@ -9770,9 +9803,4 @@ module bsim4va(d, g, s, b);
     end
 
 endmodule // end of bsim4_va
-
-
-
-
-
 

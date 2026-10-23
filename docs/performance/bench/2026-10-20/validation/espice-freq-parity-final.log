@@ -1,0 +1,3 @@
+PASS ac_noise: 17 mixed points, 19 frequencies, 27 repeated plots; worst 0x tolerance
+PASS sp_xf: 17 mixed points, 19 frequencies, 31 repeated plots; worst 0x tolerance
+PASS stability: 17 mixed points, 19 frequencies, 27 repeated plots; worst 0x tolerance

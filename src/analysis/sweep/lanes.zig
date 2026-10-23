@@ -9,6 +9,7 @@
 const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
+const op = @import("../dc/op.zig");
 
 /// Lanes `first..first + count` of a sweep of `total`: all of them, or the
 /// one lane a split row (`lane`) solves.
@@ -27,8 +28,10 @@ pub const Range = struct {
 /// `setup` points at the caller's installer: `apply(k)` writes lane k's
 /// params and is called in lane order, `restore()` puts the nominals back.
 /// The driver recomputes after each, and restores on success and on error.
-/// A lane starts from `warm` when given (asserted `ckt.n` long), else cold.
-/// A lane's solver error is a non-converged result; what escapes is
+/// A lane starts from `warm` when given (asserted `ckt.n` long), else cold,
+/// and one its plain Newton leaves unconverged takes the operating-point
+/// ladder under `ladder` (`rescue`). A lane's solver error is a
+/// non-converged result; what escapes is
 /// cancellation, a recompute's error.TopologyChanged and allocation failure.
 /// Asserts that `rows.len == results.len * probes.len`.
 pub fn solveLanes(
@@ -39,12 +42,13 @@ pub fn solveLanes(
     rows: []f64,
     results: []converger.Result,
     opts: converger.Options,
+    ladder: op.Options,
     warm: ?[]const f64,
     scratch: std.mem.Allocator,
 ) !void {
     errdefer {
-        setup.restore();
-        ckt.recompute() catch {}; // keep the original error; no solve follows
+        setup.restore() catch {}; // keep the original error; no solve follows
+        ckt.recompute() catch {};
     }
     std.debug.assert(rows.len == results.len * probes.len);
     const n: usize = ckt.n;
@@ -54,23 +58,24 @@ pub fn solveLanes(
     const ws = try ckt.workspace();
     for (results, 0..) |*result, i| {
         if (i != 0) try ckt.checkpoint(.{ .phase = .sweep, .completed = i, .total = results.len });
-        setup.apply(first + i);
+        try setup.apply(first + i);
         try ckt.recompute();
         start(ckt, x, warm);
         result.* = converger.run(ckt, ws, x, 0, opts, root.EvalHook{}) catch |err| switch (err) {
             error.QueryCancelled, error.OutOfMemory => return err,
             else => converger.Result{ .converged = false, .iterations = 0 }, // else: a numerical failure marks the lane unconverged
         };
+        if (!result.converged) result.* = try rescue(ckt, x, warm, ladder);
         if (result.converged) for (probes, rows[i * probes.len ..][0..probes.len]) |node, *out| {
             out.* = x[node];
         };
     }
-    setup.restore();
+    try setup.restore();
     try ckt.recompute();
 }
 
 /// A lane's Newton start: a copy of `warm`, or zero with the junctions seeded.
-pub fn start(ckt: *root.Circuit, x: []f64, warm: ?[]const f64) void {
+fn start(ckt: *root.Circuit, x: []f64, warm: ?[]const f64) void {
     if (warm) |w| {
         @memcpy(x, w);
     } else {
@@ -79,15 +84,35 @@ pub fn start(ckt: *root.Circuit, x: []f64, warm: ?[]const f64) void {
     }
 }
 
+/// A lane whose plain Newton failed: the operating-point ladder (plain
+/// Newton at the OP's budget, then gmin and source stepping, JFNK, OPtran)
+/// from the lane's own start, as a `.dc` point whose warm Newton fails
+/// cold-starts through it. Without it the lane was dropped as unconverged
+/// (04 4.10). Its numerical failure is a non-converged result.
+fn rescue(ckt: *root.Circuit, x: []f64, warm: ?[]const f64, ladder: op.Options) !converger.Result {
+    start(ckt, x, warm);
+    var o = ladder;
+    o.warm_start = warm != null;
+    return op.solve(ckt, x, o, &.{}, &.{}) catch |err| switch (err) {
+        error.QueryCancelled, error.OutOfMemory => |e| return e,
+        else => .{ .converged = false, .iterations = 0 }, // else: a numerical failure leaves the lane unconverged
+    };
+}
+
+/// The ladder `rescue` runs: `.dc`'s tolerances.
+fn ladderOptions(opts: anytype) op.Options {
+    return .{ .tol = opts.dc_options.tol };
+}
+
 /// Lane `k` of `setup` on `ckt`: its params, a recompute and its start.
-pub fn install(ckt: *root.Circuit, setup: anytype, k: usize, x: []f64, warm: ?[]const f64) !void {
-    setup.apply(k);
+fn install(ckt: *root.Circuit, setup: anytype, k: usize, x: []f64, warm: ?[]const f64) !void {
+    try setup.apply(k);
     try ckt.recompute();
     start(ckt, x, warm);
 }
 
 /// The Newton options every lane solves with: `.dc`'s, at its itl2.
-pub fn newtonOptions(opts: anytype) converger.Options {
+fn newtonOptions(opts: anytype) converger.Options {
     return converger.optionsFromTolerances(opts.dc_options.tol, opts.dc_options.tol.itl2);
 }
 
@@ -104,7 +129,7 @@ pub fn run(comptime M: type, ctx: *const root.RunCtx, opts: M.Options) !root.Res
     defer scratch.free(rows);
     const results = try scratch.alloc(converger.Result, range.count);
     defer scratch.free(results);
-    try solveLanes(ctx.circuit, &setup, range.first, ctx.probes, rows, results, newtonOptions(opts), M.warm(ctx, opts), scratch);
+    try solveLanes(ctx.circuit, &setup, range.first, ctx.probes, rows, results, newtonOptions(opts), ladderOptions(opts), M.warm(ctx, opts), scratch);
     return M.publish(ctx, opts, range.first, rows, results);
 }
 
@@ -166,16 +191,20 @@ pub fn runBatch(comptime W: usize, comptime M: type, ctxs: []const root.RunCtx, 
             out[l] = err;
             continue;
         }
+        const res = if (r.converged) r else rescue(ctx.circuit, xs[l], M.warm(ctx, opts[l]), ladderOptions(opts[l])) catch |err| {
+            out[l] = err;
+            continue;
+        };
         const np = ctx.probes.len;
         const row = scratch.alloc(f64, np) catch |err| {
             out[l] = err;
             continue;
         };
         defer scratch.free(row);
-        if (r.converged) for (ctx.probes, row) |node, *v| {
+        if (res.converged) for (ctx.probes, row) |node, *v| {
             v.* = xs[l][node];
         };
-        out[l] = M.publish(ctx, opts[l], opts[l].lane.?, row, &.{r});
+        out[l] = M.publish(ctx, opts[l], opts[l].lane.?, row, &.{res});
     }
 }
 
@@ -183,7 +212,7 @@ pub fn runBatch(comptime W: usize, comptime M: type, ctxs: []const root.RunCtx, 
 /// installed and started at `xs[l]`, run W wide; `results[l]` is bitwise
 /// lane l's `converger.run`. Under a JFNK pin or `-Dcertify` every lane
 /// runs `converger.run`. Fails, for every lane, on allocation or a cancel.
-pub fn solveBatch(comptime W: usize, ckts: []const *root.Circuit, xs: []const []f64, opts: converger.Options, results: []converger.Result, gpa: std.mem.Allocator) LaneError!void {
+fn solveBatch(comptime W: usize, ckts: []const *root.Circuit, xs: []const []f64, opts: converger.Options, results: []converger.Result, gpa: std.mem.Allocator) LaneError!void {
     const g = ckts.len;
     std.debug.assert(g >= 1 and g <= W and xs.len == g and results.len == g);
     const pin = ckts[0].knobs.newton.pin;

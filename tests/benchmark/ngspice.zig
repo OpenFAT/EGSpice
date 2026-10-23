@@ -9,7 +9,8 @@ pub const version_flag = "--version";
 /// runs from a copy beside `raw_path` with `.options klu` inserted. ngspice
 /// reads a `.spiceinit` beside the deck (a suite's `ngbehavior` or `option
 /// klu`); with none there, `-n` keeps the user's own from leaking in.
-pub fn prepare(io: std.Io, a: std.mem.Allocator, bin: []const u8, netlist: []const u8, raw_path: []const u8, klu: bool) common.Error!common.Job {
+pub fn prepare(io: std.Io, a: std.mem.Allocator, bin: []const u8, netlist: []const u8, raw_path: []const u8, klu: bool, hspice_dialect: bool) common.Error!common.Job {
+    if (hspice_dialect) return .{ .refused = "ngspice adapter does not translate HSPICE semantics (temperature, options, sources and transient segments)" };
     const source = std.Io.Dir.cwd().realPathFileAlloc(io, netlist, a) catch return error.DeckFailed;
     const raw_dir = std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(raw_path) orelse ".", a) catch return error.ScratchFailed;
     const raw = try std.fmt.allocPrint(a, "{s}/{s}", .{ raw_dir, std.fs.path.basename(raw_path) });
@@ -90,7 +91,13 @@ test "a .spiceinit beside the deck is read; with none, -n keeps the user's out" 
     const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const deck = try std.fmt.allocPrint(a, "{s}/deck.sp", .{dir});
     const raw = try std.fmt.allocPrint(a, "{s}/out.raw", .{dir});
-    try std.testing.expectEqualStrings("-n", (try prepare(io, a, "ngspice", deck, raw, false)).argv[1]);
+    try std.testing.expectEqualStrings("-n", (try prepare(io, a, "ngspice", deck, raw, false, false)).argv[1]);
     try tmp.dir.writeFile(io, .{ .sub_path = ".spiceinit", .data = "set ngbehavior=ltpsa\n" });
-    try std.testing.expectEqualStrings("-b", (try prepare(io, a, "ngspice", deck, raw, false)).argv[1]);
+    try std.testing.expectEqualStrings("-b", (try prepare(io, a, "ngspice", deck, raw, false, false)).argv[1]);
+}
+
+test "an untranslated HSPICE dialect is refused before reading the deck" {
+    const job = try prepare(std.testing.io, std.testing.allocator, "ngspice", "unused", "unused", false, true);
+    try std.testing.expect(job.refused.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), job.argv.len);
 }

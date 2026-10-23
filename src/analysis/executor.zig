@@ -11,12 +11,10 @@ const Deck = @import("core").Deck;
 const requests = @import("core").query;
 const types = @import("types.zig");
 const op = @import("dc/op.zig");
-const dc = @import("dc/dc.zig");
 const sweep_lanes = @import("sweep/lanes.zig");
 const tran = @import("tran/tran.zig");
-const pss = @import("pss/pss.zig");
-const gpu = @import("gpu.zig");
-const gpu_lu = @import("gpu_lu.zig");
+const gpu = @import("gpu/context.zig");
+const gpu_lu = @import("gpu/lu.zig");
 const ParEval = @import("par_eval.zig").ParEval;
 const Controller = @import("worker.zig").Worker(QueryError, types.Result);
 const Quantum = @import("worker.zig").Quantum;
@@ -49,9 +47,21 @@ pub const Config = struct {
     /// rather than fall back when the machine cannot run it. `cuda` and `hip`
     /// imply it and never fall back (`gpu.fallsBack`).
     gpu_explicit: bool = false,
+    /// The caller left the backend at its default `auto` (the CLI in a
+    /// build with kernels): a query the GPU declines runs on the CPU
+    /// without a warning, since the user asked for nothing.
+    gpu_quiet: bool = false,
     solver_threads: u8 = 1,
     /// Device-stamp lanes; above 1 each query builds a ParEval.
     device_threads: u32 = 1,
+    /// Extra lanes a large query may borrow for its device stamp and
+    /// multicore refactor when the caller fixed no thread count; null
+    /// keeps `device_threads` and `solver_threads` as given.
+    thread_pool: ?*ThreadPool = null,
+    /// Reusable query threads (`worker.Threads`); null spawns one per query.
+    threads: ?*@import("worker.zig").Threads = null,
+    /// Workspaces shared by the Problem's queries (`ws_pool.WsPool`).
+    ws_pool: ?*@import("ws_pool.zig").WsPool = null,
     /// Print per-query setup and per-checkpoint timing to stderr.
     timing_in_depth: bool = false,
     /// The caller adds no query after the session is built (the CLI), so a
@@ -68,8 +78,19 @@ pub const Config = struct {
     /// decided once per Problem by `gpu_lanes.policy`, true for an explicit
     /// `cuda`/`hip` and, under `auto`, on an FP64-class device only.
     gpu_lanes: bool = false,
+    /// False when the deck has nothing to batch (one transient, no runs or
+    /// tuning): its operating point is alone and may take the device LU
+    /// under `gpu_lanes` too.
+    may_batch: bool = true,
     /// Lanes per GPU batch at most.
     gpu_lane_cap: u32 = 16384,
+    /// The share of a GPU lane batch's points the device keeps; the CPU
+    /// workers run the rest beside it (`Session.shareWithHost`, 05 5.3b).
+    /// The facade sets it from `gpu_lanes.share`; 1 keeps every point.
+    gpu_share: f64 = 1,
+    /// Operating points and `.dc` sweeps batch as GPU lanes too (06 6.9);
+    /// the facade sets it from `gpu_lanes.staticPolicy` under `gpu_lanes`.
+    gpu_static: bool = false,
 
     /// The facade's record of whether the GPU driver is up, shared by every
     /// query of the Problem; null prices the driver setup in every query.
@@ -95,6 +116,56 @@ pub fn validateBackend(config: Config) !void {
     if (config.solver_threads == 0 or config.device_threads == 0) return error.InvalidThreadCount;
 }
 
+/// Threads a Problem lends its queries beyond each worker's own. A query
+/// whose device work or matrix is large enough to gain from more lanes
+/// (`borrowLanes`) takes up to `per_query - 1` of them for its run and
+/// gives them back when it ends, so `--jobs` workers plus the pool bound
+/// the threads in use: one big transient gets the machine, a sweep of
+/// small points stays one thread each.
+pub const ThreadPool = struct {
+    free: std.atomic.Value(u32),
+
+    /// Most lanes one query runs. ParEval measured flat or worse past 8
+    /// on a hybrid CPU (dev/analysis/refactoring.md, #138).
+    pub const per_query: u32 = 8;
+
+    /// Half the logical CPUs (SMT siblings share a core's FP units), at
+    /// least none.
+    pub fn init(cpus: usize) ThreadPool {
+        return .{ .free = .init(@intCast(@min(cpus / 2, std.math.maxInt(u16)))) };
+    }
+
+    /// Up to `want` threads, fewer when others hold them; never blocks.
+    pub fn take(pool: *ThreadPool, want: u32) u32 {
+        var cur = pool.free.load(.monotonic);
+        while (true) {
+            const got = @min(cur, want);
+            if (got == 0) return 0;
+            cur = pool.free.cmpxchgWeak(cur, cur - got, .monotonic, .monotonic) orelse return got;
+        }
+    }
+
+    pub fn give(pool: *ThreadPool, n: u32) void {
+        if (n != 0) _ = pool.free.fetchAdd(n, .monotonic);
+    }
+};
+
+/// Device weight (`ParEval`'s per-instance stamp estimate summed over the
+/// circuit) from which extra lanes pay: about 800 BSIM4 instances. ParEval
+/// measured 3.3x on 4,000 bsim4 at 8 threads and no gain on 4,000 mos1,
+/// whose summed weight sits below this (`gpu/context.zig` cost notes).
+const borrow_min_weight: u64 = 4_000_000;
+/// Matrix entries from which a refactor may be thick enough for the
+/// multicore LU; its own per-epoch admission (`direct.zig`) still decides.
+const borrow_min_nnz: u32 = 50_000;
+
+/// Lanes for a query of `ckt`: 1 below both gates.
+fn wantLanes(ckt: *const types.Circuit) u32 {
+    var weight: u64 = 0;
+    for (ckt.batches) |b| weight += @as(u64, b.count) * @import("par_eval.zig").instanceWeight(b);
+    return if (weight >= borrow_min_weight or ckt.nnz >= borrow_min_nnz) ThreadPool.per_query else 1;
+}
+
 /// Lanes per batch: the CPU's f64 vector width (4 on AVX2, 8 on AVX-512).
 pub const lane_width = std.simd.suggestVectorLength(f64) orelse 4;
 
@@ -108,12 +179,31 @@ pub fn lanesOn(config: Config) bool {
     });
 }
 
+/// Most points `Session` runs together as one lane batch under `config`:
+/// `gpu_lane_cap` under GPU lanes, `lane_width` under CPU lanes (as
+/// `Session.gather` admits them), else 1. Advisory: batching never changes
+/// a point's result.
+pub fn batchWidth(config: Config) u32 {
+    if (config.gpu_lanes) return config.gpu_lane_cap;
+    if (lanesOn(config) and config.backend == .cpu and config.device_threads == 1 and !config.timing_in_depth) return lane_width;
+    return 1;
+}
+
 /// The AC-family kinds a lane batch runs (`runFreqLanes`): small-signal
 /// analyses at their own operating point, each lane bitwise its query run
 /// alone (lane-batched-simulation.md §6, the AC family rows).
 pub fn freqLaneKind(kind: requests.Kind) bool {
     return switch (kind) {
         .ac, .noise, .sp, .stb, .lstb, .acxf, .tf, .dcxf, .dcinc, .sens, .dcmatch, .dcsens, .acmatch => true,
+        else => false,
+    };
+}
+
+/// Sweeps with a GPU (point, frequency) provider. LSTB margins keep their
+/// live solvers across the leading sweep and crossover refinements.
+pub fn gpuFreqLaneKind(kind: requests.Kind) bool {
+    return switch (kind) {
+        .ac, .noise, .sp, .stb, .lstb, .acxf => true,
         else => false,
     };
 }
@@ -162,6 +252,9 @@ pub const Executor = struct {
     row: u32 = 0,
     /// A peer's failure, set by its batch; `published` holds its success.
     peer_failure: ?QueryError = null,
+    /// No query copies this one's circuit once it completes (a final plan
+    /// and no readers), so a GPU batch frees it with its wave.
+    no_readers: bool = false,
 
     /// What one `wait` saw: a checkpoint, the result, an error or a cancel.
     pub const Outcome = Controller.Outcome;
@@ -202,8 +295,17 @@ pub const Executor = struct {
             .initial = initial,
             .take = take,
         };
-        self.controller = Controller.init(io, self, execute, .{ .report_nonlinear = job == .op });
+        self.controller = Controller.init(io, self, execute, .{ .report_nonlinear = job == .op, .threads = config.threads });
         return self;
+    }
+
+    /// Whether this query runs at another temperature than the nominal
+    /// point, whose operating point then sits too far away for a warm start
+    /// to land where the cold ladder does (variants/step_temp_source.sp).
+    fn movesTemp(self: *const Executor) bool {
+        if (queryTemp(self.job) != null) return true;
+        const v = queryVariant(self.job) orelse return false;
+        return self.deck.variants.temp_c[v] != null;
     }
 
     /// The circuit copy, variant and AC overrides `create` deferred, built
@@ -227,6 +329,7 @@ pub const Executor = struct {
         const config = self.config;
         const lu_threads: u8 = @intCast(@min(if (config.solver_threads > 1) config.solver_threads else config.device_threads, 16));
         self.circuit.configure(.{ .io = self.io, .threads = config.solver_threads, .lu_threads = lu_threads }, config.knobs);
+        self.circuit.ws_pool = config.ws_pool;
         if (self.initial) |source| self.x = try self.work.allocator().dupe(f64, source.operatingPoint().?);
         // A dependent copies its prerequisite's circuit, variant included.
         if (self.initial == null) try self.installVariant();
@@ -345,7 +448,9 @@ pub const Executor = struct {
     /// another instead. Every peer ends with `published` or `peer_failure`;
     /// returns this query's own.
     fn executeBatch(self: *Executor) QueryError!types.Result {
-        if (self.config.gpu_lanes and self.job == .tran) return self.executeGpuBatch();
+        if (self.config.gpu_lanes and (self.job == .tran or self.job == .pss or self.job == .hb or
+            (self.job == .lstb and self.job.lstb.margins) or (self.config.gpu_static and (self.job == .op or self.job == .dc)))) return self.executeGpuBatch();
+        if (self.config.gpu_lanes and gpuFreqLaneKind(self.job)) return self.executeGpuFreqBatch();
         const g = 1 + self.peers.len;
         std.debug.assert(g <= lane_width and (self.job == .op or self.job == .dc or self.job == .mc or self.job == .temp or self.job == .tran or self.job == .pss or freqLaneKind(self.job)));
         var members: [lane_width]*Executor = undefined;
@@ -475,7 +580,22 @@ pub const Executor = struct {
         return outcomes[0];
     }
 
-    /// `executeBatch` for a GPU lane batch (`tran.runGpuLanes`): `peers` may
+    /// Host bytes one GPU lane holds while its wave runs, estimated from the
+    /// circuit's size: its materialized circuit, its run and step machine (about
+    /// 20 n-vectors and the charge rings) and its solver's factors. Measured at
+    /// about 2.3 KB per unknown on a 72-unknown deck; this errs high.
+    fn gpuLaneBytes(topology: *const Circuit) usize {
+        return 4096 * (@as(usize, topology.n) + @as(usize, topology.nnz) / 4) + 64 * 1024;
+    }
+
+    /// The host bytes a GPU batch's wave may hold (`gpuLaneBytes` each).
+    // ponytail: a fixed 4 GiB; size it from the machine's memory if decks
+    // with tens of thousands of large lanes need more per wave.
+    const gpu_wave_bytes: usize = 4 << 30;
+    /// Fewest lanes per wave, so a huge circuit still batches.
+    const gpu_wave_min: usize = 256;
+
+    /// `executeBatch` for a transient, periodic or live LSTB GPU batch: `peers` may
     /// be thousands wide, so the per-member arrays come from the work arena.
     fn executeGpuBatch(self: *Executor) QueryError!types.Result {
         const a = self.work.allocator();
@@ -488,13 +608,38 @@ pub const Executor = struct {
         defer for (members[1..], outcomes[1..]) |p, o| {
             if (o) |r| p.published = r else |err| p.peer_failure = err;
         };
-        const live = try a.alloc(usize, g);
+        // Waves bound the host: each member's circuit, run and solver state
+        // exist only for its wave, and one nothing reads afterwards is freed
+        // with it. One wave unless the lanes would pass `gpu_wave_bytes`.
+        const per_lane = gpuLaneBytes(self.topology);
+        const wave = @max(gpu_wave_min, @min(g, gpu_wave_bytes / per_lane));
+        const live = try a.alloc(usize, @min(g, wave));
+        var first: usize = 0;
+        while (first < g) : (first += wave) {
+            const end = @min(g, first + wave);
+            try self.runGpuWave(members[first..end], outcomes[first..end], live);
+            for (members[first..end]) |e| if (e.no_readers and e.built) e.circuit.release();
+        }
+        return outcomes[0];
+    }
+
+    /// One wave of `executeGpuBatch`: materialize its members, run their
+    /// lanes, label their outcomes and check their latches.
+    fn runGpuWave(self: *Executor, members: []const *Executor, outcomes: []QueryError!types.Result, live: []usize) QueryError!void {
+        const a = self.work.allocator();
         var n_live: usize = 0;
         // ponytail: serial materialize; thousands of lanes take seconds here.
         // Parallelize over a thread pool if it shows above 5% of the batch.
-        const t0 = @import("gpu_lanes.zig").Prof.now();
+        const t0 = @import("gpu/lanes.zig").Prof.now();
         for (members, 0..) |e, k| {
             e.materialize() catch |err| {
+                outcomes[k] = err;
+                continue;
+            };
+            // UIC omits the operating point; its initial vector still
+            // has to exist before the GPU admission or host fallback
+            // receives a RunCtx, just as in runQuery and CPU lane batches.
+            if (e.job.uic()) e.seedUic() catch |err| {
                 outcomes[k] = err;
                 continue;
             };
@@ -502,19 +647,161 @@ pub const Executor = struct {
             live[n_live] = k;
             n_live += 1;
         }
-        if (self.config.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: materialize {d} lanes {d:.1} ms\n", .{ g, @as(f64, @floatFromInt(@import("gpu_lanes.zig").Prof.now() - t0)) / 1e6 });
+        if (self.config.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: materialize {d} lanes {d:.1} ms\n", .{ members.len, @as(f64, @floatFromInt(@import("gpu/lanes.zig").Prof.now() - t0)) / 1e6 });
+        if (self.job == .op) return self.runGpuOps(members, live[0..n_live], outcomes);
         const ctxs = try a.alloc(types.RunCtx, n_live);
         for (live[0..n_live], ctxs) |k, *c| {
-            members[k].circuit.setSimState(.{ .kind = .ic });
+            members[k].circuit.setSimState(.{ .kind = simKind(members[k].job) });
             c.* = members[k].runCtx();
         }
-        const ran = try a.alloc(tran.LaneOutcome, n_live);
-        if (n_live != 0) tran.runGpuLanes(ctxs, self.job.tran, ran);
-        for (live[0..n_live], ran) |k, o| {
-            outcomes[k] = if (o) |r| members[k].label(r) else |err| err;
-            members[k].refuseLatched() catch |err| {
+        switch (self.job) {
+            inline .tran, .pss, .hb, .lstb, .dc => |opts, tag| {
+                const M = module(tag);
+                const ran = try a.alloc(M.LaneOutcome, n_live);
+                if (n_live != 0) {
+                    if (comptime tag == .lstb)
+                        M.runGpuLanes(ctxs, opts, self.config.backend, ran)
+                    else
+                        M.runGpuLanes(ctxs, opts, ran);
+                }
+                for (live[0..n_live], ran) |k, o| {
+                    outcomes[k] = if (o) |r| members[k].label(r) else |err| err;
+                    members[k].refuseLatched() catch |err| {
+                        outcomes[k] = err;
+                    };
+                }
+            },
+            else => unreachable,
+        }
+    }
+
+    /// `runGpuWave` for operating points: each live member's start
+    /// (`opStart`), `op.solveGpuLanes` over all of them, then each ends as
+    /// `executeBatch`'s operating points do.
+    fn runGpuOps(self: *Executor, members: []const *Executor, live: []const usize, outcomes: []QueryError!types.Result) QueryError!void {
+        const a = self.work.allocator();
+        const ckts = try a.alloc(*types.Circuit, live.len);
+        const xs = try a.alloc([]f64, live.len);
+        var options: op.Options = undefined;
+        for (live, ckts, xs) |k, *c, *x| {
+            const e = members[k];
+            e.circuit.setSimState(.{ .kind = if (e.job.op.tran_op) .ic else .dc });
+            options = e.opStart() catch |err| {
+                for (live) |j| outcomes[j] = err;
+                return;
+            };
+            c.* = &e.circuit;
+            x.* = e.x.?;
+        }
+        const solved = try a.alloc(op.LaneOutcome, live.len);
+        if (live.len != 0) op.solveGpuLanes(lane_width, ckts, xs, options, self.deck.nodeset, self.deck.ic, solved) catch |err| {
+            for (live) |k| outcomes[k] = err;
+            return;
+        };
+        for (live, solved) |k, o| {
+            const e = members[k];
+            outcomes[k] = blk: {
+                const r = o catch |err| break :blk err;
+                if (!r.converged) break :blk error.OpDidNotConverge;
+                break :blk e.finish();
+            };
+            e.refuseLatched() catch |err| {
                 outcomes[k] = err;
             };
+        }
+    }
+
+    /// The leading AC-family sweeps across a wide GPU batch. Every query
+    /// keeps its own solver/plan and reuses its ordinary readout. A point
+    /// whose setup or precompute fails runs live, preserving its numerical
+    /// failure, device-backend policy and partial streaming behavior.
+    fn executeGpuFreqBatch(self: *Executor) QueryError!types.Result {
+        const frequency = @import("ac/freq.zig");
+        const provider = @import("gpu/freq.zig");
+        const FS = @import("solver").freq_solve.FreqSolver;
+        const a = self.work.allocator();
+        const g = 1 + self.peers.len;
+        const members = try a.alloc(*Executor, g);
+        members[0] = self;
+        @memcpy(members[1..], self.peers);
+        const outcomes = try a.alloc(QueryError!types.Result, g);
+        @memset(outcomes, error.QueryCancelled);
+        defer for (members[1..], outcomes[1..]) |p, o| {
+            if (o) |r| p.published = r else |err| p.peer_failure = err;
+        };
+        const ctxs = try a.alloc(?types.RunCtx, g);
+        @memset(ctxs, null);
+        const plans = try a.alloc(?frequency.Plan, g);
+        @memset(plans, null);
+        const solvers = try a.alloc(?FS, g);
+        @memset(solvers, null);
+        defer for (plans, solvers, ctxs) |p, *fs, ctx| {
+            if (fs.*) |*f| f.deinit();
+            if (p) |plan| plan.deinit(ctx.?.scratch_allocator);
+        };
+        const points = try a.alloc(provider.Point, g);
+        const point_ids = try a.alloc(usize, g);
+        var n: usize = 0;
+        var pre_bytes: usize = 0;
+        for (members, 0..) |e, k| {
+            e.materialize() catch |err| {
+                outcomes[k] = err;
+                continue;
+            };
+            e.circuit.progress = self.controller.callback();
+            e.circuit.setSimState(.{ .kind = simKind(e.job) });
+            ctxs[k] = e.runCtx();
+            // Stateful display tasks must run only through their ordinary
+            // analysis; the precompute would evaluate them an extra time.
+            const display_names = e.sayNames() catch continue;
+            if (display_names.len != 0) continue;
+            plans[k] = e.frequencyPlan(&ctxs[k].?) catch continue;
+            const plan = plans[k] orelse continue;
+            const rhs_bytes = std.math.mul(usize, plan.rhs.len, @sizeOf(f64)) catch continue;
+            const bytes = std.math.mul(usize, plan.omegas.len, rhs_bytes) catch continue;
+            // Bound the extra precompute storage of a wide group. Large
+            // individual sweeps keep their bounded Stream working set.
+            if (bytes > 256 * 1024 * 1024 - pre_bytes) continue;
+            solvers[k] = FS.fromCircuit(ctxs[k].?.scratch_allocator, &e.circuit, ctxs[k].?.x_op) catch continue;
+            plan.configure(&solvers[k].?);
+            const out = e.work.allocator().alloc(f64, bytes / @sizeOf(f64)) catch continue;
+            points[n] = .{
+                .fs = &solvers[k].?,
+                .circuit = &e.circuit,
+                .x_op = ctxs[k].?.x_op,
+                .omegas = plan.omegas,
+                .rhs = plan.rhs,
+                .out = out,
+                .adjoint = plan.adjoint,
+            };
+            point_ids[n] = k;
+            n += 1;
+            pre_bytes += bytes;
+        }
+        const computed = blk: {
+            const stats = provider.solveAll(a, self.config.backend, points[0..n]) catch |err| {
+                if (self.config.knobs.gpu_stats != .off)
+                    std.debug.print("gpu-freq: precompute declined ({s}); running queries live\n", .{@errorName(err)});
+                break :blk false;
+            };
+            if (self.config.knobs.gpu_stats != .off and stats.lanes != 0)
+                std.debug.print("gpu-freq: {d} points, {d} frequency lanes, {d} groups, {d} peels\n", .{ stats.points, stats.lanes, stats.groups, stats.peels });
+            break :blk true;
+        };
+        if (computed) {
+            for (points[0..n], point_ids[0..n]) |p, k| ctxs[k].?.freq_pre = p.out;
+        }
+        for (members, ctxs, 0..) |e, *ctx, k| {
+            if (ctx.*) |*c| {
+                if (c.freq_pre.len == 0) {
+                    outcomes[k] = e.finishAlone();
+                    continue;
+                }
+                outcomes[k] = if (run(c, e.job)) |r| e.label(r) else |err| err;
+                e.refuseLatched() catch |err| {
+                    outcomes[k] = err;
+                };
+            }
         }
         return outcomes[0];
     }
@@ -551,19 +838,26 @@ pub const Executor = struct {
     fn precompute(self: *Executor, ctx: *const types.RunCtx) ![]const f64 {
         const freq = @import("ac/freq.zig");
         const scratch = ctx.scratch_allocator;
-        const p: freq.Plan = switch (self.job) {
-            .ac => |o| try @import("ac/ac.zig").plan(ctx, o),
-            .acxf => |o| try @import("ac/xf.zig").plan(ctx, o),
-            .stb => |o| try @import("ac/stb.zig").plan(ctx, o),
-            .noise => |o| try @import("ac/noise.zig").plan(ctx, o),
-            else => return &.{}, // else: every other kind solves live (class E)
-        };
+        const p = (try self.frequencyPlan(ctx)) orelse return &.{};
         defer p.deinit(scratch);
         var fs = try @import("solver").freq_solve.FreqSolver.fromCircuit(scratch, ctx.circuit, ctx.x_op);
         defer fs.deinit();
+        p.configure(&fs);
         const out = try self.work.allocator().alloc(f64, p.omegas.len * p.rhs.len);
         try freq.solveAll(scratch, &fs, ctx.circuit, ctx.x_op, p.omegas, p.rhs, p.adjoint, out);
         return out;
+    }
+
+    fn frequencyPlan(self: *Executor, ctx: *const types.RunCtx) !?@import("ac/freq.zig").Plan {
+        return switch (self.job) {
+            .ac => |o| try @import("ac/ac.zig").plan(ctx, o),
+            .acxf => |o| try @import("ac/xf.zig").plan(ctx, o),
+            .stb => |o| try @import("ac/stb.zig").plan(ctx, o),
+            .lstb => |o| try @import("ac/lstb.zig").plan(ctx, o),
+            .sp => |o| try @import("ac/sp.zig").plan(ctx, o),
+            .noise => |o| try @import("ac/noise.zig").plan(ctx, o),
+            else => null,
+        };
     }
 
     /// `execute` past `materialize`, for a batch lane that runs alone.
@@ -592,16 +886,37 @@ pub const Executor = struct {
     }
 
     fn runQuery(self: *Executor) !types.Result {
+        // Borrowed lanes serve the device stamp and the multicore refactor;
+        // both are bitwise their one-thread forms, so only speed moves.
+        var lanes = self.config.device_threads;
+        var borrowed: u32 = 0;
+        if (self.config.thread_pool) |pool| if (self.circuit.ws == null) {
+            const want = wantLanes(&self.circuit);
+            borrowed = pool.take(want - 1);
+            lanes = 1 + borrowed;
+            var execution = self.circuit.solver_execution;
+            execution.lu_threads = @intCast(@min(lanes, 16));
+            self.circuit.configure(execution, self.circuit.knobs);
+        };
+        defer if (self.config.thread_pool) |pool| pool.give(borrowed);
         var par: ?ParEval = null;
-        if (self.config.device_threads > 1) {
-            par = try ParEval.init(self.allocator, self.io, self.circuit.batches, self.circuit.nnz, self.circuit.n, self.circuit.has_charge, self.config.device_threads);
+        if (lanes > 1) {
+            par = try ParEval.init(self.allocator, self.io, self.circuit.batches, self.circuit.nnz, self.circuit.n, self.circuit.has_charge, lanes);
             self.circuit.par_eval = &par.?;
         }
         defer {
             self.circuit.par_eval = null;
             if (par) |*p| p.deinit();
         }
-        const gpu_context = try self.prepareGpu();
+        const gpu_context = try self.prepareGpu(lanes);
+        // The bypass serves host evaluations only.
+        if (self.config.knobs.bypass and gpu_context == null) {
+            // A tenth of reltol: a replay's current error is about reltol
+            // times the device currents, which a net current that nearly
+            // cancels (a supply at a switching edge) would show at full reltol.
+            const tol = self.deck.deck_tol;
+            self.circuit.setBypass(.{ .reltol = tol.reltol / 10, .vntol = tol.vntol, .abstol = tol.abstol });
+        }
         defer if (gpu_context) |g| {
             // `refuseLatched` reads statuses off the host instances.
             g.syncStatus();
@@ -657,9 +972,17 @@ pub const Executor = struct {
             std.debug.assert(self.deck.op_guess.len == self.circuit.n);
             @memcpy(self.x.?, self.deck.op_guess);
             options.warm_start = true;
-        } else if (options.warm_start and self.deck.warm_op.len != 0) {
+        } else if ((options.warm_start or options.tol.warm_op) and self.deck.warm_op.len != 0 and !self.movesTemp()) {
             std.debug.assert(self.deck.warm_op.len == self.circuit.n);
             @memcpy(self.x.?, self.deck.warm_op);
+            options.warm_start = true;
+            // From another point's solution Newton stops within reltol of
+            // this one's, on the far side from where the cold ladder stops:
+            // converge a thousand times tighter (one or two more quadratic
+            // iterations) so the answer is the point's own, not the path's.
+            options.tol.reltol *= 1e-3;
+            options.tol.vntol *= 1e-3;
+            options.tol.abstol *= 1e-3;
         } else options.warm_start = false;
         return options;
     }
@@ -724,7 +1047,9 @@ pub const Executor = struct {
     /// column or in all (`GpuLu.admits`), whatever the card's FP64 rate. A
     /// driver that refuses leaves the host LU.
     fn prepareGpuLu(self: *Executor) ?*gpu_lu.GpuLu {
-        if (self.config.backend == .cpu or (self.config.gpu_lanes and self.job == .op)) return null;
+        // A lone operating point refactors on the device (logic_bsim4_10k
+        // under `cuda`: 57 iterations, 6.3 s against 7.5-40 s of host LU).
+        if (self.config.backend == .cpu or (self.config.gpu_lanes and self.config.may_batch and self.job == .op)) return null;
         var forced = false;
         if (self.config.knobs.gpu_lu) |on| {
             if (!on) return null;
@@ -739,19 +1064,19 @@ pub const Executor = struct {
         return context;
     }
 
-    fn prepareGpu(self: *Executor) !?*gpu.GpuContext {
+    fn prepareGpu(self: *Executor, lanes: u32) !?*gpu.GpuContext {
         // Under GPU lanes the operating points run on the CPU workers, in
         // parallel, and only the transients' lanes take the device.
         if (self.config.backend == .cpu or (self.config.gpu_lanes and self.job == .op)) return null;
         const explicit = self.config.gpu_explicit or self.config.backend != .auto;
         const c = &self.circuit;
         const host: gpu.Host = .{ .batches = c.batches, .planes = c.ownPlanes(), .n = c.n, .trash_slot = c.trash_slot, .has_charge = c.has_charge, .knobs = c.knobs };
-        const context = gpu.GpuContext.init(self.allocator, host, self.config.gpu_driver, explicit, self.config.device_threads, expectedEvals(self.job)) catch |err| {
+        const context = gpu.GpuContext.init(self.allocator, host, self.config.gpu_driver, explicit, lanes, expectedEvals(self.job)) catch |err| {
             if (!gpu.fallsBack(self.config.backend, explicit, err)) {
                 std.log.warn("--backend {s}: GPU unavailable ({s}); detected GPU hardware: {s}", .{ @tagName(self.config.backend), @errorName(err), gpu.detectedHardware() });
                 return err;
             }
-            if (gpu.declineKind(err) != .policy)
+            if (gpu.declineKind(err) != .policy and !self.config.gpu_quiet)
                 std.log.warn("GPU unavailable ({s}); running on the CPU", .{@errorName(err)});
             return null;
         };
@@ -811,7 +1136,7 @@ fn expectedEvals(job: requests.Query) f64 {
             const outer = if (d.target2 != null) @abs(d.stop2 - d.start2) / @max(@abs(d.step2), 1e-300) + 1 else 1;
             break :blk 3 * inner * outer;
         },
-        .tran => |t| 4 * t.t_stop / @min(t.dt_init, t.dt_max orelse t.t_stop / 50.0),
+        .tran => |t| 4 * t.t_stop / @min(t.dt_init, t.requestedCeiling(.api)),
         .ac, .noise, .sp, .stb, .tf, .pz, .disto, .four, .dcmatch, .sens, .lstb, .acxf, .dcxf, .dcinc, .acmatch, .dcsens => 1,
         else => 200,
     };

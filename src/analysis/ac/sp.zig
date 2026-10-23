@@ -48,6 +48,51 @@ pub const t0_kelvin = 290.0;
 /// O(gd_step²) and roundoff O(1e-16 / gd_step), both near 1e-10 relative.
 const gd_step = 1e-5;
 
+/// The leading multi-RHS sweep, including each ideal port's series
+/// termination. `.lin` keeps its sweep live because later delay/noise
+/// solves continue that solver's pivot history.
+pub fn plan(ctx: *const root.RunCtx, opts: Options) !?freq.Plan {
+    if (opts.lin != null) return null;
+    const scratch = ctx.scratch_allocator;
+    const n: usize = ctx.circuit.n;
+    const one_port = [_]Port{.{ .node = ctx.source_node, .branch = ctx.source_branch }};
+    var basis = try Basis.init(scratch, if (opts.ports.len > 0) opts.ports else &one_port, .{ false, false });
+    defer basis.deinit(scratch);
+    if (opts.net and basis.legs.len > 2) return error.InvalidQueryOptions;
+    const rhs = try scratch.alloc(f64, basis.legs.len * 2 * n);
+    errdefer scratch.free(rhs);
+    fillRhs(basis.legs, n, rhs);
+    var n_diag: usize = 0;
+    if (!opts.net) {
+        for (basis.legs) |port| n_diag += @intFromBool(!port.series_z0);
+    }
+    const diag = try scratch.alloc(freq.Plan.Diagonal, n_diag);
+    errdefer scratch.free(diag);
+    var k: usize = 0;
+    if (!opts.net) {
+        for (basis.legs) |port| {
+            if (port.series_z0) continue;
+            diag[k] = .{ .row = port.branch, .value = -port.z0 };
+            k += 1;
+        }
+    }
+    const freqs, const omegas = try freq.axis(scratch, opts.sweep);
+    return .{ .freqs = freqs, .omegas = omegas, .rhs = rhs, .adjoint = false, .g_diagonal = diag };
+}
+
+fn fillRhs(ports: []const Port, n: usize, rhs: []f64) void {
+    @memset(rhs, 0);
+    for (ports, 0..) |port, p| {
+        if (port.branch != Port.no_branch) {
+            rhs[p * 2 * n + port.branch] = 1.0;
+            continue;
+        }
+        // `.net`: a unit current into `node`, out of `neg`.
+        if (port.node != root.GROUND) rhs[p * 2 * n + port.node] = 1.0;
+        if (port.neg != root.GROUND) rhs[p * 2 * n + port.neg] = -1.0;
+    }
+}
+
 /// Contract entry: opts.ports (or the deck's drive source as port 1), the
 /// full S-matrix per frequency, then `.lin`'s columns (`linNames`).
 /// Complex, point-major (frequency, S11, S12, ..., Snn, ...).
@@ -96,19 +141,11 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     // One unit drive per port, every one solved against each factorization.
     const rhs = try scratch.alloc(f64, n_ports * nn);
     defer scratch.free(rhs);
-    @memset(rhs, 0);
-    for (ports, 0..) |port, p| {
-        if (port.branch != Port.no_branch) {
-            rhs[p * nn + port.branch] = 1.0;
-            continue;
-        }
-        // `.net`: a unit current into `node`, out of `neg`.
-        if (port.node != root.GROUND) rhs[p * nn + port.node] = 1.0;
-        if (port.neg != root.GROUND) rhs[p * nn + port.neg] = -1.0;
-    }
+    fillRhs(ports, n, rhs);
 
     var stream = try freq.Stream.init(scratch, &fs, ckt, ctx.x_op, omegas, rhs, false);
     defer stream.deinit(scratch);
+    stream.pre = ctx.freq_pre;
     while (try stream.next(ckt)) |pt| {
         const row = data[pt.k * row_len ..][0..row_len];
         row[0] = freqs[pt.k];

@@ -1,0 +1,7 @@
+PASS hb: grouped GPU sampling, harmonic factorization and masked Krylov, 3 mixed/repeated points; worst 0x tolerance
+PASS mhb: grouped GPU sampling, harmonic factorization and masked Krylov, 3 mixed/repeated points; worst 0x tolerance
+PASS hb_diode: grouped GPU sampling, harmonic factorization and masked Krylov, 3 mixed/repeated points; worst 0x tolerance
+PASS mhb_diode: grouped GPU sampling, harmonic factorization and masked Krylov, 3 mixed/repeated points; worst 0x tolerance
+PASS hbac: resident HB Krylov and GPU sideband preconditioning, 3 mixed/repeated points; worst 0x tolerance
+PASS hbxf: resident HB Krylov and GPU sideband preconditioning, 3 mixed/repeated points; worst 0x tolerance
+PASS hbnoise: resident HB Krylov and GPU sideband preconditioning, 3 mixed/repeated points; worst 0x tolerance

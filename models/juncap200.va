@@ -1,0 +1,1676 @@
+//======================================================================================
+//======================================================================================
+// Filename: juncap200.va
+//======================================================================================
+//======================================================================================
+//
+//  (c) Copyright notice
+//
+//  Since 2015 until today, PSP has been co-developed by NXP Semiconductors and
+//  CEA-Leti. For this part of the model, each claim undivided ownership and copyrights
+//  Since 2012 until 2015, PSP has been co-developed by NXP Semiconductors and
+//  Delft University of Technology. For this part of the model, each claim undivided
+//  ownership and copyrights
+//  Until and including 2011, PSP has been co-developed by NXP Semiconductors and
+//  Arizona State University. For this part of the model, NXP Semiconductors claims
+//  undivided ownership and copyrights.
+//
+//
+//  Version: 200.6.2, April 2021
+//
+//======================================================================================
+//======================================================================================
+//
+// Further information can be found in the file releasenotesPSP103.txt
+//
+
+`include "discipline.h"
+
+// ---- begin `include "Common103_macrodefs.include" ----
+//======================================================================================
+//======================================================================================
+// Filename: Common103_macrodefs.include
+//======================================================================================
+//======================================================================================
+//
+//  (c) Copyright notice
+//
+//  Since 2015 until today, PSP has been co-developed by NXP Semiconductors and
+//  CEA-Leti. For this part of the model, each claim undivided ownership and copyrights
+//  Since 2012 until 2015, PSP has been co-developed by NXP Semiconductors and
+//  Delft University of Technology. For this part of the model, each claim undivided
+//  ownership and copyrights
+//  Until and including 2011, PSP has been co-developed by NXP Semiconductors and
+//  Arizona State University. For this part of the model, NXP Semiconductors claims
+//  undivided ownership and copyrights.
+//
+//
+//  Version: 103.8.2 (PSP), 200.6.2 (JUNCAP), June 2022
+//
+//======================================================================================
+//======================================================================================
+//
+// Further information can be found in the file releasenotesPSP103.txt
+//
+
+//////////////////////////////////////////////////////////////
+//
+//  General macros and constants for compact va-models
+//
+//////////////////////////////////////////////////////////////
+
+// Clipping functions
+`define CLIP_LOW(val,min)      ((val)>(min)?(val):(min))
+`define CLIP_HIGH(val,max)     ((val)<(max)?(val):(max))
+`define CLIP_BOTH(val,min,max) ((val)>(min)?((val)<(max)?(val):(max)):(min))
+
+// Min/Max functions
+`define MAX(x,y)              ((x)>(y)?(x):(y))
+`define MIN(x,y)              ((x)<(y)?(x):(y))
+
+// Mathematical constants
+`define PI                    3.1415926535897931
+`define SQRTPI                1.77245385090551603
+
+// Physical constants
+`define KELVINCONVERSION      273.15
+`define KBOL                  1.3806505E-23
+`define QELE                  1.6021918E-19
+`define HBAR                  1.05457168E-34
+`define MELE                  9.1093826E-31
+`define EPSO                  8.8541878176E-12
+`define EPSRSI                11.8
+
+// Other constants
+`define oneThird              3.3333333333333333e-01
+`define twoThirds             6.6666666666666667e-01
+
+// Constants needed in safe exponential function (called "expl")
+`define se                    4.6051701859880916e+02
+`define se05                  2.3025850929940458e+02
+`define ke                    1.0e-200
+`define ke05                  1.0e-100
+`define keinv                 1.0e200
+`define ke05inv               1.0e100
+
+//  P3       3rd order polynomial expansion of exp()
+`define P3(u) (1.0 + (u) * (1.0 + 0.5 * ((u) * (1.0 + (u) * `oneThird))))
+
+//  expl     exp() with 3rd order polynomial extrapolation for very low values (exp_low),
+//           very high values (exp_high), or both (expl)
+`define expl(x, res) \
+    if (abs(x) < `se05) begin\
+        res       = exp(x); \
+    end else begin \
+        if ((x) < 0.0) begin\
+            res       = `ke05 / `P3(-`se05 - (x)); \
+        end else begin\
+            res       =  `ke05inv * `P3((x) - `se05); \
+        end \
+    end
+
+`define expl_low(x, res) \
+    if ((x) > -`se05) begin\
+        res       =  exp(x); \
+    end else begin\
+        res       = `ke05 / `P3(-`se05 - (x)); \
+    end
+
+`define expl_high(x, res) \
+    if ((x) < `se05) begin\
+        res       = exp(x); \
+    end else begin \
+        res       =  `ke05inv * `P3((x) - `se05); \
+    end
+
+//  Exchange function
+`define swap(a, b) \
+    temp = a; \
+    a    = b; \
+    b    = temp;
+
+//  Parameter definition macros: "des" description argument is intended to
+//  be a short description, the "inf" information argument is intended to be
+//  a detailed description (e.g. for display as part of on-line help).
+//
+//  MPR      model    parameter real
+//  MPI      model    parameter integer
+//  IPR      instance parameter real
+//  IPI      instance parameter integer
+//  OPP      operating point parameter, includes units and description for printing
+//  OPM      operating point parameter, scales with $mfactor
+//  OPD      operating point parameter, scales with 1/$mfactor
+//
+//  Instance parameters have the attribute *type="instance"* and note that
+//  compilers treat these as both instance and model parameters, with a
+//  specified instance value taking precedence over a specified model card value.
+//
+//  There are some issues with passing range directives with some compilers,
+//  so for each parameter declaration there are multiple versions:
+//  cc       closed lower bound, closed upper bound
+//  co       closed lower bound, open   upper bound
+//  cz       closed lower bound of zero (no upper bound)
+//  oc       open   lower bound, closed upper bound
+//  oo       open   lower bound, open   upper bound
+//  oz       open   lower bound of zero (no upper bound)
+//  nb       no bounds
+//  sw       switch (integer only, values  0=false  and >0=true)
+//  ty       switch (integer only, values -1=n-type and +1=p-type)
+//
+
+`define ALIAS(alias,paramName) aliasparam alias = paramName;
+`define OPP(nam,uni,des)               (*units=uni,                             desc=des*)           real    nam;
+`define OPM(nam,uni,des)               (*units=uni, multiplicity="multiply",    desc=des*)           real    nam;
+`define OPD(nam,uni,des)               (*units=uni, multiplicity="divide",      desc=des*)           real    nam;
+`define MPRcc(nam,def,uni,lwr,upr,des) (*units=uni                            , desc=des*) parameter real    nam=def from[lwr:upr];
+`define MPRco(nam,def,uni,lwr,upr,des) (*units=uni                            , desc=des*) parameter real    nam=def from[lwr:upr);
+`define MPRcz(nam,def,uni,        des) (*units=uni                            , desc=des*) parameter real    nam=def from[  0:inf);
+`define MPRoc(nam,def,uni,lwr,upr,des) (*units=uni                            , desc=des*) parameter real    nam=def from(lwr:upr];
+`define MPRoo(nam,def,uni,lwr,upr,des) (*units=uni                            , desc=des*) parameter real    nam=def from(lwr:upr);
+`define MPRoz(nam,def,uni,        des) (*units=uni                            , desc=des*) parameter real    nam=def from(  0:inf);
+`define MPRnb(nam,def,uni,        des) (*units=uni                            , desc=des*) parameter real    nam=def;
+`define MPIcc(nam,def,uni,lwr,upr,des) (*units=uni                            , desc=des*) parameter integer nam=def from[lwr:upr];
+`define MPIco(nam,def,uni,lwr,upr,des) (*units=uni                            , desc=des*) parameter integer nam=def from[lwr:upr);
+`define MPIcz(nam,def,uni,        des) (*units=uni                            , desc=des*) parameter integer nam=def from[  0:inf);
+`define MPIoc(nam,def,uni,lwr,upr,des) (*units=uni                            , desc=des*) parameter integer nam=def from(lwr:upr];
+`define MPIoo(nam,def,uni,lwr,upr,des) (*units=uni                            , desc=des*) parameter integer nam=def from(lwr:upr);
+`define MPIoz(nam,def,uni,        des) (*units=uni                            , desc=des*) parameter integer nam=def from(  0:inf);
+`define MPInb(nam,def,uni,        des) (*units=uni                            , desc=des*) parameter integer nam=def;
+`define MPIsw(nam,def,uni,        des) (*units=uni                            , desc=des*) parameter integer nam=def from[  0:inf);
+`define MPIty(nam,def,uni,        des) (*units=uni                            , desc=des*) parameter integer nam=def from[ -1:  1] exclude 0;
+`define IPRcc(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",            desc=des*) parameter real    nam=def from[lwr:upr];
+`define IPRco(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",            desc=des*) parameter real    nam=def from[lwr:upr);
+`define IPRcz(nam,def,uni,        des) (*units=uni, type="instance",            desc=des*) parameter real    nam=def from[  0:inf);
+`define IPRoc(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",            desc=des*) parameter real    nam=def from(lwr:upr];
+`define IPRoo(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",            desc=des*) parameter real    nam=def from(lwr:upr);
+`define IPRoz(nam,def,uni,        des) (*units=uni, type="instance",            desc=des*) parameter real    nam=def from(  0:inf);
+`define IPRnb(nam,def,uni,        des) (*units=uni, type="instance",            desc=des*) parameter real    nam=def;
+`define IPIcc(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",            desc=des*) parameter integer nam=def from[lwr:upr];
+`define IPIco(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",            desc=des*) parameter integer nam=def from[lwr:upr);
+`define IPIcz(nam,def,uni,        des) (*units=uni, type="instance",            desc=des*) parameter integer nam=def from[  0:inf);
+`define IPIoc(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",            desc=des*) parameter integer nam=def from(lwr:upr];
+`define IPIoo(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",            desc=des*) parameter integer nam=def from(lwr:upr);
+`define IPIoz(nam,def,uni,        des) (*units=uni, type="instance",            desc=des*) parameter integer nam=def from(  0:inf);
+`define IPInb(nam,def,uni,        des) (*units=uni, type="instance",            desc=des*) parameter integer nam=def;
+`define IPIsw(nam,def,uni,        des) (*units=uni, type="instance",            desc=des*) parameter integer nam=def from[  0:inf);
+// ---- end `include "Common103_macrodefs.include" ----
+
+// ---- begin `include "JUNCAP200_macrodefs.include" ----
+//======================================================================================
+//======================================================================================
+// Filename: JUNCAP200_macrodefs.include
+//======================================================================================
+//======================================================================================
+//
+//  (c) Copyright notice
+//
+//  Since 2015 until today, PSP has been co-developed by NXP Semiconductors and
+//  CEA-Leti. For this part of the model, each claim undivided ownership and copyrights
+//  Since 2012 until 2015, PSP has been co-developed by NXP Semiconductors and
+//  Delft University of Technology. For this part of the model, each claim undivided
+//  ownership and copyrights
+//  Until and including 2011, PSP has been co-developed by NXP Semiconductors and
+//  Arizona State University. For this part of the model, NXP Semiconductors claims
+//  undivided ownership and copyrights.
+//
+//
+//  Version: 200.6.2, April 2021
+//
+//======================================================================================
+//======================================================================================
+//
+// Further information can be found in the file releasenotesPSP103.txt
+//
+
+///////////////////////////////////////////
+//
+// Macros and constants used in JUNCAP2
+//
+///////////////////////////////////////////
+
+// Other constants
+`define MINTEMP          -2.5e2
+`define vbilow            5.0e-2
+`define a                 2.0
+`define epsch             0.1
+`define dvbi              5.0e-2
+`define epsav             1.0e-6
+`define vbrmax            1.0e3
+`define vmaxlarge         1.0e8
+`define aerfc             0.29214664
+`define twothirds         0.666666666666667
+
+// Clipping values
+`define levelnumber        2.0e2
+`define AB_cliplow         0.0
+`define LS_cliplow         0.0
+`define LG_cliplow         0.0
+`define MULT_cliplow       0.0
+`define TRJ_cliplow        `MINTEMP
+`define IMAX_cliplow       1.0e-12
+`define FREV_cliplow       1.0e1
+`define FREV_cliphigh      1.0e10
+`define IFACTOR_cliplow    0.0
+`define CFACTOR_cliplow    0.0
+`define CJORBOT_cliplow    1.0e-12
+`define CJORSTI_cliplow    1.0e-18
+`define CJORGAT_cliplow    1.0e-18
+`define VBIR_cliplow       `vbilow
+`define P_cliplow          5.0e-2
+`define P_cliphigh         0.95
+`define IDSATR_cliplow     0.0
+`define CSRH_cliplow       0.0
+`define XJUN_cliplow       1.0e-9
+`define CTAT_cliplow       0.0
+`define MEFFTAT_cliplow    1.0e-2
+`define CBBT_cliplow       0.0
+`define VBR_cliplow        0.1
+`define PBR_cliplow        0.1
+`define VJUNREF_cliplow    0.5
+`define FJUNQ_cliplow      0.0
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+//  Macro definitions.
+//
+//  Note that because at present locally scoped variables
+//  can only be in named blocks, the intermediate variables
+//  used in the macros below must be explicitly declared
+//  as variables.
+//
+/////////////////////////////////////////////////////////////////////////////
+
+// Variable declarations of variables that need to be *local* in juncap-express initialization
+
+`define LocalGlobalVars \
+    /*  Declaration of variables needed in macro "calcerfcexpmtat" */ \
+    real ysq, terfc, erfcpos; \
+    \
+    /*  Declaration of variables needed in hypfunction 5 */ \
+    real h1, h2, h2d, h3, h4, h5; \
+    \
+    /*  Declaration of variables calculated outside macro "juncapfunction", voltage-dependent part */ \
+    real idmult, vj, z, zinv, two_psistar, vjlim, vjsrh, vbbt, vav; \
+    \
+    /*  Declaration of variables used within macro "juncapfunction" */ \
+    real tmp, id; \
+    real isrh, vbi_minus_vjsrh, wsrhstep, dwsrh, wsrh, wdep, asrh; \
+    real itat, btat, twoatatoverthreebtat, umaxbeforelimiting, umax, sqrtumax, umaxpoweronepointfive; \
+    real wgamma, wtat, ktat, ltat, mtat, xerfc, erfctimesexpmtat, gammamax; \
+    real ibbt, Fmaxr; \
+    real fbreakdown;
+
+//  Initialization of (local) variables; required for some verilog-A compilers
+`define JuncapLocalVarInit \
+    ysq          =  0.0; \
+    terfc        =  0.0; \
+    erfcpos      =  0.0; \
+    h1           =  0.0; \
+    h2           =  0.0; \
+    h2d          =  0.0; \
+    h3           =  0.0; \
+    h4           =  0.0; \
+    h5           =  0.0; \
+    idmult       =  0.0; \
+    vj           =  0.0; \
+    z            =  0.0; \
+    zinv         =  0.0; \
+    two_psistar  =  0.0; \
+    vjlim        =  0.0; \
+    vjsrh        =  0.0; \
+    vbbt         =  0.0; \
+    vav          =  0.0; \
+    tmp          =  0.0; \
+    id           =  0.0; \
+    isrh         =  0.0; \
+    vbi_minus_vjsrh =  0.0; \
+    wsrhstep     =  0.0; \
+    dwsrh        =  0.0; \
+    wsrh         =  0.0; \
+    wdep         =  0.0; \
+    asrh         =  0.0; \
+    itat         =  0.0; \
+    btat         =  0.0; \
+    twoatatoverthreebtat =  0.0; \
+    umaxbeforelimiting =  0.0; \
+    umax         =  0.0; \
+    sqrtumax     =  0.0; \
+    umaxpoweronepointfive = 0.0; \
+    wgamma       =  0.0; \
+    wtat         =  0.0; \
+    ktat         =  0.0; \
+    ltat         =  0.0; \
+    mtat         =  0.0; \
+    xerfc        =  0.0; \
+    erfctimesexpmtat =  0.0; \
+    gammamax     =  0.0; \
+    ibbt         =  0.0; \
+    Fmaxr        =  0.0; \
+    fbreakdown   =  0.0;
+
+// Instance parameter dependent initialization
+`define JuncapInitInstance(AB_i, LS_i, LG_i, idsatbot, idsatsti, idsatgat, vbibot, vbisti, vbigat, PBOT_i, PSTI_i, PGAT_i, VBIRBOT_i, VBIRSTI_i, VBIRGAT_i, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim) \
+    if (idsatbot * AB_i > 0.0) begin \
+        vmaxbot      =  phitd * ln(IMAX / (idsatbot * AB_i) + 1.0); \
+    end else begin \
+        vmaxbot      = `vmaxlarge; \
+    end \
+    if (idsatsti * LS_i > 0.0) begin \
+        vmaxsti      =  phitd * ln(IMAX / (idsatsti * LS_i) + 1.0); \
+    end else begin \
+        vmaxsti      = `vmaxlarge; \
+    end \
+    if (idsatgat * LG_i > 0.0) begin \
+        vmaxgat      =  phitd * ln(IMAX / (idsatgat * LG_i) + 1.0); \
+    end else begin \
+        vmaxgat      = `vmaxlarge; \
+    end \
+    VMAX         =  min(min(vmaxbot, vmaxsti), vmaxgat); \
+    `expl(VMAX * phitdinv, exp_VMAX_over_phitd) \
+    \
+    /*  Determination of minimum value of the relevant built-in voltages */ \
+    /*  and determination of limiting value of conditioned voltage for BBT calculation */ \
+    vbibot2      =  vbibot; \
+    vbisti2      =  vbisti; \
+    vbigat2      =  vbigat; \
+    pbot2        =  PBOT_i; \
+    psti2        =  PSTI_i; \
+    pgat2        =  PGAT_i; \
+    vbibot2r     =  VBIRBOT_i; \
+    vbisti2r     =  VBIRSTI_i; \
+    vbigat2r     =  VBIRGAT_i; \
+    if (AB_i == 0.0) begin \
+        vbibot2      =  vbisti + vbigat; \
+        pbot2        =  0.9 * min(PSTI_i, PGAT_i); \
+        vbibot2r     =  VBIRSTI_i + VBIRGAT_i; \
+    end \
+    if (LS_i == 0.0) begin \
+        vbisti2      =  vbibot + vbigat; \
+        psti2        =  0.9 * min(PBOT_i, PGAT_i); \
+        vbisti2r     =  VBIRBOT_i + VBIRGAT_i; \
+    end \
+    if (LG_i == 0.0) begin \
+        vbigat2      =  vbibot + vbisti; \
+        pgat2        =  0.9 * min(PBOT_i, PSTI_i); \
+        vbigat2r     =  VBIRBOT_i + VBIRSTI_i; \
+    end \
+    vbimin       =  min(min(vbibot2, vbisti2), vbigat2); \
+    vch          =  vbimin * `epsch; \
+    pmax         =  max(max(pbot2, psti2), pgat2); \
+    vfmin        =  vbimin * (1.0 - (pow(`a, (-1.0 / (pmax))))); \
+    vbbtlim      =  min(min(vbibot2r, vbisti2r), vbigat2r) - `dvbi;
+
+
+// Special power-functions
+
+`define mypower(x,power,result) \
+    if (power == 0.5) begin \
+        result       =  sqrt(x); \
+    end else begin \
+        result       =  pow(x, power); \
+    end
+
+`define mypower2(x,power,result) \
+    if (power == -1.0) begin \
+        result       =  1.0 / (x); \
+    end else begin \
+        result       =  pow(x, power); \
+    end
+
+`define mypower3(x,power,result) \
+    if (power == 4.0) begin \
+        result       =  (x) * (x) * (x) * (x); \
+    end else begin \
+        result       =  pow(abs(x), power); \
+    end
+
+// Smoothing functions
+`define hypfunction2(x,x0,eps,hyp2) \
+    hyp2         =  0.5 * ((x) + (x0) - sqrt(((x) - (x0)) * ((x) - (x0)) + 4.0 * (eps) * (eps)));
+
+`define hypfunction5(x,x0,eps,hyp5) \
+    h1           =  4.0 * (eps) * (eps); \
+    h2           =  (eps) / (x0); \
+    h2d          =  (x) + (eps) * h2; \
+    h3           =  (x0) + h2d; \
+    h4           =  (x0) - h2d; \
+    h5           =  sqrt(h4 * h4 + h1); \
+    hyp5         =  2.0 * ((x) * (x0) / (h3 + h5));
+
+
+// A special function used to calculate TAT-currents,
+// including an approximation of the erfc-function
+
+`define calcerfcexpmtat(y,m,result) \
+    ysq          =  y * y; \
+    if (y > 0.0) begin \
+        terfc        =  1.0 / (1.0 + perfc * y); \
+    end else begin \
+        terfc        =  1.0 / (1.0 - perfc * y); \
+    end \
+    `expl_low(-ysq + m, tmp) \
+    erfcpos = (`aerfc * terfc + berfc * (terfc * terfc) + cerfc * (terfc * terfc * terfc)) * tmp; \
+    if (y > 0.0) begin \
+        result       =  erfcpos; \
+    end else begin\
+        `expl_low(m, tmp) \
+        result       =  2.0 * tmp - erfcpos; \
+    end
+
+// This is the main function of the JUNCAP2-model. It returns the current and charge
+// for a single diode
+`define juncapfunction(VAK,qpref,qpref2,vbiinv,one_minus_P,idsat,CSRH,CTAT,vbi,wdepnulr,VBIRinv,P,ftd,btatpart,atat,one_over_one_minus_P,CBBT,VBIR,wdepnulrinv,fbbt,VBR,VBRinv,PBR,fstop,slope,Ijprime,Qjprime) \
+    `mypower((1.0 - vj * vbiinv), one_minus_P, tmp) \
+    Qjprime      =  CFACTOR * (qpref * (1.0 - tmp) + qpref2 * (VAK - vj)); \
+    id           =  idsat * idmult; \
+    if ((CSRH == 0.0) && (CTAT == 0.0)) begin \
+        isrh         =  0.0; \
+    end else begin \
+        vbi_minus_vjsrh =  vbi-vjsrh; \
+        wsrhstep     =  1.0 - sqrt(1.0 - two_psistar / vbi_minus_vjsrh); \
+        if (P == 0.5) begin \
+            dwsrh        =  0.0; \
+        end else begin \
+            dwsrh        =  ((wsrhstep * wsrhstep * ln(wsrhstep) / (1.0 - wsrhstep)) + wsrhstep) * (1.0 - 2.0 * P); \
+        end \
+        wsrh         =  wsrhstep + dwsrh; \
+        `mypower(vbi_minus_vjsrh * VBIRinv, P, tmp) \
+        wdep         =  wdepnulr * tmp; \
+        asrh         =  ftd * ((zinv - 1.0) * wdep); \
+        isrh         =  CSRH * (asrh * wsrh); \
+    end \
+    if (CTAT == 0.0) begin \
+        itat         =  0.0; \
+    end else begin \
+        btat         =  btatpart * ((wdep * one_minus_P) / vbi_minus_vjsrh); \
+        twoatatoverthreebtat = (`twothirds * atat) / btat; \
+        umaxbeforelimiting = twoatatoverthreebtat * twoatatoverthreebtat; \
+        umax         =  sqrt(umaxbeforelimiting * umaxbeforelimiting / (umaxbeforelimiting * umaxbeforelimiting + 1.0)); \
+        sqrtumax     =  sqrt(umax); \
+        umaxpoweronepointfive = umax * sqrtumax; \
+        `mypower2((1.0 + btat * umaxpoweronepointfive), (-P * one_over_one_minus_P), wgamma) \
+        wtat         =  wsrh * wgamma / (wsrh + wgamma); \
+        ktat         =  sqrt(0.375 * (btat / sqrtumax)); \
+        ltat         =  2.0 * (twoatatoverthreebtat * sqrtumax) - umax; \
+        mtat         =  atat * twoatatoverthreebtat * sqrtumax - atat * umax + 0.5 * (btat * umaxpoweronepointfive); \
+        xerfc        =  (ltat - 1.0) * ktat; \
+        `calcerfcexpmtat(xerfc, mtat, erfctimesexpmtat) \
+        gammamax     = `SQRTPI * 0.5 * (atat * erfctimesexpmtat  / ktat); \
+        itat         =  CTAT * (asrh * gammamax * wtat); \
+    end \
+    if (CBBT == 0.0) begin \
+        ibbt         =  0.0; \
+    end else begin \
+        `mypower(((VBIR - vbbt) * VBIRinv), P, tmp) \
+        Fmaxr        =  one_over_one_minus_P * ((VBIR - vbbt) * wdepnulrinv / tmp); \
+        `expl(-fbbt / Fmaxr, tmp) \
+        ibbt         =  CBBT * (VAK * Fmaxr * Fmaxr * tmp); \
+    end \
+    if (VBR > `vbrmax) begin \
+        fbreakdown   =  1.0; \
+    end else begin \
+        if (vav > -alphaav * VBR) begin \
+            `mypower3(vav * VBRinv, PBR, tmp) \
+            fbreakdown    =  1.0 / (1.0 - tmp); \
+        end else begin \
+            fbreakdown    =  fstop + (vav + alphaav * VBR) * slope; \
+        end \
+    end \
+    Ijprime      =  IFACTOR * (id + isrh + itat + ibbt) * fbreakdown;
+
+
+// The following code is written as a macro because the naming of the instance parameters is
+// different for JUNCAP2 stand-alone and JUNCAP2-in-PSP: AB, LS, LG for JUNCAP2 stand-alone,
+// ABSOURCE, LSSOURCE, LGSOURCE for source junction in PSP and ABDRAIN, LSDRAIN, LGDRAIN for
+// drain junction in PSP
+`define juncapcommon(V, AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim, ijunbot, qjunbot, ijunsti, qjunsti, ijungat, qjungat) \
+    vbbt         =  0.0; \
+    two_psistar  =  0.0; \
+    if ( !( ((AB_i) == 0.0) && ((LS_i) == 0.0) && ((LG_i) == 0.0) ) ) begin \
+        `hypfunction5(V, vfmin, vch, vj) \
+        if (V < VMAX)  begin \
+            `expl(0.5 * (V * phitdinv), zinv) \
+            idmult       =  zinv * zinv; \
+        end else begin \
+            idmult       =  (1.0 + (V - VMAX) * phitdinv) * exp_VMAX_over_phitd; \
+            zinv         =  sqrt(idmult); \
+        end \
+        idmult       =  idmult - 1.0; \
+        z            =  1.0 / zinv; \
+        if (V > 0.0) begin \
+            two_psistar    =  2.0 * (phitd * ln(2.0 + z + sqrt((z + 1.0) * (z + 3.0)))); \
+        end else begin \
+            two_psistar    = -V + 2.0 * (phitd * ln(2.0 * zinv + 1.0 + sqrt((1.0 + zinv) * (1.0 + 3.0 * zinv)))); \
+        end \
+        vjlim        =  vbimin - two_psistar; \
+        `hypfunction2(V, vjlim, phitd, vjsrh) \
+        `hypfunction2(V, vbbtlim, phitr, vbbt) \
+        `hypfunction2(V, 0.0, `epsav, vav) \
+    end \
+    if ((AB_i) == 0.0) begin \
+        ijunbot      =  0.0; \
+        qjunbot      =  0.0; \
+    end else begin \
+        `juncapfunction(V, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, ijunbot, qjunbot) \
+    end \
+    if ((LS_i) == 0.0) begin \
+        ijunsti      =  0.0; \
+        qjunsti      =  0.0; \
+    end else begin \
+        `juncapfunction(V, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, ijunsti, qjunsti) \
+    end \
+    if ((LG_i) == 0.0) begin \
+        ijungat      =  0.0; \
+        qjungat      =  0.0; \
+    end else begin \
+        `juncapfunction(V, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, ijungat, qjungat) \
+    end
+
+//============================================================================================================
+//  JUNCAP-express
+//
+//  The macros below are used in the express-version of JUNCAP2
+//============================================================================================================
+
+`define relerr      1.0e-3
+`define P1(x)       ((x) + 1.0)
+
+`define expll(x, xlow, expxlow, xhigh, expxhigh) \
+    ((x) < (xlow)) ? (expxlow) / `P1((xlow) - (x)) : (((x) > (xhigh)) ? (expxhigh) * `P1((x) - (xhigh)) : exp(x))
+
+
+// The "JuncapExpressInit"-macro below is split into three parts, as some verilog-A compilers cannot handle
+// macros beyond a certain size. Moreover, it is useful to limit the list of input and output variables.
+
+// Part 1
+`define JuncapExpressInit1(AB_i, LS_i, LG_i, VJUNREF_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim) \
+    FRACNA       =  0.4; \
+    FRACNB       =  0.65; \
+    FRACI        =  0.8; \
+    /* Sample voltages */ \
+    V1           = -FRACNA * VJUNREF_i; \
+    V2           = -FRACNB * VJUNREF_i; \
+    V3           = -FRACI * VJUNREF_i; \
+    V4           =  0.1; \
+    V5           =  0.2; \
+    /*  Evaluate full JUNCAP-model at five voltages */ \
+    `juncapcommon(V1, AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim, ijunbot, qjunbot, ijunsti, qjunsti, ijungat, qjungat) \
+    I1           =  AB_i * ijunbot + LS_i * ijunsti + LG_i * ijungat; \
+    `juncapcommon(V2, AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim, ijunbot, qjunbot, ijunsti, qjunsti, ijungat, qjungat) \
+    I2           =  AB_i * ijunbot + LS_i * ijunsti + LG_i * ijungat; \
+    `juncapcommon(V3, AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim, ijunbot, qjunbot, ijunsti, qjunsti, ijungat, qjungat) \
+    I3           =  AB_i * ijunbot + LS_i * ijunsti + LG_i * ijungat;
+
+// Part 2
+`define JuncapExpressInit2(AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim) \
+    /*  Forward currents */ \
+    `juncapcommon(V4, AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim, ijunbot, qjunbot, ijunsti, qjunsti, ijungat, qjungat) \
+    I4           =  AB_i * ijunbot + LS_i * ijunsti + LG_i * ijungat; \
+    `juncapcommon(V5, AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT_i, CTATBOT_i, vbibot, wdepnulrbot, VBIRBOTinv, PBOT_i, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT_i, VBIRBOT_i, wdepnulrinvbot, fbbtbot, VBRBOT_i, VBRinvbot, PBRBOT_i, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI_i, CTATSTI_i, vbisti, wdepnulrsti, VBIRSTIinv, PSTI_i, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI_i, VBIRSTI_i, wdepnulrinvsti, fbbtsti, VBRSTI_i, VBRinvsti, PBRSTI_i, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT_i, CTATGAT_i, vbigat, wdepnulrgat, VBIRGATinv, PGAT_i, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT_i, VBIRGAT_i, wdepnulrinvgat, fbbtgat, VBRGAT_i, VBRinvgat, PBRGAT_i, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim, ijunbot, qjunbot, ijunsti, qjunsti, ijungat, qjungat) \
+    I5           =  AB_i * ijunbot + LS_i * ijunsti + LG_i * ijungat;
+
+// Part 3
+`define JuncapExpressInit3(AB_i, LS_i, LG_i, idsatbot, idsatsti, idsatgat, ISATFOR1, MFOR1, ISATFOR2, MFOR2, ISATREV, MREV, m0flag) \
+    /*  Compute internal parameters from these five (I,V)-values */ \
+    ISATFOR1     =  AB_i * idsatbot + LS_i * idsatsti + LG_i * idsatgat; \
+    I4_cor       =  I4 - ISATFOR1 * (exp(V4 * phitdinv * MFOR1) - 1.0); \
+    I5_cor       =  I5 - ISATFOR1 * (exp(V5 * phitdinv * MFOR1) - 1.0); \
+    if ( !( ((AB_i) == 0.0) && ((LS_i) == 0.0) && ((LG_i) == 0.0) ) ) begin \
+        if ((I4 > 0.0) && (I5 > 0.0)) begin \
+            if ((((I4_cor / I4) > `relerr) || ((I5_cor / I5) > `relerr)) && (I4_cor > 0.0) && (I5_cor > 0.0) && (I5_cor > I4_cor)) begin \
+                alphaje      =  I4_cor / I5_cor; \
+                MFOR2        =  phitd * ln(alphaje) / (V4 - V5); \
+                ISATFOR2     =  I4_cor / (exp(V4 * phitdinv * MFOR2) - 1.0); \
+            end \
+        end \
+        I1_cor       =  I1 - ISATFOR1 * (exp(V1 * phitdinv * MFOR1) - 1.0) - ISATFOR2 * (exp(V1 * phitdinv * MFOR2) - 1.0); \
+        I2_cor       =  I2 - ISATFOR1 * (exp(V2 * phitdinv * MFOR1) - 1.0) - ISATFOR2 * (exp(V2 * phitdinv * MFOR2) - 1.0); \
+        I3_cor       =  I3 - ISATFOR1 * (exp(V3 * phitdinv * MFOR1) - 1.0) - ISATFOR2 * (exp(V3 * phitdinv * MFOR2) - 1.0); \
+        if ((I1 < 0.0) && (I2 < 0.0) && (I3 < 0.0)) begin \
+            if ((((I1_cor / I1) > `relerr) || ((I2_cor / I2) > `relerr) || ((I3_cor / I3) > `relerr)) \
+                && (I1_cor < 0.0) && (I2_cor < 0.0) && (I3_cor < 0.0)) begin \
+                alphaje      =  I1_cor / I2_cor; \
+                m0_rev       = -phitd * ln(alphaje) / (V1 - V2); /* zeroth order approximation */ \
+                tt0          =  V2 / (V2 - V1); \
+                tt1          =  phitd * (alphaje - 1.0) * (pow(alphaje, tt0) - 1.0); \
+                tt0          =  V1 / (V1 - V2); \
+                tt2          =  pow(alphaje, tt0) * (V2 - V1) + alphaje * V1 - V2; \
+                mcor_rev     =  tt1 / tt2; /* first order Newton correction */ \
+                MREV         =  m0_rev + mcor_rev; \
+                if (abs(V3 * phitdinv * MREV) < 1.0e-6) begin \
+                    /* Taylor approximation needed */ \
+                    /* Note: ISATREV and MREV have different meaning in this situation!! */ \
+                    m0flag       =  1.0; \
+                    ISATREV      =  I3_cor * (1.0 / V3 + 0.5 * phitdinv * MREV); \
+                    MREV         = -0.5 * I3_cor * MREV * phitdinv / V3; \
+                end else begin \
+                    m0flag       =  0.0; \
+                    ISATREV      = -I3_cor / (exp(-V3 * phitdinv * MREV) - 1.0); \
+                end \
+            end \
+        end \
+    end
+
+// Part 4
+`define JuncapExpressInit4(AB_i, LS_i, LG_i, FJUNQ_i, cjobot, cjosti, cjogat, zflagbot, zflagsti, zflaggat) \
+    /*  Charge model initialization */ \
+    zfrac        =  FJUNQ_i * (AB_i * cjobot + LS_i * cjosti + LG_i * cjogat); \
+    if ((AB_i * cjobot) <= zfrac) begin \
+        zflagbot     =  0.0; \
+    end \
+    if ((LS_i * cjosti) <= zfrac) begin \
+        zflagsti     =  0.0; \
+    end \
+    if ((LG_i * cjogat) <= zfrac) begin \
+        zflaggat     =  0.0; \
+    end
+
+// Part 5
+`define JuncapExpressInit5(AB_i, LS_i, LG_i, ISATFOR1, ISATFOR2, ISATREV, xhighf1, expxhf1, xhighf2, expxhf2, xhighr, expxhr) \
+    /*  Calculate limits beyond which exponentials are linearly extrapolated */ \
+    if ( !( ((AB_i) == 0.0) && ((LS_i) == 0.0) && ((LG_i) == 0.0) ) ) begin \
+        xhighf1      =  ln(0.5 * IMAX / (ISATFOR1 + 1.0e-21)); \
+        xhighf2      =  ln(0.5 * IMAX / (ISATFOR2 + 1.0e-21)); \
+        xhighr       =  ln(0.5 * IMAX / (abs(ISATREV) + 1.0e-21)); \
+    end \
+    xhighf1      =  min(xhighf1, `se05); \
+    expxhf1      =  exp(xhighf1); \
+    xhighf2      =  min(xhighf2, `se05); \
+    expxhf2      =  exp(xhighf2); \
+    xhighr       =  min(xhighr, `se05); \
+    expxhr       =  exp(xhighr);
+
+`define JuncapExpressCurrent(V, MFOR1, ISATFOR1, MFOR2, ISATFOR2, MREV, ISATREV, m0flag, xhighf1, expxhf1, xhighf2, expxhf2, xhighr, expxhr, ijun) \
+    tm0          =  V * phitdinv * MFOR1; \
+    tm1          = `expll(tm0, -`se05, `ke05, xhighf1, expxhf1); \
+    ijunfor1     =  ISATFOR1 * (tm1 - 1.0); \
+    tm0          =  V * phitdinv * MFOR2; \
+    tm1          = `expll(tm0, -`se05, `ke05, xhighf2, expxhf2); \
+    ijunfor2     =  ISATFOR2 * (tm1 - 1.0); \
+    ijunrev      =  0.0; \
+    if (m0flag > 0.0) begin \
+        ijunrev      =  V * (ISATREV + V * MREV); \
+    end else begin \
+        tm0          = -V * phitdinv * MREV; \
+        tm1          = `expll(tm0, -`se05, `ke05, xhighr, expxhr); \
+        ijunrev      = -ISATREV * (tm1 - 1.0); \
+    end \
+    ijun         =  ijunfor1 + ijunfor2 + ijunrev;
+
+`define JuncapExpressCharge(V, AB_i, LS_i, LG_i, qprefbot, qprefsti, qprefgat, qpref2bot, qpref2sti, qpref2gat, vbiinvbot, vbiinvsti, vbiinvgat, one_minus_PBOT, one_minus_PSTI, one_minus_PGAT, vfmin, vch, zflagbot, zflagsti, zflaggat, qjunbot, qjunsti, qjungat) \
+    tmpv         =  0.0; \
+    vjv          =  0.0; \
+    `hypfunction5(V, vfmin, vch, vjv) \
+    if (zflagbot > 0.5) begin \
+        `mypower((1.0 - vjv * vbiinvbot), one_minus_PBOT, tmpv) \
+        qjunbot      =  qprefbot * (1.0 - tmpv) + qpref2bot * (V - vjv); \
+    end \
+    if (zflagsti > 0.5) begin \
+        `mypower((1.0 - vjv * vbiinvsti), one_minus_PSTI, tmpv) \
+        qjunsti      =  qprefsti * (1.0 - tmpv) + qpref2sti * (V - vjv); \
+    end \
+    if (zflaggat > 0.5) begin \
+        `mypower((1.0 - vjv * vbiinvgat), one_minus_PGAT, tmpv) \
+        qjungat      = qprefgat * (1.0 - tmpv) + qpref2gat * (V - vjv); \
+    end
+
+// ---- end `include "JUNCAP200_macrodefs.include" ----
+
+`define JUNCAP_StandAlone
+
+// Note: some verilog-A compilers have problems handling the ddx-operator,
+// which occurs in definition of OP-output variables. If the line below is
+// commented out, all OP-output variables using the ddx-operator are skipped.
+`define OPderiv
+
+/////////////////////////////////////////////////////////////////////////////
+//
+//  Start of JUNCAP2 model code
+//
+/////////////////////////////////////////////////////////////////////////////
+
+module JUNCAP200(A,K);
+
+    //  --------------------------------------------------------------------------------------------------------------
+    //  Node definitions
+    //  --------------------------------------------------------------------------------------------------------------
+    inout       A,K;
+    electrical  A,K;
+
+    //  --------------------------------------------------------------------------------------------------------------
+    //  Special model parameters and switch parameters
+    //  --------------------------------------------------------------------------------------------------------------
+    `MPInb(LEVEL          ,200        ,""                                     ,"Model level must be 200")
+    `MPIty(TYPE           ,1          ,""                                     ,"Type parameter, in output value 1 reflects n-type, -1 reflects p-type")
+    `MPRnb(DTA            ,0.0        ,"K"                                    ,"Temperature offset with respect to ambient temperature")
+
+    //  --------------------------------------------------------------------------------------------------------------
+    //  Instance parameters
+    //  --------------------------------------------------------------------------------------------------------------
+    `IPRco(AB             ,1.0e-12    ,"m^2"      ,`AB_cliplow   ,inf         ,"Junction area")
+    `IPRco(LS             ,1.0e-6     ,"m"        ,`LS_cliplow   ,inf         ,"STI-edge part of junction perimeter")
+    `IPRco(LG             ,1.0e-6     ,"m"        ,`LG_cliplow   ,inf         ,"Gate-edge part of junction perimeter")
+    `IPRco(MULT           ,1.0        ,""         ,`MULT_cliplow ,inf         ,"Number of devices in parallel")
+    `IPRnb(TRISE          ,0.0        ,"K"                                    ,"Device temperature offset")
+    aliasparam DTEMP = TRISE;
+
+    //  --------------------------------------------------------------------------------------------------------------
+    //  JUNCAP2 model parameters
+    //  --------------------------------------------------------------------------------------------------------------
+// ---- begin `include "JUNCAP200_parlist.include" ----
+//======================================================================================
+//======================================================================================
+// Filename: JUNCAP200_parlist.include
+//======================================================================================
+//======================================================================================
+//
+//  (c) Copyright notice
+//
+//  Since 2015 until today, PSP has been co-developed by NXP Semiconductors and
+//  CEA-Leti. For this part of the model, each claim undivided ownership and copyrights
+//  Since 2012 until 2015, PSP has been co-developed by NXP Semiconductors and
+//  Delft University of Technology. For this part of the model, each claim undivided
+//  ownership and copyrights
+//  Until and including 2011, PSP has been co-developed by NXP Semiconductors and
+//  Arizona State University. For this part of the model, NXP Semiconductors claims
+//  undivided ownership and copyrights.
+//
+//
+//  Version: 200.6.2, April 2021
+//
+//======================================================================================
+//======================================================================================
+//
+// Further information can be found in the file releasenotesPSP103.txt
+//
+
+//  --------------------------------------------------------------------------------------------------------------
+//  JUNCAP2 - Common model parameters
+//  --------------------------------------------------------------------------------------------------------------
+
+`MPRco(IMAX           ,1000.0     ,"A"        ,`IMAX_cliplow     ,inf              ,"Maximum current up to which forward current behaves exponentially")
+`MPRco(TRJ            ,21.0       ,"C"        ,`TRJ_cliplow      ,inf              ,"Reference temperature")
+`MPRcc(FREV           ,1.0e3      ,""         ,`FREV_cliplow     ,`FREV_cliphigh   ,"Coefficient for reverse breakdown current limitation")
+`IPRcz(IFACTOR        ,1.0        ,""                                              ,"Multiplier for current")
+`IPRcz(CFACTOR        ,1.0        ,""                                              ,"Multiplier for depletion capacitance")
+
+// Parameters for source-bulk junction
+`ifdef JUNCAP_StandAlone
+    aliasparam TREF = TRJ;
+    `MPRco(CJORBOT        ,1.0e-3     ,"Fm^-2"    ,`CJORBOT_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-area of bottom component")
+    `MPRco(CJORSTI        ,1.0e-9     ,"Fm^-1"    ,`CJORSTI_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-length of STI-edge component")
+    `MPRco(CJORGAT        ,1.0e-9     ,"Fm^-1"    ,`CJORGAT_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-length of gate-edge component")
+    `MPRco(VBIRBOT        ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of bottom component")
+    `MPRco(VBIRSTI        ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of STI-edge component")
+    `MPRco(VBIRGAT        ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of gate-edge component")
+    `MPRcc(PBOT           ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of bottom component")
+    `MPRcc(PSTI           ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of STI-edge component")
+    `MPRcc(PGAT           ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of gate-edge component")
+    `MPRnb(PHIGBOT        ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of bottom component")
+    `MPRnb(PHIGSTI        ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of STI-edge component")
+    `MPRnb(PHIGGAT        ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of gate-edge component")
+    `MPRco(IDSATRBOT      ,1.0e-12    ,"Am^-2"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of bottom component")
+    `MPRco(IDSATRSTI      ,1.0e-18    ,"Am^-1"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of STI-edge component")
+    `MPRco(IDSATRGAT      ,1.0e-18    ,"Am^-1"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of gate-edge component")
+    `MPRco(CSRHBOT        ,1.0e2      ,"Am^-3"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of bottom component")
+    `MPRco(CSRHSTI        ,1.0e-4     ,"Am^-2"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of STI-edge component")
+    `MPRco(CSRHGAT        ,1.0e-4     ,"Am^-2"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of gate-edge component")
+    `MPRco(XJUNSTI        ,1.0e-7     ,"m"        ,`XJUN_cliplow     ,inf              ,"Junction depth of STI-edge component")
+    `MPRco(XJUNGAT        ,1.0e-7     ,"m"        ,`XJUN_cliplow     ,inf              ,"Junction depth of gate-edge component")
+    `MPRco(CTATBOT        ,1.0e2      ,"Am^-3"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of bottom component")
+    `MPRco(CTATSTI        ,1.0e-4     ,"Am^-2"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of STI-edge component")
+    `MPRco(CTATGAT        ,1.0e-4     ,"Am^-2"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of gate-edge component")
+    `MPRco(MEFFTATBOT     ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of bottom component")
+    `MPRco(MEFFTATSTI     ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of STI-edge component")
+    `MPRco(MEFFTATGAT     ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of gate-edge component")
+    `MPRco(CBBTBOT        ,1.0e-12    ,"AV^-3"    ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of bottom component")
+    `MPRco(CBBTSTI        ,1.0e-18    ,"AV^-3m"   ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of STI-edge component")
+    `MPRco(CBBTGAT        ,1.0e-18    ,"AV^-3m"   ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of gate-edge component")
+    `MPRnb(FBBTRBOT       ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of bottom component")
+    `MPRnb(FBBTRSTI       ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of STI-edge component")
+    `MPRnb(FBBTRGAT       ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of gate-edge component")
+    `MPRnb(STFBBTBOT      ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of bottom component")
+    `MPRnb(STFBBTSTI      ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of STI-edge component")
+    `MPRnb(STFBBTGAT      ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of gate-edge component")
+    `MPRco(VBRBOT         ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of bottom component")
+    `MPRco(VBRSTI         ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of STI-edge component")
+    `MPRco(VBRGAT         ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of gate-edge component")
+    `MPRco(PBRBOT         ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of bottom component")
+    `MPRco(PBRSTI         ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of STI-edge component")
+    `MPRco(PBRGAT         ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of gate-edge component")
+`else // JUNCAP_StandAlone
+    `MPRco(CJORBOT        ,1.0e-3     ,"Fm^-2"    ,`CJORBOT_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-area of bottom component for source-bulk junction")
+    `MPRco(CJORSTI        ,1.0e-9     ,"Fm^-1"    ,`CJORSTI_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-length of STI-edge component for source-bulk junction")
+    `MPRco(CJORGAT        ,1.0e-9     ,"Fm^-1"    ,`CJORGAT_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-length of gate-edge component for source-bulk junction")
+    `MPRco(VBIRBOT        ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of bottom component for source-bulk junction")
+    `MPRco(VBIRSTI        ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of STI-edge component for source-bulk junction")
+    `MPRco(VBIRGAT        ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of gate-edge component for source-bulk junction")
+    `MPRcc(PBOT           ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of bottom component for source-bulk junction")
+    `MPRcc(PSTI           ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of STI-edge component for source-bulk junction")
+    `MPRcc(PGAT           ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of gate-edge component for source-bulk junction")
+    `MPRnb(PHIGBOT        ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of bottom component for source-bulk junction")
+    `MPRnb(PHIGSTI        ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of STI-edge component for source-bulk junction")
+    `MPRnb(PHIGGAT        ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of gate-edge component for source-bulk junction")
+    `MPRco(IDSATRBOT      ,1.0e-12    ,"Am^-2"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of bottom component for source-bulk junction")
+    `MPRco(IDSATRSTI      ,1.0e-18    ,"Am^-1"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of STI-edge component for source-bulk junction")
+    `MPRco(IDSATRGAT      ,1.0e-18    ,"Am^-1"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of gate-edge component for source-bulk junction")
+    `MPRco(CSRHBOT        ,1.0e2      ,"Am^-3"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of bottom component for source-bulk junction")
+    `MPRco(CSRHSTI        ,1.0e-4     ,"Am^-2"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of STI-edge component for source-bulk junction")
+    `MPRco(CSRHGAT        ,1.0e-4     ,"Am^-2"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of gate-edge component for source-bulk junction")
+    `MPRco(XJUNSTI        ,1.0e-7     ,"m"        ,`XJUN_cliplow     ,inf              ,"Junction depth of STI-edge component for source-bulk junction")
+    `MPRco(XJUNGAT        ,1.0e-7     ,"m"        ,`XJUN_cliplow     ,inf              ,"Junction depth of gate-edge component for source-bulk junction")
+    `MPRco(CTATBOT        ,1.0e2      ,"Am^-3"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of bottom component for source-bulk junction")
+    `MPRco(CTATSTI        ,1.0e-4     ,"Am^-2"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of STI-edge component for source-bulk junction")
+    `MPRco(CTATGAT        ,1.0e-4     ,"Am^-2"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of gate-edge component for source-bulk junction")
+    `MPRco(MEFFTATBOT     ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of bottom component for source-bulk junction")
+    `MPRco(MEFFTATSTI     ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of STI-edge component for source-bulk junction")
+    `MPRco(MEFFTATGAT     ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of gate-edge component for source-bulk junction")
+    `MPRco(CBBTBOT        ,1.0e-12    ,"AV^-3"    ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of bottom component for source-bulk junction")
+    `MPRco(CBBTSTI        ,1.0e-18    ,"AV^-3m"   ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of STI-edge component for source-bulk junction")
+    `MPRco(CBBTGAT        ,1.0e-18    ,"AV^-3m"   ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of gate-edge component for source-bulk junction")
+    `MPRnb(FBBTRBOT       ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of bottom component for source-bulk junction")
+    `MPRnb(FBBTRSTI       ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of STI-edge component for source-bulk junction")
+    `MPRnb(FBBTRGAT       ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of gate-edge component for source-bulk junction")
+    `MPRnb(STFBBTBOT      ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of bottom component for source-bulk junction")
+    `MPRnb(STFBBTSTI      ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of STI-edge component for source-bulk junction")
+    `MPRnb(STFBBTGAT      ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of gate-edge component for source-bulk junction")
+    `MPRco(VBRBOT         ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of bottom component for source-bulk junction")
+    `MPRco(VBRSTI         ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of STI-edge component for source-bulk junction")
+    `MPRco(VBRGAT         ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of gate-edge component for source-bulk junction")
+    `MPRco(PBRBOT         ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of bottom component for source-bulk junction")
+    `MPRco(PBRSTI         ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of STI-edge component for source-bulk junction")
+    `MPRco(PBRGAT         ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of gate-edge component for source-bulk junction")
+`endif // JUNCAP_StandAlone
+
+// Parameters for drain-bulk junction
+`ifdef JUNCAP_StandAlone
+    // do nothing
+`else // JUNCAP_StandAlone
+    `MPRco(CJORBOTD       ,1.0e-3     ,"Fm^-2"    ,`CJORBOT_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-area of bottom component for drain-bulk junction")
+    `MPRco(CJORSTID       ,1.0e-9     ,"Fm^-1"    ,`CJORSTI_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-length of STI-edge component for drain-bulk junction")
+    `MPRco(CJORGATD       ,1.0e-9     ,"Fm^-1"    ,`CJORGAT_cliplow  ,inf              ,"Zero-bias capacitance per unit-of-length of gate-edge component for drain-bulk junction")
+    `MPRco(VBIRBOTD       ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of bottom component for drain-bulk junction")
+    `MPRco(VBIRSTID       ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of STI-edge component for drain-bulk junction")
+    `MPRco(VBIRGATD       ,1.0        ,"V"        ,`VBIR_cliplow     ,inf              ,"Built-in voltage at the reference temperature of gate-edge component for drain-bulk junction")
+    `MPRcc(PBOTD          ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of bottom component for drain-bulk junction")
+    `MPRcc(PSTID          ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of STI-edge component for drain-bulk junction")
+    `MPRcc(PGATD          ,0.5        ,""         ,`P_cliplow        ,`P_cliphigh      ,"Grading coefficient of gate-edge component for drain-bulk junction")
+    `MPRnb(PHIGBOTD       ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of bottom component for drain-bulk junction")
+    `MPRnb(PHIGSTID       ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of STI-edge component for drain-bulk junction")
+    `MPRnb(PHIGGATD       ,1.16       ,"V"                                             ,"Zero-temperature bandgap voltage of gate-edge component for drain-bulk junction")
+    `MPRco(IDSATRBOTD     ,1.0e-12    ,"Am^-2"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of bottom component for drain-bulk junction")
+    `MPRco(IDSATRSTID     ,1.0e-18    ,"Am^-1"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of STI-edge component for drain-bulk junction")
+    `MPRco(IDSATRGATD     ,1.0e-18    ,"Am^-1"    ,`IDSATR_cliplow   ,inf              ,"Saturation current density at the reference temperature of gate-edge component for drain-bulk junction")
+    `MPRco(CSRHBOTD       ,1.0e2      ,"Am^-3"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of bottom component for drain-bulk junction")
+    `MPRco(CSRHSTID       ,1.0e-4     ,"Am^-2"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of STI-edge component for drain-bulk junction")
+    `MPRco(CSRHGATD       ,1.0e-4     ,"Am^-2"    ,`CSRH_cliplow     ,inf              ,"Shockley-Read-Hall prefactor of gate-edge component for drain-bulk junction")
+    `MPRco(XJUNSTID       ,1.0e-7     ,"m"        ,`XJUN_cliplow     ,inf              ,"Junction depth of STI-edge component for drain-bulk junction")
+    `MPRco(XJUNGATD       ,1.0e-7     ,"m"        ,`XJUN_cliplow     ,inf              ,"Junction depth of gate-edge component for drain-bulk junction")
+    `MPRco(CTATBOTD       ,1.0e2      ,"Am^-3"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of bottom component for drain-bulk junction")
+    `MPRco(CTATSTID       ,1.0e-4     ,"Am^-2"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of STI-edge component for drain-bulk junction")
+    `MPRco(CTATGATD       ,1.0e-4     ,"Am^-2"    ,`CTAT_cliplow     ,inf              ,"Trap-assisted tunneling prefactor of gate-edge component for drain-bulk junction")
+    `MPRco(MEFFTATBOTD    ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of bottom component for drain-bulk junction")
+    `MPRco(MEFFTATSTID    ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of STI-edge component for drain-bulk junction")
+    `MPRco(MEFFTATGATD    ,0.25       ,""         ,`MEFFTAT_cliplow  ,inf              ,"Effective mass (in units of m0) for trap-assisted tunneling of gate-edge component for drain-bulk junction")
+    `MPRco(CBBTBOTD       ,1.0e-12    ,"AV^-3"    ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of bottom component for drain-bulk junction")
+    `MPRco(CBBTSTID       ,1.0e-18    ,"AV^-3m"   ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of STI-edge component for drain-bulk junction")
+    `MPRco(CBBTGATD       ,1.0e-18    ,"AV^-3m"   ,`CBBT_cliplow     ,inf              ,"Band-to-band tunneling prefactor of gate-edge component for drain-bulk junction")
+    `MPRnb(FBBTRBOTD      ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of bottom component for drain-bulk junction")
+    `MPRnb(FBBTRSTID      ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of STI-edge component for drain-bulk junction")
+    `MPRnb(FBBTRGATD      ,1.0e9      ,"Vm^-1"                                         ,"Normalization field at the reference temperature for band-to-band tunneling of gate-edge component for drain-bulk junction")
+    `MPRnb(STFBBTBOTD     ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of bottom component for drain-bulk junction")
+    `MPRnb(STFBBTSTID     ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of STI-edge component for drain-bulk junction")
+    `MPRnb(STFBBTGATD     ,-1.0e-3    ,"K^-1"                                          ,"Temperature scaling parameter for band-to-band tunneling of gate-edge component for drain-bulk junction")
+    `MPRco(VBRBOTD        ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of bottom component for drain-bulk junction")
+    `MPRco(VBRSTID        ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of STI-edge component for drain-bulk junction")
+    `MPRco(VBRGATD        ,10.0       ,"V"        ,`VBR_cliplow      ,inf              ,"Breakdown voltage of gate-edge component for drain-bulk junction")
+    `MPRco(PBRBOTD        ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of bottom component for drain-bulk junction")
+    `MPRco(PBRSTID        ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of STI-edge component for drain-bulk junction")
+    `MPRco(PBRGATD        ,4.0        ,"V"        ,`PBR_cliplow      ,inf              ,"Breakdown onset tuning parameter of gate-edge component for drain-bulk junction")
+`endif // JUNCAP_StandAlone
+
+// JUNCAP2-express parameters
+`MPRcc(SWJUNEXP       ,0.0        ,""         ,0.0               ,1.0              ,"Flag for JUNCAP-express; 0=full model, 1=express model")
+`ifdef JUNCAP_StandAlone
+    `MPRco(VJUNREF        ,2.5        ,"V"        ,`VJUNREF_cliplow  ,inf              ,"Typical maximum junction voltage; usually about 2*VSUP")
+    `MPRco(FJUNQ          ,0.03       ,""         ,`FJUNQ_cliplow    ,inf              ,"Fraction below which junction capacitance components are considered negligible")
+`else // JUNCAP_StandAlone
+    `MPRco(VJUNREF        ,2.5        ,"V"        ,`VJUNREF_cliplow  ,inf              ,"Typical maximum source-bulk junction voltage; usually about 2*VSUP")
+    `MPRco(FJUNQ          ,0.03       ,""         ,`FJUNQ_cliplow    ,inf              ,"Fraction below which source-bulk junction capacitance components are considered negligible")
+    `MPRco(VJUNREFD       ,2.5        ,"V"        ,`VJUNREF_cliplow  ,inf              ,"Typical maximum drain-bulk junction voltage; usually about 2*VSUP")
+    `MPRco(FJUNQD         ,0.03       ,""         ,`FJUNQ_cliplow    ,inf              ,"Fraction below which drain-bulk junction capacitance components are considered negligible")
+`endif // JUNCAP_StandAlone
+// ---- end `include "JUNCAP200_parlist.include" ----
+
+    //  --------------------------------------------------------------------------------------------------------------
+    //  Variables
+    //  --------------------------------------------------------------------------------------------------------------
+    real MULT_i;
+    real EPSSI;
+// ---- begin `include "JUNCAP200_varlist.include" ----
+//======================================================================================
+//======================================================================================
+// Filename: JUNCAP200_varlist.include
+//======================================================================================
+//======================================================================================
+//
+//  (c) Copyright notice
+//
+//  Since 2015 until today, PSP has been co-developed by NXP Semiconductors and
+//  CEA-Leti. For this part of the model, each claim undivided ownership and copyrights
+//  Since 2012 until 2015, PSP has been co-developed by NXP Semiconductors and
+//  Delft University of Technology. For this part of the model, each claim undivided
+//  ownership and copyrights
+//  Until and including 2011, PSP has been co-developed by NXP Semiconductors and
+//  Arizona State University. For this part of the model, NXP Semiconductors claims
+//  undivided ownership and copyrights.
+//
+//
+//  Version: 200.6.2, April 2021
+//
+//======================================================================================
+//======================================================================================
+//
+// Further information can be found in the file releasenotesPSP103.txt
+//
+
+// declaration of variables calculated outside macro "juncapfunction", voltage-independent part
+real tkr, tkd, auxt, KBOL_over_QELE, phitr, phitrinv, phitd, phitdinv;
+real perfc, berfc, cerfc;
+real deltaphigr, deltaphigd, pmax;
+
+real phigrbot, phigrsti, phigrgat, phigdbot, phigdsti, phigdgat;
+real ftdbot, ftdsti, ftdgat, idsatbot, idsatsti, idsatgat;
+real ubibot, ubisti, ubigat, vbibot, vbisti, vbigat;
+real vbibot2, vbisti2, vbigat2, pbot2, psti2, pgat2, vbibot2r, vbisti2r, vbigat2r;
+real vbiinvbot, vbiinvsti, vbiinvgat;
+real one_minus_PBOT, one_minus_PSTI, one_minus_PGAT;
+real one_over_one_minus_PBOT, one_over_one_minus_PSTI, one_over_one_minus_PGAT;
+real cjobot, cjosti, cjogat;
+real qprefbot, qprefsti, qprefgat, qpref2bot, qpref2sti, qpref2gat;
+real wdepnulrbot, wdepnulrsti, wdepnulrgat, wdepnulrinvbot, wdepnulrinvsti, wdepnulrinvgat;
+real VBIRBOTinv, VBIRSTIinv, VBIRGATinv;
+real deltaEbot, deltaEsti, deltaEgat, atatbot, atatsti, atatgat;
+real btatpartbot, btatpartsti, btatpartgat;
+real fbbtbot, fbbtsti, fbbtgat;
+real alphaav, fstopbot, fstopsti, fstopgat, VBRinvbot, VBRinvsti, VBRinvgat;
+real slopebot, slopesti, slopegat;
+real vmaxbot, vmaxsti, vmaxgat;
+
+// JUNCAP-Express variables
+real SWJUNEXP_i;
+real I1, I2, I3, I4, I5;
+real I1_cor, I2_cor, I3_cor, I4_cor, I5_cor;
+real V1, V2, V3, V4, V5;
+real alphaje, m0_rev, mcor_rev;
+real tt0, tt1, tt2, tm0, tm1;
+real FRACNA, FRACNB, FRACI;
+real zfrac;
+real ijunfor1, ijunfor2, ijunrev;
+
+`ifdef JUNCAP_StandAlone
+    // do nothing
+`else // JUNCAP_StandAlone
+    real CJORBOTD_i, CJORSTID_i, CJORGATD_i, VBIRBOTD_i, VBIRSTID_i, VBIRGATD_i;
+    real PBOTD_i, PSTID_i, PGATD_i, PHIGBOTD_i, PHIGSTID_i, PHIGGATD_i;
+    real IDSATRBOTD_i, IDSATRSTID_i, IDSATRGATD_i, XJUNSTID_i, XJUNGATD_i;
+    real CSRHBOTD_i, CSRHSTID_i, CSRHGATD_i, CTATBOTD_i, CTATSTID_i, CTATGATD_i;
+    real MEFFTATBOTD_i, MEFFTATSTID_i, MEFFTATGATD_i;
+    real CBBTBOTD_i, CBBTSTID_i, CBBTGATD_i, FBBTRBOTD_i, FBBTRSTID_i, FBBTRGATD_i;
+    real STFBBTBOTD_i, STFBBTSTID_i, STFBBTGATD_i;
+    real VBRBOTD_i, VBRSTID_i, VBRGATD_i, PBRBOTD_i, PBRSTID_i, PBRGATD_i;
+
+    real VJUNREFD_i, FJUNQD_i;
+
+    real phigrbot_d, phigrsti_d, phigrgat_d, phigdbot_d, phigdsti_d, phigdgat_d;
+    real ftdbot_d, ftdsti_d, ftdgat_d, idsatbot_d, idsatsti_d, idsatgat_d;
+    real ubibot_d, ubisti_d, ubigat_d, vbibot_d, vbisti_d, vbigat_d;
+    real vbiinvbot_d, vbiinvsti_d, vbiinvgat_d;
+    real one_minus_PBOT_d, one_minus_PSTI_d, one_minus_PGAT_d;
+    real one_over_one_minus_PBOT_d, one_over_one_minus_PSTI_d, one_over_one_minus_PGAT_d;
+    real cjobot_d, cjosti_d, cjogat_d;
+    real qprefbot_d, qprefsti_d, qprefgat_d, qpref2bot_d, qpref2sti_d, qpref2gat_d;
+    real wdepnulrbot_d, wdepnulrsti_d, wdepnulrgat_d, wdepnulrinvbot_d, wdepnulrinvsti_d, wdepnulrinvgat_d;
+    real VBIRBOTinv_d, VBIRSTIinv_d, VBIRGATinv_d;
+    real deltaEbot_d, deltaEsti_d, deltaEgat_d, atatbot_d, atatsti_d, atatgat_d;
+    real btatpartbot_d, btatpartsti_d, btatpartgat_d;
+    real fbbtbot_d, fbbtsti_d, fbbtgat_d;
+    real fstopbot_d, fstopsti_d, fstopgat_d, VBRinvbot_d, VBRinvsti_d, VBRinvgat_d;
+    real slopebot_d, slopesti_d, slopegat_d;
+`endif // JUNCAP_StandAlone
+
+//================================================================
+// Variables that are different for source and drain side junction
+// and have a scope larger than a single macro-call
+//================================================================
+
+`ifdef JUNCAP_StandAlone
+    real AB_i, LS_i, LG_i;
+    real zflagbot, zflagsti, zflaggat;
+    real VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim;
+
+    // JUNCAP-express variables
+    real xhighf1, expxhf1, xhighf2, expxhf2, xhighr, expxhr;
+
+    // JUNCAP2-express intermediate parameters
+    real ISATFOR1, MFOR1, ISATFOR2, MFOR2, ISATREV, MREV, m0flag;
+`else // JUNCAP_StandAlone
+    real ABSOURCE_i, LSSOURCE_i, LGSOURCE_i, AS_i, PS_i;
+    real zflagbot_s, zflagsti_s, zflaggat_s;
+    real VMAX_s, exp_VMAX_over_phitd_s, vbimin_s, vch_s, vfmin_s, vbbtlim_s;
+
+    // JUNCAP-express variables
+    real xhighf1_s, expxhf1_s, xhighf2_s, expxhf2_s, xhighr_s, expxhr_s, m0flag_s;
+
+    // JUNCAP2-express intermediate parameters
+    real ISATFOR1_s, MFOR1_s, ISATFOR2_s, MFOR2_s, ISATREV_s, MREV_s;
+
+    real ABDRAIN_i, LSDRAIN_i, LGDRAIN_i, AD_i, PD_i;
+    real zflagbot_d, zflagsti_d, zflaggat_d;
+    real VMAX_d, exp_VMAX_over_phitd_d, vbimin_d, vch_d, vfmin_d, vbbtlim_d;
+
+    // JUNCAP-express variables
+    real xhighf1_d, expxhf1_d, xhighf2_d, expxhf2_d, xhighr_d, expxhr_d, m0flag_d;
+
+    // JUNCAP2-express intermediate parameters
+    real ISATFOR1_d, MFOR1_d, ISATFOR2_d, MFOR2_d, ISATREV_d, MREV_d;
+`endif // JUNCAP_StandAlone
+// ---- end `include "JUNCAP200_varlist.include" ----
+
+    //  --------------------------------------------------------------------------------------------------------------
+    //  Variables for operating point info
+    //  --------------------------------------------------------------------------------------------------------------
+
+    `OPP(vak               ,"V"            ,"Voltage between anode and cathode")
+    `ifdef OPderiv
+        `OPM(cj                ,"F"            ,"Total source junction capacitance")
+        `OPM(cjbot             ,"F"            ,"Junction capacitance (bottom component)")
+        `OPM(cjgat             ,"F"            ,"Junction capacitance (gate-edge component)")
+        `OPM(cjsti             ,"F"            ,"Junction capacitance (STI-edge component)")
+    `endif // OPderiv
+    `OPM(ij                ,"A"            ,"Total source junction current")
+    `OPM(ijbot             ,"A"            ,"Junction current (bottom component)")
+    `OPM(ijgat             ,"A"            ,"Junction current (gate-edge component)")
+    `OPM(ijsti             ,"A"            ,"Junction current (STI-edge component)")
+    `OPM(si                ,"A^2/Hz"       ,"Total junction current noise spectral density")
+
+    // local parameters after scaling, T-scaling, and clipping
+    `OPM(idsatsbot         ,"A"            ,"Total bottom saturation current")
+    `OPM(idsatssti         ,"A"            ,"Total STI-edge saturation current")
+    `OPM(idsatsgat         ,"A"            ,"Total gate-edge saturation current")
+    `OPM(cjosbot           ,"F"            ,"Total bottom capacity")
+    `OPM(cjossti           ,"F"            ,"Total STI-edge capacity")
+    `OPM(cjosgat           ,"F"            ,"Total gate-edge capacity")
+    `OPP(vbisbot           ,"V"            ,"built-in voltage of the bottom junction")
+    `OPP(vbissti           ,"V"            ,"built-in voltage of the STI-edge junction")
+    `OPP(vbisgat           ,"V"            ,"built-in voltage of the gate-edge junction")
+
+    //  --------------------------------------------------------------------------------------------------------------
+    //  Analog block with all calculations and contribs
+    //  --------------------------------------------------------------------------------------------------------------
+
+    analog begin
+
+        //  --------------------------------------------------------------------------------------------------------------
+        //  Definition of bias/instance independent model variables
+        //  --------------------------------------------------------------------------------------------------------------
+        begin : initial_model
+
+            EPSSI        = `EPSO * `EPSRSI;
+// ---- begin `include "JUNCAP200_InitModel.include" ----
+//======================================================================================
+//======================================================================================
+// Filename: JUNCAP200_InitModel.include
+//======================================================================================
+//======================================================================================
+//
+//  (c) Copyright notice
+//
+//  Since 2015 until today, PSP has been co-developed by NXP Semiconductors and
+//  CEA-Leti. For this part of the model, each claim undivided ownership and copyrights
+//  Since 2012 until 2015, PSP has been co-developed by NXP Semiconductors and
+//  Delft University of Technology. For this part of the model, each claim undivided
+//  ownership and copyrights
+//  Until and including 2011, PSP has been co-developed by NXP Semiconductors and
+//  Arizona State University. For this part of the model, NXP Semiconductors claims
+//  undivided ownership and copyrights.
+//
+//
+//  Version: 200.6.2, April 2021
+//
+//======================================================================================
+//======================================================================================
+//
+// Further information can be found in the file releasenotesPSP103.txt
+//
+
+    //  --------------------------------------------------------------------------------------------------------------
+    //  Calculation of internal parameters which are independent on instance parameters
+    //  --------------------------------------------------------------------------------------------------------------
+
+SWJUNEXP_i   =  0.0;
+if (SWJUNEXP > 0.5) begin
+    SWJUNEXP_i   =  1.0;
+end else begin
+    SWJUNEXP_i   =  0.0;
+end
+
+`ifdef JUNCAP_StandAlone
+    // do nothing
+`else // JUNCAP_StandAlone
+    if (SWJUNASYM == 0.0) begin
+        CJORBOTD_i   =  CJORBOT;
+        CJORSTID_i   =  CJORSTI;
+        CJORGATD_i   =  CJORGAT;
+        VBIRBOTD_i   =  VBIRBOT;
+        VBIRSTID_i   =  VBIRSTI;
+        VBIRGATD_i   =  VBIRGAT;
+        PBOTD_i      =  PBOT;
+        PSTID_i      =  PSTI;
+        PGATD_i      =  PGAT;
+        PHIGBOTD_i   =  PHIGBOT;
+        PHIGSTID_i   =  PHIGSTI;
+        PHIGGATD_i   =  PHIGGAT;
+        IDSATRBOTD_i =  IDSATRBOT;
+        IDSATRSTID_i =  IDSATRSTI;
+        IDSATRGATD_i =  IDSATRGAT;
+        CSRHBOTD_i   =  CSRHBOT;
+        CSRHSTID_i   =  CSRHSTI;
+        CSRHGATD_i   =  CSRHGAT;
+        XJUNSTID_i   =  XJUNSTI;
+        XJUNGATD_i   =  XJUNGAT;
+        CTATBOTD_i   =  CTATBOT;
+        CTATSTID_i   =  CTATSTI;
+        CTATGATD_i   =  CTATGAT;
+        MEFFTATBOTD_i =  MEFFTATBOT;
+        MEFFTATSTID_i =  MEFFTATSTI;
+        MEFFTATGATD_i =  MEFFTATGAT;
+        CBBTBOTD_i   =  CBBTBOT;
+        CBBTSTID_i   =  CBBTSTI;
+        CBBTGATD_i   =  CBBTGAT;
+        FBBTRBOTD_i  =  FBBTRBOT;
+        FBBTRSTID_i  =  FBBTRSTI;
+        FBBTRGATD_i  =  FBBTRGAT;
+        STFBBTBOTD_i =  STFBBTBOT;
+        STFBBTSTID_i =  STFBBTSTI;
+        STFBBTGATD_i =  STFBBTGAT;
+        VBRBOTD_i    =  VBRBOT;
+        VBRSTID_i    =  VBRSTI;
+        VBRGATD_i    =  VBRGAT;
+        PBRBOTD_i    =  PBRBOT;
+        PBRSTID_i    =  PBRSTI;
+        PBRGATD_i    =  PBRGAT;
+        VJUNREFD_i   =  VJUNREF;
+        FJUNQD_i     =  FJUNQ;
+    end else begin
+        CJORBOTD_i   =  CJORBOTD;
+        CJORSTID_i   =  CJORSTID;
+        CJORGATD_i   =  CJORGATD;
+        VBIRBOTD_i   =  VBIRBOTD;
+        VBIRSTID_i   =  VBIRSTID;
+        VBIRGATD_i   =  VBIRGATD;
+        PBOTD_i      =  PBOTD;
+        PSTID_i      =  PSTID;
+        PGATD_i      =  PGATD;
+        PHIGBOTD_i   =  PHIGBOTD;
+        PHIGSTID_i   =  PHIGSTID;
+        PHIGGATD_i   =  PHIGGATD;
+        IDSATRBOTD_i =  IDSATRBOTD;
+        IDSATRSTID_i =  IDSATRSTID;
+        IDSATRGATD_i =  IDSATRGATD;
+        CSRHBOTD_i   =  CSRHBOTD;
+        CSRHSTID_i   =  CSRHSTID;
+        CSRHGATD_i   =  CSRHGATD;
+        XJUNSTID_i   =  XJUNSTID;
+        XJUNGATD_i   =  XJUNGATD;
+        CTATBOTD_i   =  CTATBOTD;
+        CTATSTID_i   =  CTATSTID;
+        CTATGATD_i   =  CTATGATD;
+        MEFFTATBOTD_i =  MEFFTATBOTD;
+        MEFFTATSTID_i =  MEFFTATSTID;
+        MEFFTATGATD_i =  MEFFTATGATD;
+        CBBTBOTD_i   =  CBBTBOTD;
+        CBBTSTID_i   =  CBBTSTID;
+        CBBTGATD_i   =  CBBTGATD;
+        FBBTRBOTD_i  =  FBBTRBOTD;
+        FBBTRSTID_i  =  FBBTRSTID;
+        FBBTRGATD_i  =  FBBTRGATD;
+        STFBBTBOTD_i =  STFBBTBOTD;
+        STFBBTSTID_i =  STFBBTSTID;
+        STFBBTGATD_i =  STFBBTGATD;
+        VBRBOTD_i    =  VBRBOTD;
+        VBRSTID_i    =  VBRSTID;
+        VBRGATD_i    =  VBRGATD;
+        PBRBOTD_i    =  PBRBOTD;
+        PBRSTID_i    =  PBRSTID;
+        PBRGATD_i    =  PBRGATD;
+        VJUNREFD_i   =  VJUNREFD;
+        FJUNQD_i     =  FJUNQD;
+    end
+`endif // JUNCAP_StandAlone
+
+//  Variables related to temperatures
+tkr          = `KELVINCONVERSION + TRJ;
+tkd          =  max($temperature + DTA + TRISE, `KELVINCONVERSION + `MINTEMP);
+auxt         =  tkd / tkr;
+KBOL_over_QELE = `KBOL / `QELE;
+phitr        =  KBOL_over_QELE * tkr;
+phitrinv     =  1.0 / phitr;
+phitd        =  KBOL_over_QELE * tkd;
+phitdinv     =  1.0 / phitd;
+
+//  Bandgap voltages at reference temperature
+deltaphigr   = -(7.02e-4 * tkr * tkr) / (1108.0 + tkr);
+phigrbot     =  PHIGBOT + deltaphigr;
+phigrsti     =  PHIGSTI + deltaphigr;
+phigrgat     =  PHIGGAT + deltaphigr;
+
+// Bandgap voltages at device temperature
+deltaphigd   = -(7.02e-4 * tkd * tkd) / (1108.0 + tkd);
+phigdbot     =  PHIGBOT + deltaphigd;
+phigdsti     =  PHIGSTI + deltaphigd;
+phigdgat     =  PHIGGAT + deltaphigd;
+
+//  Factors ftd for ideal-current model
+ftdbot      =  (pow(auxt, 1.5)) * exp(0.5 * ((phigrbot * phitrinv) - (phigdbot * phitdinv)));
+ftdsti      =  (pow(auxt, 1.5)) * exp(0.5 * ((phigrsti * phitrinv) - (phigdsti * phitdinv)));
+ftdgat      =  (pow(auxt, 1.5)) * exp(0.5 * ((phigrgat * phitrinv) - (phigdgat * phitdinv)));
+
+//  Temperature-scaled saturation current for ideal-current model
+idsatbot     =  IDSATRBOT * ftdbot * ftdbot;
+idsatsti     =  IDSATRSTI * ftdsti * ftdsti;
+idsatgat     =  IDSATRGAT * ftdgat * ftdgat;
+
+//  Built-in voltages before limiting
+ubibot      =  VBIRBOT * auxt - 2.0 * phitd * ln(ftdbot);
+ubisti      =  VBIRSTI * auxt - 2.0 * phitd * ln(ftdsti);
+ubigat      =  VBIRGAT * auxt - 2.0 * phitd * ln(ftdgat);
+
+//  Built-in voltages limited to phitd
+vbibot       =  ubibot + phitd * ln(1 + exp((`vbilow - ubibot) * phitdinv));
+vbisti       =  ubisti + phitd * ln(1 + exp((`vbilow - ubisti) * phitdinv));
+vbigat       =  ubigat + phitd * ln(1 + exp((`vbilow - ubigat) * phitdinv));
+
+//  Inverse values of built-in voltages
+vbiinvbot    =  1.0 / vbibot;
+vbiinvsti    =  1.0 / vbisti;
+vbiinvgat    =  1.0 / vbigat;
+
+//  One minus the grading coefficient
+one_minus_PBOT =  1.0 - PBOT;
+one_minus_PSTI =  1.0 - PSTI;
+one_minus_PGAT =  1.0 - PGAT;
+
+//  One over "one minus the grading coefficient"
+one_over_one_minus_PBOT = 1.0 / one_minus_PBOT;
+one_over_one_minus_PSTI = 1.0 / one_minus_PSTI;
+one_over_one_minus_PGAT = 1.0 / one_minus_PGAT;
+
+//  Temperature-scaled zero-bias capacitance
+cjobot       =  CJORBOT * pow((VBIRBOT * vbiinvbot), PBOT);
+cjosti       =  CJORSTI * pow((VBIRSTI * vbiinvsti), PSTI);
+cjogat       =  CJORGAT * pow((VBIRGAT * vbiinvgat), PGAT);
+
+//  Prefactor in physical part of charge model
+qprefbot     =  cjobot * vbibot * one_over_one_minus_PBOT;
+qprefsti     =  cjosti * vbisti * one_over_one_minus_PSTI;
+qprefgat     =  cjogat * vbigat * one_over_one_minus_PGAT;
+
+//  Prefactor in mathematical extension of charge model
+qpref2bot    = `a * cjobot;
+qpref2sti    = `a * cjosti;
+qpref2gat    = `a * cjogat;
+
+//  Zero-bias depletion widths at reference temperature, needed in SRH and TAT model
+wdepnulrbot  =  EPSSI / CJORBOT;
+wdepnulrsti  =  XJUNSTI * EPSSI / CJORSTI;
+wdepnulrgat  =  XJUNGAT * EPSSI / CJORGAT;
+
+//  Inverse values of "wdepnulr", used in BBT model
+wdepnulrinvbot = 1.0 / wdepnulrbot;
+wdepnulrinvsti = 1.0 / wdepnulrsti;
+wdepnulrinvgat = 1.0 / wdepnulrgat;
+
+//  Inverse values of built-in voltages at reference temperature, needed in SRH and BBT model
+VBIRBOTinv   =  1.0 / VBIRBOT;
+VBIRSTIinv   =  1.0 / VBIRSTI;
+VBIRGATinv   =  1.0 / VBIRGAT;
+
+//  Some constants needed in erfc-approximation, needed in TAT model
+perfc        =  (`SQRTPI * `aerfc);
+berfc        =  ((-5.0 * (`aerfc) + 6.0 - pow((perfc), -2.0)) / 3.0);
+cerfc        =  (1.0 - (`aerfc) - (berfc));
+
+//  Half the bandgap energy, limited to values > phitd, needed in TAT model
+deltaEbot    =  max(0.5 * phigdbot, phitd);
+deltaEsti    =  max(0.5 * phigdsti, phitd);
+deltaEgat    =  max(0.5 * phigdgat, phitd);
+
+//  Values of atat, needed in TAT model
+atatbot      =  deltaEbot * phitdinv;
+atatsti      =  deltaEsti * phitdinv;
+atatgat      =  deltaEgat * phitdinv;
+
+//  Values of btatpart, needed in TAT model
+btatpartbot  =  sqrt(32.0 * MEFFTATBOT * `MELE * `QELE * (deltaEbot * deltaEbot * deltaEbot)) / (3.0 * `HBAR);
+btatpartsti  =  sqrt(32.0 * MEFFTATSTI * `MELE * `QELE * (deltaEsti * deltaEsti * deltaEsti)) / (3.0 * `HBAR);
+btatpartgat  =  sqrt(32.0 * MEFFTATGAT * `MELE * `QELE * (deltaEgat * deltaEgat * deltaEgat)) / (3.0 * `HBAR);
+
+//  Temperature-scaled values of FBBT, needed in BBT model
+fbbtbot      =  FBBTRBOT * (1.0 + STFBBTBOT * (tkd - tkr));
+fbbtsti      =  FBBTRSTI * (1.0 + STFBBTSTI * (tkd - tkr));
+fbbtgat      =  FBBTRGAT * (1.0 + STFBBTGAT * (tkd - tkr));
+fbbtbot      = `CLIP_LOW(fbbtbot, 0.0);
+fbbtsti      = `CLIP_LOW(fbbtsti, 0.0);
+fbbtgat      = `CLIP_LOW(fbbtgat, 0.0);
+
+//  Values of fstop, needed in avalanche/breakdown model
+alphaav      =  1.0 - 1.0 / FREV;
+fstopbot     =  1.0 / (1.0 - pow(alphaav, PBRBOT));
+fstopsti     =  1.0 / (1.0 - pow(alphaav, PBRSTI));
+fstopgat     =  1.0 / (1.0 - pow(alphaav, PBRGAT));
+
+//  Inverse values of breakdown voltages, needed in avalanche/breakdown model
+VBRinvbot    =  1.0 / VBRBOT;
+VBRinvsti    =  1.0 / VBRSTI;
+VBRinvgat    =  1.0 / VBRGAT;
+
+//  Slopes for linear extrapolation close to and beyond breakdown, needed in avalanche/breakdown model
+slopebot     = -(fstopbot * fstopbot * pow(alphaav, (PBRBOT - 1.0))) * PBRBOT * VBRinvbot;
+slopesti     = -(fstopsti * fstopsti * pow(alphaav, (PBRSTI - 1.0))) * PBRSTI * VBRinvsti;
+slopegat     = -(fstopgat * fstopgat * pow(alphaav, (PBRGAT - 1.0))) * PBRGAT * VBRinvgat;
+
+`ifdef JUNCAP_StandAlone
+    // do nothing
+`else // JUNCAP_StandAlone
+    //  Bandgap voltages at reference temperature for drain-bulk junction
+    phigrbot_d   =  PHIGBOTD_i + deltaphigr;
+    phigrsti_d   =  PHIGSTID_i + deltaphigr;
+    phigrgat_d   =  PHIGGATD_i + deltaphigr;
+
+    //  Bandgap voltages at device temperature for drain-bulk junction
+    phigdbot_d   =  PHIGBOTD_i + deltaphigd;
+    phigdsti_d   =  PHIGSTID_i + deltaphigd;
+    phigdgat_d   =  PHIGGATD_i + deltaphigd;
+
+    //  Factors ftd for ideal-current model for drain-bulk junction
+    ftdbot_d     =  (pow(auxt, 1.5)) * exp(0.5 * ((phigrbot_d * phitrinv) - (phigdbot_d * phitdinv)));
+    ftdsti_d     =  (pow(auxt, 1.5)) * exp(0.5 * ((phigrsti_d * phitrinv) - (phigdsti_d * phitdinv)));
+    ftdgat_d     =  (pow(auxt, 1.5)) * exp(0.5 * ((phigrgat_d * phitrinv) - (phigdgat_d * phitdinv)));
+
+    //  Temperature-scaled saturation current for ideal-current model for drain-bulk junction
+    idsatbot_d   =  IDSATRBOTD_i * ftdbot_d * ftdbot_d;
+    idsatsti_d   =  IDSATRSTID_i * ftdsti_d * ftdsti_d;
+    idsatgat_d   =  IDSATRGATD_i * ftdgat_d * ftdgat_d;
+
+    //  Built-in voltages before limiting for drain-bulk junction
+    ubibot_d     =  VBIRBOTD_i * auxt - 2.0 * phitd * ln(ftdbot_d);
+    ubisti_d     =  VBIRSTID_i * auxt - 2.0 * phitd * ln(ftdsti_d);
+    ubigat_d     =  VBIRGATD_i * auxt - 2.0 * phitd * ln(ftdgat_d);
+
+    //  Built-in voltages limited to phitd for drain-bulk junction
+    vbibot_d     =  ubibot_d + phitd * ln(1.0 + exp((`vbilow - ubibot_d) * phitdinv));
+    vbisti_d     =  ubisti_d + phitd * ln(1.0 + exp((`vbilow - ubisti_d) * phitdinv));
+    vbigat_d     =  ubigat_d + phitd * ln(1.0 + exp((`vbilow - ubigat_d) * phitdinv));
+
+    //  Inverse values of built-in voltages for drain-bulk junction
+    vbiinvbot_d  =  1.0 / vbibot_d;
+    vbiinvsti_d  =  1.0 / vbisti_d;
+    vbiinvgat_d  =  1.0 / vbigat_d;
+
+    //  One minus the grading coefficient for drain-bulk junction
+    one_minus_PBOT_d = 1.0 - PBOTD_i;
+    one_minus_PSTI_d = 1.0 - PSTID_i;
+    one_minus_PGAT_d = 1.0 - PGATD_i;
+
+    //  One over "one minus the grading coefficient" for drain-bulk junction
+    one_over_one_minus_PBOT_d = 1.0 / one_minus_PBOT_d;
+    one_over_one_minus_PSTI_d = 1.0 / one_minus_PSTI_d;
+    one_over_one_minus_PGAT_d = 1.0 / one_minus_PGAT_d;
+
+    //  Temperature-scaled zero-bias capacitance for drain-bulk junction
+    cjobot_d     =  CJORBOTD_i * pow((VBIRBOTD_i * vbiinvbot_d), PBOTD_i);
+    cjosti_d     =  CJORSTID_i * pow((VBIRSTID_i * vbiinvsti_d), PSTID_i);
+    cjogat_d     =  CJORGATD_i * pow((VBIRGATD_i * vbiinvgat_d), PGATD_i);
+
+    //  Prefactor in physical part of charge model for drain-bulk junction
+    qprefbot_d   =  cjobot_d * vbibot_d * one_over_one_minus_PBOT_d;
+    qprefsti_d   =  cjosti_d * vbisti_d * one_over_one_minus_PSTI_d;
+    qprefgat_d   =  cjogat_d * vbigat_d * one_over_one_minus_PGAT_d;
+
+    //  Prefactor in mathematical extension of charge model for drain-bulk junction
+    qpref2bot_d  = `a * cjobot_d;
+    qpref2sti_d  = `a * cjosti_d;
+    qpref2gat_d  = `a * cjogat_d;
+
+    //  Zero-bias depletion widths at reference temperature, needed in SRH and TAT model for drain-bulk junction
+    wdepnulrbot_d =  EPSSI / CJORBOTD_i;
+    wdepnulrsti_d =  XJUNSTID_i * EPSSI / CJORSTID_i;
+    wdepnulrgat_d =  XJUNGATD_i * EPSSI / CJORGATD_i;
+
+    //  Inverse values of "wdepnulr", used in BBT model for drain-bulk junction
+    wdepnulrinvbot_d = 1.0 / wdepnulrbot_d;
+    wdepnulrinvsti_d = 1.0 / wdepnulrsti_d;
+    wdepnulrinvgat_d = 1.0 / wdepnulrgat_d;
+
+    //  Inverse values of built-in voltages at reference temperature, needed in SRH and BBT model for drain-bulk junction
+    VBIRBOTinv_d =  1.0 / VBIRBOTD_i;
+    VBIRSTIinv_d =  1.0 / VBIRSTID_i;
+    VBIRGATinv_d =  1.0 / VBIRGATD_i;
+
+    //  Half the bandgap energy, limited to values > phitd, needed in TAT model for drain-bulk junction
+    deltaEbot_d  =  max(0.5 * phigdbot_d, phitd);
+    deltaEsti_d  =  max(0.5 * phigdsti_d, phitd);
+    deltaEgat_d  =  max(0.5 * phigdgat_d, phitd);
+
+    //  Values of atat, needed in TAT model for drain-bulk junction
+    atatbot_d    =  deltaEbot_d * phitdinv;
+    atatsti_d    =  deltaEsti_d * phitdinv;
+    atatgat_d    =  deltaEgat_d * phitdinv;
+
+    //  Values of btatpart, needed in TAT model for drain-bulk junction
+    btatpartbot_d =  sqrt(32.0 * MEFFTATBOTD_i * `MELE * `QELE * (deltaEbot_d * deltaEbot_d * deltaEbot_d)) / (3.0 * `HBAR);
+    btatpartsti_d =  sqrt(32.0 * MEFFTATSTID_i * `MELE * `QELE * (deltaEsti_d * deltaEsti_d * deltaEsti_d)) / (3.0 * `HBAR);
+    btatpartgat_d =  sqrt(32.0 * MEFFTATGATD_i * `MELE * `QELE * (deltaEgat_d * deltaEgat_d * deltaEgat_d)) / (3.0 * `HBAR);
+
+    //  Temperature-scaled values of FBBT, needed in BBT model for drain-bulk junction
+    fbbtbot_d    =  FBBTRBOTD_i * (1.0 + STFBBTBOTD_i * (tkd - tkr));
+    fbbtsti_d    =  FBBTRSTID_i * (1.0 + STFBBTSTID_i * (tkd - tkr));
+    fbbtgat_d    =  FBBTRGATD_i * (1.0 + STFBBTGATD_i * (tkd - tkr));
+    fbbtbot_d    = `CLIP_LOW(fbbtbot_d, 0.0);
+    fbbtsti_d    = `CLIP_LOW(fbbtsti_d, 0.0);
+    fbbtgat_d    = `CLIP_LOW(fbbtgat_d, 0.0);
+
+    //  Values of fstop, needed in avalanche/breakdown model for drain-bulk junction
+    fstopbot_d   =  1.0 / (1.0 - pow(alphaav, PBRBOTD_i));
+    fstopsti_d   =  1.0 / (1.0 - pow(alphaav, PBRSTID_i));
+    fstopgat_d   =  1.0 / (1.0 - pow(alphaav, PBRGATD_i));
+
+    //  Inverse values of breakdown voltages, needed in avalanche/breakdown model for drain-bulk junction
+    VBRinvbot_d  =  1.0 / VBRBOTD_i;
+    VBRinvsti_d  =  1.0 / VBRSTID_i;
+    VBRinvgat_d  =  1.0 / VBRGATD_i;
+
+    //  Slopes for linear extrapolation close to and beyond breakdown, needed in avalanche/breakdown model for drain-bulk junction
+    slopebot_d   = -(fstopbot_d * fstopbot_d * pow(alphaav, (PBRBOTD_i - 1.0))) * PBRBOTD_i * VBRinvbot_d;
+    slopesti_d   = -(fstopsti_d * fstopsti_d * pow(alphaav, (PBRSTID_i - 1.0))) * PBRSTID_i * VBRinvsti_d;
+    slopegat_d   = -(fstopgat_d * fstopgat_d * pow(alphaav, (PBRGATD_i - 1.0))) * PBRGATD_i * VBRinvgat_d;
+`endif // JUNCAP_StandAlone
+// ---- end `include "JUNCAP200_InitModel.include" ----
+
+        end // initial_model
+
+        //  --------------------------------------------------------------------------------------------------------------
+        //  Definition of instance dependent and bias independent variables
+        //  --------------------------------------------------------------------------------------------------------------
+        begin : initial_instance
+
+            // Clipping of the local model parameters
+            AB_i         = `CLIP_LOW(AB, `AB_cliplow);
+            LS_i         = `CLIP_LOW(LS, `LS_cliplow);
+            LG_i         = `CLIP_LOW(LG, `LG_cliplow);
+            MULT_i       = `CLIP_LOW(MULT, `MULT_cliplow);
+
+            exp_VMAX_over_phitd = 0.0;
+            `JuncapInitInstance(AB_i, LS_i, LG_i, idsatbot, idsatsti, idsatgat, vbibot, vbisti, vbigat, PBOT, PSTI, PGAT, VBIRBOT, VBIRSTI, VBIRGAT, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim)
+
+            // Initialization of (global) variables; required for some verilog-A compilers
+            ISATFOR1     =  0.0;
+            MFOR1        =  1.0;
+            MFOR2        =  1.0;
+            ISATFOR2     =  0.0;
+            MREV         =  1.0;
+            ISATREV      =  0.0;
+            m0flag       =  0.0;
+            xhighf1      =  0.0;
+            expxhf1      =  0.0;
+            xhighf2      =  0.0;
+            expxhf2      =  0.0;
+            xhighr       =  0.0;
+            expxhr       =  0.0;
+
+            m0_rev       =  0.0;
+            mcor_rev     =  0.0;
+            I1_cor       =  0.0;
+            I2_cor       =  0.0;
+            I3_cor       =  0.0;
+            I4_cor       =  0.0;
+            I5_cor       =  0.0;
+            tt0          =  0.0;
+            tt1          =  0.0;
+            tt2          =  0.0;
+            zfrac        =  0.0;
+            zflagbot     =  1.0;
+            zflagsti     =  1.0;
+            zflaggat     =  1.0;
+            alphaje      =  0.0;
+
+            if (SWJUNEXP_i == 1.0) begin : JUNCAPexpressInit
+                // Note: the variables in the macro below are (re-)declared locally, to keep them separated from their globally declared counterparts.
+                // This trick allows one to use the "juncapcommon" macro both in the JUNCAP-express initialization and in the full-JUNCAP evalutation,
+                // while in the former the verilog-A compiler will still consider the variables as voltage-INdependent. This is essential to avoid
+                // recomputation of the JUNCAP-express initialization at each bias-step.
+
+                `LocalGlobalVars
+                // results computed here are not used elsewhere
+                real ijunbot, ijunsti, ijungat, qjunbot, qjunsti, qjungat;
+
+                // Initialization of (local) variables; required for some verilog-A compilers
+                `JuncapLocalVarInit
+
+                // Computation of JUNCAP-express internal parameters
+                `JuncapExpressInit1(AB_i, LS_i, LG_i, VJUNREF, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT, CTATBOT, vbibot, wdepnulrbot, VBIRBOTinv, PBOT, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT, VBIRBOT, wdepnulrinvbot, fbbtbot, VBRBOT, VBRinvbot, PBRBOT, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI, CTATSTI, vbisti, wdepnulrsti, VBIRSTIinv, PSTI, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI, VBIRSTI, wdepnulrinvsti, fbbtsti, VBRSTI, VBRinvsti, PBRSTI, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT, CTATGAT, vbigat, wdepnulrgat, VBIRGATinv, PGAT, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT, VBIRGAT, wdepnulrinvgat, fbbtgat, VBRGAT, VBRinvgat, PBRGAT, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim)
+                `JuncapExpressInit2(AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT, CTATBOT, vbibot, wdepnulrbot, VBIRBOTinv, PBOT, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT, VBIRBOT, wdepnulrinvbot, fbbtbot, VBRBOT, VBRinvbot, PBRBOT, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI, CTATSTI, vbisti, wdepnulrsti, VBIRSTIinv, PSTI, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI, VBIRSTI, wdepnulrinvsti, fbbtsti, VBRSTI, VBRinvsti, PBRSTI, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT, CTATGAT, vbigat, wdepnulrgat, VBIRGATinv, PGAT, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT, VBIRGAT, wdepnulrinvgat, fbbtgat, VBRGAT, VBRinvgat, PBRGAT, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim)
+                `JuncapExpressInit3(AB_i, LS_i, LG_i, idsatbot, idsatsti, idsatgat, ISATFOR1, MFOR1, ISATFOR2, MFOR2, ISATREV, MREV, m0flag)
+                `JuncapExpressInit4(AB_i, LS_i, LG_i, FJUNQ, cjobot, cjosti, cjogat, zflagbot, zflagsti, zflaggat)
+                `JuncapExpressInit5(AB_i, LS_i, LG_i, ISATFOR1, ISATFOR2, ISATREV, xhighf1, expxhf1, xhighf2, expxhf2, xhighr, expxhr)
+
+            end // JUNCAPexpressInit
+
+        end // initial_instance
+
+        begin : evaluateblock
+
+            // Local variables
+            real ijunbot, qjunbot, ijunsti, qjunsti, ijungat, qjungat, ijun, qjun, jnoise, VAK;
+
+            // Variable initializing
+            ijun        =  0.0;
+            ijunbot     =  0.0;
+            ijunsti     =  0.0;
+            ijungat     =  0.0;
+
+            //  --------------------------------------------------------------------------------------------------------------
+            //  DC and AC bias dependent quantities (calculations for current and charge contributions)
+            //  --------------------------------------------------------------------------------------------------------------
+            begin : evaluateStaticDynamic
+
+                //  Fix: add here variables declaration; required for some verilog-A compilers
+                `LocalGlobalVars
+
+                // Fix: initialization of (local) variables; required for some verilog-A compilers
+                `JuncapLocalVarInit
+                qjunbot      =  0.0;
+                qjunsti      =  0.0;
+                qjungat      =  0.0;
+
+                VAK         =  TYPE * V(A, K);
+                if (SWJUNEXP_i == 1.0) begin
+                    `JuncapExpressCurrent(VAK, MFOR1, ISATFOR1, MFOR2, ISATFOR2, MREV, ISATREV, m0flag, xhighf1, expxhf1, xhighf2, expxhf2, xhighr, expxhr, ijun)
+                    begin : evaluateDynamic
+                        real tmpv, vjv;
+                        `JuncapExpressCharge(VAK, AB_i, LS_i, LG_i, qprefbot, qprefsti, qprefgat, qpref2bot, qpref2sti, qpref2gat, vbiinvbot, vbiinvsti, vbiinvgat, one_minus_PBOT, one_minus_PSTI, one_minus_PGAT, vfmin, vch, zflagbot, zflagsti, zflaggat, qjunbot, qjunsti, qjungat)
+                    end
+                end else begin
+                    `juncapcommon(VAK, AB_i, LS_i, LG_i, qprefbot, qpref2bot, vbiinvbot, one_minus_PBOT, idsatbot, CSRHBOT, CTATBOT, vbibot, wdepnulrbot, VBIRBOTinv, PBOT, ftdbot, btatpartbot, atatbot, one_over_one_minus_PBOT, CBBTBOT, VBIRBOT, wdepnulrinvbot, fbbtbot, VBRBOT, VBRinvbot, PBRBOT, fstopbot, slopebot, qprefsti, qpref2sti, vbiinvsti, one_minus_PSTI, idsatsti, CSRHSTI, CTATSTI, vbisti, wdepnulrsti, VBIRSTIinv, PSTI, ftdsti, btatpartsti, atatsti, one_over_one_minus_PSTI, CBBTSTI, VBIRSTI, wdepnulrinvsti, fbbtsti, VBRSTI, VBRinvsti, PBRSTI, fstopsti, slopesti, qprefgat, qpref2gat, vbiinvgat, one_minus_PGAT, idsatgat, CSRHGAT, CTATGAT, vbigat, wdepnulrgat, VBIRGATinv, PGAT, ftdgat, btatpartgat, atatgat, one_over_one_minus_PGAT, CBBTGAT, VBIRGAT, wdepnulrinvgat, fbbtgat, VBRGAT, VBRinvgat, PBRGAT, fstopgat, slopegat, VMAX, exp_VMAX_over_phitd, vbimin, vch, vfmin, vbbtlim, ijunbot, qjunbot, ijunsti, qjunsti, ijungat, qjungat)
+                    ijun        =  AB_i * ijunbot + LS_i * ijunsti + LG_i * ijungat;
+                end
+                qjun        =  AB_i * qjunbot + LS_i * qjunsti + LG_i * qjungat;
+
+            end // evaluateStaticDynamic
+
+            //  --------------------------------------------------------------------------------------------------------------
+            //  Current contributions
+            //  --------------------------------------------------------------------------------------------------------------
+
+            begin : loadStatic
+                I(A, K)      <+  (TYPE * MULT_i) * ijun;
+            end // loadStatic
+
+            //  --------------------------------------------------------------------------------------------------------------
+            //  ddt() contribs from charges
+            //  --------------------------------------------------------------------------------------------------------------
+
+            begin : loadDynamic
+                I(A, K)      <+  ddt((TYPE * MULT_i) * qjun);
+            end // loadDynamic
+
+            //  --------------------------------------------------------------------------------------------------------------
+            //  Noise
+            //  --------------------------------------------------------------------------------------------------------------
+
+            begin : noise
+                jnoise      = (2 * `QELE) * abs(ijun);
+                I(A, K)      <+  white_noise(MULT_i * jnoise, "shot");
+            end // noise
+
+            //  --------------------------------------------------------------------------------------------------------------
+            //  Operating point info
+            //  --------------------------------------------------------------------------------------------------------------
+
+            begin : OPinfo
+                vak         =  VAK;
+                `ifdef OPderiv
+                    cjbot       =  TYPE * MULT_i * AB_i * ddx(qjunbot, V(A));
+                    cjgat       =  TYPE * MULT_i * LG_i * ddx(qjungat, V(A));
+                    cjsti       =  TYPE * MULT_i * LS_i * ddx(qjunsti, V(A));
+                    cj          =  cjbot + cjgat + cjsti;
+                `endif // OPderiv
+                if (SWJUNEXP_i == 1.0) begin
+                    ijbot       =  0.0;
+                    ijgat       =  0.0;
+                    ijsti       =  0.0;
+                    idsatsbot   =  0.0;
+                    idsatssti   =  0.0;
+                    idsatsgat   =  0.0;
+                end else begin
+                    ijbot       =  MULT_i * AB_i * ijunbot;
+                    ijgat       =  MULT_i * LG_i * ijungat;
+                    ijsti       =  MULT_i * LS_i * ijunsti;
+                    idsatsbot   =  MULT_i * AB_i * idsatbot;
+                    idsatssti   =  MULT_i * LS_i * idsatsti;
+                    idsatsgat   =  MULT_i * LG_i * idsatgat;
+                end
+                ij        = MULT_i * ijun;
+                si        = MULT_i * jnoise;
+                cjosbot   = MULT_i * AB_i * cjobot;
+                cjossti   = MULT_i * LS_i * cjosti;
+                cjosgat   = MULT_i * LG_i * cjogat;
+                vbisbot   = vbibot;
+                vbissti   = vbisti;
+                vbisgat   = vbigat;
+            end // OPinfo
+        end // evaluateblock
+    end // analogBlock
+endmodule

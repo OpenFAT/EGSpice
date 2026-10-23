@@ -1,8 +1,8 @@
 // VCVS through a rational transfer function: HSPICE's E ... LAPLACE in+ in-
 // k0 k1 ... / d0 d1 ... [SCALE=val], V(p,n) = scale * H(s) V(cp,cn) with
 // H(s) = (k0 + k1 s + ...) / (d0 + d1 s + ...), coefficients ascending.
-// With LAPLACE_CURRENT defined (vccs_laplace.va) it is the G card: I(p,n).
-// With LAPLACE_ZP defined (vcvs_pole.va, vccs_pole.va) it is the POLE card,
+// With LAPLACE_CURRENT defined (vccs_laplace) it is the G card: I(p,n).
+// With LAPLACE_ZP defined (vcvs_pole, vccs_pole) it is the POLE card,
 // gain * laplace_zp over root vectors the builder fills (see addPole).
 //
 // Verilog-A implementation: Omar El-Sawy, University of Waterloo.

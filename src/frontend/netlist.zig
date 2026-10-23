@@ -931,6 +931,8 @@ const Frame = struct {
     path: ?[]const u8 = null,
     ports: []const []const u8 = &.{},
     actuals: []const VertexId = &.{},
+    /// `ports` by name (`Subckt.port_index`), when long enough to keep one.
+    port_index: ?*const PortIndex = null,
     scopes: []const *const Scope,
     depth: u8 = 0,
     instance: u32 = 0,
@@ -939,6 +941,14 @@ const Frame = struct {
     /// Where this instance's rows start in `Reader.instance_models`.
     models_mark: u32 = 0,
 };
+
+/// A subcircuit's port names to their first position.
+const PortIndex = std.StringHashMapUnmanaged(u32);
+
+/// Ports past this count are looked up through a `PortIndex` instead of a
+/// scan, so a wrapper holding a whole extracted network costs pins, not
+/// pins × ports.
+const port_scan_max = 16;
 
 /// Nested `.subckt` definitions past this depth are refused; ngspice's
 /// syntax check warns past 10 (ngspice-syntax.md §4.1).
@@ -961,6 +971,8 @@ const Subckt = struct {
     /// The body holds a nested `.subckt` definition, whose lines `expand`
     /// skips (they are that subcircuit's).
     has_nested: bool = false,
+    /// `ports` by name past `port_scan_max` ports, else null.
+    port_index: ?*const PortIndex = null,
 };
 
 const ModelRow = struct { name: []const u8, kind: []const u8, kv: Span };
@@ -1063,6 +1075,14 @@ fn Reader(comptime S: type) type {
         /// distinct set of values, so instances with equal parameters share
         /// a row. Sized on the first `localRow`, once `local_models` is whole.
         variants: []std.ArrayList(u32) = &.{},
+        /// Per `local_models` row, the parameter names its line can read
+        /// (`localReads`); null until first needed.
+        local_reads: []?LocalReads = &.{},
+        /// `localRow` results keyed by the row and every scope entry its
+        /// line can reach (`localKey`): an instance whose parameters are the
+        /// same text as an earlier one's skips re-reading the card.
+        local_memo: std.StringHashMapUnmanaged(u32) = .empty,
+        local_key: std.ArrayList(u8) = .empty,
         /// `(name, row)` of the instance models the open expansions resolved;
         /// `Frame.models_mark` splits it by instance.
         instance_models: std.ArrayList(struct { name: []const u8, row: u32 }) = .empty,
@@ -1495,7 +1515,19 @@ fn Reader(comptime S: type) type {
                         const id: u16 = @intCast(r.subckts.items.len);
                         opens[depth] = .{ .id = id, .defaults = defaults };
                         depth += 1;
-                        try r.subckts.append(arena, .{ .name = name, .ports = ports.items, .defaults = &.{}, .first = i + 1, .end = i + 1 });
+                        var port_index: ?*const PortIndex = null;
+                        if (ports.items.len > port_scan_max) {
+                            const by_name = try arena.create(PortIndex);
+                            by_name.* = .empty;
+                            try by_name.ensureTotalCapacity(arena, @intCast(ports.items.len));
+                            // A repeated port keeps its first position, as the scan finds it.
+                            for (ports.items, 0..) |port, k| {
+                                const got = by_name.getOrPutAssumeCapacity(port);
+                                if (!got.found_existing) got.value_ptr.* = @intCast(k);
+                            }
+                            port_index = by_name;
+                        }
+                        try r.subckts.append(arena, .{ .name = name, .ports = ports.items, .defaults = &.{}, .first = i + 1, .end = i + 1, .port_index = port_index });
                         try r.subckt_ids.put(arena, name, id);
                     },
                     // A block's close outside its block closes nothing (#162).
@@ -1653,7 +1685,8 @@ fn Reader(comptime S: type) type {
             const was_in_card = r.in_card;
             r.in_card = true;
             defer r.in_card = was_in_card;
-            r.site_owner = nameKey(nameKey(0, frame.path orelse ""), name);
+            // Site keys are read only under Monte Carlo (`emit`).
+            if (r.monte) r.site_owner = nameKey(nameKey(0, frame.path orelse ""), name);
             r.site_ordinal = 0;
             const matrix_keys = std.StaticStringMap(void).initComptime(.{ .{ "r", {} }, .{ "l", {} }, .{ "g", {} }, .{ "c", {} } });
             // CPL matrices are blank-separated; a negative entry is not a subtraction.
@@ -1815,7 +1848,17 @@ fn Reader(comptime S: type) type {
                 std.debug.assert(r.variants.len == 0);
                 r.variants = try r.arena.alloc(std.ArrayList(u32), r.local_models.items.len);
                 @memset(r.variants, .empty);
+                r.local_reads = try r.arena.alloc(?LocalReads, r.local_models.items.len);
+                @memset(r.local_reads, null);
             }
+            // A PDK reads each subcircuit-local card once per instance
+            // under the instance's parameters (78% of `Problem.init` on
+            // c7552_ihp); equal inputs fold to equal rows.
+            const memo = try r.localKey(lm, frame);
+            if (memo) |key| if (r.local_memo.get(key)) |row| {
+                try r.instance_models.append(r.arena, .{ .name = name, .row = row });
+                return row;
+            };
             const kv_mark = r.kvs.items.len;
             try r.readModel(r.lines.items[line], frame, false);
             var row: u32 = @intCast(r.models.items.len - 1);
@@ -1829,8 +1872,103 @@ fn Reader(comptime S: type) type {
                 row = old;
                 break;
             } else try seen.append(r.arena, row);
+            if (memo) |key| try r.local_memo.put(r.arena, try r.arena.dupe(u8, key), row);
             try r.instance_models.append(r.arena, .{ .name = name, .row = row });
             return row;
+        }
+
+        /// The memo key of local model `lm` read in `frame`: `lm`, then for
+        /// each name its line can read, every scope's entry for it (all
+        /// scopes, not only the innermost, so any lookup order the fold uses
+        /// is covered), following text entries' own names. Null when the
+        /// line draws a statistical value, which differs per instance site.
+        /// Borrows `r.local_key` until the next call.
+        fn localKey(r: *R, lm: usize, frame: *const Frame) Error!?[]const u8 {
+            const reads = r.local_reads[lm] orelse blk: {
+                const got = try r.localReads(r.lines.items[r.local_models.items[lm].line]);
+                r.local_reads[lm] = got;
+                break :blk got;
+            };
+            const names = switch (reads) {
+                .stochastic => return null,
+                .names => |ns| ns,
+            };
+            const key = &r.local_key;
+            key.clearRetainingCapacity();
+            try key.appendSlice(r.arena, std.mem.asBytes(&@as(u64, lm)));
+            // Names reached through text entries, breadth first, each once.
+            var queue: std.ArrayList([]const u8) = .empty;
+            defer queue.deinit(r.arena);
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(r.arena);
+            for (names) |n| if (!(try seen.getOrPut(r.arena, n)).found_existing) try queue.append(r.arena, n);
+            var i: usize = 0;
+            while (i < queue.items.len) : (i += 1) {
+                const n = queue.items[i];
+                for (frame.scopes) |scope| {
+                    const e = scope.get(n) orelse {
+                        try key.append(r.arena, 0);
+                        continue;
+                    };
+                    switch (e) {
+                        .num => |v| {
+                            try key.append(r.arena, 1);
+                            try key.appendSlice(r.arena, std.mem.asBytes(&v));
+                        },
+                        .text => |t| {
+                            try key.append(r.arena, 2);
+                            try key.appendSlice(r.arena, std.mem.asBytes(&@as(u64, t.len)));
+                            try key.appendSlice(r.arena, t);
+                            switch (try r.localReads(t)) {
+                                .stochastic => return null,
+                                .names => |more| for (more) |m| if (!(try seen.getOrPut(r.arena, m)).found_existing) try queue.append(r.arena, m),
+                            }
+                        },
+                    }
+                }
+            }
+            return key.items;
+        }
+
+        const LocalReads = union(enum) { stochastic, names: []const []const u8 };
+
+        /// The identifiers `text` holds, `.func` bodies followed, or
+        /// `.stochastic` when it calls a distribution. Keys and function
+        /// names count too: a superset only makes the memo key stricter.
+        fn localReads(r: *R, text: []const u8) Error!LocalReads {
+            var out: std.ArrayList([]const u8) = .empty;
+            var todo: std.ArrayList([]const u8) = .empty;
+            defer todo.deinit(r.arena);
+            try todo.append(r.arena, text);
+            var bodies: usize = 0;
+            while (todo.pop()) |t| {
+                var k: usize = 0;
+                while (k < t.len) {
+                    const c = t[k];
+                    if (std.ascii.isDigit(c) or c == '.') {
+                        // A number with its exponent and scale suffix.
+                        while (k < t.len and (std.ascii.isAlphanumeric(t[k]) or t[k] == '.' or t[k] == '_' or
+                            ((t[k] == '+' or t[k] == '-') and k > 0 and (t[k - 1] == 'e' or t[k - 1] == 'E')))) k += 1;
+                        continue;
+                    }
+                    if (!(std.ascii.isAlphabetic(c) or c == '_')) {
+                        k += 1;
+                        continue;
+                    }
+                    const start = k;
+                    while (k < t.len and (std.ascii.isAlphanumeric(t[k]) or t[k] == '_')) k += 1;
+                    const ident = t[start..k];
+                    if (expr.isDistributionName(ident)) return .stochastic;
+                    if (r.funcs.get(ident)) |func| {
+                        bodies += 1;
+                        // A recursive `.func` chain: give up on the memo.
+                        if (bodies > 64) return .stochastic;
+                        try todo.append(r.arena, func.body);
+                    }
+                    try out.append(r.arena, ident);
+                }
+            }
+            return .{ .names = out.items };
         }
 
         /// Equal keys and values; an unfolded expression never compares equal.
@@ -3120,7 +3258,7 @@ fn Reader(comptime S: type) type {
                                     r.site_owner = owner;
                                     r.site_ordinal = ordinal;
                                 }
-                                r.site_owner = nameKey(nameKey(0, levelPath(frame, hit.level)), name);
+                                if (r.monte) r.site_owner = nameKey(nameKey(0, levelPath(frame, hit.level)), name);
                                 r.site_ordinal = 0;
                                 // A parameter's text never sees the formals of a
                                 // function that reads it.
@@ -3267,7 +3405,9 @@ fn Reader(comptime S: type) type {
         /// is `<path>.<node>`.
         fn netOf(r: *R, frame: *const Frame, node: []const u8) Error!VertexId {
             const path = frame.path orelse return r.intern(node);
-            for (frame.ports, frame.actuals) |p, a| if (std.mem.eql(u8, p, node)) return a;
+            if (frame.port_index) |index| {
+                if (index.get(node)) |k| return frame.actuals[k];
+            } else for (frame.ports, frame.actuals) |p, a| if (std.mem.eql(u8, p, node)) return a;
             if (isGround(r.dialect, node) or r.global_nets.contains(node)) return r.intern(node);
             return r.intern(try r.joined(&.{ path, ".", node }));
         }
@@ -3354,7 +3494,7 @@ fn Reader(comptime S: type) type {
             const was_in_card = r.in_card;
             r.in_card = true;
             defer r.in_card = was_in_card;
-            r.site_owner = nameKey(nameKey(0, frame.path orelse ""), head);
+            if (r.monte) r.site_owner = nameKey(nameKey(0, frame.path orelse ""), head);
             r.site_ordinal = 0;
             if (!F.isWord(head) or !std.ascii.isAlphabetic(head[0])) return error.ParseError;
             // HSPICE's P element is a port: a V card that `port=` numbers
@@ -3893,6 +4033,7 @@ fn Reader(comptime S: type) type {
                 .path = if (frame.path) |p| try std.mem.concat(arena, u8, &.{ p, ".", head }) else head,
                 .ports = sub.ports,
                 .actuals = actuals,
+                .port_index = sub.port_index,
                 .scopes = scopes,
                 .depth = frame.depth + 1,
                 .instance = instance,

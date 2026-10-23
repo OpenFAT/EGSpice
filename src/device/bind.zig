@@ -171,13 +171,35 @@ fn lowered(comptime s: []const u8) []const u8 {
     }
 }
 
-/// Sets the `<field>__given` flag VerA emits for LRM §9.19 `$param_given`, if
-/// the type has one. Without it a bound value still takes the model's
-/// defaulted branch (bsim3's derived k1/k2/vth0 defaults, mos1's NSUB rules).
+/// Marks `field` given for LRM §9.19 `$param_given`: VerA's `setGiven`
+/// (one `given__` bitset; a name without a bit is a no-op), or a
+/// hand-written type's `<field>__given` flag. Without it a bound value still
+/// takes the model's defaulted branch (bsim3's derived k1/k2/vth0 defaults,
+/// mos1's NSUB rules).
 pub fn markGiven(target: anytype, comptime field: []const u8) void {
     const T = @TypeOf(target.*);
-    if (comptime @hasField(T, field ++ "__given"))
+    if (comptime @hasDecl(T, "setGiven")) {
+        target.setGiven(field);
+    } else if (comptime @hasField(T, field ++ "__given")) {
         @field(target.*, field ++ "__given") = true;
+    }
+}
+
+test "markGiven sets VerA's given__ bit through setGiven" {
+    // VerA's emitted shape (codegen `emitGiven`).
+    const M = struct {
+        cjo: f64 = 0,
+        vt0: f64 = 0,
+        given__: std.StaticBitSet(1) = .empty,
+        pub const given_params = [_][]const u8{"cjo"};
+        pub fn setGiven(model: *@This(), name: []const u8) void {
+            for (given_params, 0..) |n, k| if (std.mem.eql(u8, n, name)) model.given__.set(k);
+        }
+    };
+    var m: M = .{};
+    try apply(&m, &.{ .{ .key = "cjo", .value = 4 }, .{ .key = "vt0", .value = 1 } }).unwrap();
+    try std.testing.expect(m.given__.isSet(0));
+    try std.testing.expectEqual(@as(usize, 1), m.given__.count());
 }
 
 fn isScalar(comptime T: type) bool {

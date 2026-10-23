@@ -27,14 +27,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mlugg/setup-zig@v2
+      - uses: cachix/install-nix-action@v31
         with:
-          version: 0.17.0
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
       # The C API guide's host program, docs/embed/host.c: compiled against
       # libespice.a and run, so the documented example keeps working.
       - name: C API example
-        run: zig build c-example -Dgpu=false
+        run: nix develop .#ci -c zig build c-example -Doptimize=ReleaseSafe -Dgpu=false -Dcuda-arch=none -Dhip-arch=none
 
       # The in-browser playground (tools/playground/): espice.wasm and
       # cktimg.wasm, served from docs/wasm/ next to javascripts/playground.js.
@@ -43,7 +44,7 @@ jobs:
       - name: Playground
         continue-on-error: true
         run: |
-          zig build wasm
+          nix develop .#ci -c zig build wasm -Doptimize=ReleaseSafe -Dgpu=false -Dcuda-arch=none -Dhip-arch=none
           mkdir -p docs/wasm
           cp zig-out/wasm/*.wasm docs/wasm/
 

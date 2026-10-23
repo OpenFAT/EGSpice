@@ -1,8 +1,8 @@
 //! Shared analysis context: the circuit, the run context and the result type
 //! every analysis leaf needs. Leaves import this file, never ../root.zig,
-//! which imports the leaves for dispatch. File DAG inside src/analysis/:
-//! Circuit.zig -> types.zig -> leaves / executor.zig -> root.zig. Cites
-//! nothing.
+//! which imports the leaves for dispatch: Circuit.zig (with gpu/) ->
+//! types.zig -> leaves -> executor.zig -> session.zig -> root.zig.
+//! Cites nothing.
 const std = @import("std");
 const assert = std.debug.assert;
 

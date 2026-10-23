@@ -1,0 +1,13 @@
+0 1 PASS 11.904s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+1 1 PASS 11.762s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+2 1 PASS 11.750s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+3 1 PASS 11.726s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+4 1 PASS 11.802s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+5 1 PASS 11.733s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+6 1 PASS 11.739s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+7 1 PASS 11.711s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+8 1 PASS 11.751s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+9 1 PASS 11.726s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+10 1 PASS 11.705s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+11 1 PASS 11.721s espice.test.lane lockstep (#207): 16 sizing points, a moved edge, an extreme and a failing row, in three orders, each bitwise its run alone
+failures=0

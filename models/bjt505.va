@@ -1,0 +1,2358 @@
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+// ---- begin `include "frontdef.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+// Front definitions
+
+`include "discipline.h"
+
+// Numerical, physical and model constants
+`define TEN_M40 1.0e-40
+`define TEN_M07 1.0e-7
+`define C2K     273.15
+`define KB      1.3806226e-23
+`define QQ      1.6021918e-19
+`define KBdivQQ   8.61708691805812512584e-5
+`define one_third 0.33333333333333333333
+`define one_sixth 0.16666666666666666667
+`define VDLOW   0.05
+`define AJE     3.0
+`define AJC     2.0
+`define AJS     2.0
+`define PI      3.14159265358979323846
+`define LN2     0.69314718055994530942
+`define epsilon_ath 1.0e-6
+
+// Smooth limiting functions
+`define max_hyp0(result, x, epsilon) \
+    eps2 = epsilon * epsilon; \
+    x2 = x * x; \
+    if (x < 0.0) begin \
+        result = 0.5 * eps2 / (sqrt(x2 + eps2) - x); \
+    end else begin \
+        result = 0.5 * (sqrt(x2 + eps2) + x); \
+    end
+
+`define min_logexp(result, x, x0, a) \
+    dxa = (x - x0) / (a); \
+    if (x < x0) begin \
+        result = x - a * ln(1.0 + exp(dxa)); \
+    end else begin \
+        result = x0 - a * ln(1.0 + exp(-dxa)); \
+    end
+
+`define max_logexp(result, x, x0, a) \
+    dxa = (x - x0) / (a); \
+    if (x < x0) begin \
+        result = x0 + a * ln(1.0 + exp(dxa)); \
+    end else begin \
+        result = x + a * ln(1.0 + exp(-dxa)); \
+    end
+
+`define expLin(result, x, vexlim) \
+    if ((x) < vexlim) begin \
+        result = exp(x); \
+    end else begin \
+        expl = exp(vexlim); \
+        result = expl * (1.0 + ((x) - vexlim)); \
+    end
+
+`define expLin_lh(result, x, vexlimr, vexlim) \
+    if ((x) < -vexlimr) begin \
+        expl = exp(-vexlimr); \
+        result = expl / (1.0 + ((-x) - vexlimr)); \
+    end else if ((x) < vexlim) begin \
+        result = exp(x); \
+    end else begin \
+        expl = exp(vexlim); \
+        result = expl * (1.0 + ((x) - vexlim)); \
+    end
+
+`define linLog(result, x, vlim) \
+    if (x < vlim) begin \
+        result = x; \
+    end else begin \
+        result = vlim + ln(1.0 + (x - vlim)); \
+    end
+
+//  Macros for the model/instance parameters
+//
+//  MPRxx    model    parameter real
+//  MPIxx    model    parameter integer
+//  IPRxx    instance    parameter real
+//  IPIxx    instance    parameter integer
+//     ||
+//     cc    closed lower bound, closed upper bound
+//     oo    open   lower bound, open   upper bound
+//     co    closed lower bound, open   upper bound
+//     oc    open   lower bound, closed upper bound
+//     cz    closed lower bound=0, open upper bound=inf
+//     oz    open   lower bound=0, open upper bound=inf
+//     nb    no bounds
+//     ex    no bounds with exclude
+//     sw    switch(integer only, values  0=false  and  1=true)
+//     ty    switch(integer only, values -1=p-type and +1=n-type)
+//
+//
+`define MPRnb(nam,def,uni,        des) (*units=uni,                   desc=des*) parameter real    nam=def;
+`define MPRex(nam,def,uni,exc,    des) (*units=uni,                   desc=des*) parameter real    nam=def exclude exc;
+`define MPRcc(nam,def,uni,lwr,upr,des) (*units=uni,                   desc=des*) parameter real    nam=def from[lwr:upr];
+`define MPRoo(nam,def,uni,lwr,upr,des) (*units=uni,                   desc=des*) parameter real    nam=def from(lwr:upr);
+`define MPRco(nam,def,uni,lwr,upr,des) (*units=uni,                   desc=des*) parameter real    nam=def from[lwr:upr);
+`define MPRoc(nam,def,uni,lwr,upr,des) (*units=uni,                   desc=des*) parameter real    nam=def from(lwr:upr];
+`define MPRcz(nam,def,uni,        des) (*units=uni,                   desc=des*) parameter real    nam=def from[  0:inf);
+`define MPRoz(nam,def,uni,        des) (*units=uni,                   desc=des*) parameter real    nam=def from(  0:inf);
+
+`define MPInb(nam,def,uni,        des) (*units=uni,                   desc=des*) parameter integer nam=def;
+`define MPIex(nam,def,uni,exc,    des) (*units=uni,                   desc=des*) parameter integer nam=def exclude exc;
+`define MPIcc(nam,def,uni,lwr,upr,des) (*units=uni,                   desc=des*) parameter integer nam=def from[lwr:upr];
+`define MPIoo(nam,def,uni,lwr,upr,des) (*units=uni,                   desc=des*) parameter integer nam=def from(lwr:upr);
+`define MPIco(nam,def,uni,lwr,upr,des) (*units=uni,                   desc=des*) parameter integer nam=def from[lwr:upr);
+`define MPIoc(nam,def,uni,lwr,upr,des) (*units=uni,                   desc=des*) parameter integer nam=def from(lwr:upr];
+`define MPIcz(nam,def,uni,        des) (*units=uni,                   desc=des*) parameter integer nam=def from[  0:inf);
+`define MPIoz(nam,def,uni,        des) (*units=uni,                   desc=des*) parameter integer nam=def from(  0:inf);
+
+`define MPIsw(nam,def,uni,        des) (*units=uni,                   desc=des*) parameter integer nam=def from[  0:  1];
+`define MPIty(nam,def,uni,        des) (*units=uni,                   desc=des*) parameter integer nam=def from[ -1:  1] exclude 0;
+
+`define IPRnb(nam,def,uni,        des) (*units=uni, type="instance",  desc=des*) parameter real    nam=def;
+`define IPRoo(nam,def,uni,lwr,upr,des) (*units=uni, type="instance",  desc=des*) parameter real    nam=def from(lwr:upr);
+
+`define OPP(nam,uni,des) (* desc=des, units=uni *) real nam;
+`define OPM(nam,uni,des) (* desc=des, units=uni, multiplicity="multiply" *) real nam;
+`define OPD(nam,uni,des) (* desc=des, units=uni, multiplicity="divide"   *) real nam;
+
+// ---- end `include "frontdef.inc" ----
+`define SUBSTRATE
+
+module bjt505_va (c, b, e, s);
+
+    // External ports
+    inout c, b, e, s;
+
+    electrical e, b, c, s;
+
+    // Internal nodes
+    electrical e1, b1, b2, c1, c2, c3, c4;
+
+    // NQS nodes
+    electrical nqs1, nqs2;
+
+    // Noise node
+    electrical noi;  // for correlated noise implementation
+
+// ---- begin `include "parameters.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+//Instance parameters
+`IPRnb( dta            ,0.0            ,"degC"                                   ,"Difference between the local and global ambient temperatures" )
+aliasparam trise = dta;
+aliasparam dtemp = dta;
+`IPRoo( mult           ,1.0            ,""            ,0.0         ,inf          ,"Multiplication factor" )
+
+// Mextram parameters
+`MPRco( version        ,505.60         ,""            ,505.60      ,505.61       ,"Model version" )
+`MPIty( type           ,1              ,""                                       ,"Flag for NPN (1) or PNP (-1) transistor type" )
+`MPRco( tref           ,25.0           ,"degC"        ,-273.0      ,inf          ,"Reference temperature" )
+`MPIcc( exmod          ,1              ,""            ,0           ,4            ,"Flag for extended modeling of the reverse current gain" )
+`MPIcc( exphi          ,1              ,""            ,0           ,1            ,"Flag for distributed high-frequency effects in transient" )
+`MPIcc( exavl          ,0              ,""            ,0           ,1            ,"Flag for extended modeling of avalanche currents" )
+
+`ifdef SUBSTRATE
+    `MPIcc( exsub          ,1              ,""            ,0           ,1           ,"Flag for extended modeling of substrate currents" )
+`endif
+
+// main current parameters
+`MPRoz( is             ,22.0a          ,"A"                                      ,"Saturation current of main current" )
+`MPRco( nff            ,1.0            ,""            ,1.0         ,inf          ,"Non-ideality factor of forward main current" )
+`MPRco( nfr            ,1.0            ,""            ,1.0         ,inf          ,"Non-ideality factor of reverse main current" )
+`MPRco( ik             ,0.1            ,"A"           ,1.0p        ,inf          ,"CE high injection knee current" )
+`MPRco( ver            ,2.5            ,"V"           ,0.01        ,inf          ,"Reverse Early voltage" )
+`MPRco( vef            ,44.0           ,"V"           ,0.01        ,inf          ,"Forward Early voltage" )
+`MPRoo( issr           ,1.0            ,""            ,0.0         ,inf          ,"Fraction of saturation current for reverse main current" )
+// forward base current parameters
+`MPRcz( ibi            ,0.1a           ,"A"                                      ,"Saturation current of ideal base current" )
+`MPRco( nbi            ,1.0            ,""            ,0.1         ,inf          ,"Non-ideality factor of ideal base current" )
+`MPRcz( ibis           ,0.0            ,"A"                                      ,"Saturation current of ideal side wall base current" )
+`MPRco( nbis           ,1.0            ,""            ,0.1         ,inf          ,"Non-ideality factor of ideal side wall base current" )
+`MPRcz( ibf            ,2.7f           ,"A"                                      ,"Saturation current of non-ideal forward base current" )
+`MPRco( mlf            ,2.0            ,""            ,0.1         ,inf          ,"Non-ideality factor of non-ideal forward base current" )
+`MPRcz( ibfs           ,0.0            ,"A"                                      ,"Saturation current of non-ideal side wall forward base current" )
+`MPRco( mlfs           ,2.0            ,""            ,0.1         ,inf          ,"Non-ideality factor of non-ideal side wall forward base current" )
+// forward base current with swib1 = 1
+`MPIcc( swib1          ,0              ,""            ,0           ,1            ,"Switch of Ib1 and Ib1s model" )
+`MPRcz( ibinbr         ,0.0            ,"A"                                      ,"Saturation current of NBR ideal base current when swib1=1" )
+`MPRcz( ibinbrs        ,0.0            ,"A"                                      ,"Saturation current of ideal side wall base current when swib1=1" )
+`MPRco( vknbr          ,0.68           ,"V"           ,0.05        ,inf          ,"High injection knee voltage for NBR Ib1 and Ib1s when swib1=1" )
+`MPRcz( ibinbrqs       ,0.0            ,"A"                                      ,"Saturation current of quasi-saturation component of NBR Ib1 when swib1=1" )
+// reverse base current parameters
+`MPRoz( ibx            ,3.14a          ,"A"                                      ,"Saturation current of extrinsic reverse base current" )
+`MPRco( ikbx           ,14.29m         ,"A"           ,1.0p        ,inf          ,"Extrinsic CB high injection knee current" )
+`MPRcz( ibr            ,1.0f           ,"A"                                      ,"Saturation current of non-ideal reverse base current" )
+`MPRco( mlr            ,2.0            ,""            ,0.1         ,inf          ,"Non-ideality factor of non-ideal reverse base current" )
+`MPRcc( xext           ,0.63           ,""            ,0.0         ,1.0          ,"Part of currents and charges that belong to extrinsic region" )
+// EB tunneling model parameters
+`MPRcz( izeb           ,0.0            ,"A"                                      ,"Pre-factor of EB Zener tunneling current" )
+`MPRcz( nzeb           ,22.0           ,""                                       ,"Coefficient of EB Zener tunneling current" )
+// CB tunneling model parameters
+`MPRcz( izcb           ,0.0            ,"A"                                      ,"Pre-factor of CB Zener tunneling current" )
+`MPRcz( nzcb           ,22.0           ,""                                       ,"Coefficient of CB Zener tunneling current" )
+// zener tunneling model parameters
+`MPRoo( vzmin          ,1.0u           ,"V"           ,0.0         ,inf          ,"Minimum junction reverse voltage to help avoid Zener current numerical issues close to zero bias" )
+// 505 avalanche model parameters
+`MPIcc( swavl          ,1              ,""            ,0           ,3            ,"Switch of avalanche factor Gem model" )
+`MPRcz( aavl           ,400.0          ,""                                       ,"aavl of swavl=1,3 Gem models" )
+`MPRoo( cavl           ,-370.0m        ,""            ,-inf        ,0.0          ,"cavl of swavl=1,3 Gem models" )
+`MPRoz( itoavl         ,500.0m         ,"A"                                      ,"Current dependence parameter of swavl=1 Gem model" )
+`MPRoz( bavl           ,25.0           ,""                                       ,"bavl of swavl=1,3 Gem models" )
+`MPRnb( vdcavl         ,100.0m         ,"V"                                      ,"CB diffusion voltage dedicated for swavl=1 Gem model" )
+// 504 avalanche model parameters
+`MPRco( wavl           ,1.1u           ,"m"           ,1.0n        ,inf          ,"Epilayer thickness used in weak-avalanche model" )
+`MPRco( vavl           ,3.0            ,"V"           ,0.01        ,inf          ,"Voltage determining curvature of avalanche current" )
+`MPRcz( sfh            ,0.3            ,""                                       ,"Current spreading factor of avalanche model when exavl=1" )
+// 505.2.0 avalanche model parameters
+`MPRco( ihcavl         ,4.0m           ,"A"           ,1.0p        ,inf          ,"Critical current for velocity saturation of swavl=3 Gem model" )
+`MPRoo( davl           ,-370.0m        ,""            ,-inf        ,0.0          ,"Coefficient for controlling decrease of Gem with current in swavl=3 Gem model" )
+`MPRoo( eavl           ,-370.0m        ,""            ,-inf        ,0.0          ,"Coefficient for controlling increase of Gem with current in swavl=3 extended Gem model" )
+`MPRoo( aexavl         ,0.3            ,""            ,0.0         ,inf          ,"Smoothness parameter for onset of swavl=3 extended Gem model" )
+`MPRco( ionexavl       ,4.0m           ,"A"           ,1.0p        ,inf          ,"Onset current of swavl=3 extended Gem model" )
+`MPIcc( swgemlim       ,1              ,""            ,0           ,1            ,"Switch of limiting of avalanche factor Gem model" )
+// resistance parameters
+`MPRco( re             ,5.0            ,"Ohm"         ,1.0m        ,inf          ,"Emitter resistance" )
+`MPRco( rbc            ,23.0           ,"Ohm"         ,1.0m        ,inf          ,"Constant part of base resistance" )
+`MPRco( rbv            ,18.0           ,"Ohm"         ,1.0m        ,inf          ,"Zero-bias value of variable part of the base resistance" )
+`MPRco( rcc            ,12.0           ,"Ohm"         ,1.0m        ,inf          ,"Constant part of collector resistance" )
+`MPRcz( rcblx          ,0.0            ,"Ohm"                                    ,"Resistance Collector Buried Layer extrinsic" )
+`MPRcz( rcbli          ,0.0            ,"Ohm"                                    ,"Resistance Collector Buried Layer Intrinsic" )
+// epilayer dc parameters
+`MPRco( rcv            ,150.0          ,"Ohm"         ,1.0m        ,inf          ,"Resistance of un-modulated epilayer" )
+`MPRco( scrcv          ,1250.0         ,"Ohm"         ,1.0m        ,inf          ,"Space charge resistance of epilayer" )
+`MPRco( ihc            ,4.0m           ,"A"           ,1.0p        ,inf          ,"Critical current for velocity saturation in epilayer" )
+`MPRco( axi            ,0.3            ,""            ,0.02        ,inf          ,"Smoothness parameter for onset of quasi-saturation" )
+`MPRco( vdc            ,0.68           ,"V"           ,0.05        ,inf          ,"CB diffusion voltage" )
+// EB junction capacitance parameters
+`MPRcz( cje            ,73.0f          ,"F"                                      ,"Zero-bias EB depletion capacitance" )
+`MPRco( vde            ,0.95           ,"V"           ,0.05        ,inf          ,"EB diffusion voltage" )
+`MPRco( pe             ,0.4            ,""            ,0.01        ,0.99         ,"EB grading coefficient" )
+`MPRcc( xcje           ,0.4            ,""            ,0.0         ,1.0          ,"Sidewall fraction of EB depletion capacitance" )
+`MPRcz( cbeo           ,0.0            ,"F"                                      ,"EB overlap capacitance" )
+// CB junction capacitance parameters
+`MPRcz( cjc            ,78.0f          ,"F"                                      ,"Zero-bias CB depletion capacitance" )
+`MPRco( vdcctc         ,0.68           ,"V"           ,0.05        ,inf          ,"CB diffusion voltage of depletion capacitance" )
+`MPRco( pc             ,0.5            ,""            ,0.01        ,0.99         ,"CB grading coefficient" )
+`MPIcc( swvchc         ,0              ,""            ,0           ,1            ,"Switch of Vch for CB depletion capacitance" )
+`MPIcc( swvjunc        ,0              ,""            ,0           ,2            ,"Switch of Vjunc for collector junction capacitance" )
+`MPRco( xp             ,0.35           ,""            ,0.0         ,0.99         ,"Constant part of Cjc" )
+`MPRco( mc             ,0.5            ,""            ,0.0         ,1.0          ,"Coefficient for current modulation of CB depletion capacitance" )
+`MPRcc( xcjc           ,32.0m          ,""            ,0.0         ,1.0          ,"Fraction of CB depletion capacitance under the emitter" )
+`MPRcz( cbco           ,0.0            ,"F"                                      ,"CB overlap capacitance" )
+`MPIcc( swqex          ,0              ,""            ,0           ,1            ,"Switch for CB diffusion capacitance" )
+`MPRco( vdcex          ,0.68           ,"V"           ,0.05        ,inf          ,"CB diffusion voltage of diffusion capacitance" )
+// Breakdown for CB junction leakage parameters (not avalanche of IN)
+`MPRoc( vbrcb          ,100.0          ,"V"           ,0.0         ,2000.0       ,"Breakdown voltage for CB junction leakage" )
+`MPRoc( pbrcb          ,4.0            ,"V"           ,0.0         ,500.0        ,"Breakdown onset tuning parameter for CB junction leakage" )
+`MPRoc( frevcb         ,1000.0         ,""            ,1e1         ,1e10         ,"Coefficient for limiting CB junction breakdown leakage current" )
+`MPIsw( swjbrcb        ,0              ,""                                       ,"Switch for breakdown in CB junction leakage" )
+// transit time parameters
+`MPRco( mtau           ,1.0            ,""            ,0.1         ,inf          ,"Non-ideality factor of emitter stored charge" )
+`MPRcz( taue           ,2.0p           ,"s"                                      ,"Minimum transit time of stored emitter charge" )
+`MPRoz( taub           ,4.2p           ,"s"                                      ,"Transit time of stored base charge" )
+`MPRcz( tepi           ,41.0p          ,"s"                                      ,"Transit time of stored epilayer charge" )
+`MPRcz( taur           ,520.0p         ,"s"                                      ,"Transit time of reverse extrinsic stored base charge" )
+`MPRcz( tauex          ,10.0p          ,"s"                                      ,"Transit time of reverse extrinsic stored epilayer charge of swqex=1" )
+`MPRco( nex            ,1.0            ,""            ,0.1         ,inf          ,"Non-ideality factor of reverse extrinsic stored epilayer charge of swqex=1" )
+// heterojunction parameters
+`MPRnb( deg            ,0.0            ,"eV"                                     ,"Bandgap difference over the base" )
+// neutral base recombination parameter
+`MPRcz( xrec           ,0.0            ,""                                       ,"Pre-factor of the recombination part of Ib1" )
+// charge partition parameters
+`MPRcc( xqb            ,`one_third     ,""            ,0.0         ,1.0          ,"Emitter-fraction of base diffusion charge" )
+`MPRcc( ke             ,0.0            ,""            ,0.0         ,1.0          ,"Fraction of QE in excess phase shift" )
+// general temperature scaling parameters
+`MPRnb( aqbo           ,0.3            ,""                                       ,"Temperature coefficient of zero-bias base charge" )
+`MPRnb( ae             ,0.0            ,""                                       ,"Temperature coefficient of resistivity of the emitter" )
+`MPRnb( ab             ,1.0            ,""                                       ,"Temperature coefficient of resistivity of the base" )
+`MPRnb( aepi           ,2.5            ,""                                       ,"Temperature coefficient of resistivity of the epilayer" )
+`MPRnb( aepiex         ,2.5            ,""                                       ,"Temperature coefficient of reverse transit time of the extrinsic epilayer" )
+`MPRnb( aex            ,0.62           ,""                                       ,"Temperature coefficient of resistivity of the extrinsic base" )
+`MPRnb( ac             ,2.0            ,""                                       ,"Temperature coefficient of resistivity of the collector contact" )
+`MPRnb( acx            ,1.3            ,""                                       ,"Temperature coefficient of extrinsic reverse base current" )
+`MPRcz( acbl           ,2.0            ,""                                       ,"Temperature coefficient of resistivity of the collector buried layer" )
+`MPRco( vgb            ,1.17           ,"V"           ,0.1         ,inf          ,"Band-gap voltage of base" )
+`MPRco( vgbnbrqs       ,1.12           ,"V"           ,0.1         ,inf          ,"Band-gap voltage of quasi-saturation component of NBR Ib1 when swib1=1" )
+`MPRco( vgbnbr         ,1.12           ,"V"           ,0.1         ,inf          ,"Band-gap voltage of NBR Ib1 when swib1=1" )
+`MPRco( vgbnbrs        ,1.12           ,"V"           ,0.1         ,inf          ,"Band-gap voltage of NBR Ib1s when swib1=1" )
+`MPRco( vgknbr         ,1.12           ,"V"           ,0.1         ,inf          ,"Band-gap voltage of high injection knee voltage for NBR Ib1 and Ib1s when swib1=1" )
+`MPRco( vgc            ,1.18           ,"V"           ,0.1         ,inf          ,"Band-gap voltage of collector" )
+`MPRco( vge            ,1.12           ,"V"           ,0.1         ,inf          ,"Band-gap voltage of emitter" )
+`MPRco( vgcx           ,1.125          ,"V"           ,0.1         ,inf          ,"Band-gap voltage of extrinsic collector" )
+`MPRco( vgj            ,1.15           ,"V"           ,0.1         ,inf          ,"Band-gap voltage recombination EB junction" )
+`MPRco( vgzeb          ,1.15           ,"V"           ,0.1         ,inf          ,"Band-gap voltage at Tref for EB tunneling" )
+`MPRnb( avgeb          ,4.73e-4        ,"V/K"                                    ,"Temperature coefficient of band-gap voltage for EB tunneling" )
+`MPRcz( tvgeb          ,636.0          ,"K"                                      ,"Temperature coefficient of band-gap voltage for EB tunneling" )
+`MPRco( vgzcb          ,1.15           ,"V"           ,0.1         ,inf          ,"Band-gap voltage at Tref for CB tunneling" )
+`MPRnb( avgcb          ,4.73e-4        ,"V/K"                                    ,"Temperature coefficient of band-gap voltage for CB tunneling" )
+`MPRcz( tvgcb          ,636.0          ,"K"                                      ,"Temperature coefficient of band-gap voltage for CB tunneling" )
+`MPRnb( dvgte          ,0.05           ,"V"                                      ,"Band-gap voltage difference of emitter stored charge" )
+`MPRnb( dais           ,0.0            ,""                                       ,"Fine tuning of temperature dependence of CE saturation current" )
+`MPRnb( tnff           ,0.0            ,"/K"                                     ,"Temperature coefficient of nff" )
+`MPRnb( tnfr           ,0.0            ,"/K"                                     ,"Temperature coefficient of nfr" )
+`MPRnb( tbavl          ,500.0u         ,""                                       ,"Temperature scaling parameter of bavl when swavl=1" )
+`MPRcz( dtmax          ,200.0          ,"K"                                      ,"Maximum temperature rise by self-heating" )
+// 1/f noise parameters
+`MPRco( af             ,2.0            ,""            ,0.01        ,inf          ,"Exponent of Flicker-noise of ideal base current" )
+`MPRco( afn            ,2.0            ,""            ,0.01        ,inf          ,"Exponent of Flicker-noise of non-ideal base current" )
+`MPRcz( kf             ,20.0p          ,""                                       ,"Flicker-noise coefficient of ideal base current" )
+`MPRcz( kfn            ,20.0p          ,""                                       ,"Flicker-noise coefficient of non-ideal base current" )
+// avalanche noise switch
+`MPIcc( kavl           ,0              ,""            ,0           ,1            ,"Switch for white noise contribution due to avalanche" )
+// correlated noise parameters
+`MPIcc( kc             ,0              ,""            ,0           ,2            ,"Switch for RF correlation noise model selection" )
+`MPRcc( ftaun          ,0.0            ,""            ,0.0         ,1.0          ,"Fraction of noise transit time to total transit time" )
+
+`ifdef SUBSTRATE
+    `MPRcz( iss            ,48.0a          ,"A"                                      ,"Saturation current of parasitic BCS transistor main current" )
+    `MPRcz( icss           ,0.0            ,"A"                                      ,"CS ideal saturation current" )
+    `MPRco( iks            ,545.5u         ,"A"           ,1.0p        ,inf          ,"Knee current for BCS transistor main current" )
+    `MPRco( ikcs           ,50.0u          ,"A"           ,1.0p        ,inf          ,"Knee current for CS junction diode current" )
+    `MPRcz( cjs            ,315.0f         ,"F"                                      ,"Zero-bias CS depletion capacitance" )
+    `MPRoo( vds            ,0.62           ,"V"           ,0.05        ,inf          ,"CS diffusion voltage" )
+    `MPRoo( ps             ,0.34           ,""            ,0.01        ,0.99         ,"CS grading coefficient" )
+    `MPRco( vgs            ,1.20           ,"V"           ,0.1         ,inf          ,"Band-gap voltage of the substrate" )
+    `MPRnb( as             ,1.58           ,""                                       ,"Substrate temperature coefficient" )
+    `MPRnb( asub           ,2.0            ,""                                       ,"Temperature coefficient for mobility of minorities in the substrate" )
+    `MPRcc( xisubi         ,0.0            ,""            ,0.0         ,1.0          ,"Part of substrate current that belongs to intrinsic region" )
+    `MPIsw( swvsch         ,0              ,""                                       ,"Switch for Vsc induced high injection in main currents of BCS transistors and CS diode current" )
+`endif
+
+// self heating parameters
+`ifdef SELFHEATING
+    `MPIcc( swnlsh          ,0              ,""            ,0           ,1            ,"Switch for nonlinear self-heating (default off 0, on 1)" )
+    `MPRoz( rth            ,300.0          ,"K/W"                                    ,"Thermal resistance" )
+    `MPRcz( cth            ,3.0n           ,"J/K"                                    ,"Thermal capacitance" )
+    `MPRnb( ath            ,0.0            ,""                                       ,"Temperature coefficient of thermal resistance" )
+`endif
+
+// reliability modeling parameters
+`MPRcz( isibrel        ,0.0            ,"A"                                     ,"Saturation current of base current for reliability simulation" )
+`MPRco( nfibrel        ,2.0            ,""            ,0.1         ,inf         ,"Non-ideality factor of base current for reliability simulation" )
+
+`MPRcc( vexlim         ,400.0          ,""            ,40.0        ,400.0       ,"Upper limit of exp() function argument for convergence" )
+`MPRcc( vexlimr        ,400.0          ,""            ,40.0        ,400.0       ,"Lower limit of exp() function argument for convergence" )
+
+`MPRcc( p0starlim      ,1.0e-40        ,""            ,0.0         ,1.0e-20     ,"Lower limit for p0star clipping" )
+`MPRcc( pwlim          ,1.0e-40        ,""            ,0.0         ,1.0e-20     ,"Lower limit for pW clipping" )
+`MPRcc( iclimvbcstar   ,1.0e-15        ,""            ,0.0         ,1.0         ,"Ic1c2 threshold for using Vb2c2star = Vt*ln(eVb2c2star) branch" )
+
+`MPRcz( minr           ,$simparam("minr", 1.0e-3)         ,"Ohm"                ,"Minimum resistance" )
+
+//trap-assisted tunneling
+`MPRcz( istat            ,0.0          ,"A"                                      ,"Saturation current of TAT current" )
+`MPRoz( vtat             ,1.0          ,"A"                                      ,"Coefficient of TAT current" )
+`MPRnb( ktat             ,0.0          ,""                                       ,"Temperature coefficient of TAT current" )
+//tunneling current
+`MPRcz( vbtbt             ,0.16         ,"V"                                     ,"Coefficient of base tunneling current" )
+`MPRnb( kbtbt             ,0.0          ,""                                      ,"Coefficient of base tunneling current" )
+
+// exmod = 4: quasi-static transit time for the XQex formula at B-C3
+`MPRcz( tauxqex        ,10.0p        ,"s"                                      ,"Quasi-static transit time of reverse extrinsic stored epilayer charge of B-C3 nodes; used when exmod = 4 (independent of swqex)" )
+
+// exmod = 4: NQS first-order lag dynamics for Qex and XQex
+`MPRnb( aqexnqs        ,2.5          ,""                                       ,"Temperature coefficient of NQS transit times for Qex and XQex" )
+`MPRco( taunqsqex      ,0.0          ,"s"           ,0.0         ,inf          ,"NQS characteristic time for Qex" )
+`MPRco( taunqsxqex     ,0.0          ,"s"           ,0.0         ,inf          ,"NQS characteristic time for XQex" )
+// ---- end `include "parameters.inc" ----
+// ---- begin `include "variables.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+// Declaration of variables
+
+// Model constants
+
+real An, Bn;
+
+// Temperature scaling variables
+
+real Tk, Trk, tN, Tamb;
+real Vt, Vtr, VtINV, VtrINV, VdtINV;
+real Vdt;
+real dT;
+
+real UdeT, vde_t, UdcT, vdc_t, vdc_ctc_t, UdcT_ctc, vdc_zener_t, UdcT_zener;
+real UdcexT, vdcex_t;
+real cje_t, cjc_t, xp_t;
+real cjc_scale, cjc_scale_inv;
+
+real re_t, rbv_t, rbc_t, rcv_t;
+real rcc_xx_t, rcc_ex_t, rcc_in_t;
+
+real is_t, ik_t, ikbx_t, ibf_t, ibr_t, vef_t, ver_t, ibi_t, ibx_t, ibis_t, ibinbrs_t, ibfs_t, isibrel_t;
+real nff_t, nfr_t, nff_t_tmp, nfr_t_tmp, eps_nf;
+real ibinbr_t, ibinbrqs_t;
+real vknbr_t, UknbrT;
+
+// Zener tunneling parameters and variables:
+real Izteb, izeb_t, E0EB, dE0EB,nzeb_t, pow2_2m_pe, pow2_pe_m2, inv_vde, inv_vde_t, inv_vdc_zener, inv_vdc_zener_t;
+real expnzeb, dzeb, vgzeb_t, vgzeb_tr, inv_vgzeb_tr, cje_t_div_cje;
+real vgzebok;
+real Vdc_zener, Pc_zener, E0CB, expnzcb, pow2_2m_pc, dE0CB, dzcb, Iztcb, nzcb_t, izcb_t, vgzcb_t, inv_vgzcb_tr, vgzcb_tr, vgzcbok, pow2_pc_m2;
+real cjc_t_div_cjc_zener;
+real e_dzeb, e_dzcb;
+`ifdef SELFHEATING
+    real Vztcb;
+`endif
+
+real taue_t, taub_t, tepi_t, taur_t, tauex_t;
+real Bnt, deg_t, Tk300;
+
+`ifdef SELFHEATING
+    real P_rth;
+    real rth_tamb;
+`endif
+
+`ifdef SUBSTRATE
+    real UdsT, vds_t, cjs_t, iss_t, icss_t, iks_t, ikcs_t;
+`endif
+
+real gcc_xx_t, gcc_ex_t, gcc_in_t;
+
+// Epilayer model variables
+
+real K0, Kw, pW, Ec, Ic1c2;
+real Vqs_th, Vqs, Iqs;
+real alpha, vyi, yi, xi_w, xi_w1;
+real gp0, gp02, p0star, Vb2c2star, eVb2c2star, eVb2c2star_nfr;
+real B1, B2, Vxi0, Vch, Icap, pav;
+
+// Effective emitter and collector junction bias variables
+
+real Vfe, Vje, Vte;
+real Vjunc, bjc, Vfc, Vjc, fI, Vcv, Vtc;
+
+// Transfer current variables
+
+real If0, f1, f2, n0, nB;
+real q0I, q1I, qBI, Ir, If, In;
+
+// Base and substrate current(s) variables
+
+real Xext1;
+real Ib1, Ib1_s, Ib2, Ib3, Ib2_s, Ibrel;
+real Iex;
+real g1, g2, pWex, nBex;
+real Xg1, XnBex, XIMex, XIMsub, Vex, VBex, Fex, XIex;
+real eVb1c4vdcex, eVbc3vdcex;
+
+`ifdef SUBSTRATE
+    real Isub, XIsub, Isf, Isub_int;
+`endif
+
+// Distributed base effects variables
+
+real q0Q, q1Q, qBQ, Rb2, Rbvtemp, Ib1b2;
+real dVteVb2e1, dVteVje, dVjeVb2e1;
+real dQteVb2e1, dQbeVb2e1, dQeVb2e1;
+real dn0Vb2e1;
+
+// swavl=2 (504) avalanche current variables
+
+real dEdx0, xd, Weff, Wd, Eav, E0, Em, SHw, Efi, Ew;
+real lambda, Gem, Gmax, Iavl;
+real Icap_ihc;
+
+// swavl=3 (505.2.0) avalanche current variables
+
+real Vdeptmp, Vdep, In_shift_ihcavl, In_shift_n;
+
+`ifdef SELFHEATING
+    real Tki, power, I_cth;
+`endif
+
+// Charges and capacitances variables
+
+real Qte, Vje_s, Qte_s;
+real Qtc;
+real Qb0, Qbe, Qbc, Qb1b2;
+real Qbe_qs, Qbc_qs;
+real Vjcex, Vtexv, Qtex, XVjcex, XVtexv, XQtex;
+
+`ifdef SUBSTRATE
+    real Vfs, Vjs, Qts;
+`endif
+
+real Qe0, Qe;
+real Qe_qs;
+real Qepi0, Qepi, Xg2, XpWex, XQMex, XQex;
+real Qex;
+
+// Biases and exponential terms variables
+
+real Vb2c1, Vb2c2, Vb2e1, Vb1e1, Vb1b2, Vb1c4, Vc1c2;
+real Vc3c4, Vc4c1;
+`ifdef  SUBSTRATE
+    real Vsc1, Vsc3, Vsc4, eVsc1, eVsc3, eVsc4;
+`endif
+real Vee1, Vbb1, Vbc3, Vcc3, Vbe, Vbc;
+real eVb2c2, eVb2e1, eVb1b2, eVb1c4, eVbc3;
+real eVb1c4vdc, eVb2c2vdc, eVbc3vdc, eVb2c1vdc;
+
+// Help variables
+
+// lntN introduced to speed up T-scaling:
+// Acknowledgements due to Geoffrey Coram
+real lntN;
+
+// Variables for local use; may be re-used globally:
+real x, y, xx, yy;
+
+real dxa, sqr_arg;
+real eps2, x2;
+real alpha1, vdif, Ic1c2_Iqs, gp0_help;
+real EmEav_Em, Vb2e1Vfe, termE, termC;
+real Vex_bias;
+real eps_vdc, a_vde, a_vdcctc;
+
+real expl, tmpExp, tmpV, tmpExp1, tmpExp2, tmpExp3;
+
+
+`ifdef  SUBSTRATE
+    real a_vds;
+`endif
+
+// Noise variables
+real common;
+real power_rec, power_rbc, power_rcc_xx, power_rcc_ex, power_rcc_in, power_rbv;
+real powerCCS;
+real powerFBCS;
+real powerFBC1f;
+real powerNFBC1f;
+real powerEBSCS;
+real powerRBCS, powerRBC1f, powerZTCB;
+real powerExCS, powerExCSMOD, powerExC1f, powerExC1fMOD;
+real powerIIS;
+real Ib_fwd_ideal_tot, Ib_fwd_non_ideal_tot;
+
+`ifdef SUBSTRATE
+    real powerSubsCS_B2S, powerSubsCS_B1S, powerSubsCS_BS;
+`endif
+
+// noise correlation help variables
+real In_N, Gem_N, Taub_N, taun, Qbe_qs_eff;
+
+// New avalanche model when swavl=1
+real expIn, vl, bavl_t, bavl_t_tmp, eps_bavl_t, expMm1;
+
+// Minimum conductances
+real GMIN, MINR, MINR_m, g_MINR_m;
+
+`ifdef SUBSTRATE
+    real GMIN_cs;
+`endif
+
+// CB junction avalanche factors
+real alpha_brcb, Vcbr_stop, fbrcb, dfbrcb;
+real Vb1c1, Vcbeff, f_stop;
+
+// non-linear self-heating
+`ifdef SELFHEATING
+    real one_minus_ath;
+`endif
+
+// BTBT and TAT variables
+real istat_t,Itat,Ibtbt;
+
+// Extrinsic CB NQS variables
+real Qex_qs, XQex_qs, Qex_nqs, XQex_nqs, taunqsqex_t, taunqsxqex_t;
+
+// Two tauex variables
+real tauxqex_t;
+// ---- end `include "variables.inc" ----
+// ---- begin `include "opvars.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+//
+// Operation point (output) variables
+//
+
+// The external currents and current gain
+`OPM(ic,        "A", "External collector current")
+`OPM(ib,        "A", "External base current")
+`OPP(betadc,     "", "External current gain Ic/Ib")
+
+// begin added in MXT 504.9:
+`OPM(ie,        "A", "External emitter current")
+
+// The external biases
+`OPP(vbe,     "V", "External base-emitter bias")
+`OPP(vce,     "V", "External collector-emitter bias")
+`OPP(vbc,     "V", "External base-collector bias")
+
+`ifdef SUBSTRATE
+    `OPM(isx,     "A", "External substrate current")
+    `OPP(vse,     "V", "External substrate-emitter bias")
+    `OPP(vbs,     "V", "External base-substrate bias")
+    `OPP(vsc,     "V", "External substrate-collector bias")
+`endif
+
+// end added in MXT 504.9
+// The internal biases
+`OPP(vb2e1,     "V", "Internal base-emitter bias")
+`OPP(vb2c2,     "V", "Internal base-collector bias")
+`OPP(vb2c1,     "V", "Internal base-collector bias including epilayer")
+`OPP(vb1c1,     "V", "External base-collector bias without contact resistances")
+`OPP(vc4c1,     "V", "Bias over intrinsic buried layer")
+`OPP(vc3c4,     "V", "Bias over extrinsic buried layer")
+`OPP(ve1e,      "V", "Bias over emitter resistance")
+
+// The actual currents
+`OPM(in,        "A", "Main current")
+`OPM(ic1c2,     "A", "Epilayer current")
+`OPM(ib1b2,     "A", "Pinched-base current")
+`OPM(ib1,       "A", "Ideal forward base current")
+`OPM(ib1s,      "A", "Ideal side-wall base current")
+`OPM(ib2s,      "A", "Non-ideal side-wall base current")
+`OPM(ibrel,     "A", "Additional non-ideal base current for reliability simulation")
+//
+// 504.8, RvdT, TU-Delft April. 2009, Zener tunneling current:
+//
+`OPM(izteb,     "A", "Zener tunneling current in the emitter base junction")
+//
+`OPM(iztcb,     "A", "Zener tunneling current in the collector base junction")
+`OPM(ib2,       "A", "Non-ideal forward base current")
+`OPM(ib3,       "A", "Non-ideal reverse base current")
+`OPM(iavl,      "A", "Avalanche current")
+`OPM(iex,       "A", "Extrinsic reverse base current")
+
+`OPM(xiex,      "A", "Extrinsic reverse base current")
+`ifdef SUBSTRATE
+    `OPM(isub,      "A", "Substrate current")
+    `OPM(xisub,     "A", "Substrate current")
+    `OPM(isf,       "A", "Substrate failure current")
+`endif
+`OPM(ire,       "A", "Current through emitter resistance")
+`OPM(irbc,      "A", "Current through constant base resistance")
+`OPM(ircblx,    "A", "Current through extrinsic buried layer resistance")
+`OPM(ircbli,    "A", "Current through intrinsic buried layer resistance")
+`OPM(ircc,      "A", "Current through collector contact resistance")
+
+//The actual charges
+`OPM(qe,        "coul", "Emitter charge or emitter neutral charge")
+`OPM(qte,       "coul", "Base-emitter depletion charge")
+`OPM(sqte,      "coul", "Sidewall base-emitter depletion charge")
+`OPM(qbe,       "coul", "Base-emitter diffusion charge")
+`OPM(qbc,       "coul", "Base_collector diffusion charge")
+`OPM(qtc,       "coul", "Base-collector depletion charge")
+`OPM(qepi,      "coul", "Epilayer diffusion charge")
+`OPM(qb1b2,     "coul", "ac current crowding charge")
+`OPM(qtex,      "coul", "Extrinsic base-collector depletion charge")
+`OPM(xqtex,     "coul", "Extrinsic base-collector depletion charge")
+`OPM(qex,       "coul", "Extrinsic base-collector diffusion charge")
+`OPM(xqex,      "coul", "Extrinsic base-collector diffusion charge")
+`ifdef SUBSTRATE
+    `OPM(qts,       "coul", "Collector-substrate depletion charge")
+`endif
+
+//Small signal equivalent circuit conductances and resistances
+`OPM(gx,        "S", "Forward transconductance")
+`OPM(gy,        "S", "Reverse transconductance")
+`OPM(gz,        "S", "Reverse transconductance")
+`OPM(sgpi,      "S", "Conductance sidewall b-e junction")
+`OPM(gpix,      "S", "Conductance floor b-e junction")
+`OPM(gpiy,      "S", "Early effect on recombination base current")
+`OPM(gpiz,      "S", "Early effect on recombination base current")
+`OPM(gmux,      "S", "Early effect on avalanche current limiting")
+`OPM(gmuy,      "S", "Conductance of avalanche current")
+`OPM(gmuz,      "S", "Conductance of avalanche current")
+`OPM(gmuex,     "S", "Conductance of extrinsic b-c junction")
+`OPM(xgmuex,    "S", "Conductance of extrinsic b-c junction")
+`OPM(grcvy,     "S", "Conductance of epilayer current")
+`OPM(grcvz,     "S", "Conductance of epilayer current")
+`OPD(rb_v,    "Ohm", "Variable base resistance")
+`OPM(grbvx,     "S", "Early effect on variable base resistance")
+`OPM(grbvy,     "S", "Early effect on variable base resistance")
+`OPM(grbvz,     "S", "Early effect on variable base resistance")
+`OPD(r_e,     "Ohm", "Emitter resistance")
+`OPD(rb_c,    "Ohm", "Constant base resistance")
+`OPD(rc_c,    "Ohm", "Collector contact resistance")
+`OPD(rc_blx,  "Ohm", "Extrinsic buried layer resistance")
+`OPD(rc_bli,  "Ohm", "Intrinsic buried layer resistance")
+`ifdef SUBSTRATE
+    `OPM(gs,        "S", "Conductance parasitic PNP transistor")
+    `OPM(xgs,       "S", "Conductance parasitic PNP transistor")
+    `OPM(gsf,       "S", "Conductance substrate failure current")
+`endif
+//Small signal equivalent circuit capacitances
+`OPM(scbe,      "F", "Capacitance sidewall b-e junction")
+`OPM(cbex,      "F", "Capacitance floor b-e junction")
+`OPM(cbey,      "F", "Early effect on b-e diffusion charge")
+`OPM(cbez,      "F", "Early effect on b-e diffusion charge")
+`OPM(cbcx,      "F", "Early effect on b-c diffusion charge")
+`OPM(cbcy,      "F", "Capacitance floor b-c junction")
+`OPM(cbcz,      "F", "Capacitance floor b-c junction")
+`OPM(cbcex,     "F", "Capacitance extrinsic b-c junction")
+`OPM(xcbcex,    "F", "Capacitance extrinsic b-c junction")
+`OPM(cb1b2,     "F", "Capacitance AC current crowding")
+`OPM(cb1b2x,    "F", "Cross-capacitance AC current crowding")
+`OPM(cb1b2y,    "F", "Cross-capacitance AC current crowding")
+`OPM(cb1b2z,    "F", "Cross-capacitance AC current crowding")
+`ifdef SUBSTRATE
+    `OPM(cts,       "F", "Capacitance s-c junction")
+`endif
+//Approximate small signal equivalent circuit
+`OPM(gm,        "S", "transconductance")
+`OPP(beta,       "", "Current amplification")
+`OPM(gout,      "S", "Output conductance")
+`OPM(gmu,       "S", "Feedback transconductance")
+`OPD(rb,      "Ohm", "Base resistance")
+`OPD(rc,      "Ohm", "Collector resistance")
+`OPM(cbe,       "F", "Base-emitter capacitance")
+`OPM(cbc,       "F", "Base-collector capacitance")
+
+//quantities to describe internal state of the model
+`OPP(ft,       "Hz", "Good approximation for cut-off frequency")
+`OPM(iqs,       "A", "Current at onset of quasi-saturation")
+`OPP(xiwepi,     "", "Thickness of injection layer normalized to epi layer width")
+`OPP(vb2c2star, "V", "Physical value of internal base-collector bias")
+
+//self-heating
+`ifdef SELFHEATING
+    `OPM(pdiss,     "W", "Dissipation")
+`endif
+`OPP(tk,        "K", "Actual temperature")
+
+//help variables
+real dydx, dydz, gpi;
+real gammax, gammay, gammaz, gbfx, gbfy, gbfz, alpha_ft;
+real rx, ry, rz, rb1b2, rex, xrex, taut;
+// ---- end `include "opvars.inc" ----
+
+    analog begin
+// ---- begin `include "initialize.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+// Initialize model constants
+
+// Impact ionization constants (NPN - PNP)
+
+if (type == 1) begin
+    An = 7.03e7;
+    Bn = 1.23e8;
+end else begin
+    An = 1.58e8;
+    Bn = 2.04e8;
+end
+
+Xext1 = 1.0 - xext;
+
+
+// Reference Temperature expressed in Kelvin:
+Trk = tref + `C2K;
+// Ambient Temperature expressed in Kelvin:
+Tamb = $temperature + dta;
+// Minimum conductance:
+GMIN = $simparam("gmin", 0.0);
+// Minimum resistance:
+if (minr == 0.0) begin
+    MINR = 1.0e-12;
+end else begin
+    MINR = minr;
+end
+MINR_m = MINR * mult;
+g_MINR_m = 1.0 / MINR_m;
+// icss flag
+`ifdef SUBSTRATE
+    if (icss > 0) begin
+        GMIN_cs = GMIN;
+    end else begin
+        GMIN_cs = 0.0;
+    end
+`endif
+
+// nff_t and nfr_t limiting width
+eps_nf = 1e-3;
+// Minimum bavl_t:
+eps_bavl_t = 1e-3;
+
+// begin: RvdT, November 2008; Zener tunneling current model
+
+pow2_2m_pe = pow(2.0, 2.0 - pe);
+pow2_pe_m2 = 1.0 / pow2_2m_pe;
+
+// begin: RvdT, November 2008; Zener tunneling current model
+//
+// Comment added March 2009: this assumes vgzebok as a model parameter.
+//
+// Bandgap for Zener tunnel current model at reference temperature in eV:
+//   vgzeb_tr = vgzebok - avgeb*Trk*Trk / (Trk + tvgeb);
+//    `max_logexp(vgzeb_tr, vgzebok - avgeb*Trk*Trk / (Trk + tvgeb), 0.05, 0.1)
+// end: RvdT, November 2008
+
+// begin: RvdT March 2009:
+// to decrease parameter interdependency,
+// use vgzeb as a parameter, instead of vgzebok:
+//   vgzeb   : bandgap for Zener tunneling at T = Tref,
+//   vgzebok : bandgap for Zener tunneling at T = 0 K.
+`max_logexp(vgzebok, vgzeb + avgeb * Trk * Trk / (Trk + tvgeb), 0.05, 0.1)
+vgzeb_tr = vgzeb;
+// end: RvdT March 2009: use vgzeb as a parameter, instead of vgzebok:
+// end: RvdT, November 2008; Zener tunneling current model
+inv_vgzeb_tr = 1.0 / vgzeb_tr;
+inv_vde = 1.0 / vde;
+
+// CB Zener tunneling
+Vdc_zener = vdcctc;
+Pc_zener = pc;
+pow2_2m_pc = pow(2.0, 2.0 - Pc_zener);
+pow2_pc_m2 = 1.0 / pow2_2m_pc;
+`max_logexp(vgzcbok, vgzcb + avgcb * Trk * Trk / (Trk + tvgcb), 0.05, 0.1)
+vgzcb_tr = vgzcb;
+inv_vgzcb_tr = 1.0 / vgzcb_tr;
+inv_vdc_zener = 1.0 / Vdc_zener;
+
+// Alpha factor of CB junction avalanche model
+alpha_brcb = 1.0 - 1.0 /frevcb;
+
+// Initial values
+Ib1 = 0.0;
+Ib1_s = 0.0;
+XIex = 0.0;
+Fex = 1.0;
+Gem = 0.0;
+Iavl = 0.0;
+XQex = 0.0;
+Qb1b2 = 0.0;
+ibi_t = 0.0;
+ibis_t = 0.0;
+ibinbr_t = 0.0;
+ibinbrqs_t = 0.0;
+ibinbrs_t = 0.0;
+
+// ---- end `include "initialize.inc" ----
+// ---- begin `include "tscaling.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+// Temperature scaling of parameters
+
+// The excess transistor temperature due to the self-heating
+`ifdef SELFHEATING
+    Tki = Temp(dt);
+    // *** Convergence related smoothing ***
+    if (Tki < 0.0) begin
+        Tki = - ln(1.0 - Tki);
+    end
+    `linLog(Vdt, Tki, dtmax)
+    //   `min_logexp(Vdt, Tki, 200.0, 10.0)
+`else
+    Vdt = 0.0;
+`endif
+
+// Temperature variables
+Tk  = Tamb + Vdt;
+
+tN  = Tk / Trk;
+Vt  = `KBdivQQ * Tk;
+Vtr = `KBdivQQ * Trk;
+VtINV = 1.0 / Vt;
+VtrINV = 1.0 / Vtr;
+VdtINV = VtINV - VtrINV;
+dT = Tk - Trk;
+
+lntN = ln(tN);
+
+// RvdT, November 2008, EB Zener tunneling model
+//        vgzeb_t = vgzebok - avgeb*Tk*Tk / (Tk + tvgeb);
+`max_logexp(vgzeb_t, vgzebok - avgeb*Tk*Tk / (Tk + tvgeb), 0.05, 0.1)
+
+// 2016. CB Zener tunneling model
+`max_logexp(vgzcb_t, vgzcbok - avgcb*Tk*Tk / (Tk + tvgcb), 0.05, 0.1)
+
+// Diffusion voltages for depletion capacitances, quasi-saturation, and Zener tunneling
+// EB vde - shared by CV and Zener
+UdeT = -3.0 * Vt * lntN + vde * tN + (1.0 - tN) * vgb;
+`max_logexp(vde_t, `VDLOW, UdeT, Vt)
+
+// CB vdc dedicated to quasi-saturation
+UdcT = -3.0 * Vt * lntN + vdc * tN + (1.0 - tN) * vgc;
+`max_logexp(vdc_t, `VDLOW, UdcT, Vt)
+
+// Qex 2019
+UdcexT = -3.0 * Vt * lntN + vdcex * tN + (1.0 - tN) * vgc;
+`max_logexp(vdcex_t, `VDLOW, UdcexT, Vt)
+
+// CB vdc dedicated to CV
+UdcT_ctc = -3.0 * Vt * lntN + vdcctc * tN + (1.0 - tN) * vgc;
+`max_logexp(vdc_ctc_t, `VDLOW, UdcT_ctc, Vt)
+
+// CB vdc dedicated to Zener tunneling
+UdcT_zener = -3.0 * Vt * lntN + Vdc_zener * tN + (1.0 - tN) * vgc;
+`max_logexp(vdc_zener_t, `VDLOW, UdcT_zener, Vt)
+
+// Knee voltage for base current high injection 2021
+UknbrT = -3.0 * Vt * lntN + vknbr * tN + (1.0 - tN) * vgknbr;
+`max_logexp(vknbr_t, `VDLOW, UknbrT, Vt)
+
+// CS
+`ifdef SUBSTRATE
+    UdsT = -3.0 * Vt * lntN + vds * tN + (1.0 - tN) * vgs;
+    `max_logexp(vds_t, `VDLOW, UdsT, Vt)
+`endif
+
+inv_vde_t = 1.0 / vde_t;
+inv_vdc_zener_t = 1.0 / vdc_zener_t;
+cje_t_div_cje = pow(vde * inv_vde_t, pe);
+cjc_t_div_cjc_zener = pow(Vdc_zener * inv_vdc_zener_t, Pc_zener);
+cje_t = cje * cje_t_div_cje;
+
+`ifdef SUBSTRATE
+    cjs_t = cjs * pow(vds / vds_t, ps);
+`endif
+
+cjc_scale = ((1.0 - xp) * pow(vdcctc / vdc_ctc_t, pc) + xp);
+cjc_scale_inv = 1.0 / cjc_scale;
+
+cjc_t = cjc * cjc_scale;
+xp_t = xp * cjc_scale_inv;
+
+// Resistances
+
+// RvdT, November 2008:
+// Instead of the following definition
+//   re_t  = re  * pow(tN, ae);
+// we use, here, and in all following powers of tN,
+// the following computationally cheaper implementation:
+re_t  = re  * exp(lntN * ae);
+if (re_t < MINR_m) begin
+    re_t = MINR_m;
+end
+// This is based on the observation that exp() is faster than pow().
+// Acknowledgement due to Geoffrey Coram.
+rbv_t = rbv * exp(lntN * (ab - aqbo));
+rbc_t = rbc * exp(lntN * aex);
+if (rbc_t < MINR_m) begin
+    rbc_t = MINR_m;
+end
+
+// RvdT, 30-11-2007: new collector resistances rcc_xx_t, rcc_ex_t, rcc_in_t
+rcc_xx_t = rcc * exp(lntN * ac);
+rcc_ex_t = rcblx * exp(lntN * acbl);
+rcc_in_t = rcbli * exp(lntN * acbl);
+
+rcv_t = rcv * exp(lntN * aepi);
+
+// Currents and voltages
+// main current non-ideality factor - forward
+if (tnff != 0.0) begin
+    nff_t_tmp = nff * (1.0 + dT * tnff);
+    `max_logexp(nff_t_tmp, nff_t_tmp, 1.0, eps_nf)
+    nff_t = nff_t_tmp - eps_nf * `LN2;
+end else begin
+    nff_t = nff;
+end
+// main current non-ideality factor - reverse
+if (tnfr != 0.0) begin
+    nfr_t_tmp = nfr * (1.0 + dT * tnfr);
+    `max_logexp(nfr_t_tmp, nfr_t_tmp, 1.0, eps_nf)
+    nfr_t = nfr_t_tmp - eps_nf * `LN2;
+end else begin
+    nfr_t = nfr;
+end
+
+// avalanche coefficient bavl
+bavl_t_tmp = bavl * (1.0 + tbavl * dT);
+`max_hyp0(bavl_t, bavl_t_tmp, eps_bavl_t)
+
+// Saturation currents for main current and diode currents, knee currents
+is_t = is * exp(lntN * (4.0 - ab - aqbo + dais) / nff_t) * exp(-vgb * VdtINV / nff_t);
+ik_t = ik * exp(lntN * (1.0 - ab));
+ikbx_t = ikbx * exp(lntN * (1.0 - acx));
+ibf_t = ibf * exp(lntN * (6.0 - 2.0 * mlf)) * exp(-vgj * VdtINV / mlf);
+ibr_t = ibr * exp(lntN * (6.0 - 2.0 * mlr)) * exp(-vgc * VdtINV / mlr);
+ibi_t = ibi * exp(lntN * (4.0 - ae + dais) / nbi) * exp(-vge * VdtINV / nbi);
+ibis_t = ibis * exp(lntN * (4.0 - ae + dais) / nbis) * exp(-vge * VdtINV / nbis);
+if (swib1 == 1) begin
+    ibinbr_t = ibinbr * exp(-vgbnbr * VdtINV / nbi);
+    ibinbrqs_t = ibinbrqs * exp(-vgbnbrqs * VdtINV);
+    ibinbrs_t = ibinbrs * exp(-vgbnbrs * VdtINV / nbis);
+end
+ibx_t = ibx * exp(lntN * (4.0 - acx + dais)) * exp(-vgcx * VdtINV);
+ibfs_t = ibfs * exp(lntN * (6.0 - 2.0 * mlfs)) * exp(-vgj * VdtINV / mlfs);
+isibrel_t = isibrel * exp(lntN * (4.0 / nfibrel)) * exp(-vgj * VdtINV / nfibrel);
+//trap-assisted tunneling
+istat_t = istat * sqrt(tN) * exp(ktat * dT);
+// begin  RvdT, November 2008, MXT504.8_alpha
+// T-scaling BE tunneling:
+//
+x = pow(vgzeb_t * inv_vgzeb_tr, -0.5);
+//   y = pow(vde_t * inv_vde, pe);
+// more efficient, because we need both y and 1.0 / y:
+y = 1.0 / cje_t_div_cje;
+// definition:
+// nzeb_t = nzeb* pow(vgzeb_t/vgzeb_tr, 1.5) * pow(vde_t / vde, pe-1);
+// more efficient implementation:
+//   nzeb_t = nzeb* vgzeb_t * vgzeb_t * x * y * vde /(vde_t*vgzeb_tr*vgzeb_tr);
+nzeb_t = nzeb* vgzeb_t * vgzeb_t * x * y * vde * inv_vde_t * inv_vgzeb_tr * inv_vgzeb_tr;
+
+// definition:
+// izeb_t = izeb* pow(vgzeb_t/vgzeb_tr, -0.5) * pow(vde_t / vde, 2-pe) * exp(nzeb-nzeb_t);
+// more efficient implementation:
+izeb_t = izeb * x * vde_t * vde_t * inv_vde * inv_vde * cje_t_div_cje * exp(nzeb - nzeb_t);
+//
+// end  RvdT, November 2008, MXT504.8_alpha
+
+// T-scaling CB tunneling:
+inv_vdc_zener_t = 1.0 / vdc_zener_t;
+xx = pow(vgzcb_t * inv_vgzcb_tr, -0.5);
+yy = 1.0 / cjc_t_div_cjc_zener;
+nzcb_t = nzcb * vgzcb_t * vgzcb_t  * xx * yy * Vdc_zener * inv_vdc_zener_t * inv_vgzcb_tr * inv_vgzcb_tr;
+izcb_t = izcb * xx * vdc_zener_t  * vdc_zener_t * inv_vdc_zener * inv_vdc_zener * cjc_t_div_cjc_zener * exp(nzcb - nzcb_t);
+
+x = exp(lntN * aqbo);
+vef_t = vef * x * cjc_scale_inv;
+//   ver_t = ver * x * pow(vde / vde_t, -pe);
+ver_t = ver * x * y;
+
+`ifdef SUBSTRATE
+    iss_t = iss * exp(lntN * (4.0 - as)) * exp(-vgs * VdtINV);
+    // New 504.9:
+    icss_t = icss * exp(lntN * (3.5 - 0.5 * asub)) * exp(-vgs * VdtINV);
+    // End New 504.9.
+
+    iks_t = iks * exp(lntN * (1.0 - as));
+    ikcs_t = ikcs * exp(lntN * (1.0 - asub));
+`endif
+
+// Transit times
+
+taue_t = taue * exp(lntN * (ab - 2.0)) * exp(-dvgte * VdtINV);
+taub_t = taub * exp(lntN * (aqbo + ab - 1.0));
+tepi_t = tepi * exp(lntN * (aepi - 1.0));
+taur_t = taur * (taub_t + tepi_t) / (taub + tepi);
+tauex_t = tauex * exp(lntN * (aepiex - 1.0));
+
+// Tscaling for taunqsqex 
+taunqsqex_t = taunqsqex * exp(lntN * (aqexnqs - 1.0));
+taunqsxqex_t = taunqsxqex * exp(lntN * (aqexnqs - 1.0));
+
+// Avalanche constant
+
+Tk300 = Tk - 300.0;
+// RvdT, 15-02-2008: prevent division by zero and overflow at high temperatures:
+if (Tk < 525.0) begin
+    Bnt = Bn * (1.0 + 7.2e-4 * Tk300 - 1.6e-6 * Tk300 * Tk300);
+end else begin
+    Bnt = Bn * 1.081;
+end
+
+// Heterojunction features
+
+deg_t = deg * exp(lntN * aqbo);
+
+`ifdef SELFHEATING
+    // Temperature scaling of the thermal resistance
+    rth_tamb = rth * pow(Tamb / Trk, ath);
+`endif
+
+// mult - scaling
+// RvdT: November 2008, EB Zener tunneling parameters
+// 2016, CB tunneling izcb
+
+// RvdT, 30-01-2007: new collector resistances:
+
+// RvdT, 03-12-2007: new collector conductances
+if (rcc > 0.0) begin
+    gcc_xx_t = 1.0 / rcc_xx_t;
+    if (gcc_xx_t > g_MINR_m) begin
+        gcc_xx_t = g_MINR_m;
+    end
+end else begin
+    gcc_xx_t = 0.0;
+end
+
+if (rcblx > 0.0) begin
+    gcc_ex_t = 1.0 / rcc_ex_t;
+    if (gcc_ex_t > g_MINR_m) begin
+        gcc_ex_t = g_MINR_m;
+    end
+end else begin
+    gcc_ex_t = 0.0;
+end
+
+if (rcbli > 0.0) begin
+    gcc_in_t = 1.0 / rcc_in_t;
+    if (gcc_in_t > g_MINR_m) begin
+        gcc_in_t = g_MINR_m;
+    end
+end else begin
+    gcc_in_t = 0.0;
+end
+
+tauxqex_t = tauxqex * exp(lntN * (aepiex - 1.0));
+// ---- end `include "tscaling.inc" ----
+// ---- begin `include "evaluate.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+// Evaluate model equations
+
+// Currents and charges
+// Nodal biases
+Vb2c1 = type * V(b2, c1);
+Vb2c2 = type * V(b2, c2);
+Vb2e1 = type * V(b2, e1);
+Vb1e1 = type * V(b1, e1);
+Vb1b2 = type * V(b1, b2);
+`ifdef SUBSTRATE
+    Vsc1  = type * V(s,  c1);
+`endif
+Vc1c2 = type * V(c1, c2);
+Vee1  = type * V(e,  e1);
+Vbb1  = type * V(b,  b1);
+Vbe   = type * V(b,  e);
+Vbc   = type * V(b,  c);
+
+// RvdT, 03-12-2007, voltage differences
+//associated with distributed parasitic collector.
+
+Vc4c1 = type * V(c4, c1);
+Vc3c4 = type * V(c3, c4);
+
+Vb1c4 = Vb1b2 + Vb2c2 - Vc1c2 - Vc4c1;
+Vcc3  = - Vbc + Vbb1 + Vb1c4 - Vc3c4;
+Vbc3  = Vbc + Vcc3;
+
+`ifdef  SUBSTRATE
+    Vsc4 = Vsc1 - Vc4c1;
+    Vsc3 = Vsc4 - Vc3c4;
+`endif
+
+
+// Exponential bias terms
+
+`expLin_lh(eVb2c2,Vb2c2 * VtINV,vexlimr,vexlim)
+`expLin_lh(eVb2e1,Vb2e1 * VtINV / nff_t,vexlimr,vexlim)
+`expLin_lh(eVb1c4,Vb1c4 * VtINV,vexlimr,vexlim)
+`expLin(eVb1b2,Vb1b2 * VtINV,vexlim)
+`expLin_lh(eVbc3,Vbc3 * VtINV,vexlimr,vexlim)
+`ifdef SUBSTRATE
+    `expLin_lh(eVsc1,Vsc1 * VtINV,vexlimr,vexlim)
+    // RvdT MXT504.10, new: eVsc3, eVsc4
+    `expLin_lh(eVsc3,Vsc3 * VtINV,vexlimr,vexlim)
+    `expLin_lh(eVsc4,Vsc4 * VtINV,vexlimr,vexlim)
+`endif
+
+`expLin(eVbc3vdc,(Vbc3 - vdc_t) * VtINV,vexlim)
+`expLin(eVb1c4vdc,(Vb1c4 - vdc_t) * VtINV,vexlim)
+`expLin(eVb2c2vdc,(Vb2c2 - vdc_t) * VtINV,vexlim)
+`expLin(eVb2c1vdc,(Vb2c1 - vdc_t) * VtINV,vexlim)
+
+// Governing equations
+
+// Epilayer model
+
+K0 = sqrt(1.0 + 4.0 * eVb2c2vdc);
+Kw = sqrt(1.0 + 4.0 * eVb2c1vdc);
+pW = 2.0 *  eVb2c1vdc / (1.0 + Kw);
+if (pW < pwlim) pW = pwlim;
+Ec = Vt * (K0 - Kw - ln((K0 + 1.0) / (Kw + 1.0)) );
+Ic1c2 =  (Ec + Vc1c2) / rcv_t;
+
+if (Ic1c2 > 0.0) begin
+    `linLog(tmpV,Vb2c1,100.0)
+    Vqs_th = vdc_t +
+             2.0 * Vt * ln(0.5 * Ic1c2 * rcv_t * VtINV + 1.0) - tmpV;
+    eps_vdc = 0.2 * vdc_t;
+    `max_hyp0(Vqs, Vqs_th, eps_vdc)
+    Iqs = Vqs * (Vqs + ihc * scrcv) / (scrcv * (Vqs + ihc * rcv_t));
+
+    Ic1c2_Iqs = Ic1c2 / Iqs;
+    `max_logexp(alpha1, Ic1c2_Iqs, 1.0, axi)
+    alpha = alpha1 / (1.0 + axi * ln(1.0 + exp(-1.0 / axi)));
+    vyi = Vqs / (ihc * scrcv);
+    yi = (1.0 + sqrt(1.0 + 4.0 * alpha * vyi * (1.0 + vyi))) /
+         (2.0 * alpha * (1.0 + vyi));
+
+    //xi_w = 1.0 - yi / (1.0 + pW * yi);
+    /* Niu 5/23/2015, fixes numerical discontinuity at forward/reverse transition,
+    see "Epi layer model improvement of smoothness at I=0" */
+    xi_w = (1.0 - yi + pW * yi) / (1.0 + pW * yi);
+    gp0 = 0.5 * Ic1c2 * rcv_t * xi_w * VtINV;
+
+    gp0_help = 2.0 * gp0 + pW * (pW + gp0 + 1.0);
+    gp02 = 0.5 * (gp0 - 1.0);
+    sqr_arg = gp02 * gp02 + gp0_help;
+    if (gp0 >= 1.0) begin
+        p0star = gp02 + sqrt(sqr_arg);
+    end else begin
+        p0star = gp0_help / (sqrt(sqr_arg) - gp02);
+    end
+    if (p0star < p0starlim) begin
+        p0star = p0starlim;
+    end
+
+    eVb2c2star = p0star * (p0star + 1.0) * exp(vdc_t * VtINV);
+    B1 = 0.5 * scrcv * (Ic1c2 - ihc);
+    B2 = scrcv * rcv_t * ihc * Ic1c2;
+    Vxi0 = B1 + sqrt(B1 * B1 + B2);
+
+    if (swvchc == 0) begin
+        Vch = vdc_ctc_t * 0.1;
+    end else begin
+        Vch = vdc_ctc_t * (0.1 + 2.0 * Ic1c2 / (Ic1c2 + Iqs));
+    end
+    Icap = ihc * Ic1c2 / (ihc + Ic1c2);
+    Icap_ihc = ihc / (ihc + Ic1c2);
+end else begin
+    Iqs = 0.0;
+    p0star = 2.0 * eVb2c2vdc / (1.0 + K0);
+    eVb2c2star = eVb2c2;
+
+    if ((abs(Vc1c2) < 1.0e-5 * Vt) ||
+        (abs(Ec) < `TEN_M40 * Vt * (K0 + Kw))) begin
+        pav = 0.5 * (p0star + pW);
+        xi_w = pav / (pav + 1.0);
+    end else begin
+        xi_w = Ec / (Ec + Vb2c2 - Vb2c1);
+    end
+
+    Vxi0 = Vc1c2;
+    Vch = 0.1 * vdc_ctc_t;
+    Icap = Ic1c2;
+    Icap_ihc = 1.0 - Icap / ihc;
+end
+
+// Effective EB junction capacitance bias
+
+Vfe = vde_t * (1.0 - pow(`AJE , -1.0 / pe));
+a_vde = 0.1 * vde_t;
+`min_logexp(Vje, Vb2e1, Vfe, a_vde)
+
+// RvdT, November 2008, E0EB to be re-used in EB- Zener tunnel model:
+E0EB = pow(1.0 - Vje * inv_vde_t, 1.0 - pe);
+Vte = vde_t / (1.0 - pe) * (1.0 - E0EB) +
+      `AJE * (Vb2e1 - Vje);
+
+// Effective CB junction capacitance bias switch
+if (swvjunc == 1) begin
+    // ignore epi layer voltage drop
+    Vjunc = Vb2c1;
+end else if (swvjunc == 2) begin
+    // 504, using resistance at xi=0
+    Vjunc = Vb2c1 + Vxi0;
+end else begin
+    // default
+    Vjunc = Vb2c2;
+end
+
+bjc = (`AJC - xp_t) / (1.0 - xp_t);
+Vfc = vdc_ctc_t * (1.0 - pow(bjc, -1.0 / pc));
+`min_logexp(Vjc, Vjunc, Vfc, Vch)
+fI = pow(Icap_ihc, mc);
+Vcv = vdc_ctc_t / (1.0 - pc) * (1.0 - fI * pow(1.0 - Vjc / vdc_ctc_t, 1.0 - pc)) +
+      fI * bjc * (Vjunc - Vjc);
+Vtc = (1.0 - xp_t) * Vcv + xp_t * Vb2c1;
+
+// Transfer current
+
+If0 = 4.0 * is_t / ik_t;
+// nff effect included in eVb2e1 definition,
+// necessary to keep Qbe/If ratio at transit time,
+// so that the effective transit time is not affected
+// by addition of nff
+f1 =  If0 * eVb2e1;
+n0 =  f1 / (1.0 + sqrt(1.0 + f1));
+
+// nfr effect on diffusion charge included here
+eVb2c2star_nfr = pow(eVb2c2star, 1.0 / nfr_t);
+f2 =  If0 * eVb2c2star_nfr;
+nB =  f2 / (1.0 + sqrt(1.0 + f2));
+
+if (deg == 0.0) begin
+    q0I = 1.0 + Vte / ver_t + Vtc / vef_t;
+end else begin
+    termE = (Vte / ver_t + 1.0) * deg_t * VtINV;
+    termC = -Vtc / vef_t * deg_t * VtINV;
+    q0I = (exp(termE) - exp(termC)) /
+          (exp(deg_t * VtINV) - 1.0);
+end
+`max_hyp0(q1I, q0I, 0.1)
+qBI = q1I * (1.0 + 0.5 * (n0 + nB));
+
+Ir = issr * is_t * eVb2c2star_nfr;
+If = is_t * eVb2e1;
+In = (If - Ir) / qBI;
+
+//BTBT and TAT base current
+`max_logexp(tmpExp, Vb2e1, 0.0,0.0001)
+tmpExp1 = tmpExp / vtat;
+`expLin(tmpExp2, tmpExp1, vexlim)
+//trap-assisted tunneling current
+Itat = istat_t * (tmpExp2 - 1.0);
+//tunneling current
+`min_logexp(tmpExp3, Vb2e1, vbtbt, 0.001)
+Ibtbt = kbtbt * tmpExp3 * pow(vbtbt - tmpExp3, 2.0);
+
+// Base and substrate current(s)
+`expLin(tmpExp, Vb2e1 * VtINV / nbi, vexlim)
+if (swib1 == 1) begin
+    `expLin(tmpExp1, (Vb2e1 - vknbr_t) * VtINV, vexlim)
+    `expLin(tmpExp2, (In / is_t - 1.0e3), 40.0)
+    Ib1 = ibi_t * (tmpExp - 1.0) +
+          ibinbr_t * 2.0 * (tmpExp - 1.0) / (1.0 + sqrt(1.0 + 4.0 * tmpExp1)) * (1.0 + Vtc / vef_t) +
+          ibinbrqs_t * (eVb2c2star - 1.0) * tmpExp2 / (1.0 + tmpExp2);
+end else begin
+    if (xrec == 0.0) begin
+        Ib1 = ibi_t * (tmpExp - 1.0);
+    end else begin
+        Ib1 = ibi_t * ((1.0 - xrec) * (tmpExp - 1.0) +
+              xrec * (tmpExp + eVb2c2star - 2.0) * (1.0 + Vtc / vef_t));
+    end
+end
+
+`expLin(tmpExp,Vb1e1 * VtINV / nbis,vexlim)
+if (swib1 == 1) begin
+    `expLin(tmpExp1, (Vb1e1 - vknbr_t) * VtINV, vexlim)
+    Ib1_s = ibis_t * (tmpExp - 1.0) +
+            ibinbrs_t * 2.0 * (tmpExp - 1.0) / (1.0 + sqrt(1.0 + 4.0 * tmpExp1));
+end else begin
+    Ib1_s = ibis_t * (tmpExp - 1.0);
+end
+
+`expLin(tmpExp,Vb2e1 * VtINV / mlf,vexlim)
+Ib2 = ibf_t * (tmpExp - 1.0);
+`expLin(tmpExp,Vb1e1 * VtINV / mlfs,vexlim)
+Ib2_s = ibfs_t * (tmpExp - 1.0);
+`expLin(tmpExp,Vb1c4 * VtINV / mlr,vexlim)
+Ib3 = ibr_t * (tmpExp - 1.0);
+`expLin(tmpExp,Vb1e1 * VtINV / nfibrel,vexlim)
+Ibrel = isibrel_t * (tmpExp - 1.0);
+
+// begin  RvdT, November 2008, MXT504.8_alpha
+
+// Base-emitter tunneling current
+// max E-field E0BE calculated in BE depletion charge model:
+
+if ((izeb > 0.0) && (nzeb > 0.0) && (Vb2e1 < 0.0)) begin
+    `expLin(expnzeb, nzeb_t * (1.0 - (pow2_2m_pe / (2.0 * E0EB))),vexlim)
+    // Force all derivatives at Vb2e1=0 to zero by using in dzeb a
+    // modified dE0EB expression for E0EB:
+    x = Vb2e1 * inv_vde_t;
+    dE0EB = pow(sqrt(x * x + 1.0e-30), -2.0 - pe) *
+            (pe * (1.0 - pe * pe - 3.0 * x * (pe - 1.0)) -
+            6.0 * x * x * (pe - 1.0 + x)) *
+            `one_sixth;
+    x = Vb2e1 * pow2_2m_pe * nzeb_t / (vgzeb_t * dE0EB);
+    if (x < -0.001) begin
+        `expLin(e_dzeb, x, vexlim)
+        dzeb = -Vb2e1 * (1.0 + (1.0 - e_dzeb) / x);
+    end else begin
+        dzeb = Vb2e1 * 0.5 * x * (1.0 + (x * `one_third) * (1.0 + 0.25 * x));
+    end
+    Izteb = 2.0 * izeb_t * dzeb * E0EB * expnzeb * inv_vde_t * pow2_pe_m2;
+end else begin
+    dzeb  = 0.0;
+    Izteb = 0.0;
+end
+
+// end  RvdT, November 2008, MXT504.8_alpha
+
+// 505. Collector-base tunneling current
+// max E-field E0CB calculated from CB capacitance using dedicated Vdc_zener and Pc_zener:
+
+if ((izcb > 0.0) && (nzcb > 0.0) && (Vb2c1 < 0.0)) begin
+    E0CB = pow(1.0 - Vb2c1 * inv_vdc_zener_t, 1.0 - Pc_zener);
+    `expLin(expnzcb, nzcb_t * (1.0 - (pow2_2m_pc / (2.0 * E0CB))),vexlim)
+    xx = Vb2c1 * inv_vdc_zener_t;
+    dE0CB = pow(sqrt(xx * xx + 1.0e-30), -2.0 - Pc_zener) *
+            (Pc_zener * (1.0 - Pc_zener * Pc_zener - 3.0 * xx * (Pc_zener - 1.0)) -
+            6.0 * xx * xx * (Pc_zener - 1.0 + xx)) *
+            `one_sixth;
+    xx = Vb2c1 * pow2_2m_pc * nzcb_t / (vgzcb_t * dE0CB);
+    if (xx < -0.001) begin
+        `expLin(e_dzcb, xx, vexlim)
+        dzcb = -Vb2c1 * (1.0 + (1.0 - e_dzcb) / xx);
+    end else begin
+        dzcb = Vb2c1 * 0.5 * xx * (1.0 + (xx * `one_third) * (1.0 + 0.25 * xx));
+    end
+    Iztcb = 2.0 * izcb_t * dzcb * E0CB * expnzcb * inv_vdc_zener_t * pow2_pc_m2;
+end else begin
+    dzcb  = 0.0;
+    Iztcb = 0.0;
+end
+
+// Iex, Isub (XIex, XIsub)
+g1 = If0 * eVb1c4;
+g2 = 4.0 * eVb1c4vdc;
+
+// nBex until and including MXT 504.9:
+//     nBex = g1 / (1.0 + sqrt(1.0 + g1));
+// nBex since MXT 504.10.1: Ackn. Jos Peters, Geoffrey Coram
+nBex = (g1 - If0) / (1.0 + sqrt(1.0 + g1));
+pWex = g2 / (1.0 + sqrt(1.0 + g2));
+/* Iex until and including MXT 504.9:
+    Iex = (1.0 / BRI_T) * (0.5 * ik_t * nBex - is_t);
+*/
+
+// Iex since MXT 505.0 - hole injection from p+ extrinsic base into n-epi
+Iex = 2.0 * ibx_t * (eVb1c4 - 1.0) / (1.0 + sqrt(1.0 + 4.0 * ibx_t / ikbx_t * eVb1c4));
+
+`ifdef SUBSTRATE
+    // RvdT MXT504.10, new term: eVsc4
+    if (exsub == 1) begin
+        Isub_int = xisubi * 2.0 * iss_t * (eVb2c2 - eVsc1) /
+                   (1.0 + sqrt(1.0 + 4.0 * (iss_t / iks_t) * (eVb2c2 + swvsch * eVsc1)));
+        Isub = (1.0 - xisubi) * 2.0 * iss_t * (eVb1c4 - eVsc4) /
+               (1.0 + sqrt(1.0 + 4.0 * (iss_t / iks_t) * (eVb1c4 + swvsch * eVsc4)));
+    end else begin
+        Isub_int = xisubi * 2.0 * iss_t * (eVb2c2 - 1.0) /
+                   (1.0 + sqrt(1.0 + 4.0 * (iss_t / iks_t) * eVb2c2));
+        Isub = (1.0 - xisubi) * 2.0 * iss_t * (eVb1c4 - 1.0) /
+               (1.0 + sqrt(1.0 + 4.0 * (iss_t / iks_t) * eVb1c4));
+    end
+
+    Isf = 2.0 * icss_t * (eVsc1 - 1.0) /
+          (1.0 + sqrt(1.0 + swvsch * 4.0 * (icss_t / ikcs_t) * eVsc1)) + Vsc1 * GMIN_cs;
+`endif
+
+`ifdef SUBSTRATE
+    XIsub = 0.0;
+`endif
+
+/* beginof RvdT, Q4 2012, Mextram 504.11: added exmod=2 option:     */
+if ((exmod > 0.0) && (xext > 0.0)) begin
+    Iex = Iex *  Xext1;
+
+    `ifdef SUBSTRATE
+        Isub = Isub * Xext1;
+    `endif
+
+    /* XIMex until and including MXT 504.9:
+         XIMex = xext * (0.5 * ik_t * XnBex - is_t) / BRI_T;
+    */
+    // XIMex 505.0.0:
+    XIMex = xext * 2.0 * ibx_t * (eVbc3 - 1.0) / (1.0 + sqrt(1.0 + 4.0 * ibx_t / ikbx_t * eVbc3));
+
+    `ifdef SUBSTRATE
+        // RvdT MXT504.10, new term: eVsc3
+        if (exsub == 1) begin
+            XIMsub = (1.0 - xisubi) * xext * 2.0 * iss_t * (eVbc3 - eVsc3) /
+                     (1.0 + sqrt(1.0 + 4.0 * iss_t / iks_t * (eVbc3 + swvsch * eVsc3)));
+        end else begin
+            XIMsub = (1.0 - xisubi) * xext * 2.0 * iss_t * (eVbc3 - 1.0) /
+                     (1.0 + sqrt(1.0 + 4.0 * iss_t / iks_t * eVbc3));
+        end
+    `else
+        XIMsub = 0.0;
+    `endif
+
+    if (exmod == 1) begin
+        `ifdef SUBSTRATE
+            Vex_bias = xext * (ibx_t + iss_t) * rcc_xx_t;
+        `else
+            Vex_bias = xext * ibx_t * rcc_xx_t;
+        `endif
+        Vex  = Vt * (2.0 - ln( Vex_bias * VtINV ));
+        vdif = Vbc3 - Vex;
+        `max_hyp0(VBex, vdif, 0.11)
+        Fex  = VBex /(Vex_bias + (XIMex + XIMsub) * rcc_xx_t + VBex);
+    end else begin
+        Vex  = 0.0;
+        vdif = 0.0;
+        VBex = 0.0;
+        Fex  = 1.0;
+    end
+
+    /* endof: RvdT, Q4, 2012, Mextram 504.11: added exmod=2 option:     */
+
+    XIex = Fex * XIMex;
+
+    `ifdef SUBSTRATE
+        XIsub = Fex * XIMsub;
+    `endif
+end
+
+// Breakdown of CB junction
+if (swjbrcb == 1) begin
+    Vb1c1 = Vb1b2 + Vb2c1;
+    `max_hyp0(Vcbeff, -1.0 * Vb1c1, 1e-6)
+    f_stop = 1.0 / (1.0 - pow(alpha_brcb, pbrcb));
+    Vcbr_stop = alpha_brcb * vbrcb;
+    dfbrcb = f_stop * f_stop * pow(alpha_brcb, pbrcb - 1.0) * pbrcb / vbrcb;
+    if (Vcbeff < Vcbr_stop) begin
+        fbrcb = 1.0 / (1.0 - pow(Vcbeff / vbrcb, pbrcb));
+    end else begin
+        fbrcb = f_stop + (Vcbeff - Vcbr_stop) * dfbrcb;
+    end
+end else begin
+    fbrcb = 1.0;
+end
+Iztcb = Iztcb * fbrcb;
+Iex = Iex * fbrcb;
+Ib3 = Ib3 * fbrcb;
+XIex = XIex * fbrcb;
+
+// Variable base resistance
+q0Q = 1.0 + Vte / ver_t + Vtc / vef_t;
+`max_hyp0(q1Q, q0Q, 0.1)
+qBQ = q1Q * (1.0 + 0.5 * (n0 + nB));
+
+// Variable base resistance clipping
+Rbvtemp = rbv_t / qBQ;
+if (Rbvtemp < MINR_m) begin
+    Rbvtemp = MINR_m;
+end
+Rb2 = 3.0 * Rbvtemp;
+Ib1b2 =  (2.0 * Vt * (eVb1b2 - 1.0) + Vb1b2) / Rb2;
+
+// Avalanche factor and avalanche current
+if (In > 0.0) begin
+    if (swavl == 1) begin
+        if (Vb2c1 < vdcavl) begin
+            `expLin(expIn,-In / itoavl,vexlim)
+            vl = (vdcavl - Vb2c1) * expIn;
+            `expLin(expMm1,-bavl_t * pow(vl, cavl),vexlim)
+            Gem = aavl / bavl_t * vl * expMm1;
+        end
+    end else if (swavl == 2) begin
+        if (Vb2c1 < vdc_t) begin
+            dEdx0 = 2.0 * vavl / (wavl * wavl);
+            sqr_arg = (vdc_t - Vb2c1) / Icap_ihc;
+            xd = sqrt(2.0 * sqr_arg / dEdx0);
+            if (exavl == 0) begin
+                Weff = wavl;
+            end else begin
+                xi_w1 = 1.0 - 0.5 * xi_w;
+                Weff = wavl * xi_w1 * xi_w1;
+            end
+            Wd = xd * Weff / sqrt(xd * xd + Weff * Weff);
+            Eav = (vdc_t - Vb2c1) / Wd;
+            E0 = Eav + 0.5 * Wd * dEdx0 * Icap_ihc;
+
+            if (exavl == 0) begin
+                Em = E0;
+            end else begin
+                SHw = 1.0 + 2.0 * sfh * (1.0 + 2.0 * xi_w);
+                Efi = (1.0 + sfh) / (1.0 + 2.0 * sfh);
+                Ew = Eav - 0.5 * Wd * dEdx0 * (Efi - In / (ihc * SHw));
+                sqr_arg = (Ew - E0) * (Ew - E0) + 0.1 * Eav * Eav * Icap / ihc;
+                Em = 0.5 * (Ew + E0 + sqrt(sqr_arg));
+            end
+
+            EmEav_Em = (Em - Eav) / Em;
+            if (abs(EmEav_Em) > `TEN_M07) begin
+                lambda = 0.5 * Wd / EmEav_Em;
+                Gem = An / Bnt * Em * lambda *
+                      (exp(-Bnt / Em) - exp(-Bnt / Em * (1.0 + Weff / lambda)) );
+            end else begin
+                Gem = An * Weff * exp(-Bnt / Em);
+            end
+        end
+    end else if (swavl == 3) begin
+        if (Vb2c1 < vdcavl) begin
+            Vdeptmp = pow((vdcavl - Vb2c1), cavl) *  pow((1 - In/(ihcavl+In)), davl);
+            if (exavl == 0) begin
+                Vdep = Vdeptmp;
+            end else begin
+                In_shift_ihcavl = (In-ionexavl) / ihcavl;
+                `max_logexp(In_shift_n, In_shift_ihcavl, 1.0, aexavl)
+                Vdep = Vdeptmp * pow(In_shift_n,eavl);
+            end
+            `expLin(expMm1,-bavl_t * Vdep,vexlim)
+            Gem = aavl / bavl_t * (vdcavl - Vb2c1) * expMm1;
+        end
+    end
+    if (Gem > 0.0) begin
+        if (swgemlim == 1) begin
+            Gmax = Vt / (In * (rbc_t + Rb2) + 0.1 * Vt) + qBI / is_t * ibi_t +
+                   re_t / (rbc_t + Rb2);
+            if (swavl == 3) begin
+                `min_logexp(Gem, Gem, Gmax, 1e-6)
+                Iavl = In * Gem;
+            end else begin
+                Iavl = In * Gem* Gmax / (Gem + Gmax);
+            end
+        end else begin
+            Iavl = In * Gem;
+        end
+    end
+end
+if (Ic1c2 > iclimvbcstar) begin
+    Vb2c2star = Vt * ln(eVb2c2star);
+end else begin
+    Vb2c2star = Vb2c2;
+end
+
+`ifdef SELFHEATING
+    // Power dissipation
+    // RvdT 03-12-2007, modified power equation due to distribution collector resistance
+    if (swib1 == 1) begin
+        Vztcb = Vb2c1;
+    end else begin
+        Vztcb = Vb2c2;
+    end
+    power =  In * (Vb2e1 - Vb2c2star) +
+             Ic1c2 * (Vb2c2star - Vb2c1) -
+             Iavl  * Vb2c2star +
+             Vee1  * Vee1  / re_t +
+             Vcc3  * Vcc3  * gcc_xx_t +
+             Vc3c4 * Vc3c4 * gcc_ex_t +
+             Vc4c1 * Vc4c1 * gcc_in_t +
+             Vbb1  * Vbb1  / rbc_t +
+             Ib1b2 * Vb1b2 +
+             // 504.8: Nov. 2008, RvdT, TU_Delft: Zener current contribution added:
+             // Izteb > 0 for Vb2e1 < 0, hence the minus sign:
+             (Ib1 + Ib2 + GMIN * Vb2e1 - Izteb + Ibtbt + Itat) * Vb2e1 - Iztcb * Vztcb +
+             (Ib1_s + Ib2_s + Ibrel) * Vb1e1 +
+    `ifdef SUBSTRATE
+        (Iex + Ib3 + GMIN * Vb1c4) * Vb1c4 + XIex  * Vbc3 +
+        Isub * (Vb1c4 - Vsc4) +
+        // Vb2s = Vb2c2 - Vsc2 = Vb2c1 - Vsc1 to avoid defining Vsc2
+        Isub_int * (Vb2c1 - Vsc1) +
+        XIsub * (Vbc3 - Vsc3) +
+        Isf * Vsc1;
+    `else
+        (Iex + Ib3 + GMIN * Vb1c4) * Vb1c4 + XIex * Vbc3;
+    `endif
+`endif
+
+// Charges
+Qte = (1.0 - xcje) * cje_t * Vte;
+`min_logexp(Vje_s, Vb1e1, Vfe, a_vde)
+Qte_s = xcje * cje_t * (vde_t / (1.0 - pe) *
+        (1.0 - pow(1.0 - Vje_s * inv_vde_t, 1.0 - pe)) +
+        `AJE * (Vb1e1 - Vje_s));
+
+Qtc = xcjc * cjc_t * Vtc;
+Qb0 = taub_t * ik_t;
+Qbe_qs = 0.5 * Qb0 * n0 * q1Q;
+Qbc_qs = 0.5 * Qb0 * nB * q1Q;
+
+a_vdcctc = 0.1 * vdc_ctc_t;
+`min_logexp(Vjcex, Vb1c4, Vfc, a_vdcctc)
+Vtexv = vdc_ctc_t / (1.0 - pc) * (1.0 - pow(1.0 - Vjcex / vdc_ctc_t, 1.0 - pc)) +
+        bjc * (Vb1c4 - Vjcex);
+Qtex = cjc_t * ((1.0 - xp_t) * Vtexv + xp_t * Vb1c4) *
+       (1.0 - xcjc) * (1.0 - xext);
+
+`min_logexp(XVjcex, Vbc3, Vfc, a_vdcctc)
+XVtexv = vdc_ctc_t / (1.0 - pc) * (1.0 - pow(1.0 - XVjcex / vdc_ctc_t, 1.0 - pc)) +
+         bjc * (Vbc3 - XVjcex);
+XQtex = cjc_t * ((1.0 - xp_t) * XVtexv + xp_t * Vbc3) *
+        (1.0 - xcjc) * xext;
+
+`ifdef SUBSTRATE
+    a_vds = 0.1 * vds_t;
+    Vfs = vds_t * (1.0 - pow(`AJS , -1.0 / ps));
+    `min_logexp(Vjs, Vsc1, Vfs, a_vds)
+    Qts = cjs_t * (vds_t / (1.0 - ps) *
+          (1.0 - pow(1.0 - Vjs / vds_t, 1.0 - ps)) +  `AJS * (Vsc1 - Vjs));
+`endif
+
+Qe0 = taue_t * ik_t * pow(is_t / ik_t, 1.0 / mtau);
+`expLin(tmpExp, Vb2e1 / (mtau * Vt), vexlim)
+
+// Niu Q2, 2016, for fixing reverse VBE noise when ke=1, kc=1,
+// Previous Qe_qs causes unphysically large noise correlation time constant tau_n
+Qe_qs = Qe0 * tmpExp;
+
+Qepi0 = 4.0 * tepi_t * Vt / rcv_t;
+Qepi = 0.5 * Qepi0 * xi_w * (p0star + pW + 2.0);
+
+if (swqex == 0) begin
+    Qex = taur_t * 0.5 * (Qb0 * nBex + Qepi0 * pWex) / (taub_t + tepi_t);
+end else begin
+    `expLin(eVb1c4vdcex,(Vb1c4 - vdcex_t)/ nex * VtINV,vexlim)
+    Qex = 2.0 * ibx_t * tauex_t * eVb1c4 / (1.0 + sqrt(1.0 + 4.0 * eVb1c4vdcex));
+end
+
+if (((exmod == 1) || (exmod == 3)) && (xext > 0.0)) begin
+    Qex = Qex * Xext1;
+    if (swqex == 0) begin
+        Xg1 = If0 * eVbc3;
+        // XnBex until and including MXT 504.9:
+        //       XnBex = Xg1 / (1.0 + sqrt(1.0 + Xg1));
+        // XnBex in MXT 504.10.1: Ackn. Jos Peters, Geoffrey Coram:
+        XnBex = (Xg1 - If0) / (1.0 + sqrt(1.0 + Xg1));
+        Xg2 = 4.0 * eVbc3vdc;
+        XpWex = Xg2 / (1.0 + sqrt(1.0 + Xg2));
+        XQMex = 0.5 * xext * taur_t *
+                (Qb0 * XnBex + Qepi0 * XpWex) / (taub_t + tepi_t);
+    end else begin
+        `expLin(eVbc3vdcex,(Vbc3 - vdcex_t) * VtINV,vexlim)
+        XQMex = 2.0 * xext * ibx_t *
+                tauex_t * eVbc3 / (1.0 + sqrt(1.0 + 4.0 * eVbc3vdcex));
+    end
+    XQex = Fex * XQMex;
+end
+
+if (exmod == 4) begin
+    // exmod=4: NQS first-order lag applied to both Qex and XQex.
+    // Qex uses the tauex-based (swqex=1) form, overriding whatever
+    // lines 573-578 produced for the user's swqex setting.
+    // XQex uses the new tauxqex-based form when xext > 0, and 0
+    // otherwise (no extrinsic partition means no extrinsic charge).
+    `expLin(eVb1c4vdcex,(Vb1c4 - vdcex_t) / nex * VtINV,vexlim)
+    Qex = 2.0 * Xext1 * ibx_t * tauex_t * eVb1c4 / (1.0 + sqrt(1.0 + 4.0 * eVb1c4vdcex));
+
+    if (xext > 0.0) begin
+        `expLin(eVbc3vdcex,(Vbc3 - vdcex_t) * VtINV,vexlim)
+        XQex = 2.0 * xext * ibx_t * tauxqex_t * eVbc3 / (1.0 + sqrt(1.0 + 4.0 * eVbc3vdcex));
+    end else begin
+        XQex = 0.0;
+    end
+
+    Qex_qs = Qex;
+    XQex_qs = XQex;
+
+    Qex_nqs = V(nqs1);
+    XQex_nqs = V(nqs2);
+
+    I(nqs1) <+ taunqsqex_t * ddt(Qex_nqs) + Qex_nqs - Qex_qs;
+    I(nqs2) <+ taunqsxqex_t * ddt(XQex_nqs) + XQex_nqs - XQex_qs;
+
+    Qex = Qex_nqs;
+    XQex = XQex_nqs;
+end else begin
+    // nqs1, nqs2 are declared in all four wrappers so the exmod=4
+    // path compiles regardless of which wrapper is instantiated.
+    // For exmod != 4 (the default 505.5.0-compatible case), the
+    // nqs nodes have no current contributions; anchor them to
+    // ground here so the MNA matrix stays non-singular and the
+    // legacy physics is bit-identical to 505.5.0.
+    V(nqs1) <+ 0.0;
+    V(nqs2) <+ 0.0;
+end
+
+if (exphi == 1) begin
+    dVteVje = pow(1.0 - Vje * inv_vde_t, -pe) - `AJE;
+    Vb2e1Vfe = (Vb2e1 - Vfe) / a_vde;
+    if (Vb2e1Vfe < 0.0) begin
+        dVjeVb2e1 = 1.0 / (1.0 + exp(Vb2e1Vfe));
+    end else begin
+        dVjeVb2e1 = exp(- Vb2e1Vfe) / (1.0 + exp(- Vb2e1Vfe));
+    end
+
+    dVteVb2e1 = dVteVje * dVjeVb2e1 + `AJE;
+    dQteVb2e1 = (1.0 - xcje) * cje_t * dVteVb2e1;
+
+    // nff needs to be in diffusion capacitance too
+    // Note that eVb2e1 includes nff_t
+    dn0Vb2e1 = If0 * eVb2e1 * VtINV / nff_t * (0.5 / sqrt(1.0 + f1));
+    dQbeVb2e1 = 0.5 * Qb0 * q1Q * dn0Vb2e1;
+
+    // Niu, Q2 2016. Modified to fix reverse VBE noise problem.
+    dQeVb2e1 = Qe_qs / (mtau * Vt);
+
+    Qb1b2 = 0.2 * Vb1b2 * (dQteVb2e1 + dQbeVb2e1 + dQeVb2e1);
+
+    Qe = (1.0 - ke) * Qe_qs;
+    Qbe_qs_eff = Qbe_qs + ke * Qe_qs;
+    Qbc = xqb * Qbe_qs_eff + Qbc_qs;
+    Qbe = (1.0 - xqb) * Qbe_qs_eff;
+end else begin
+    Qbe = Qbe_qs;
+    Qbc = Qbc_qs;
+    Qe = Qe_qs;
+end
+
+// Add branch current contributions
+
+// Static currents
+I(c1, c2) <+ type * Ic1c2 * mult;
+I(c2, e1) <+ type * In * mult;
+I(b1, e1) <+ type * (Ib1_s + Ib2_s + Ibrel) * mult;
+// begin  RvdT, 28-10-2008, MXT504.8_alpha
+// contribution tunnel current added
+I(b2, e1) <+ type * (Ib1 + Ib2 + GMIN * Vb2e1 - Izteb + Ibtbt + Itat) * mult;
+
+// CB tunneling current
+if (swib1 == 1) begin
+    I(b2, c1) <+ type * (-Iztcb) * mult;
+end else begin
+    I(b2, c2) <+ type * (-Iztcb) * mult;
+end
+
+`ifdef SUBSTRATE
+    I(b1, s)  <+ type * Isub * mult;
+    I(b2, s)  <+ type * Isub_int * mult;
+    I(b,  s)  <+ type * XIsub * mult;
+    I(s,  c1) <+ type * Isf * mult;
+`endif
+I(b1, b2) <+ type * Ib1b2 * mult;
+I(b2, c2) <+ type * (-1.0 * Iavl) * mult;
+I(e, e1) <+ type * Vee1 / re_t * mult;
+I(b, b1) <+ type * Vbb1 / rbc_t * mult;
+
+`ifdef SELFHEATING
+    // Electrical equivalent for the thermal network
+    I_cth = ddt(cth * Temp(dt)) * mult;
+    one_minus_ath = 1.0 - ath;
+    if (rth > MINR_m) begin
+        if (swnlsh==0) begin
+            // Linear self-heating
+            P_rth = Temp(dt) / rth_tamb * mult;
+        end else begin
+            // Nonlinear self-heating
+            if (abs(one_minus_ath) < `epsilon_ath) begin
+                P_rth = Tamb / rth_tamb * mult * ln(1.0 + Temp(dt) / Tamb);
+            end else begin
+                P_rth = Tamb / (one_minus_ath * rth_tamb) * mult * (pow(1.0 + Temp(dt) / Tamb, one_minus_ath) - 1.0);
+            end
+        end
+    end else begin
+        P_rth = Temp(dt) / MINR;
+    end
+    Pwr(dt) <+ P_rth;
+    Pwr(dt) <+ I_cth;
+    Pwr(dt) <+ -1.0 * power * mult;
+`endif
+
+
+// Dynamic currents
+I(b2, e1) <+ ddt(type * (Qte + Qbe + Qe)) * mult;
+I(b1, e1) <+ ddt(type * (Qte_s)) * mult;
+I(b2, c2) <+ ddt(type * (Qtc + Qbc + Qepi)) * mult;
+`ifdef SUBSTRATE
+    I(s,  c1) <+ ddt(type * Qts) * mult;
+`endif
+I(b1, b2) <+ ddt(type * Qb1b2) * mult;
+I(b,   e) <+ ddt(type * cbeo * Vbe) * mult;
+I(b,   c) <+ ddt(type * cbco * Vbc) * mult;
+
+I(b,  c3) <+ type * XIex * mult;
+I(c,  c3) <+ type * Vcc3 * gcc_xx_t * mult;
+I(b,  c3) <+ ddt(type * (XQtex + XQex)) * mult;
+I(b1, c4) <+ type * (Ib3 + GMIN * Vb1c4 + Iex) * mult;
+I(b1, c4) <+ ddt(type * (Qtex + Qex)) * mult;
+
+if (rcblx > 0.0) begin
+    I(c3, c4) <+ type * Vc3c4 * gcc_ex_t * mult;
+end else begin
+    V(c3, c4) <+ 0.0;
+end
+if (rcbli > 0.0) begin
+    I(c4, c1) <+ type * Vc4c1 * gcc_in_t * mult;
+end else begin
+    V(c4, c1) <+ 0.0;
+end
+
+// ---- end `include "evaluate.inc" ----
+// ---- begin `include "noise.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+// Noise sources
+// Thermal noise
+common = 4.0 * `KB * Tk;
+power_rec = common / re_t;  // Emitter resistance
+power_rbc = common / rbc_t; // Constant Base resistance
+power_rcc_xx = common * gcc_xx_t; // Collector resistance
+power_rcc_ex = common * gcc_ex_t; // Collector resistance
+power_rcc_in = common * gcc_in_t; // Collector resistance
+power_rbv = common / Rb2 * (4.0 * eVb1b2 + 5.0) * `one_third; // Variable base resistance
+
+// Main current shot noise
+In_N = (If + Ir) / qBI;
+powerCCS = 2.0 * `QQ * abs(In_N);
+
+// Weak-avalanche current shot noise
+if (kavl > 0) begin
+    Gem_N = abs(Iavl / In_N);
+end else begin
+    Gem_N = 0.0;
+end
+
+powerIIS = 2.0 * `QQ * Iavl * (Gem_N + 1.0);
+
+// Transit time for noise
+if (In_N > 0.0) begin
+    Taub_N = (Qbe + Qbc) / In_N;
+end else begin
+    Taub_N = taub_t * q1Q * qBI;
+end
+
+// RF correlation noise model switch
+if (kc == 1) begin
+    // use charge partition for noise transit time
+    taun = xqb * Taub_N;
+end else if (kc == 2) begin
+    // use fraction of transit time for noise transit time
+    taun = ftaun * Taub_N;
+end else begin
+    // kc == 0, no correlation noise
+    taun = 0.0;
+end
+
+// Forward base current shot noise
+powerFBCS = 2.0 * `QQ * abs(Ib1 + Ib2 - Izteb + Ibtbt + Itat);
+
+// Ideal forward base current 1/f noise
+Ib_fwd_ideal_tot = Ib1 + Ib1_s;
+powerFBC1f = kf * pow(abs(Ib_fwd_ideal_tot), af);
+if (Ib_fwd_ideal_tot < 0) begin
+    powerFBC1f = -powerFBC1f;
+end
+
+// Non-ideal forward base current 1/f noise
+Ib_fwd_non_ideal_tot = Ib2 + Ib2_s + Ibrel;
+powerNFBC1f = kfn * pow(abs(Ib_fwd_non_ideal_tot), afn);
+if (Ib_fwd_non_ideal_tot < 0) begin
+    powerNFBC1f = -powerNFBC1f;
+end
+
+// Emitter-base sidewall current shot
+powerEBSCS = 2.0 * `QQ * abs(Ib1_s + Ib2_s + Ibrel);
+
+// Reverse base current shot noise and 1/f noise
+powerRBCS = 2.0 * `QQ * abs(Ib3);
+powerRBC1f = kf * pow(abs(Ib3), af);
+if (Ib3 < 0) begin
+    powerRBC1f = -powerRBC1f;
+end
+powerZTCB = 2.0 * `QQ * abs(Iztcb);
+
+// Extrinsic current shot noise and 1/f noise
+powerExCS = 2.0 * `QQ * abs(Iex);
+powerExC1f = kf * (1.0 - (exmod * xext)) *
+                    pow((abs(Iex) / (1.0 - (exmod * xext))), af);
+if (Iex < 0) begin
+    powerExC1f = -powerExC1f;
+end
+powerExCSMOD = 2.0 * `QQ * abs(XIex) * exmod;
+if (xext == 0.0) begin
+    powerExC1fMOD = 0.0;
+end else begin
+    powerExC1fMOD = kf * exmod * xext * pow((abs(XIex) / xext), af);
+end
+if (XIex < 0) begin
+    powerExC1fMOD = -powerExC1fMOD;
+end
+
+`ifdef SUBSTRATE
+    // Substrate current shot noise (between nodes B1 and S, resp. B and S)
+    powerSubsCS_B2S = 2.0 * `QQ * abs(Isub_int);
+    powerSubsCS_B1S = 2.0 * `QQ * abs(Isub);
+    powerSubsCS_BS  = 2.0 * `QQ * abs(XIsub);
+`endif
+
+// Reference un-correlated current shot noise sources
+I(noi) <+ white_noise(powerCCS * mult, "in");
+I(noi) <+ V(noi);
+
+// Implementing correlated noise sources
+I(b2, e1) <+ taun * ddt(V(noi));
+I(c2, b2) <+ Gem_N * V(noi);
+I(c2, e1) <+ V(noi);
+
+// Implementing un-correlated noise sources
+I(c2, b2) <+ white_noise(powerIIS * mult, "iavl");
+I(b2, e1) <+ white_noise(powerFBCS * mult, "ib2e1");
+
+// Add noise sources
+I(e, e1)    <+ white_noise(power_rec * mult, "re");
+I(b, b1)    <+ white_noise(power_rbc * mult, "rbc");
+I(b1, b2)   <+ white_noise(power_rbv * mult, "rbv");
+I(b2, e1)   <+ flicker_noise(powerFBC1f * mult, 1, "ib2e1_f");
+I(b1, e1)   <+ flicker_noise(powerNFBC1f * mult, 1, "ib1e1_f");
+I(b1, e1)   <+ white_noise(powerEBSCS * mult, "ib1e1");
+I(b1, c4)   <+ white_noise(powerRBCS * mult, "ib3");
+I(b1, c4)   <+ flicker_noise(powerRBC1f * mult, 1, "ib3_f");
+I(b1, c4)   <+ white_noise(powerExCS * mult, "iex");
+I(b1, c4)   <+ flicker_noise(powerExC1f * mult, 1, "iex_f");
+I(b, c3)    <+ white_noise(powerExCSMOD * mult, "xiex");
+I(b, c3)    <+ flicker_noise(powerExC1fMOD * mult, 1, "xiex_f");
+if (swib1 == 1) begin
+    I(c1, b2)   <+ white_noise(powerZTCB * mult, "iztcb");
+end else begin
+    I(c2, b2)   <+ white_noise(powerZTCB * mult, "iztcb");
+end
+
+`ifdef SUBSTRATE
+    I(b2, s)   <+ white_noise(powerSubsCS_B2S * mult, "isub_int");
+    I(b1, s)   <+ white_noise(powerSubsCS_B1S * mult, "isub");
+    I(b, s)    <+ white_noise(powerSubsCS_BS * mult, "xisub");
+`endif
+
+if (rcblx > 0.0) begin
+    if (rcbli > 0.0) begin /* all branches exist */
+        I(c,  c3)  <+ white_noise(power_rcc_xx * mult, "rcc");
+        I(c3, c4)  <+ white_noise(power_rcc_ex * mult, "rcblx");
+        I(c4, c1)  <+ white_noise(power_rcc_in * mult, "rcbli");
+    end else begin  /* only Rcblx exists */
+        I(c,  c3)  <+ white_noise(power_rcc_xx * mult, "rcc");
+        I(c3, c1)  <+ white_noise(power_rcc_ex * mult, "rcblx");
+    end
+end else begin
+    if (rcbli > 0.0) begin   /* only Rcbli exists */
+        I(c,  c4)  <+ white_noise(power_rcc_xx * mult, "rcc");
+        I(c4, c1)  <+ white_noise(power_rcc_in * mult, "rcbli");
+    end else begin /* neither Rcblx nor Rcbli exists */
+        I(c,  c1)  <+ white_noise(power_rcc_xx * mult, "rcc");
+    end
+end
+
+// ---- end `include "noise.inc" ----
+// ---- begin `include "opinfo.inc" ----
+// Copyright (c) 2000-2007, NXP Semiconductor
+// Copyright (c) 2007-2014, Delft University of Technology
+// Copyright (c) 2015-2026, Auburn University
+// All rights reserved, see IP_NOTICE_DISCLAIMER_LICENSE for further information.
+
+// Evaluate the operating point (output) variables
+
+// The external currents and the current gain
+ic = I(<c>);        // Terminal collector current
+ib = I(<b>);        // Terminal base current
+
+if (ib == 0.0) begin
+    betadc = 0.0;
+end else begin
+    betadc = ic / ib; // Terminal current gain
+end
+
+// begin added in MXT 504.9:
+ie     = I(<e>);    // Terminal emitter current
+vbe    = V(b, e);   // External base-emitter bias
+vce    = V(c, e);   // External collector-emitter bias
+vbc    = V(b, c);   // External base-collector bias
+
+`ifdef SUBSTRATE
+    isx    = I(<s>);    // Terminal substrate current
+    vse    = V(s, e);   // External substrate-emitter bias
+    vbs    = V(b, s);   // External base-substrate bias
+    vsc    = V(s, c);   // External substrate-collector bias
+`endif
+
+// end added in MXT 504.9:
+
+// The internal voltage differences
+vb2e1 = Vb2e1;  // Internal base-emitter bias
+vb2c2 = Vb2c2;  // Internal base-emitter bias
+vb2c1 = Vb2c1;  // Internal base-collector bias including epilayer
+
+vb1c1 = Vb1b2 + Vb2c1;  // External base-collector bias without contact resistances
+
+vc4c1 = Vc4c1;  // Bias over intrinsic buried layer
+vc3c4 = Vc3c4;  // Bias over extrinsic buried layer
+
+ve1e  = - Vee1; // Bias over emitter resistance
+
+// The branch currents
+in    = In;            // Main current
+ic1c2 = Ic1c2;         // Epilayer current
+ib1b2 = Ib1b2;         // Pinched-base current
+ib1   = Ib1;           // Ideal forward base current
+ib1s  = Ib1_s;         // Ideal side-wall base current
+ib2s  = Ib2_s;         // Non-ideal side-wall base current
+ibrel = Ibrel;         // Additional non-ideal base current for reliability simulation
+//
+// 504.8, RvdT, TU-Delft April. 2009:
+//
+izteb  = Izteb;        // Zener emitter-base tunneling current
+//
+iztcb = Iztcb;         // Zener collector-base tunneling current
+ib2   = Ib2 + GMIN * Vb2e1;           // Non-ideal forward base current
+ib3   = Ib3 + GMIN * Vb1c4;           // Non-ideal reverse base current
+iavl  = Iavl;          // Avalanche current
+iex   = Iex;           // Extrinsic reverse base current
+xiex  = XIex;          // Extrinsic reverse base current
+`ifdef SUBSTRATE
+    isub  = Isub;          // Substrate current
+    xisub = XIsub;         // Substrate current
+    isf   = Isf;           // Substrate-collector current
+`endif
+ire   = - Vee1 / re_t;  // Current through emitter resistance
+irbc  = Vbb1 / rbc_t; // Current through constant base resistance
+
+ircc  = Vcc3 * gcc_xx_t; // Current through collector contact resistance
+ircblx = Vc3c4 * gcc_ex_t; // Current through extrinsic buried layer resistance
+ircbli = Vc4c1 * gcc_in_t; // Current through extrinsic buried layer resistance
+
+// The branch charges
+qe    = Qe;    // Emitter charge or emitter neutral charge
+qte   = Qte;   // Base-emitter depletion charge
+sqte  = Qte_s; // Sidewall base-emitter depletion charge
+qbe   = Qbe;   // Base-emitter diffusion charge
+qbc   = Qbc;   // Base-collector diffusion charge
+qtc   = Qtc;   // Base-collector depletion charge
+qepi  = Qepi;  // Epilayer diffusion charge
+qb1b2 = Qb1b2; // AC current crowding charge
+qtex  = Qtex;  // Extrinsic base-collector depletion charge
+xqtex = XQtex; // Extrinsic base-collector depletion charge
+qex   = Qex;   // Extrinsic base-collector diffusion charge
+xqex  = XQex;  // Extrinsic base-collector diffusion charge
+`ifdef SUBSTRATE
+    qts   = Qts;   // Collector substrate depletion charge
+`endif
+
+// Small signal equivalent circuit conductances and resistances
+
+gx     = - ddx(In, V(e1));      // Forward transconductance
+gy     = - ddx(In, V(c2));      // Reverse transconductance
+
+gz     = - ddx(In, V(c1));      // Reverse transconductance
+
+sgpi   = - ddx(Ib1_s, V(e1));   // Conductance sidewall b-e junction
+gpix   = - ddx(Ib1+Ib2, V(e1)); // Conductance floor b-e junction
+
+gpiy   = - ddx(Ib1, V(c2));  // Early effect on recombination base current
+gpiz   = - ddx(Ib1, V(c1));  // Early effect on recombination base current
+
+gmux   =  ddx( Iavl, V(e1)); // Early effect on avalanche current limiting
+gmuy   =  ddx( Iavl, V(c2)); // Conductance of avalanche current
+gmuz   =  - ddx(- Iavl, V(c1));   // Conductance of avalanche current
+
+// Conductance extrinsic b-c current :
+gmuex  =   ddx(Iex+Ib3, V(b1))
+              + ddx(Iex+Ib3, V(b2))
+              + ddx(Iex+Ib3, V(c2));
+
+xgmuex = ddx(XIex, V(b)); // Conductance extrinsic b-c current
+
+grcvy  =  - ddx(Ic1c2, V(c2)); // Conductance of epilayer current
+grcvz  =  - ddx(Ic1c2, V(c1));  // Conductance of epilayer current
+
+rb_v   = 1.0 / (- ddx(Ib1b2, V(b2)) - ddx(Ib1b2, V(c2)));  // Variable base resistance
+
+grbvx  = - ddx(Ib1b2, V(e1)); // Early effect on variable base resistance
+grbvy  = - ddx(Ib1b2, V(c2)); // Early effect on variable base resistance
+
+grbvz  = - ddx(Ib1b2, V(c1)); // Early effect on variable base resistance
+
+r_e    = re_t;  // Emitter resistance
+rb_c   = rbc_t; // Constant base resistance
+rc_c   = rcc_xx_t; // Collector Contact resistance
+rc_blx = rcc_ex_t; // Extrinsic buried layer resistance
+rc_bli = rcc_in_t; // Extrinsic buried layer resistance
+
+
+`ifdef SUBSTRATE
+    gs     = ddx(Isub, V(b1));  // Conductance parasitic PNP transistor
+    xgs    = ddx(XIsub, V(b)); // Conductance parasitic PNP transistor
+    gsf    = ddx(Isf, V(s));   // Conductance substrate-collector current
+`endif
+
+
+
+// Small signal equivalent circuit capacitances
+scbe   = - ddx(Qte_s, V(e1)); // Capacitance sidewall b-e junction
+
+cbex   = - ddx(Qte + Qbe + Qe, V(e1));           // Capacitance floor b-e junction
+
+cbey   = - ddx(Qbe, V(c2)); // Early effect on b-e diffusion junction
+
+cbez   = - ddx(Qbe, V(c1)); // Early effect on b-e diffusion junction
+
+cbcx   = - ddx(Qbc, V(e1)); // Early effect on b-c diffusion junction
+
+
+cbcy   =  - ddx(Qtc + Qbc + Qepi, V(c2)); // Capacitance floor b-c junction
+cbcz   =  - ddx(Qtc + Qbc + Qepi, V(c1)); // Capacitance floor b-c junction
+
+// Capacitance extrinsic b-c junction :
+cbcex  =   ddx(Qtex + Qex,V(b1))
+              + ddx(Qtex + Qex,V(b2))
+              + ddx(Qtex + Qex,V(c2));
+
+// Capacitance extrinsic b-c junction :
+xcbcex =  ddx(XQtex + XQex, V(b));
+
+cb1b2  = - ddx(Qb1b2, V(b2)) - ddx(Qb1b2, V(c2));  // Capacitance AC current crowding
+
+cb1b2x =  - ddx(Qb1b2, V(e1));  // Cross-capacitance AC current crowding
+cb1b2y =  - ddx(Qb1b2, V(c2));  // Cross-capacitance AC current crowding
+cb1b2z =  - ddx(Qb1b2, V(c1));  // Cross-capacitance AC current crowding
+
+`ifdef SUBSTRATE
+    cts    = ddx(Qts, V(s)); // Capacitance s-c junction
+`endif
+
+// Approximate small signal equivalent circuit
+dydx = (gx - gmux) / (grcvy + gmuy - gy);
+dydz = (gz - grcvz - gmuz) / (grcvy + gmuy - gy);
+gpi  = sgpi + gpix + gmux + gpiz + gmuz +
+         (gpiy + gmuy) * (dydx + dydz);
+gm   = (grcvy * (gx - gmux +                   // Transconductance
+           gz - gmuz) - grcvz *
+           (gy - gmuy)) / (grcvy + gmuy - gy);
+beta = gm / gpi;                                     // Current amplification
+gout = ((gy - gmuy) * grcvz -                  // Output conductance
+           (gz - gmuz) * grcvy) /
+           (grcvy + gmuy - gy);
+gmu  = gpiz + gmuz + (gpiy + gmuy) * dydz + // Feedback transconductance
+          gmuex + xgmuex;
+rb   = rbc_t + rb_v;                        // Base resistance
+rc   = rc_c + rc_blx + rc_bli;           // Collector resistance
+cbe  = cbex + scbe + cbcx +                    // Base-emitter capacitance
+          (cbey + cbcy) * dydx + cbeo;
+cbc  = (cbey + cbcy) * dydz + cbcz +           // Base-collector capacitance
+           cbcex + xcbcex + cbco;
+
+
+// Quantities to describe internal state of the model
+gammax = (gpix + gmux - grbvx) * rb_v;
+gammay = (gpiy + gmuy - grbvy) * rb_v;
+gammaz = (gpiz + gmuz - grbvz) * rb_v;
+gbfx   =  gpix + sgpi * (1.0 + gammax);
+gbfy   =  gpiy + sgpi * gammay;
+gbfz   =  gpiz + sgpi * gammaz;
+
+// RvdT March 2008:
+alpha_ft  = (1.0 + (grcvy * dydx * rc) +
+             (gx + gbfx + (gy + gbfy) * dydx) * re_t)/
+            (1.0 - (grcvz + grcvy * dydz) * rc -
+             (gz + gbfz + (gy + gbfy) * dydz) * re_t);
+
+rx = pow((grcvy * dydx + alpha_ft * (grcvz + grcvy * dydz)), -1);
+rz = alpha_ft * rx;
+ry = (1.0 - grcvz * rz) / grcvy;
+rb1b2 = gammax * rx + gammay * ry + gammaz * rz;
+rex = rz + rb1b2 - rc_bli;
+xrex = rz + rb1b2 + rbc_t * ((gbfx + gmux) * rx + (gbfy + gmuy) * ry +
+       (gbfz + gmuz) * rz) - rc_bli - rc_blx;
+
+taut = scbe * (rx + rb1b2) + (cbex + cbcx) * rx + (cbey + cbcy) *
+       ry + (cbez + cbcz) * rz + cbcex * rex + xcbcex * xrex +
+       (cbeo + cbco) * (xrex - rcc_xx_t);
+
+ft = 1.0 / (2.0 * `PI * taut); // Good approximation for cut-off frequency
+iqs = Iqs;                     // Current at onset of quasi-saturation
+xiwepi = xi_w;                 // Thickness of injection layer
+vb2c2star = Vb2c2star;         // Physical value of internal base-collector bias
+
+//self-heating
+`ifdef SELFHEATING
+    pdiss = power;                 // Dissipation
+`endif
+
+tk = Tk;                       // Actual temperature
+
+if (mult != 1.0) begin
+    in = in * mult;
+    ic1c2 = ic1c2 * mult;
+    ib1b2 = ib1b2 * mult;
+    ib1 = ib1 * mult;
+    ib1s = ib1s * mult;
+    ib2s = ib2s * mult;
+    ibrel = ibrel * mult;
+    izteb = izteb * mult;
+    iztcb = iztcb * mult;
+    ib2 = ib2 * mult;
+    ib3 = ib3 * mult;
+    iavl = iavl * mult;
+    iex = iex * mult;
+    xiex = xiex * mult;
+    `ifdef SUBSTRATE
+        isub = isub * mult;
+        xisub = xisub * mult;
+        isf = isf * mult;
+    `endif
+    ire = ire * mult;
+    irbc = irbc * mult;
+    ircblx = ircblx * mult;
+    ircbli = ircbli * mult;
+    ircc = ircc * mult;
+    qe = qe * mult;
+    qte = qte * mult;
+    sqte = sqte * mult;
+    qbe = qbe * mult;
+    qbc = qbc * mult;
+    qtc = qtc * mult;
+    qepi = qepi * mult;
+    qb1b2 = qb1b2 * mult;
+    qtex = qtex * mult;
+    xqtex = xqtex * mult;
+    qex = qex * mult;
+    xqex = xqex * mult;
+    `ifdef SUBSTRATE
+        qts = qts * mult;
+    `endif
+    gx = gx * mult;
+    gy = gy * mult;
+    gz = gz * mult;
+    sgpi = sgpi * mult;
+    gpix = gpix * mult;
+    gpiy = gpiy * mult;
+    gpiz = gpiz * mult;
+    gmux = gmux * mult;
+    gmuy = gmuy * mult;
+    gmuz = gmuz * mult;
+    gmuex = gmuex * mult;
+    xgmuex = xgmuex * mult;
+    grcvy = grcvy * mult;
+    grcvz = grcvz * mult;
+    rb_v = rb_v / mult;
+    grbvx = grbvx * mult;
+    grbvy = grbvy * mult;
+    grbvz = grbvz * mult;
+    r_e = r_e / mult;
+    rb_c = rb_c / mult;
+    rc_c = rc_c / mult;
+    rc_blx = rc_blx / mult;
+    rc_bli = rc_bli / mult;
+    `ifdef SUBSTRATE
+        gs = gs * mult;
+        xgs = xgs * mult;
+        gsf = gsf * mult;
+    `endif
+    scbe = scbe * mult;
+    cbex = cbex * mult;
+    cbey = cbey * mult;
+    cbez = cbez * mult;
+    cbcx = cbcx * mult;
+    cbcy = cbcy * mult;
+    cbcz = cbcz * mult;
+    cbcex = cbcex * mult;
+    xcbcex = xcbcex * mult;
+    cb1b2 = cb1b2 * mult;
+    cb1b2x = cb1b2x * mult;
+    cb1b2y = cb1b2y * mult;
+    cb1b2z = cb1b2z * mult;
+    `ifdef SUBSTRATE
+        cts = cts * mult;
+    `endif
+    gm = gm * mult;
+    gout = gout * mult;
+    gmu = gmu * mult;
+    rb = rb / mult;
+    rc = rc / mult;
+    cbe = cbe * mult;
+    cbc = cbc * mult;
+    iqs = iqs * mult;
+    `ifdef SELFHEATING
+        pdiss = pdiss * mult;
+    `endif
+end
+// ---- end `include "opinfo.inc" ----
+
+        // The following can be used to print OP-info to std out:
+        // `include "op_print.inc"
+
+    end  // analog
+endmodule
+

@@ -11,8 +11,7 @@ espice --format=touchstone -r out.s2p deck.sp
 espice --backend cuda sweep.sp                   # sweep points as GPU lanes
 ```
 
-Docs: <https://omarsiwy.github.io/ESPice/> · Changes: [CHANGELOGS.md](CHANGELOGS.md) ·
-Worked example vs HSPICE: [EXAMPLES.md](EXAMPLES.md)
+Docs: <https://omarsiwy.github.io/ESPice/> · Changes: [CHANGELOGS.md](CHANGELOGS.md)
 
 ## Install
 
@@ -28,6 +27,24 @@ From source (Zig 0.18.0-dev.349, provided by the devshell; VerA and Gompute are 
 nix develop            # .#ci for CPU only
 zig build              # zig-out/bin/espice; -Dgpu=false skips the GPU kernels
 ```
+
+`espice --version` prints the installed version.
+
+## Dependencies
+
+For Ubuntu 20.04 or newer and Linux Mint 20 or newer. The release binaries link only glibc 2.28+,
+so running ESPice on the CPU needs nothing beyond the base system.
+
+| To | Install |
+|---|---|
+| Run on the CPU | nothing |
+| Run on an NVIDIA GPU | the proprietary driver, which provides `libcuda.so.1`: `sudo ubuntu-drivers autoinstall` (or Mint's Driver Manager). The CUDA toolkit is not needed at run time. |
+| Run on an AMD GPU | the ROCm HIP runtime from AMD's repository (`amdgpu-install --usecase=hip`), which provides `libamdhip64.so`. |
+| Load `.hdl` models at run time | Zig `0.18.0-dev.349+d924f83bf` on `PATH`, or its path in `$ZIG` |
+| Build from source with Nix (recommended) | `sudo apt install curl git xz-utils`, then Nix: `sh <(curl -L https://nixos.org/nix/install) --daemon`; `nix develop` then provides Zig, Python and the GPU toolkits |
+| Build from source without Nix | `sudo apt install git curl xz-utils python3`, and Zig `0.18.0-dev.349+d924f83bf` from <https://ziglang.org/download/> |
+| Embed precompiled CUDA kernels (optional) | `ptxas` and `fatbinary` on `PATH`, from NVIDIA's CUDA 12 toolkit repository (`cuda-toolkit-12-x`; Ubuntu's own `nvidia-cuda-toolkit` is too old for recent GPUs). Without them the driver compiles the kernels on first use. |
+| Run the test corpus | `python3`; `nodejs` for the WebAssembly playground comparison |
 
 ## What it does
 

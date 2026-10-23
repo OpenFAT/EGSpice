@@ -6,7 +6,6 @@
 # against ngspice and VACASK and compares their waveforms.
 #   tests/suites/fetch.sh zig-out/suites            every suite
 #   tests/suites/fetch.sh zig-out/suites ngspice    one suite
-# Survey and licences: dev/research/spice-benchmark-suites.md.
 set -euo pipefail
 OUT=${1:?usage: fetch.sh DIR [suite...]}
 shift

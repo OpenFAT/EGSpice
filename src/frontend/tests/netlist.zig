@@ -724,6 +724,26 @@ test "nested .subckt definitions flatten through both levels (#121)" {
     _ = try device(nl, "r.x2.r2");
 }
 
+test "a subcircuit past 16 ports maps its pins as the scan does, a repeated port by its first position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\t
+        \\.subckt wide p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p12 p13 p14 p15 p16 p17 p18 p0
+        \\r1 p18 p0 1k
+        \\r2 p17 inner 1k
+        \\.ends wide
+        \\x1 n0 n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 n13 n14 n15 n16 n17 n18 n19 wide
+    );
+    var buf: [2][]const u8 = undefined;
+    const r1 = pinNames(nl, try device(nl, "r.x1.r1"), &buf);
+    try std.testing.expectEqualStrings("n18", r1[0]);
+    try std.testing.expectEqualStrings("n0", r1[1]);
+    const r2 = pinNames(nl, try device(nl, "r.x1.r2"), &buf);
+    try std.testing.expectEqualStrings("n17", r2[0]);
+    try std.testing.expectEqualStrings("x1.inner", r2[1]);
+}
+
 test "user functions: .func and .param f(x)= expand where they are called (#121)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

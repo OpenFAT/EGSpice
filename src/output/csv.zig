@@ -9,8 +9,14 @@ const Plot = @import("types.zig").Plot;
 /// Writes `plot`, which must have passed `types.validatePlot(.csv, ...)`.
 /// Asserts that it has variables and one sample row per point.
 pub fn encode(w: *Io.Writer, plot: Plot) !void {
-    assert(plot.result.varnames.len > 0);
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
+    try writeHeader(w, plot);
+    try writeRows(w, plot.stride(), plot.result.data);
+}
+
+/// The header row: what `encode` writes before the points.
+pub fn writeHeader(w: *Io.Writer, plot: Plot) !void {
+    assert(plot.result.varnames.len > 0);
     for (plot.result.varnames, 0..) |name, i| {
         if (i > 0) try w.writeByte(',');
         if (plot.result.is_complex) {
@@ -20,8 +26,15 @@ pub fn encode(w: *Io.Writer, plot: Plot) !void {
         } else try field(w, name, "");
     }
     try w.writeByte('\n');
-    for (0..plot.result.npoints) |pt| {
-        for (plot.point(pt), 0..) |x, i| {
+}
+
+/// One line per point of `rows` (`stride` f64s each): what `encode`
+/// writes after the header.
+pub fn writeRows(w: *Io.Writer, stride: usize, rows: []const f64) !void {
+    assert(rows.len % stride == 0);
+    var at: usize = 0;
+    while (at < rows.len) : (at += stride) {
+        for (rows[at..][0..stride], 0..) |x, i| {
             if (i > 0) try w.writeByte(',');
             try w.print("{e}", .{x});
         }

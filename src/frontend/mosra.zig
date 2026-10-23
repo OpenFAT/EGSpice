@@ -56,7 +56,8 @@ pub fn plan(sim: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netli
     var dtemp: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     var temp_param: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     const params = try variants.collect(scratch, circuit);
-    for (params, 0..) |ref, k| {
+    for (0..params.len) |k| {
+        const ref = params.at(k);
         const key = refKey(ref.type, ref.index);
         const map = if (std.mem.eql(u8, ref.param_name, "delvto"))
             &delvto
@@ -107,12 +108,12 @@ pub fn plan(sim: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netli
         const own = for (d.kv) |kv| {
             if (std.mem.eql(u8, kv.key, "temp")) break temp_param.get(key);
         } else null;
-        try temp_k.append(sim, 273.15 + if (own) |r| params[r].get() else temp_c + if (dtemp.get(key)) |r| params[r].get() else 0);
+        try temp_k.append(sim, 273.15 + if (own) |r| params.get(r) else temp_c + if (dtemp.get(key)) |r| params.get(r) else 0);
         try model.append(sim, src[k]);
         try delvto_refs.append(sim, dv);
         try mulu0_refs.append(sim, mu);
-        try delvto_fresh.append(sim, params[dv].get());
-        try mulu0_fresh.append(sim, if (mu == core.Mosra.no_param) 1 else params[mu].get());
+        try delvto_fresh.append(sim, params.get(dv));
+        try mulu0_fresh.append(sim, if (mu == core.Mosra.no_param) 1 else params.get(mu));
     }
     if (names.items.len == 0) return refuse(line, "a .mosra that binds no MOSFET (.appendmodel)");
 

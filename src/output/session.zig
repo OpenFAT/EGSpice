@@ -1,6 +1,7 @@
 //! Delivery of plots to one output selection, in publish order. The caller
 //! keeps each result alive until `publish` returns, or streams a binary raw
-//! plot's rows as they are computed (`beginStream`). Plots that share one
+//! plot's rows as they are computed (`beginStream`), or any number of plots'
+//! rows to temporary files from any thread (`beginSide`). Plots that share one
 //! file (binary and ASCII raw, `.print`) are appended to one replacement,
 //! each written once, and `finish` renames it over the destination (#179).
 const std = @import("std");
@@ -27,13 +28,17 @@ pub const Session = struct {
     /// renames it over the destination; until then the destination keeps its
     /// old bytes. A batch after a `finish` starts with a copy of the file.
     pending: ?*Stream = null,
+    /// The open `beginSide` files, dropped by `deinit`.
+    sides: std.ArrayList(*Stream) = .empty,
+    /// The next side file's number.
+    side_serial: u32 = 0,
 
     /// Plot 0 in binary raw, written while its query runs: the header with
     /// the point count left blank, then rows as they arrive; `endStream`
     /// keeps it as `pending`. Without a path the rows are counted and
     /// dropped. A `pending` replacement opened by `publish` uses only
     /// `atomic`, `file` and `buffer`.
-    const Stream = struct {
+    pub const Stream = struct {
         atomic: ?Io.File.Atomic,
         file: Io.File.Writer,
         discard: Io.Writer.Discarding,
@@ -41,10 +46,14 @@ pub const Session = struct {
         count_at: u64,
         rows_at: u64,
         complex: bool,
+        /// A `beginSide` file, read back by `endSide`, and its name, which
+        /// `drop` deletes. Null for every other stream.
+        side: ?Io.File,
+        side_name: []u8,
         buffer: [64 * 1024]u8,
 
-        fn writer(s: *Stream) *Io.Writer {
-            return if (s.atomic != null) &s.file.interface else &s.discard.writer;
+        pub fn writer(s: *Stream) *Io.Writer {
+            return if (s.atomic != null or s.side != null) &s.file.interface else &s.discard.writer;
         }
     };
 
@@ -63,6 +72,8 @@ pub const Session = struct {
     /// destination as it was, and frees the path copy.
     pub fn deinit(self: *Session) void {
         self.abortStream();
+        for (self.sides.items) |s| self.drop(s);
+        self.sides.deinit(self.allocator);
         if (self.pending) |s| self.drop(s);
         if (self.selection.path) |path| self.allocator.free(path);
         self.* = undefined;
@@ -115,6 +126,8 @@ pub const Session = struct {
         s.count_at = 0;
         s.rows_at = 0;
         s.complex = false;
+        s.side = null;
+        s.side_name = &.{};
         s.atomic = try Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
         errdefer s.atomic.?.deinit(io);
         s.file = s.atomic.?.file.writer(io, &s.buffer);
@@ -135,6 +148,11 @@ pub const Session = struct {
     /// destination as it was.
     fn drop(self: *Session, s: *Stream) void {
         if (s.atomic) |*atomic| atomic.deinit(s.file.io);
+        if (s.side) |file| {
+            file.close(s.file.io);
+            Io.Dir.cwd().deleteFile(s.file.io, s.side_name) catch {};
+            self.allocator.free(s.side_name);
+        }
         self.allocator.destroy(s);
     }
 
@@ -153,6 +171,8 @@ pub const Session = struct {
             const s = try self.allocator.create(Stream);
             s.discard = .init(&.{});
             s.atomic = null;
+            s.side = null;
+            s.side_name = &.{};
             s.count_at = 0;
             s.rows_at = 0;
             s.complex = plot.result.is_complex;
@@ -214,6 +234,148 @@ pub const Session = struct {
         const s = self.stream orelse return;
         self.drop(s);
         self.stream = null;
+    }
+
+    /// A side plot: rows written to the returned stream's `writer` (native-
+    /// endian f64s, as `beginStream` takes them) land in a temporary file
+    /// beside the destination, or are only counted without a path, and
+    /// `endSide` later publishes them as the next plot. Any thread may write
+    /// one side while others write theirs, so a sweep's points stream as
+    /// they run and publish in request order. Null when the selection is
+    /// not a row format (binary or ASCII raw, CSV, `.print`), the session
+    /// has failed, or the destination is a device or FIFO; publish the
+    /// whole plot then. The stream is valid until `endSide`, `dropSide` or
+    /// `deinit`.
+    pub fn beginSide(self: *Session, io: Io) !?*Stream {
+        const format = self.selection.format;
+        if (!sideFormat(format) or self.state == .failed) return null;
+        try self.sides.ensureUnusedCapacity(self.allocator, 1);
+        const s = try self.allocator.create(Stream);
+        errdefer self.allocator.destroy(s);
+        s.discard = .init(&.{});
+        s.atomic = null;
+        s.count_at = 0;
+        s.rows_at = 0;
+        s.complex = false;
+        s.side = null;
+        s.side_name = &.{};
+        if (self.selection.path) |path| {
+            if (Io.Dir.cwd().statFile(io, path, .{})) |stat| {
+                if (stat.kind != .file) {
+                    self.allocator.destroy(s);
+                    return null;
+                }
+            } else |_| {}
+            // Beside the destination, readable for `endSide`, named
+            // `<path>.<n>.side` with the first `n` free; `drop` deletes it.
+            while (true) : (self.side_serial +%= 1) {
+                const name = try self.allocator.print("{s}.{d}.side", .{ path, self.side_serial });
+                const file = Io.Dir.cwd().createFile(io, name, .{ .read = true, .exclusive = true }) catch |err| {
+                    self.allocator.free(name);
+                    if (err == error.PathAlreadyExists) continue;
+                    return err;
+                };
+                s.side = file;
+                s.side_name = name;
+                self.side_serial +%= 1;
+                break;
+            }
+            s.file = s.side.?.writer(io, &s.buffer);
+        }
+        self.sides.appendAssumeCapacity(s);
+        return s;
+    }
+
+    /// Publishes side `s` as the next plot: `plot`'s header (its `data`
+    /// empty, `npoints` the rows written) then the side's rows, appended
+    /// to the replacement, or written to the plot's own file, as `publish`
+    /// writes them. The bytes are those `publish` writes for the whole
+    /// plot. Closes `s` whether or not it succeeds; errors are
+    /// `endStream`'s, and with a path any of them fails the session.
+    pub fn endSide(self: *Session, io: Io, s: *Stream, plot: types.Plot) !void {
+        defer self.dropSide(s);
+        if (self.state == .failed) return error.DeliveryFailed;
+        if (self.published == std.math.maxInt(u32)) return error.TooManyPlots;
+        try types.validateSchema(self.selection.format, plot.schema());
+        const want = @as(u64, plot.result.npoints) * plot.stride() * @sizeOf(f64);
+        if (s.side == null) {
+            if (s.discard.fullCount() != want) return error.DataLengthMismatch;
+            self.published += 1;
+            return;
+        }
+        errdefer self.state = .failed;
+        try s.file.interface.flush();
+        if (s.file.logicalPos() != want) return error.DataLengthMismatch;
+        const path = self.selection.path.?;
+        if (dispatch.concatenates(self.selection.format)) {
+            const out = self.pending orelse try self.open(io, path, self.published != 0) orelse return error.DeliveryFailed;
+            self.pending = out;
+            try self.copySide(io, &out.file.interface, s, plot);
+        } else {
+            // Its own file, named as `deliver` names it.
+            const numbered = if (self.published == 0) null else try self.allocator.print("{s}.{d}", .{ path, self.published + 1 });
+            defer if (numbered) |n| self.allocator.free(n);
+            var atomic = try Io.Dir.cwd().createFileAtomic(io, numbered orelse path, .{ .replace = true });
+            defer atomic.deinit(io);
+            var buf: [64 * 1024]u8 = undefined;
+            var fw = atomic.file.writer(io, &buf);
+            try self.copySide(io, &fw.interface, s, plot);
+            try fw.interface.flush();
+            try atomic.replace(io);
+        }
+        self.published += 1;
+    }
+
+    /// Writes `plot`'s header then side `s`'s rows to `w` in the
+    /// selection's format.
+    fn copySide(self: *Session, io: Io, w: *Io.Writer, s: *Stream, plot: types.Plot) !void {
+        const format = self.selection.format;
+        var rbuf: [64 * 1024]u8 = undefined;
+        var reader = s.side.?.reader(io, &rbuf);
+        switch (format) {
+            .binary => try @import("rawfile.zig").writeHeader(w, plot, true),
+            .ascii => try @import("rawfile.zig").writeHeader(w, plot, false),
+            .csv => try @import("csv.zig").writeHeader(w, plot),
+            .print => try @import("spice_print.zig").writeHeader(w, plot),
+            else => unreachable, // else: `beginSide` opens only `sideFormat`s
+        }
+        if (format == .binary) {
+            _ = try reader.interface.streamRemaining(w);
+            return;
+        }
+        // Whole rows at a time, about 64 KiB of them.
+        const stride = plot.stride();
+        const per = @max(1, 8192 / stride);
+        const rows = try self.allocator.alloc(f64, per * stride);
+        defer self.allocator.free(rows);
+        var pt: usize = 0;
+        while (pt < plot.result.npoints) {
+            const k = @min(per, plot.result.npoints - pt);
+            const chunk = rows[0 .. k * stride];
+            try reader.interface.readSliceAll(std.mem.sliceAsBytes(chunk));
+            switch (format) {
+                .ascii => try @import("ascii_raw.zig").writeRows(w, plot.result.is_complex, stride, pt, chunk),
+                .csv => try @import("csv.zig").writeRows(w, stride, chunk),
+                .print => try @import("spice_print.zig").writeRows(w, stride, pt, chunk),
+                else => unreachable, // else: binary copied its bytes above
+            }
+            pt += k;
+        }
+    }
+
+    /// The formats a side stream writes: a header, then rows.
+    fn sideFormat(format: types.Format) bool {
+        return switch (format) {
+            .binary, .ascii, .csv, .print => true,
+            .touchstone, .psf, .fsdb, .sst2, .citi => false,
+        };
+    }
+
+    /// Closes side `s` without publishing it.
+    pub fn dropSide(self: *Session, s: *Stream) void {
+        const at = std.mem.indexOfScalar(*Stream, self.sides.items, s).?;
+        _ = self.sides.swapRemove(at);
+        self.drop(s);
     }
 
     /// Publishes the plots appended since the last `finish` with one rename
@@ -457,6 +619,57 @@ test "session: a streamed plot matches the whole-plot encoding but for the padde
     try std.testing.expectEqualStrings(whole.written()[0..at], streamed[0..at]);
     try std.testing.expectEqualStrings(&@as([Session.count_width - 1]u8, @splat(' ')), streamed[at..][0 .. Session.count_width - 1]);
     try std.testing.expectEqualSlices(u8, whole.written()[at..], streamed[at + Session.count_width - 1 ..]);
+}
+
+test "session: side plots publish in order the bytes of whole plots" {
+    for ([_]types.Format{ .binary, .ascii, .print, .csv }) |format| {
+        const io = std.testing.io;
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try a.print(".zig-cache/tmp/{s}/sweep.raw", .{tmp.sub_path});
+        defer a.free(path);
+        const rows = [_][4]f64{ .{ 0, 1.5, 1e-9, 2.5 }, .{ 0, -3, 2e-9, 0.25 } };
+        // One file for the concatenating formats, else one per plot.
+        var want: Io.Writer.Allocating = .init(a);
+        defer want.deinit();
+        var want2: Io.Writer.Allocating = .init(a);
+        defer want2.deinit();
+        var session = try Session.init(a, .{ .format = format, .path = path });
+        defer session.deinit();
+        // The second point finishes first; a third is dropped.
+        const first = (try session.beginSide(io)).?;
+        const second = (try session.beginSide(io)).?;
+        const dropped = (try session.beginSide(io)).?;
+        try dropped.writer().writeAll(std.mem.sliceAsBytes(&rows[0]));
+        session.dropSide(dropped);
+        try second.writer().writeAll(std.mem.sliceAsBytes(&rows[1]));
+        try first.writer().writeAll(std.mem.sliceAsBytes(&rows[0]));
+        for ([_]*Session.Stream{ first, second }, [_][]const u8{ "p (x=1)", "p (x=2)" }, &rows) |side, name, *data| {
+            var plot: types.Plot = .{ .title = "t", .result = .{ .plotname = name, .varnames = &.{ "time", "v(out)" }, .is_complex = false, .npoints = 2, .data = &.{} } };
+            try session.endSide(io, side, plot);
+            plot.result.data = data;
+            try dispatch.encode(if (dispatch.concatenates(format) or side == first) &want.writer else &want2.writer, format, plot);
+        }
+        try std.testing.expectEqual(@as(usize, 0), session.sides.items.len);
+        try session.finish(io);
+        const got = try tmp.dir.readFileAlloc(io, "sweep.raw", a, .unlimited);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(want.written(), got);
+        if (dispatch.concatenates(format)) continue;
+        const got2 = try tmp.dir.readFileAlloc(io, "sweep.raw.2", a, .unlimited);
+        defer a.free(got2);
+        try std.testing.expectEqualStrings(want2.written(), got2);
+    }
+    // Without a path the rows are counted, and checked.
+    var none = try Session.init(std.testing.allocator, .{});
+    defer none.deinit();
+    const side = (try none.beginSide(std.testing.io)).?;
+    try side.writer().writeAll(std.mem.sliceAsBytes(&[_]f64{ 0, 1, 2 }));
+    const plot: types.Plot = .{ .title = "t", .result = .{ .plotname = "p", .varnames = &.{ "time", "v(out)" }, .is_complex = false, .npoints = 1, .data = &.{} } };
+    try std.testing.expectError(error.DataLengthMismatch, none.endSide(std.testing.io, side, plot));
+    try std.testing.expectEqual(@as(u32, 0), none.published);
+    _ = try none.beginSide(std.testing.io);
 }
 
 test "session: without a path plots are counted, not written" {

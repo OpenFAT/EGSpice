@@ -280,7 +280,9 @@ def logic(d, size):
     return sources, window(size, 1000), saves
 
 
-def sram(d, size):
+def sram(d, size, state="alternating"):
+    if state not in ("alternating", "unseeded"):
+        raise ValueError(f"unknown SRAM state: {state}")
     rows = min(256, max(16, 2 ** round(math.log2(math.sqrt(size / 6) * 1.4))))
     cols = max(2, size // (6 * rows))
     vdd = d.t["vdd"]
@@ -301,6 +303,9 @@ def sram(d, size):
         blb = d.net(f"blb{c}", rows + 1, 2)
         for r in range(rows):
             d.inst(f"b{r}_{c}", "bit6t", [bl[r + 1], blb[r + 1], wl[r][c + 1], *rail(r, c)])
+            if state == "alternating":
+                d.lines.append(f".nodeset v(xb{r}_{c}.q)={(c % 2) * vdd:g} "
+                               f"v(xb{r}_{c}.qb)={(1 - c % 2) * vdd:g}")
         vdd_pin, vss_pin = rail(rows, c)
         d.inst(f"p{c}", "pre", [bl[0], blb[0], "pb", vdd_pin])
         # Alternate the written value column by column.
@@ -318,10 +323,11 @@ SUITE = [(f, m, s) for m, sizes in (("bsim4", ("1k", "10k", "100k")), ("psp103",
          for f in FAMILIES for s in sizes if (f, s) not in (("logic", "100k"), ("sram", "100k"))]
 
 
-def generate(root, family, model, size, seed=1):
+def generate(root, family, model, size, seed=1, sram_state="alternating"):
     n = int(float(size[:-1]) * 1000) if size.endswith("k") else int(size)
     d = Deck(model, seed, root)
-    sources, tran, saves = FAMILIES[family](d, n)
+    sources, tran, saves = (sram(d, n, sram_state) if family == "sram"
+                            else FAMILIES[family](d, n))
     d.extract()
     title = f"postlayout {family} {model} {size}"
     return d.render(title, sources, tran, saves), d
@@ -343,6 +349,20 @@ def selftest(root):
             if line.startswith(".save"):
                 for v in line.split()[1:]:
                     assert v[2:-1] in nodes, (fam, v)
+    for model in ("bsim4", "psp103"):
+        text, d = generate(root, "sram", model, "1k")
+        hints = [line for line in text.splitlines() if line.startswith(".nodeset")]
+        cells = [line.split()[0].lower() for line in text.splitlines()
+                 if line.startswith("Xb") and line.endswith(" bit6t")]
+        assert len(hints) == len(cells) > 0
+        for name, hint in zip(cells, hints):
+            col = int(name.rsplit("_", 1)[1])
+            assert hint == (f".nodeset v({name}.q)={(col % 2) * d.t['vdd']:g} "
+                            f"v({name}.qb)={(1 - col % 2) * d.t['vdd']:g}")
+        unseeded, _ = generate(root, "sram", model, "1k", sram_state="unseeded")
+        assert ".nodeset" not in unseeded
+        assert "\n".join(line for line in text.splitlines()
+                        if not line.startswith(".nodeset")) + "\n" == unseeded
     print("selftest ok")
 
 
@@ -351,10 +371,18 @@ def main(argv):
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     if argv[1:] == ["--selftest"]:
         return selftest(root)
+    state = "alternating"
+    argv = list(argv)
+    if "--sram-state" in argv:
+        at = argv.index("--sram-state")
+        if at + 1 == len(argv) or argv[at + 1] not in ("alternating", "unseeded"):
+            raise SystemExit("--sram-state requires alternating or unseeded")
+        state = argv[at + 1]
+        del argv[at:at + 2]
     out = argv[1]
     os.makedirs(out, exist_ok=True)
     for fam, model, size in [tuple(argv[2:5])] if len(argv) == 5 else SUITE:
-        text, d = generate(root, fam, model, size)
+        text, d = generate(root, fam, model, size, sram_state=state)
         path = f"{out}/{fam}_{model}_{size}.sp"
         with open(path, "w") as f:
             f.write(text)

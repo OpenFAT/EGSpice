@@ -1,0 +1,2 @@
+PASS GPU PSS RC: 9 mixed points, 64 steps, 3 replicas, worst 0x tolerance
+PASS GPU PSS diode RC: 9 mixed points, 64 steps, 3 replicas, worst 0.0247x tolerance

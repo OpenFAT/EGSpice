@@ -19,10 +19,13 @@ const Ic = @import("core").Ic;
 
 const failed: converger.Result = .{ .converged = false, .iterations = 0 };
 
-/// Zeroes `x`, then applies the SPICE MODEINITJCT junction seeds so the first
-/// iteration linearizes at vcrit/vto instead of 0. `x.len` must be `ckt.n`.
+/// Zeroes `x`, writes the devices' §3.6.3.2 net initializers (Newton's
+/// guess, never held), then applies the SPICE MODEINITJCT junction seeds so
+/// the first iteration linearizes at vcrit/vto instead of 0; a limiter
+/// without a seed starts from the initializer. `x.len` must be `ckt.n`.
 pub fn coldStart(ckt: *root.Circuit, x: []f64) void {
     @memset(x, 0);
+    ckt.seedNodesets(x);
     ckt.seedJunctions(x);
 }
 
@@ -227,9 +230,9 @@ fn afterPlain(
         ckt.setHomotopy(gtarget, 1.0); // rung 3 rebuilds the baseline
     }
 
-    // Rung 3: source stepping through the devices' attempt(lambda), with an
-    // adaptive step: grow 1.5x on success, halve on failure and retry from
-    // the last good lambda and x. The holds scale with the sources, as
+    // Rung 3: source stepping through §9.15 `$simparam("sourceScaleFactor")`,
+    // with an adaptive step: grow 1.5x on success, halve on failure and retry
+    // from the last good lambda and x. The holds scale with the sources, as
     // ngspice's cktload.c multiplies each `.ic` by CKTsrcFact.
     coldStart(ckt, x);
     {
@@ -240,14 +243,12 @@ fn afterPlain(
         var delta: f64 = 0.25;
         var solves: u32 = 0;
         while (solves < 100) : (solves += 1) {
-            ckt.applyAttempt(lambda);
             ckt.setHomotopy(options.tol.gmin, lambda);
             try ckt.rebuildBaseline();
             for (scaled, hold) |*s, h| s.value = h.value * lambda;
             const sr = newtonRun(ckt, ws, x, options.tol, scaled, 0.0, &.{}, options.tol.itl2, lambda_good < 0.0) catch |e| switch (e) {
                 error.SingularMatrix => failed,
-                else => { // else: only a singular Jacobian is a failed step; the rest unwinds the models
-                    ckt.restoreModels();
+                else => { // else: only a singular Jacobian is a failed step; the rest unwinds the sources
                     ckt.setHomotopy(options.tol.gmin, 1.0);
                     try ckt.rebuildBaseline();
                     return e;
@@ -273,7 +274,6 @@ fn afterPlain(
             }
         }
     }
-    ckt.restoreModels();
     ckt.setHomotopy(options.tol.gmin, 1.0);
     try ckt.rebuildBaseline();
 
@@ -500,6 +500,88 @@ pub fn solveLanes(
 
 /// One lane's `solve` outcome.
 pub const LaneOutcome = root.ErrorOf(solve)!converger.Result;
+
+/// `solveLanes` for any number of lanes with every lane's plain rung on the
+/// GPU (06 6.9): one device Newton from INITFIX, as `solve` runs it; a lane
+/// it leaves unconverged, singular or with a flipped latch takes its own
+/// ladder from rung 2 on the host, from the device state it started with.
+/// Within tolerance of `solveLanes`, not bitwise: the device replays one
+/// LU pivot order. A batch the device cannot take (nodesets, `.ic` holds,
+/// a floating start, a JFNK pin, `-Dcertify`, `gpu_lanes.staticRefusal`, a
+/// driver error) runs `solveLanes` W lanes at a time.
+pub fn solveGpuLanes(
+    comptime W: usize,
+    ckts: []const *root.Circuit,
+    xs: []const []f64,
+    options: Options,
+    nodeset: []const Ic,
+    ic: []const Ic,
+    out: []LaneOutcome,
+) !void {
+    const gpu_lanes = @import("../gpu/lanes.zig");
+    std.debug.assert(xs.len == ckts.len and out.len == ckts.len);
+    if (ckts.len == 0) return;
+    const c0 = ckts[0];
+    const held = if (options.tran_op) ic else &.{};
+    const pin = c0.knobs.newton.pin;
+    const why: ?[]const u8 = if (ckts.len < 2 or nodeset.len != 0 or held.len != 0 or c0.needs_tran_op)
+        "nodesets, holds or a floating start"
+    else if (!(pin == .auto or pin == .direct) or root.Circuit.certify)
+        "a JFNK pin or certify"
+    else
+        gpu_lanes.staticRefusal(c0);
+    if (why == null) {
+        if (solveOnDevice(ckts, xs, options, out)) return else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => if (c0.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: op lanes declined ({s})\n", .{@errorName(e)}),
+        }
+    } else if (c0.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: op lanes on the CPU: {s}\n", .{why.?});
+    var i: usize = 0;
+    while (i < ckts.len) : (i += W) {
+        const end = @min(ckts.len, i + W);
+        try solveLanes(W, ckts[i..end], xs[i..end], options, nodeset, ic, out[i..end]);
+    }
+}
+
+/// `solveGpuLanes`' device half. Fails before any lane's outcome is set
+/// (a driver error or `GpuLanes` refusal) or with out of memory.
+fn solveOnDevice(ckts: []const *root.Circuit, xs: []const []f64, options: Options, out: []LaneOutcome) !void {
+    const gpu_lanes = @import("../gpu/lanes.zig");
+    const gpa = ckts[0].gpa;
+    for (ckts, xs) |c, x| {
+        c.setSimState(.{ .kind = if (options.tran_op) .ic else .dc, .initial_step = true });
+        if (!options.warm_start) coldStart(c, x);
+        try c.computeBaseline();
+    }
+    const res = try gpa.alloc(gpu_lanes.LaneNewton, ckts.len);
+    defer gpa.free(res);
+    {
+        const dev = try gpu_lanes.GpuLanes.initStatic(gpa, ckts, xs);
+        defer dev.deinit();
+        dev.prof.on = ckts[0].knobs.gpu_stats != .off;
+        var copts = converger.optionsFromTolerances(options.tol, null);
+        copts.gmin = 0;
+        copts.init_fix = !options.warm_start;
+        try dev.solveStatic(xs, copts, res);
+        // `deinit` copies back the device state of the lanes it settled;
+        // the rest keep the host's start.
+        for (res, dev.detached) |r, *d| d.* = !(r.result.converged and !r.singular and !r.reject);
+    }
+    for (ckts, xs, out, res) |c, x, *o, r| {
+        const plain: ?converger.Result = if (r.singular) null else if (r.reject) .{ .converged = false, .iterations = r.result.iterations } else r.result;
+        o.* = blk: {
+            const ws = c.workspace() catch |e| break :blk e;
+            // Rung 2 reads the plain rung's last assembly off the planes.
+            if (plain == null or !plain.?.converged) c.evalNewton(x, 0);
+            break :blk afterPlain(c, ws, x, options, &.{}, plain);
+        };
+        // As `solve` ends.
+        if (o.*) |rr| {
+            if (rr.converged) _ = c.stateCtl(.commit);
+        } else |_| {}
+        c.setSimState(.{ .kind = if (options.tran_op) .ic else .dc });
+    }
+}
 
 /// Contract entry: the executor's solved ctx.x_op, one point per probe.
 pub fn run(ctx: *const root.RunCtx, _: Options) !root.Result {

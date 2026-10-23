@@ -660,9 +660,7 @@ export fn espice_release_points(handle: ?*Token, first_id: u32, count: usize) u3
 export fn espice_lane_width(handle: ?*Token, out: ?*u32) u32 {
     const h = handles.get(handle) catch |err| return status(err);
     const destination = out orelse return h.fail(error.InvalidArgument);
-    // ponytail: points run one query at a time; lane batching (TODO.md
-    // phase 1) makes this the executor's group width.
-    destination.* = 1;
+    destination.* = h.problem.lane_width();
     return 0;
 }
 

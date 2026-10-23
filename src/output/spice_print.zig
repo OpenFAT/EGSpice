@@ -8,8 +8,15 @@ const Plot = @import("types.zig").Plot;
 /// Writes `plot`, which must have passed `types.validatePlot(.print, ...)`.
 /// Asserts that it has variables and one sample row per point.
 pub fn encode(w: *Io.Writer, plot: Plot) !void {
-    assert(plot.result.varnames.len > 0);
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
+    try writeHeader(w, plot);
+    try writeRows(w, plot.stride(), 0, plot.result.data);
+}
+
+/// The plot line, header row and rule: what `encode` writes before the
+/// points.
+pub fn writeHeader(w: *Io.Writer, plot: Plot) !void {
+    assert(plot.result.varnames.len > 0);
     try w.print("{s}: {s}\n", .{ plot.result.plotname, plot.title });
     try w.writeAll("Index");
     for (plot.result.varnames) |name| {
@@ -20,9 +27,20 @@ pub fn encode(w: *Io.Writer, plot: Plot) !void {
     try w.writeAll("\n-----");
     for (0..plot.stride()) |_| try w.writeAll("\t---------------");
     try w.writeByte('\n');
-    for (0..plot.result.npoints) |pt| {
+}
+
+/// The rows of the points in `rows` (`stride` f64s each), the first
+/// numbered `first`: what `encode` writes after the header.
+pub fn writeRows(w: *Io.Writer, stride: usize, first: usize, rows: []const f64) !void {
+    assert(rows.len % stride == 0);
+    var pt = first;
+    var at: usize = 0;
+    while (at < rows.len) : ({
+        at += stride;
+        pt += 1;
+    }) {
         try w.print("{d}", .{pt});
-        for (plot.point(pt)) |x| try w.print("\t{e}", .{x});
+        for (rows[at..][0..stride]) |x| try w.print("\t{e}", .{x});
         try w.writeByte('\n');
     }
 }

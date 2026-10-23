@@ -5,8 +5,6 @@
 //   ngspice: Copyright Regents of the University of California and others,
 //   modified BSD license.
 //
-// Spec: dev/tline-and-switch.md §1.2 (FSM), §3 (sw_update_state, sw_eval).
-//
 // Only variables assigned inside an event block persist across evaluations
 // (LRM §5.10), so the state is split in two:
 //   OUTSIDE the band the position is a pure function of the control value and

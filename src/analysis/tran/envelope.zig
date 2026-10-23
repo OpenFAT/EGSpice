@@ -67,7 +67,7 @@ fn newtonAt(
 /// values. Returns the rows written, the t = 0 row included, or
 /// error.EnvelopeDidNotConverge when a step fails at min_periods_per_step
 /// or `max_outer_steps` runs out before t_stop.
-pub fn simulate(
+fn simulate(
     ckt: *root.Circuit,
     x: []f64,
     probes: []const u32,

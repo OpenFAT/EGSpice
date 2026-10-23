@@ -2,7 +2,7 @@
 * Expected results: monotonic_cubic_1e-09.expected.json
 Iin 0 out 1e-09
 R1 out 0 1
-B1 out 0 I=V(out)^3
+B1 out 0 I=V(out)*V(out)*V(out)
 .op
 .options reltol=1e-7 abstol=1e-15 vntol=1e-12
 .end

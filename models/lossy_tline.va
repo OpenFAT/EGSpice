@@ -9,8 +9,7 @@
 //
 // O-card RLC/RC devices use the recursive-convolution model
 // (models/ltra.va); LC uses tline.va. This file is kept for
-// comparison and the static RG path. Migration requirements:
-// dev/native-transmission-line-migration.md.
+// comparison and the static RG path.
 //
 // Each port has one branch-current unknown (ngspice rows brEq1/brEq2), i1 and
 // i2 both flowing INTO the line:

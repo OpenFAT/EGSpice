@@ -1,5 +1,4 @@
-* KNOWN GAP: an LTRA under .ac stamps its DC series resistance, not the frequency-dependent two-port (#111)
-* X01 pending fixture: LTRA small-signal AC must rotate phase with frequency.
+* Regression #111: LTRA small-signal AC must rotate phase with frequency.
 * Z0 = sqrt(l/c) = sqrt(250n/100p) = 50 ohm, Td = len*sqrt(l*c) = 2*5n = 10 ns.
 *
 * CORRECTED AFTER REVIEW, twice.

@@ -17,7 +17,6 @@ const std = @import("std");
 const root = @import("../types.zig");
 const take = root.take;
 const num = @import("core").numerics;
-const converger = @import("solver").converger;
 const dense_lu = @import("solver").dense_lu;
 const pss = @import("pss.zig");
 const pac = @import("pac.zig");
@@ -25,6 +24,26 @@ const mhb = @import("mhb.zig");
 
 /// The `.hb` query; `extra_tones` or `phasors` route it to `mhb.zig`.
 pub const Options = @import("core").query.Hb;
+pub const LaneOutcome = root.ErrorOf(run)!root.Result;
+
+/// Wide scheduler entry for driven sparse periodic systems. Dense and
+/// autonomous problems retain their ordinary query behavior.
+pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
+    std.debug.assert(ctxs.len == out.len and ctxs.len != 0);
+    // The resident harmonic preconditioner currently accepts the sparse
+    // FreqSolver representation. Do not replace a dense solve by identity.
+    if (opts.osc_node != root.GROUND or opts.n_harmonics == 0 or ctxs[0].circuit.n <= 16) {
+        for (ctxs, out) |*ctx, *result| result.* = run(ctx, opts);
+        return;
+    }
+    var grouped_options = opts;
+    if (opts.extra_tones.len == 0 and !opts.phasors) {
+        // The positional one-tone card follows solveOneTone's spectrum.
+        grouped_options.intmodmax = 0;
+        grouped_options.subharms = 1;
+    }
+    mhb.runGpuLanes(ctxs, grouped_options, out);
+}
 
 const SolveResult = pss.SolveResult;
 

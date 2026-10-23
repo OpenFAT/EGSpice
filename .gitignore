@@ -18,9 +18,12 @@ obj_dir/
 
 # Logs / dumps
 *.log
+!docs/performance/bench/**/*.log
 /core
 core.[0-9]*
 *.dump
+vgcore.*
+*.out
 
 # Claude Code
 .claude/
@@ -28,7 +31,6 @@ core.[0-9]*
 # Editor / OS
 *.swp
 *.swo
-*.log
 *~
 .DS_Store
 .vscode/
@@ -37,19 +39,8 @@ core.[0-9]*
 # Nix
 result
 result-*
-.venv-mineru/
-
-# valgrind core dumps
-vgcore.*
-obj_dir/
-*.out
 
 # MkDocs (the Pages workflow builds these)
 /site/
 /docs/wasm/
-
-
-# PDK model links for bench/matcha (see EXAMPLES.md)
-bench/matcha/*.pm
-bench/matcha/*.mt0
-bench/matcha/espice_*.txt
+__pycache__/

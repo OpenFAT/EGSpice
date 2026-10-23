@@ -27,9 +27,9 @@ const Gmres = @import("gmres.zig").Gmres;
 const BbdInfo = @import("core").numerics.BbdInfo;
 const Execution = @import("core").numerics.Execution;
 const num = @import("core").numerics;
-const lanes = @import("lanes.zig");
+const lanes = @import("lane/lanes.zig");
 const Lanes = lanes.Lanes;
-const LaneSolver = @import("lane_solver.zig").LaneSolver;
+const LaneSolver = @import("lane/solver.zig").LaneSolver;
 
 /// `ESPICE_SOLVER` overrides `run`'s choice: direct, jfnk (LU-preconditioned
 /// GMRES) or jfnk-nolu (Jacobi-preconditioned, no factorization at all).
@@ -190,7 +190,7 @@ pub fn LaneResult(comptime W: usize) type {
 /// leaves `active` when it converges or its factor fails, and freezes;
 /// its slots still compute and are discarded. At W = 1 this is `newton`
 /// (the `gen_newton` probe). Above, `sys` is a lane system whose methods
-/// take and return lane masks and read `sys.active` (`LaneCircuit(W)`),
+/// take and return lane masks and read `sys.active` (`lane_system.LaneSystem`),
 /// and `t` is per lane; the lanes `sys.active` holds on entry are solved.
 /// Every other error fails all lanes: a checkpoint
 /// cancel, or out of memory in a lane's factor. Traces (`ZP_OPDBG`,
@@ -870,17 +870,31 @@ pub const Workspace = struct {
     /// `OutOfWorkspace`), leaving nothing allocated. Asserts that `col_ptr`
     /// has n + 1 entries.
     pub fn init(gpa: std.mem.Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?BbdInfo, knobs: Knobs, lu_knobs: direct.Knobs) !Workspace {
+        return initOrdered(gpa, n, col_ptr, row_idx, bbd, knobs, lu_knobs, null);
+    }
+
+    /// `init` with a column order to reuse (`direct.Solver.initOrdered`).
+    pub fn initOrdered(gpa: std.mem.Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?BbdInfo, knobs: Knobs, lu_knobs: direct.Knobs, order: ?[]const u32) !Workspace {
         assert(col_ptr.len == @as(usize, n) + 1);
         const dx = try gpa.alloc(f64, n);
         errdefer gpa.free(dx);
         const x_old = try gpa.alloc(f64, n);
         errdefer gpa.free(x_old);
         return .{
-            .slv = try direct.Solver.init(gpa, n, col_ptr, row_idx, bbd, lu_knobs),
+            .slv = try direct.Solver.initOrdered(gpa, n, col_ptr, row_idx, bbd, lu_knobs, order),
             .dx = dx,
             .x_old = x_old,
             .knobs = knobs,
         };
+    }
+
+    /// Returns the workspace to its state right after `initOrdered`,
+    /// keeping its allocations (`direct.Solver.reset`; `bbd` must be what
+    /// `init` got). The GMRES and combined-value buffers are scratch every
+    /// call rewrites, so they stay.
+    pub fn reset(self: *Workspace, bbd: ?BbdInfo) std.mem.Allocator.Error!void {
+        try self.slv.reset(bbd);
+        self.prof = .{};
     }
 
     fn ensureKrylov(self: *Workspace) !*Gmres {

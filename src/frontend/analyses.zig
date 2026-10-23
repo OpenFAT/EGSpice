@@ -330,6 +330,7 @@ pub const DeckOptions = struct {
     /// `.options delmax`: the transient step cap when the `.tran` card sets
     /// none.
     delmax: ?f64 = null,
+    tran_ceiling: ?@FieldType(requests.Tran, "ceiling_policy") = null,
     /// `.options xmu`: the trapezoidal damping weight; null keeps 0.5.
     xmu: ?f64 = null,
     /// `.options tnom=<degC>`: the temperature model cards were extracted at
@@ -358,7 +359,7 @@ const runlvl_trtol = [6]f64{ 28, 14, 7, 3.5, 1.75, 0.875 };
 /// Option names outside this list (and the ones `foldOptions` passes on to
 /// other readers) are not simulated, and each draws a warning in every
 /// dialect. `gshunt`, `cshunt` and `rshunt` are read by the netlist.
-const Option = enum(u8) { method, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt };
+const Option = enum(u8) { method, tran_ceiling, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt };
 
 /// Folds the deck's `.options` and `.temp` cards; `InvalidAnalysisArguments`
 /// on a value out of range, logged with its card. The last `.temp` card
@@ -378,14 +379,14 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
     // HSPICE spellings: ABSV/RELV/ABSI are VNTOL/RELTOL/ABSTOL, GMINDC the DC
     // gmin (ESPice has one gmin), METHOD=BDF its Gear.
     const names = std.StaticStringMap(Option).initComptime(.{
-        .{ "method", .method }, .{ "reltol", .reltol }, .{ "abstol", .abstol },
-        .{ "vntol", .vntol },   .{ "gmin", .gmin },     .{ "trtol", .trtol },
-        .{ "chgtol", .chgtol }, .{ "itl1", .itl1 },     .{ "itl2", .itl2 },
-        .{ "itl4", .itl4 },     .{ "maxord", .maxord }, .{ "temp", .temp },
-        .{ "tnom", .tnom },     .{ "absv", .vntol },    .{ "relv", .reltol },
-        .{ "absi", .abstol },   .{ "gmindc", .gmin },   .{ "delmax", .delmax },
-        .{ "gshunt", .gshunt }, .{ "cshunt", .cshunt }, .{ "xmu", .xmu },
-        .{ "rshunt", .rshunt },
+        .{ "method", .method }, .{ "reltol", .reltol },             .{ "abstol", .abstol },
+        .{ "vntol", .vntol },   .{ "gmin", .gmin },                 .{ "trtol", .trtol },
+        .{ "chgtol", .chgtol }, .{ "itl1", .itl1 },                 .{ "itl2", .itl2 },
+        .{ "itl4", .itl4 },     .{ "maxord", .maxord },             .{ "temp", .temp },
+        .{ "tnom", .tnom },     .{ "absv", .vntol },                .{ "relv", .reltol },
+        .{ "absi", .abstol },   .{ "gmindc", .gmin },               .{ "delmax", .delmax },
+        .{ "gshunt", .gshunt }, .{ "cshunt", .cshunt },             .{ "xmu", .xmu },
+        .{ "rshunt", .rshunt }, .{ "tran_ceiling", .tran_ceiling },
     });
     const methods = std.StaticStringMap(requests.Method).initComptime(.{
         .{ "gear", .gear_2 }, .{ "trap", .trapezoidal }, .{ "trapezoidal", .trapezoidal }, .{ "bdf", .gear_2 },
@@ -444,6 +445,15 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
                 continue;
             };
             i += 1;
+            if (option == .tran_ceiling) {
+                const value = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
+                if (std.ascii.eqlIgnoreCase(value, "duration")) {
+                    o.tran_ceiling = .duration;
+                } else if (std.ascii.eqlIgnoreCase(value, "compatibility")) {
+                    o.tran_ceiling = .compatibility;
+                } else return error.InvalidAnalysisArguments;
+                continue;
+            }
             if (option == .method) {
                 const method = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
                 if (method.len > lower.len) return error.InvalidAnalysisArguments;
@@ -458,7 +468,7 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
                 else => raw,
             };
             switch (option) {
-                .method => unreachable,
+                .method, .tran_ceiling => unreachable,
                 .temp, .tnom => {
                     if (value <= -273.15) return error.InvalidAnalysisArguments;
                     if (option == .temp) o.temp_c = value else o.tnom_c = value;
@@ -531,7 +541,9 @@ pub fn applyDeckOptions(job: *Job, o: DeckOptions) void {
         if (o.trtol) |trtol| t.tol.trtol = trtol;
         // ngspice's default tmax, min(tstep, (tstop - tstart) / 50)
         // (traninit.c:29-34).
-        t.dt_max = t.dt_max orelse o.delmax orelse @min(t.dt_init, (t.t_stop - t.t_start) / 50);
+        if (o.tran_ceiling) |policy| t.ceiling_policy = policy;
+        t.dt_max = t.dt_max orelse o.delmax;
+        t.dt_max = t.requestedCeiling(.deck);
     }
 }
 

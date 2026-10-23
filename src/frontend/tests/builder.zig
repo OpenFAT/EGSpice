@@ -777,3 +777,35 @@ test "BBD blocks follow first-seen instance order over sparse instance ordinals"
     try std.testing.expectEqual(@as(u32, 4), info.coupling_start);
     try std.testing.expectEqual(@as(u32, 3), info.coupling_size);
 }
+
+test "equal device cards bind once and share a Model row" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nl = try netlist.parse(a, "* memo\nV1 d 0 1\nR1 d a 1k\nR2 a b 1k\nR3 b 0 2k\n.model nch nmos level=54\n" ++
+        "M1 d a 0 0 nch w=1u l=0.1u\nM2 d b 0 0 nch w=1u l=0.1u\nM3 a b 0 0 nch w=2u l=0.1u\n.end\n", .ngspice);
+    const lib = try device.Library.init(a);
+    var b = try Builder.init(std.testing.allocator, &lib);
+    var compiled = false;
+    defer if (!compiled) b.deinit();
+    var nb = try builder.NetBuilder.init(a, &b, nl);
+    try nb.build();
+    // Two MOSFET inputs; R and V cards bind on their own paths.
+    try std.testing.expectEqual(@as(u32, 2), nb.memo.count());
+    var c = try b.compile();
+    compiled = true;
+    defer c.deinit();
+    var seen = false;
+    for (c.batches) |batch| {
+        if (!std.mem.eql(u8, batch.type_name, "bsim4va")) continue;
+        seen = true;
+        const l = try batch.hooks.param_layout.?(batch.ctx).unwrap();
+        try std.testing.expectEqual(@as(u32, 3), l.count);
+        // Two distinct rows among three instances, whatever order the
+        // batch keeps them in.
+        const m = l.model_of;
+        const distinct = 1 + @as(u32, @intFromBool(m[1] != m[0])) + @intFromBool(m[2] != m[0] and m[2] != m[1]);
+        try std.testing.expectEqual(@as(u32, 2), distinct);
+    }
+    try std.testing.expect(seen);
+}

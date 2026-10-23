@@ -1,0 +1,6 @@
+warning: Git tree '/home/omare/Documents/Projects/Zig/ESPice' is dirty
+Using saved setting for 'extra-substituters = https://omarsiwy.cachix.org' from ~/.local/share/nix/trusted-settings.json.
+Using saved setting for 'extra-trusted-public-keys = omarsiwy.cachix.org-1:fE15rGllP0D8ijLsCorvAx66mlXLp+1H1l0lR72iZ3U=' from ~/.local/share/nix/trusted-settings.json.
+1/1 espice-215-optional-error.test.runtime optional error equality...optional error size=2, last=ResultUnavailable, findNone=2
+OK
+All 1 tests passed.

@@ -12,9 +12,195 @@ const ProtoStore = impl.ProtoStore;
 const PsdTerm = impl.PsdTerm;
 const Real = impl.test_access.Real;
 const deviceVtable = impl.deviceVtable;
-const gpuJacFloat = impl.gpuJacFloat;
-const jacFloat = impl.jacFloat;
 const std = @import("std");
+
+/// Writes integer card value `v` to `field`, which VerA may narrow to the
+/// smallest type its range needs, and marks it given when `given`.
+fn cardInt(model: anytype, comptime field: []const u8, v: i64, given: bool) void {
+    @field(model.*, field) = @intCast(v);
+    if (given) markGiven(model, field);
+}
+
+/// LRM 9.19: marks `field` given, through VerA's `setGiven` bitset or an
+/// older device's `<field>__given` flag.
+fn markGiven(model: anytype, comptime field: []const u8) void {
+    const T = @TypeOf(model.*);
+    if (comptime @hasDecl(T, "setGiven")) {
+        model.setGiven(field);
+    } else if (comptime @hasField(T, field ++ "__given")) {
+        @field(model.*, field ++ "__given") = true;
+    }
+}
+
+test "narrow admission rejects a limiter write without a derivative lane" {
+    const D = struct {
+        pub const U = enum(u8) { a, b, c, d, e, missing };
+        pub const deriv_reads: u64 = 0b011111;
+        pub const collapse_full: [6]?u8 = .{ null, null, null, 0, 1, null };
+        pub const limit_writes: u64 = 0b100000;
+        pub fn limit() void {}
+    };
+    try std.testing.expect(!impl.test_access.narrowEligible(D));
+}
+
+test "mixed collapsed batches preserve identity and ranges crossing the narrow boundary" {
+    const D = struct {
+        pub const U = enum(u8) { p, n, a, b, c, d };
+        pub const num_ports: usize = 2;
+        pub const Model = struct { gain: f64 = 1, collapsed: bool = false };
+        pub const Instance = struct { mfactor: f64 = 1 };
+        pub const collapse_full: [6]?u8 = .{ null, null, 0, 1, 0, 1 };
+        pub const n_q: usize = 1;
+        pub const q_stamps = [_]contract.QStamp(U){
+            .{ .site = 0, .row = .p, .sign = 1 },
+            .{ .site = 0, .row = .n, .sign = -1 },
+        };
+        pub fn collapse(comptime _: type, m: *const Model, _: *const Instance) [6]?u8 {
+            return if (m.collapsed) collapse_full else @splat(null);
+        }
+        fn current(comptime S: type, xv: *const [6]S.V, m: *const Model) S.Of(0x3f) {
+            const x = contract.probes(@This(), S, xv);
+            return x[0].sub(x[1]).add(x[2].sub(x[3]).scale(2)).add(x[4].sub(x[5]).scale(3)).scale(m.gain);
+        }
+        pub fn eval(comptime S: type, x: *const [6]S.V, m: *const Model, _: *const Instance, _: SimState) contract.Rows(@This(), S) {
+            const i = current(S, x, m);
+            const zero = S.con(0).to(0x3f);
+            return contract.rows(@This(), S, .{ i, i.neg(), zero, zero, zero, zero });
+        }
+        pub fn q(comptime S: type, x: *const [6]S.V, m: *const Model, _: *const Instance, _: SimState) contract.Sites(@This(), S) {
+            return contract.sites(@This(), S, .{current(S, x, m).scale(1e-12)});
+        }
+    };
+    const allocator = std.testing.allocator;
+    var proto: ProtoStore(D) = .{};
+    for (0..4) |id| {
+        const collapsed = id % 2 != 0;
+        try proto.append(&.{ .gain = @floatFromInt(id + 1), .collapsed = collapsed }, &.{ .mfactor = @floatFromInt(2 * id + 1) }, if (collapsed) .{ 0, 1, 0, 1, 0, 1 } else .{ 0, 1, 2, 3, 4, 5 });
+    }
+    var rows: [36]u32 = undefined;
+    for (&rows, 0..) |*row, i| row.* = @intCast(i % 6);
+    const batch = try ProtoStore(D).finalize(&proto, allocator, .{
+        .col_ptr = &.{ 0, 6, 12, 18, 24, 30, 36 },
+        .row_idx = &rows,
+        .n = 6,
+        .trash_slot = 36,
+    }).unwrap();
+    defer batch.hooks.deinit(batch.ctx, allocator);
+    const store: *DeviceBatch(D) = @ptrCast(@alignCast(batch.ctx));
+    try std.testing.expectEqual(@as(u32, 2), store.narrow_count);
+    const counts = batch.hooks.derivative_counts.?(batch.ctx);
+    try std.testing.expectEqual(@as(u32, 2), counts.narrow);
+    try std.testing.expectEqual(@as(u32, 2), counts.wide);
+    for ([_]u32{ 1, 3, 0, 2 }, 0..) |original, id| {
+        const identity = batch.hooks.charge_identity.?(batch.ctx, id);
+        try std.testing.expectEqual(original, identity.instance);
+        try std.testing.expectEqual(@as(u32, 0), identity.site);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(original + 1)), store.models[id].gain);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(2 * original + 1)), store.instances[id].mfactor);
+    }
+    const PlaneSet = struct {
+        g: [37]f64 = @splat(0),
+        c: [37]f64 = @splat(0),
+        rhs: [7]f64 = @splat(0),
+        q: [7]f64 = @splat(0),
+        fn eval(self: *@This(), b: Batch, first: u32, last: u32) void {
+            b.eval(b.ctx, &.{ .g_vals = &self.g, .c_vals = &self.c, .rhs = &self.rhs, .q_vec = &self.q }, first, last, &.{ 1, 0, 2, -1, 3, -2 }, 0);
+        }
+    };
+    var full: PlaneSet = .{};
+    full.eval(batch, 0, 4);
+    var ranged: PlaneSet = .{};
+    ranged.eval(batch, 0, 1);
+    ranged.eval(batch, 1, 3); // Same range path used by a worker crossing 2.
+    ranged.eval(batch, 3, 4);
+    try std.testing.expectEqualDeep(full, ranged);
+    store.narrow_count = 0; // Test-only forced-wide reference, identical order.
+    var wide: PlaneSet = .{};
+    wide.eval(batch, 0, 4);
+    try std.testing.expectEqualDeep(full, wide);
+    store.narrow_count = 2;
+
+    if (!@import("builtin").single_threaded) {
+        // The production ParEval hook writes distinct per-instance positions.
+        // One worker deliberately straddles the narrow/wide boundary.
+        const Planes = impl.Planes;
+        const tapes = batch.hooks.scatter_tapes(batch.ctx);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Staged = struct {
+            fn init(gpa: std.mem.Allocator, slots: usize, rows_len: usize) !Planes {
+                return .{
+                    .g_vals = try gpa.alloc(f64, slots),
+                    .c_vals = try gpa.alloc(f64, slots),
+                    .rhs = try gpa.alloc(f64, rows_len),
+                    .q_vec = try gpa.alloc(f64, rows_len),
+                };
+            }
+            fn run(b: Batch, planes: *const Planes, first: u32, last: u32, mode: anytype) void {
+                b.hooks.stage(b.ctx, planes, first, last, &.{ 1, 0, 2, -1, 3, -2 }, 0, mode);
+            }
+        };
+        const serial = try Staged.init(a, tapes.slots.len, tapes.rows.len);
+        const parallel = try Staged.init(a, tapes.slots.len, tapes.rows.len);
+        inline for (.{ .full, .newton, .charge }) |mode| {
+            inline for (.{ "g_vals", "c_vals", "rhs", "q_vec" }) |field| {
+                @memset(@field(serial, field), -0.0);
+                @memset(@field(parallel, field), -0.0);
+            }
+            Staged.run(batch, &serial, 0, 4, mode);
+            {
+                const first = try std.Thread.spawn(.{}, Staged.run, .{ batch, &parallel, 0, 1, mode });
+                defer first.join();
+                const crossing = try std.Thread.spawn(.{}, Staged.run, .{ batch, &parallel, 1, 3, mode });
+                defer crossing.join();
+                Staged.run(batch, &parallel, 3, 4, mode);
+            }
+            inline for (.{ "g_vals", "c_vals", "rhs", "q_vec" }) |field|
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(@field(serial, field)), std.mem.sliceAsBytes(@field(parallel, field)));
+        }
+    }
+}
+
+test "BSIM4 noise remains wide and source PSDs are finite nonnegative across modes" {
+    const D = @import("models").bsim4va;
+    const S = impl.test_access.NoiseFamily(D);
+    for ([_]i64{ 1, -1 }) |polarity| {
+        for ([_]i64{ 0, 1 }) |tnoi| {
+            for ([_]i64{ 0, 1 }) |rds| {
+                for ([_]i64{ 0, 1, 2, 3 }) |gate| {
+                    for ([_]i64{ 0, 1 }) |body| {
+                        var model: D.Model = .{ .l = 0.5e-6, .w = 10e-6, .nf = 2, .rnoib = 1.2, .vtl = 1e5 };
+                        cardInt(&model, "typeZ", polarity, true);
+                        cardInt(&model, "tnoimod", tnoi, false);
+                        cardInt(&model, "rdsmod", rds, false);
+                        cardInt(&model, "rgatemod", gate, false);
+                        cardInt(&model, "rbodymod", body, false);
+                        markGiven(&model, "vtl");
+                        D.derive(Real, &model);
+                        for ([_][4]f64{ .{ 0.8, 0.9, 0, -0.2 }, .{ 0, 0.9, 0.8, -0.2 }, .{ 1e-8, 0.9, 0, 0 } }) |ports| {
+                            var x: [contract.nU(D)]f64 = @splat(0);
+                            for (ports, 0..) |v, i| x[i] = v * @as(f64, @floatFromInt(polarity));
+                            // Set internal nodes to the chosen intrinsic bias.
+                            // They remain distinct derivative seeds in NoiseFamily.
+                            for (D.collapse_full, 0..) |alias, i| {
+                                if (alias) |a| x[i] = x[a];
+                            }
+                            var inst: D.Instance = .{};
+                            const terms = D.noisePsd(S, x, &model, &inst, .{ .kind = .noise });
+                            for (terms) |term| {
+                                try std.testing.expect(std.math.isFinite(term.white));
+                                try std.testing.expect(term.white >= 0);
+                                try std.testing.expect(std.math.isFinite(term.flicker));
+                                try std.testing.expect(term.flicker >= 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 test "anyNonzero matches the float compare it replaces, ±0 and NaN included" {
     const specials = [_]f64{ 0.0, -0.0, std.math.nan(f64), -std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), std.math.floatTrueMin(f64), -std.math.floatTrueMin(f64), 1.0 };
@@ -32,7 +218,7 @@ test "anyNonzero matches the float compare it replaces, ±0 and NaN included" {
 }
 
 test "Dual: expm1 and log1p retain finite range and IEEE endpoints" {
-    const S = Dual(1, f64);
+    const S = Dual(1);
     for ([_]f64{ -740, -1, -1e-17, -0.0, 0, 1e-17, 0.5, 704, 709 }) |x| {
         const y = S.probe(0, x).expm1();
         try std.testing.expect(std.math.isFinite(y.v));
@@ -54,52 +240,10 @@ test "Dual: expm1 and log1p retain finite range and IEEE endpoints" {
     try std.testing.expect(std.math.signbit(S.probe(0, -0.0).log1p().v));
 }
 
-test "Dual: an f32 Jacobian leaves the residual bit-identical" {
-    // `F` is the derivative width only; the residual is the same f64
-    // arithmetic at either width, so values must be equal, not close.
-    const core = struct {
-        // A diode core: is·(exp(v/vt) − 1) + gmin·v.
-        fn f(comptime S: type, bias: f64) S.Of(0b11) {
-            const v = S.probe(0, bias).sub(S.probe(1, 0));
-            return S.con(1e-14).mul(v.div(S.con(0.025851999786450736)).exp().addC(-1.0))
-                .add(v.scale(1e-12));
-        }
-    }.f;
-    for (0..17) |i| {
-        const bias = @as(f64, @floatFromInt(i)) * 0.05;
-        const a = core(Dual(2, f64), bias);
-        const b = core(Dual(2, f32), bias);
-        try std.testing.expectEqual(a.val(), b.val());
-        // The Jacobian degrades to f32 precision and no further.
-        inline for (0..2) |c| try std.testing.expectApproxEqRel(a.ddxAt(c), b.ddxAt(c), 1e-6);
-    }
-}
-
-test "Dual is the contract's arithmetic, exact and padded, at both lane widths" {
-    try contract.expectFamily(Dual(2, f64));
-    try contract.expectFamily(Dual(2, f32));
+test "Dual is the contract's arithmetic, exact and padded" {
+    try contract.expectFamily(Dual(2));
     try contract.expectFamily(impl.test_access.Sparse);
-    try contract.expectFamily(impl.test_access.SparseF32);
     contract.checkFamily(Real);
-}
-
-test "jac width: one device, two instantiations" {
-    // `jac_f32` is a permission the GPU kernel takes and the host declines;
-    // `jac_f32_host` makes the host take it too.
-    const Plain = struct {};
-    const Permitted = struct {
-        pub const jac_f32 = true;
-    };
-    const Ordered = struct {
-        pub const jac_f32 = true;
-        pub const jac_f32_host = true;
-    };
-    try std.testing.expectEqual(f64, jacFloat(Plain));
-    try std.testing.expectEqual(f64, gpuJacFloat(Plain));
-    try std.testing.expectEqual(f64, jacFloat(Permitted));
-    try std.testing.expectEqual(f32, gpuJacFloat(Permitted));
-    try std.testing.expectEqual(f32, jacFloat(Ordered));
-    try std.testing.expectEqual(f32, gpuJacFloat(Ordered));
 }
 
 test "Real: every primitive is Dual's value half, bit for bit" {
@@ -129,7 +273,7 @@ test "Real: every primitive is Dual's value half, bit for bit" {
             const a = @as(f64, @floatFromInt(i)) * 0.25 - 1.5;
             const b = @as(f64, @floatFromInt(j)) * 0.25 - 1.5;
             try std.testing.expectEqual(
-                core(Dual(2, f64), a, b).val(),
+                core(Dual(2), a, b).val(),
                 core(Real, a, b).val(),
             );
         }
@@ -216,8 +360,6 @@ test "dyn vtable: blob init, param set by name, proto add" {
 
 test "equal cards share one Model row until a parameter is collected" {
     const D = struct {
-        // Marks a VerA device, the only kind whose Models are shared.
-        pub const lane_masks = [_]contract.LaneUse{.{ .mask = 0b11, .uses = 1 }};
         pub const U = enum(u8) { p, n };
         pub const num_ports: usize = 2;
         pub const Model = struct { r: f64 = 1000, given: bool = false };
@@ -278,6 +420,91 @@ test "equal cards share one Model row until a parameter is collected" {
     try std.testing.expectEqual(@as(f64, 1000), shared.models[2].r);
 }
 
+test "write_params copies a shared Model row only for an instance written apart" {
+    const D = struct {
+        pub const U = enum(u8) { p, n };
+        pub const num_ports: usize = 2;
+        pub const Model = struct { r: f64 = 1000 };
+        pub const Instance = struct { mfactor: f64 = 1 };
+        pub fn eval(comptime S: type, xv: *const [2]S.V, m: *const Model, _: *const Instance, _: SimState) contract.Rows(@This(), S) {
+            const x = contract.probes(@This(), S, xv);
+            const current = x[0].sub(x[1]).scale(1 / m.r);
+            return contract.rows(@This(), S, .{ current, current.neg() });
+        }
+    };
+    const a = std.testing.allocator;
+    var proto: ProtoStore(D) = .{};
+    for ([_]f64{ 1000, 50, 1000 }, [_][2]u32{ .{ 1, 2 }, .{ 2, 0 }, .{ 1, 0 } }) |r, nodes|
+        try proto.append(&.{ .r = r }, &.{}, nodes);
+    const batch = try ProtoStore(D).finalize(&proto, a, .{
+        .col_ptr = &.{ 0, 3, 6, 9 },
+        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
+        .n = 3,
+        .trash_slot = 9,
+    }).unwrap();
+    defer batch.hooks.deinit(batch.ctx, a);
+    // Ordinals: mfactor of instances 0..2, then r of instances 0..2.
+    const layout = try batch.hooks.param_layout.?(batch.ctx).unwrap();
+    try std.testing.expectEqual(@as(usize, 2), layout.fields.len);
+    try std.testing.expectEqual(@as(f64, 1000), layout.ptr(5).*);
+
+    // Instance 0 alone moves: it gets a row of its own, instance 2 keeps
+    // the card's.
+    {
+        const copy = try batch.hooks.instantiate(batch.ctx, a).unwrap();
+        defer copy.hooks.deinit(copy.ctx, a);
+        const b: *DeviceBatch(D) = @ptrCast(@alignCast(copy.ctx));
+        try copy.hooks.write_params.?(copy.ctx, &.{ 1, 3 }, &.{ 2, 10 }, 0, 6).unwrap();
+        try std.testing.expectEqual(@as(usize, 3), b.models.len);
+        try std.testing.expectEqualSlices(u32, &.{ 2, 1, 0 }, b.model_of);
+        try std.testing.expectEqual(@as(f64, 10), b.models[2].r);
+        try std.testing.expectEqual(@as(f64, 1000), b.models[0].r);
+        try std.testing.expectEqual(@as(f64, 2), b.instances[1].mfactor);
+        // A second write to the private row lands in place.
+        try copy.hooks.write_params.?(copy.ctx, &.{3}, &.{11}, 0, 6).unwrap();
+        try std.testing.expectEqual(@as(usize, 3), b.models.len);
+        try std.testing.expectEqual(@as(f64, 11), b.models[2].r);
+        // Collecting then gives every instance its own row, values kept.
+        var params: std.ArrayList(impl.test_access.ParamRef) = .empty;
+        defer params.deinit(a);
+        try copy.hooks.collect_params(copy.ctx, a, &params).unwrap();
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, b.model_of);
+        try std.testing.expectEqual(@as(f64, 11), b.models[0].r);
+        try std.testing.expectEqual(@as(f64, 50), b.models[1].r);
+        try std.testing.expectEqual(@as(f64, 1000), b.models[2].r);
+    }
+    // Every reader of the shared row moves alike: the row is written in
+    // place.
+    {
+        const copy = try batch.hooks.instantiate(batch.ctx, a).unwrap();
+        defer copy.hooks.deinit(copy.ctx, a);
+        const b: *DeviceBatch(D) = @ptrCast(@alignCast(copy.ctx));
+        try copy.hooks.write_params.?(copy.ctx, &.{ 3, 5 }, &.{ 7, 7 }, 0, 6).unwrap();
+        try std.testing.expectEqual(@as(usize, 2), b.models.len);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 0 }, b.model_of);
+        try std.testing.expectEqual(@as(f64, 7), b.models[0].r);
+    }
+    // Isolating instance 2 copies the row it shares with instance 0; a
+    // second call finds every named row private and copies nothing.
+    {
+        const copy = try batch.hooks.instantiate(batch.ctx, a).unwrap();
+        defer copy.hooks.deinit(copy.ctx, a);
+        const b: *DeviceBatch(D) = @ptrCast(@alignCast(copy.ctx));
+        try copy.hooks.isolate_rows.?(copy.ctx, &.{ 1, 2 }).unwrap();
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, b.model_of);
+        try copy.hooks.isolate_rows.?(copy.ctx, &.{ 0, 2 }).unwrap();
+        try std.testing.expectEqual(@as(usize, 3), b.models.len);
+        const l = try copy.hooks.param_layout.?(copy.ctx).unwrap();
+        l.ptr(5).* = 9;
+        try std.testing.expectEqual(@as(f64, 1000), b.models[0].r);
+        try std.testing.expectEqual(@as(f64, 9), b.models[2].r);
+    }
+    // The template is untouched.
+    const t: *DeviceBatch(D) = @ptrCast(@alignCast(batch.ctx));
+    try std.testing.expectEqual(@as(usize, 2), t.models.len);
+    try std.testing.expectEqual(@as(f64, 1000), t.models[0].r);
+}
+
 test "collect_noise emits a correlated source's rows contiguously, with coeff, group and table" {
     const D = struct {
         const Gen = struct { row: u8, col: u8, kind: enum { thermal, shot, flicker, table }, source: ?u16 = null, table: ?u16 = null, name: []const u8 = "" };
@@ -294,7 +521,11 @@ test "collect_noise emits a correlated source's rows contiguously, with coeff, g
         }
         pub const U = enum(u8) { p, n };
         pub const num_ports: usize = 2;
-        pub const Model = struct { r: f64 = 1000 };
+        // The card's knots (§4.6.4.3 array parameter), double the defaults.
+        pub const Model = struct { r: f64 = 1000, noise_table_points__: [2][2]f64 = .{ .{ 1, 4 }, .{ 3, 8 } } };
+        pub fn noiseTablePoints(m: *const Model) [2][2]f64 {
+            return m.noise_table_points__;
+        }
         pub const Instance = struct {};
         pub fn eval(comptime S: type, xv: *const [2]S.V, m: *const Model, _: *const Instance, _: SimState) contract.Rows(@This(), S) {
             const x = contract.probes(@This(), S, xv);
@@ -325,14 +556,96 @@ test "collect_noise emits a correlated source's rows contiguously, with coeff, g
         const base: u32 = @intCast(1 + 4 * id);
         try std.testing.expectEqualSlices(f64, &.{ 2, -2, 1, 0.5 }, &.{ r[0].coeff, r[1].coeff, r[2].coeff, r[3].coeff });
         try std.testing.expectEqualSlices(u32, &.{ base, base, base + 2, base + 3 }, &.{ r[0].group, r[1].group, r[2].group, r[3].group });
-        // (u, u) is u to ground; the table row carries the device's knots.
+        // (u, u) is u to ground; the table row carries the card's knots.
         try std.testing.expectEqual(@as(u32, 0), r[1].node_n);
-        try std.testing.expectEqual(@as(f64, 3), r[3].tableAt(2));
+        try std.testing.expectEqual(@as(f64, 6), r[3].tableAt(2));
         try std.testing.expectEqual(@as(f64, 0), r[0].tableAt(2));
         try std.testing.expectEqual(base + 2, NoiseSource.groupEnd(noise.items, base));
     }
     try std.testing.expectEqual(@as(u32, 1), s[0].node_p);
     try std.testing.expectEqual(@as(u32, 2), s[4].node_p);
+}
+
+test "collect_noise puts a generator on a potential branch into its flow row" {
+    const D = struct {
+        // `V(p,n) <+ R*I(p,n) + white_noise` and `I(p) <+ white_noise`:
+        // VerA names both by their nodes. The third is a generator VerA
+        // states on the flow row itself (row = col = the flow unknown).
+        pub const noise_gens = [_]NoiseGen{
+            .{ .row = 0, .col = 1, .kind = .thermal },
+            .{ .row = 0, .col = 0, .kind = .thermal },
+            .{ .row = 2, .col = 2, .kind = .thermal },
+        };
+        pub fn noisePsd(comptime _: type, _: [3]f64, _: *const Model, _: *const Instance, _: SimState) [3]PsdTerm {
+            return .{ .{ .white = 1 }, .{ .white = 2 }, .{ .white = 3, .coeff = -1 } };
+        }
+        pub const U = enum(u8) { p, n, flowZ28pZ2cnZ29 };
+        pub const num_ports: usize = 2;
+        pub const Model = struct { r: f64 = 1000 };
+        pub const Instance = struct {};
+        pub fn eval(comptime S: type, xv: *const [3]S.V, m: *const Model, _: *const Instance, _: SimState) contract.Rows(@This(), S) {
+            const x = contract.probes(@This(), S, xv);
+            return contract.rows(@This(), S, .{ x[2], x[2].neg(), x[0].sub(x[1]).sub(x[2].scale(m.r)) });
+        }
+    };
+    const a = std.testing.allocator;
+    var proto: ProtoStore(D) = .{};
+    try proto.append(&.{}, &.{}, .{ 1, 2, 3 });
+    // A switch branch in its flow arm: the flow collapsed onto p.
+    try proto.append(&.{}, &.{}, .{ 1, 2, 1 });
+    const batch = try ProtoStore(D).finalize(&proto, a, .{
+        .col_ptr = &.{ 0, 4, 8, 12, 16 },
+        .row_idx = &.{ 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3 },
+        .n = 4,
+        .trash_slot = 16,
+    }).unwrap();
+    defer batch.hooks.deinit(batch.ctx, a);
+    var noise: std.ArrayList(NoiseSource) = .empty;
+    defer noise.deinit(a);
+    try batch.hooks.collect_noise.?(batch.ctx, &.{ 0, 0, 0, 0 }, a, &noise).unwrap();
+    // The branch generator is −1 at the flow row (ground to row 3), not a
+    // current from p to n; the to-ground one has no flow(p,gnd) and stays.
+    try std.testing.expectEqual(@as(u32, 0), noise.items[0].node_p);
+    try std.testing.expectEqual(@as(u32, 3), noise.items[0].node_n);
+    try std.testing.expectEqual(@as(u32, 1), noise.items[1].node_p);
+    try std.testing.expectEqual(@as(u32, 0), noise.items[1].node_n);
+    // The flow-row form passes through as is, not retargeted twice.
+    try std.testing.expectEqual(@as(u32, 3), noise.items[2].node_p);
+    try std.testing.expectEqual(@as(u32, 0), noise.items[2].node_n);
+    try std.testing.expectEqual(@as(f64, -1), noise.items[2].coeff);
+    // Collapsed, the branch generator is the current from p to n again.
+    try std.testing.expectEqual(@as(u32, 1), noise.items[3].node_p);
+    try std.testing.expectEqual(@as(u32, 2), noise.items[3].node_n);
+}
+
+test "seed_nodeset writes each net initializer into its unknown, ground excepted" {
+    const D = struct {
+        // §3.6.3.2 `electrical p = 2.75;`: only p has an initializer.
+        pub const u_nodeset = [2]?f64{ 2.75, null };
+        pub const U = enum(u8) { p, n };
+        pub const num_ports: usize = 2;
+        pub const Model = struct { r: f64 = 1000 };
+        pub const Instance = struct {};
+        pub fn eval(comptime S: type, xv: *const [2]S.V, m: *const Model, _: *const Instance, _: SimState) contract.Rows(@This(), S) {
+            const x = contract.probes(@This(), S, xv);
+            const current = x[0].sub(x[1]).scale(1 / m.r);
+            return contract.rows(@This(), S, .{ current, current.neg() });
+        }
+    };
+    const a = std.testing.allocator;
+    var proto: ProtoStore(D) = .{};
+    try proto.append(&.{}, &.{}, .{ 1, 2 });
+    try proto.append(&.{}, &.{}, .{ 0, 1 }); // p on ground: nothing written
+    const batch = try ProtoStore(D).finalize(&proto, a, .{
+        .col_ptr = &.{ 0, 3, 6, 9 },
+        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
+        .n = 3,
+        .trash_slot = 9,
+    }).unwrap();
+    defer batch.hooks.deinit(batch.ctx, a);
+    var x = [_]f64{ -1, -1, -1 };
+    batch.hooks.seed_nodeset.?(batch.ctx, &x);
+    try std.testing.expectEqualSlices(f64, &.{ -1, 2.75, -1 }, &x);
 }
 
 test "prepared device instances share tapes and isolate parameters and accepted history" {
@@ -982,7 +1295,7 @@ test "spicePulseBreak rounds from the request time as ngspice does" {
 test "Dual: every partial matches a central difference of the value" {
     // Independent of the contract's reference family: a wrong lane rule
     // there and here would still disagree with the difference quotient.
-    const S = Dual(2, f64);
+    const S = Dual(2);
     const core = struct {
         fn f(a: f64, b: f64) S.Of(0b11) {
             const x = S.probe(0, a);
@@ -1028,7 +1341,7 @@ test "Dual: the padded layout computes the exact layout's numbers" {
     const Sparse3 = impl.test_access.Sparse3;
     const grid = [_]f64{ -1.0, -0.5, 0.0, 0.5, 1.0 };
     for (grid) |a| for (grid) |b| for (grid) |c| {
-        const exact = chain(Dual(3, f64), a, b, c);
+        const exact = chain(Dual(3), a, b, c);
         const padded = chain(Sparse3, a, b, c);
         try std.testing.expectEqual(exact.val(), padded.val());
         inline for (0..3) |u| try std.testing.expectEqual(exact.ddxAt(u), padded.ddxAt(u));
@@ -1213,4 +1526,113 @@ test "Dual: sel takes b at a ±0 indicator and a at any other, NaN included" {
     for ([_]f64{ 1.0, -1.0, std.math.floatTrueMin(f64), std.math.inf(f64), std.math.nan(f64) }) |c| {
         try std.testing.expectEqual(@as(f64, -0.5), S.sel(S.con(c), x.neg(), x).v);
     }
+}
+
+test "BSIM4 linked admission and limited planes agree with forced wide across modes" {
+    const D = @import("models").bsim4va;
+    const n = contract.nU(D);
+    const reference_vt = deviceVtable(D, "bsim4_forced_wide_test");
+    const get = @extern(*const fn () callconv(.c) @TypeOf(reference_vt), .{ .name = "arp_device_bsim4va" });
+    const actual_vt = get();
+    const a = std.testing.allocator;
+    var rows: [n * n]u32 = undefined;
+    var columns: [n + 1]u32 = undefined;
+    for (&rows, 0..) |*row, i| row.* = @intCast(i % n);
+    for (&columns, 0..) |*column, i| column.* = @intCast(i * n);
+    const pattern: impl.test_access.PatternView = .{ .col_ptr = &columns, .row_idx = &rows, .n = n, .trash_slot = n * n };
+    const Helpers = struct {
+        fn batch(gpa: std.mem.Allocator, vt: @TypeOf(reference_vt), model: *const D.Model, instance: *const D.Instance, nodes: *const [n]u32, pv: impl.test_access.PatternView) !Batch {
+            const proto = try vt.proto_create(gpa).unwrap();
+            defer proto.destroy(proto.ctx, gpa);
+            try vt.proto_add(proto.ctx, gpa, @ptrCast(model), @ptrCast(instance), nodes).unwrap();
+            // Evaluation is also valid on the finalized template; retain its
+            // owned immutable tapes for the whole test batch lifetime.
+            return proto.finalize(proto.ctx, gpa, pv).unwrap();
+        }
+        fn voltages(nodes: [n]u32, ports: [4]f64, sign: f64) [n + 1]f64 {
+            var result: [n + 1]f64 = @splat(0);
+            inline for (0..n) |u| {
+                if (comptime D.u_kinds[u] == .voltage) {
+                    const port = comptime D.collapse_full[u] orelse u;
+                    result[nodes[u]] = sign * ports[port];
+                }
+            }
+            return result;
+        }
+    };
+    const Planes = struct {
+        g: [n * n + 1]f64 = @splat(0),
+        c: [n * n + 1]f64 = @splat(0),
+        rhs: [n + 1]f64 = @splat(0),
+        q: [n + 1]f64 = @splat(0),
+        fn eval(self: *@This(), b: Batch, x: []const f64) void {
+            self.* = .{};
+            b.eval(b.ctx, &.{ .g_vals = &self.g, .c_vals = &self.c, .rhs = &self.rhs, .q_vec = &self.q }, 0, 1, x, 0);
+        }
+    };
+    var checked: usize = 0;
+    var admitted: usize = 0;
+    for ([_]i64{ 1, -1 }) |polarity| {
+        for ([_]i64{ 0, 1 }) |rds| for ([_]i64{ 0, 1, 2, 3 }) |gate| for ([_]i64{ 0, 1, 2 }) |body| for ([_]i64{ 0, 1 }) |tnoi| {
+            var model: D.Model align(16) = .{ .temperature__ = if (polarity > 0) 250 else 400, .l = 0.5e-6, .w = 10e-6, .nf = 2 };
+            cardInt(&model, "typeZ", polarity, true);
+            cardInt(&model, "rdsmod", rds, false);
+            cardInt(&model, "rgatemod", gate, false);
+            cardInt(&model, "rbodymod", body, false);
+            cardInt(&model, "tnoimod", tnoi, false);
+            D.derive(Real, &model);
+            const instance: D.Instance align(16) = .{ .mfactor = 3 };
+            const collapse = D.collapse(Real, &model, &instance);
+            const eligible = rds == 0 and gate == 0 and body == 0 and tnoi == 0;
+            try std.testing.expectEqual(eligible, std.meta.eql(collapse, D.collapse_full));
+            var nodes: [n]u32 = undefined;
+            for (&nodes, collapse, 0..) |*node, alias, u| node.* = if (alias) |root_node| root_node else @intCast(u);
+            const actual = try Helpers.batch(a, actual_vt, &model, &instance, &nodes, pattern);
+            defer actual.hooks.deinit(actual.ctx, a);
+            const reference = try Helpers.batch(a, reference_vt, &model, &instance, &nodes, pattern);
+            defer reference.hooks.deinit(reference.ctx, a);
+            const counts = actual.hooks.derivative_counts.?(actual.ctx);
+            const reference_counts = reference.hooks.derivative_counts.?(reference.ctx);
+            try std.testing.expectEqual(@as(u32, 0), reference_counts.narrow);
+            try std.testing.expectEqual(@as(u8, 11), counts.wide_lanes);
+            try std.testing.expect(counts.narrow_lanes == 0 or counts.narrow_lanes == 4);
+            try std.testing.expectEqual(@as(u32, @intFromBool(eligible and counts.narrow_lanes == 4)), counts.narrow);
+            admitted += counts.narrow;
+            checked += 1;
+            const sim: SimState = .{ .kind = .tran, .analog_initial = false, .iteration = 2 };
+            actual.hooks.set_sim_state(actual.ctx, sim);
+            reference.hooks.set_sim_state(reference.ctx, sim);
+            for ([_]bool{ false, true }) |reverse| {
+                actual.hooks.clear_limits.?(actual.ctx);
+                reference.hooks.clear_limits.?(reference.ctx);
+                const sign: f64 = @floatFromInt(polarity);
+                const old = Helpers.voltages(nodes, if (reverse) .{ 0, 0.4, 0.1, -0.1 } else .{ 0.1, 0.4, 0, -0.1 }, sign);
+                var x_actual = Helpers.voltages(nodes, if (reverse) .{ 0, 2.7, 1.8, 0.8 } else .{ 1.8, 2.7, 0, 0.8 }, sign);
+                var x_reference = x_actual;
+                for (0..3) |phase| {
+                    if (phase != 0) {
+                        const changed_a = actual.hooks.apply_limits.?(actual.ctx, &x_actual, &old);
+                        const changed_r = reference.hooks.apply_limits.?(reference.ctx, &x_reference, &old);
+                        try std.testing.expectEqual(changed_r, changed_a);
+                        try std.testing.expectEqualSlices(f64, &x_reference, &x_actual);
+                    }
+                    var got: Planes = .{};
+                    var want: Planes = .{};
+                    got.eval(actual, &x_actual);
+                    want.eval(reference, &x_reference);
+                    inline for (.{ "g", "c", "rhs", "q" }, .{ 1e-12, 1e-24, 1e-12, 1e-24 }) |field, floor| {
+                        for (@field(got, field), @field(want, field)) |v, expected| {
+                            try std.testing.expect(std.math.isFinite(v) and std.math.isFinite(expected));
+                            try std.testing.expectApproxEqAbs(expected, v, 1e-10 * @max(@abs(v), @abs(expected)) + floor);
+                        }
+                    }
+                }
+            }
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 96), checked);
+    // The same test runs in default and opt-in builds. The real linked
+    // vtable reports whether its BSIM4 object compiled the narrow family.
+    try std.testing.expect(admitted == 0 or admitted == 2);
+    std.debug.print("bsim4-mode-gate: checked={d} admitted={d}\n", .{ checked, admitted });
 }

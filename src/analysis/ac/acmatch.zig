@@ -35,8 +35,10 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const nn = 2 * n;
     const n_points: usize = opts.sweep.count();
 
-    const refs = try ckt.collectParams();
-    const groups = try dcmatch.Groups.init(scratch, refs, opts.variations);
+    const sel = try dcmatch.Refs.init(scratch, ckt, opts.variations);
+    defer sel.deinit(scratch);
+    const refs = sel.refs;
+    const groups = try dcmatch.Groups.init(scratch, refs, sel.vars);
     defer groups.deinit(scratch);
     const n_groups = groups.count();
 

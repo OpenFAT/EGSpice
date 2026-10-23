@@ -1,0 +1,26 @@
+{
+  "binary": "/tmp/espice-lanes-release/bin/espice",
+  "sha256": "455ae97cda44c28c59a355b8a7606a3c9a7108ec878d8260929011f28207f3ca",
+  "bytes": 375501136,
+  "built_utc": "2026-10-20T17:40:17.371183+00:00",
+  "cwd": "/tmp/espice-lanes-final-release",
+  "command": [
+    "nix",
+    "develop",
+    "-c",
+    "zig",
+    "build",
+    "build-cli",
+    "-Doptimize=ReleaseFast",
+    "-Dgpu=true",
+    "-Dcuda-arch=sm_89",
+    "-Dhip-arch=none",
+    "-j2",
+    "-p",
+    "/tmp/espice-lanes-release"
+  ],
+  "exit_code": 0,
+  "source_tree_sha256": "cf8510c5118e928023763e4586d461da3cf1e2a4d1091f4712ba11a9ffa3edd0",
+  "source_manifest": "lane-source-manifest.json",
+  "note": "Exit0 observed from process session61795. Frozen317-file source verified independently. Other concurrent workspace fixes are included."
+}

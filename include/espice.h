@@ -355,8 +355,10 @@ espice_status espice_copy_point_tangents(espice_problem *, uint32_t first_id,
  * bytes per query and its parameter row until espice_destroy. Errors as
  * espice_copy_point_measures. */
 espice_status espice_release_points(espice_problem *, uint32_t first_id, size_t count);
-/* The number of points the executor runs together on this problem's
- * backend: 1 today. Advisory: it changes speed, never results. */
+/* The most points the executor runs together as one lane batch on this
+ * problem's backend: 1 without lanes, the CPU lane width under ESPICE_LANES,
+ * the GPU lane cap (16384) under GPU lanes. Advisory: it changes speed,
+ * never results. */
 espice_status espice_lane_width(espice_problem *, uint32_t *out);
 
 #ifdef __cplusplus

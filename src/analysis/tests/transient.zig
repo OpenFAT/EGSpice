@@ -251,6 +251,51 @@ const TranTests = struct {
     const std = @import("std");
     const testing = std.testing;
 
+    test "floor retry: UIC forced capacitor completes at default and smaller minimum" {
+        const gpa = testing.allocator;
+        const Builder = @import("builder").Builder;
+        const Library = @import("device").Library;
+        const models = @import("models");
+        var lib = try Library.init(gpa);
+        defer lib.deinit();
+        var b = try Builder.init(gpa, &lib);
+        const out = try b.addNode();
+        try b.addDevice(models.vsource, "", &.{ .dc = 1 }, &.{}, .{ out, root.GROUND });
+        try b.addDevice(models.capacitor, "", &.{ .c = 1e-12 }, &.{}, .{ out, root.GROUND });
+        var prepared = try b.compile();
+        defer prepared.deinit();
+        for ([_]f64{ 1e-16, 1e-18, 1e-22 }) |minimum| {
+            var ckt = try root.Circuit.instantiate(&prepared, gpa);
+            defer ckt.deinit();
+            const x = try gpa.alloc(f64, ckt.n);
+            defer gpa.free(x);
+            @memset(x, 0);
+            var wf = try Waveform.init(gpa, 1, 256);
+            defer wf.deinit();
+            const complete = try simulate(&ckt, x, &.{out}, &wf, .{
+                .t_stop = 2e-12,
+                .dt_init = 2e-14,
+                .dt_max = 2e-14,
+                .dt_min = minimum,
+                .uic = true,
+                .tol = .{ .reltol = 1e-5, .abstol = 1e-14, .vntol = 1e-8, .chgtol = 1e-18 },
+            }, gpa);
+            const times = wf.column(0);
+            const volts = wf.column(1);
+            if (minimum == 1e-16) {
+                // Retrying the floor cannot bypass the unchanged LTE check.
+                try testing.expect(!complete);
+                try testing.expect(times.at(times.len - 1) < 2e-12);
+            } else {
+                try testing.expect(complete);
+                try testing.expectApproxEqAbs(@as(f64, 2e-12), times.at(times.len - 1), 1e-25);
+            }
+            // The ideal source fixes every solved voltage. The UIC t=0
+            // point is deliberately inconsistent and carries zero charge.
+            for (1..volts.len) |i| try testing.expectApproxEqAbs(@as(f64, 1), volts.at(i), 1e-12);
+        }
+    }
+
     test "almostEqualUlps counts representable doubles, as ngspice's does" {
         const eq = impl.test_access.almostEqualUlps;
         const x: f64 = 1.0e-9;
@@ -509,6 +554,11 @@ const TranTests = struct {
                 const vec = integrator.stepBound(W, m, cm, s, ip[0..len], c, lte);
                 const ora = integrator.stepBound(1, m, cm, s, ip[0..len], c, lte);
                 try testing.expectEqual(@as(u64, @bitCast(ora)), @as(u64, @bitCast(vec)));
+                const trace = integrator.diagnoseBound(m, cm, &s, ip[0..len], &.{}, c, lte, &.{ lte.dt, lte.dt1, lte.dt2 });
+                try testing.expectEqual(@as(u64, @bitCast(vec)), @as(u64, @bitCast(trace.bound)));
+                try testing.expectEqual(q[0][trace.index], trace.q[0]);
+                const rebuilt = if (m == .backward_euler) trace.unrooted_bound else @sqrt(trace.unrooted_bound);
+                try testing.expectEqual(@as(u64, @bitCast(vec)), @as(u64, @bitCast(rebuilt)));
             };
         }
     }
@@ -689,6 +739,9 @@ const TranTests = struct {
                 var q: [8][]const f64 = undefined;
                 for (&q, h[0..8]) |*v, *col| v.* = col;
                 try testing.expect(std.math.isNan(integrator.stepBoundGear(m, m, q[0 .. k + 2], &h[8], &g, c, lte, &dts)));
+                const diagnostic = integrator.diagnoseBound(m, m, q[0 .. k + 2], &h[8], &g, c, lte, &dts);
+                try testing.expect(std.math.isNan(diagnostic.bound));
+                try testing.expectEqual(@as(usize, L - 1), diagnostic.index);
             };
             // q = t^(k+1) on a unit grid: the (k+1)-th divided difference is
             // exactly 1 (in units of dt^-(k+1)), so del = (trtol*tol/(coeff*1))^(1/k).
@@ -698,6 +751,8 @@ const TranTests = struct {
             for (&q, &col) |*v, *cc| v.* = cc;
             const ip = [_]f64{0};
             const del = integrator.stepBoundGear(m, .backward_euler, q[0 .. k + 2], &ip, g[0..1], c, lte, &dts);
+            const diagnostic = integrator.diagnoseBound(m, .backward_euler, q[0 .. k + 2], &ip, g[0..1], c, lte, &dts);
+            try testing.expectEqual(@as(u64, @bitCast(del)), @as(u64, @bitCast(diagnostic.bound)));
             const i_new = c.ag0 * (col[0][0] - col[1][0]);
             const tol = @max(lte.abstol + lte.reltol * @abs(i_new), lte.reltol * @max(@max(@abs(col[0][0]), @abs(col[1][0])), lte.chgtol) / 1e-9);
             const want = std.math.pow(f64, lte.trtol * tol / @max(lte.abstol, integrator.lteCoeff(m)), 1 / @as(f64, @floatFromInt(k)));
@@ -1565,7 +1620,7 @@ const LaneKernelTests = struct {
             const lin: lk.LteIn = .{ .dt = lte.dt, .dt1 = lte.dt1, .dt2 = lte.dt2, .reltol = lte.reltol, .abstol = lte.abstol, .chgtol = lte.chgtol, .trtol = lte.trtol, .ag0 = c.ag0, .ag1 = c.ag1, .ag2 = c.ag2 };
             for (methods) |m| for (methods) |cm| {
                 const want = integrator.stepBound(W, m, cm, q, ip, c, lte);
-                const got = lk.stepBound(code(m), code(cm), q[0], q[1], q[2], q[3], ip, len, lin);
+                const got = lk.stepBound(code(m), code(cm), q[0], q[1], q[2], q[3], ip, len, 1, lin);
                 if (std.math.isNan(want)) {
                     try testing.expect(std.math.isNan(got));
                 } else {

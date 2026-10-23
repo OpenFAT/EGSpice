@@ -1,0 +1,285 @@
+{
+ "schema_version": 1,
+ "purpose": "ngspice default behavioral power, folding, zero startup and AC derivatives",
+ "oracle": {
+  "kind": "analytic",
+  "derivation": "ngspice 45 PTpower/PTpowerH default to abs(x)^y. At x=-2 the cubic value is 8 and slope is -12; explicit x*x*x has value -8 and slope +12. Sweep crosses x=0. Constant frontend folding gives 8 independently of Vin."
+ },
+ "expect": {
+  "status": "success",
+  "plots": [
+   {
+    "name": "Operating Point",
+    "match": "exact",
+    "row_count": 1,
+    "columns": {
+     "v(caret)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8
+      ]
+     },
+     "v(star)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8
+      ]
+     },
+     "v(func)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8
+      ]
+     },
+     "v(variable)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8
+      ]
+     },
+     "v(cube)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       -8
+      ]
+     },
+     "v(square)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       4
+      ]
+     },
+     "v(fraction)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       5.656854249492381
+      ]
+     },
+     "v(folded)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8
+      ]
+     }
+    }
+   },
+   {
+    "name": "AC Analysis",
+    "match": "exact",
+    "row_count": 1,
+    "columns": {
+     "v(caret)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       [
+        -12.0,
+        0.0
+       ]
+      ]
+     },
+     "v(star)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       [
+        -12.0,
+        0.0
+       ]
+      ]
+     },
+     "v(func)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       [
+        -12.0,
+        0.0
+       ]
+      ]
+     },
+     "v(variable)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       [
+        -12.0,
+        0.0
+       ]
+      ]
+     },
+     "v(cube)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       [
+        12.0,
+        0.0
+       ]
+      ]
+     },
+     "v(square)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       [
+        -4.0,
+        0.0
+       ]
+      ]
+     },
+     "v(fraction)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       [
+        -7.0710678118654755,
+        0.0
+       ]
+      ]
+     },
+     "v(folded)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       [
+        0.0,
+        0.0
+       ]
+      ]
+     }
+    }
+   },
+   {
+    "name": "DC transfer characteristic",
+    "match": "exact",
+    "row_count": 5,
+    "columns": {
+     "v(caret)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8,
+       1,
+       0,
+       1,
+       8
+      ]
+     },
+     "v(star)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8,
+       1,
+       0,
+       1,
+       8
+      ]
+     },
+     "v(func)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8,
+       1,
+       0,
+       1,
+       8
+      ]
+     },
+     "v(variable)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8,
+       1,
+       0,
+       1,
+       8
+      ]
+     },
+     "v(cube)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       -8,
+       -1,
+       0,
+       1,
+       8
+      ]
+     },
+     "v(square)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       4,
+       1,
+       0,
+       1,
+       4
+      ]
+     },
+     "v(fraction)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       5.656854249492381,
+       1.0,
+       0.0,
+       1.0,
+       5.656854249492381
+      ]
+     },
+     "v(folded)": {
+      "unit": "V",
+      "rtol": 2e-08,
+      "atol": 1e-12,
+      "values": [
+       8,
+       8,
+       8,
+       8,
+       8
+      ]
+     }
+    }
+   }
+  ],
+  "finite_values_required": true,
+  "all_requested_analyses_must_complete": true
+ },
+ "netlist_sha256": "2b4abde95293768c782424142f363e2351c58d5ae740eefb33f31385163e6c38"
+}

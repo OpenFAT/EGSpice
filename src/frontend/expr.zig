@@ -73,6 +73,12 @@ pub const Code = enum(u8) {
 /// B-source tape (models/bsource.va opcode 37).
 pub const Fn = enum(u8) { sqrt, abs, min, max, pow, pwr, exp, ln, log, log10, sin, cos, tan, atan, floor, ceil, ternary, tanh, sqr, int, nint, sgn, sinh, cosh, asin, acos, asinh, acosh, atanh, agauss, gauss, unif, aunif, limit, table, other, hsqrt, hlog, hlog10, hpow };
 
+/// True when `name` (lower case) calls a function a Monte Carlo trial draws.
+pub fn isDistributionName(name: []const u8) bool {
+    const f = fns.get(name) orelse return false;
+    return isDistribution(f);
+}
+
 /// True for the functions a Monte Carlo trial draws.
 pub fn isDistribution(f: Fn) bool {
     return switch (f) {

@@ -1,18 +1,19 @@
 name: test
 
-# The merge gate (TESTING.md § Gates): every unit suite, the codegen probes,
+# The merge gate: every unit suite, the codegen probes,
 # and the full fixture corpus with its verdict name list,
 # in the shipped mode (ReleaseSafe: LLVM with every safety check on).
 # ponytail: no Debug job. Debug builds use the self-hosted backend, which
 # diverges from LLVM (#25: numeric results, a pthread_create EINVAL, an
 # allocation count); add `zig build test -Doptimize=Debug` once #25 closes.
-# ponytail: x86_64-linux CPU only; the GPU corpus (`zig build test-gpu`) needs
-# an NVIDIA runner and runs locally until one exists (TESTING.md, nightly).
+# HIP codegen runs without a GPU; the GPU corpus (`zig build test-gpu`) needs
+# an NVIDIA runner and runs locally until one exists.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   release-safe:
@@ -29,4 +30,8 @@ jobs:
         with:
           name: omarsiwy
           skipPush: true
-      - run: nix develop .#ci -c zig build test -Dgpu=false -Doptimize=ReleaseSafe --summary failures
+      - name: Release matrix and publication checks
+        run: nix develop .#ci -c python3 -m unittest discover -s tools -p 'test_release*.py'
+      - name: Compile HIP state kernels
+        run: nix develop .#ci -c zig build test-hip-codegen -Doptimize=Debug -Dgpu=false -Dcuda-arch=none -Dhip-arch=none -j2 --summary failures
+      - run: nix develop .#ci -c zig build test -Dgpu=false -Doptimize=ReleaseSafe -j2 --summary failures

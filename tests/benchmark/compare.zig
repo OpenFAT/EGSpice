@@ -147,6 +147,10 @@ fn parseValues(gpa: std.mem.Allocator, blob: []const u8, start: usize, count: us
 fn normalizeVarName(gpa: std.mem.Allocator, lower: []const u8) []const u8 {
     if (scale_names.has(lower)) return lower;
     if (scale_aliases.get(lower)) |canonical| return canonical;
+    // ngspice's raw writer treats pole/zero vectors as voltages.
+    if ((std.mem.startsWith(u8, lower, "v(pole(") or std.mem.startsWith(u8, lower, "v(zero(")) and
+        std.mem.endsWith(u8, lower, "))"))
+        return lower[2 .. lower.len - 1];
     if (subcircuitNet(gpa, lower)) |net| return net;
     for ([_][]const u8{ "v(", "i(", "pole(", "zero(" }) |kept| if (std.mem.startsWith(u8, lower, kept)) return lower;
     const branch = std.mem.indexOf(u8, lower, "#branch") orelse std.mem.indexOf(u8, lower, ":flow(");
@@ -516,15 +520,21 @@ test "poles and zeros pair as sets, whatever order each simulator found them in"
     var normalized: [names.len][]const u8 = undefined;
     for (names, &normalized) |n, *out| out.* = normalizeVarName(a, n);
     try std.testing.expectEqualStrings("pole(1)", normalized[1]);
+    // ngspice 45's raw writer wraps roots as voltage vectors.
+    var ng_names: [names.len][]const u8 = undefined;
+    ng_names[0] = normalized[0];
+    for (names[1..], ng_names[1..]) |name, *out|
+        out.* = normalizeVarName(a, try std.fmt.allocPrint(a, "v({s})", .{name}));
     const reference: Plot = .{
         .plotname = "Pole-Zero Analysis",
-        .varnames = &normalized,
+        .varnames = &ng_names,
         .is_complex = true,
         .npoints = 1,
         .nvars = 5,
         .data = &.{ 0, 0, -1e3, 0, -2e3, 5e2, -2e3, -5e2, -7e3, 0 },
     };
     var candidate = reference;
+    candidate.varnames = &normalized;
     candidate.data = &.{ 0, 0, -2e3, -5e2, -1e3, 0, -2e3, 5e2, -7e3, 0 };
     try std.testing.expect(comparePlots(a, reference, candidate, 1e-3).?.pass);
     // A wrong root is still wrong: no permutation hides it.

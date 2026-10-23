@@ -1,0 +1,34 @@
+[
+  {
+    "reference": "ngspice",
+    "both_completed": 13,
+    "historical_agree": 13,
+    "strict_screen_agree": 13,
+    "strict_complete": 13,
+    "strict_numerical_disagreements": 0,
+    "strict_incomplete_or_unreadable": 0,
+    "geomean_all_completed": 1.8903545371189936,
+    "geomean_historical_agree": 1.8903545371189936,
+    "geomean_strict_agree": 1.8903545371189936,
+    "scaling_strict_agree": 13,
+    "geomean_scaling_strict_agree": 1.8903545371189936,
+    "faster_strict_agree": 13,
+    "unavailable": {}
+  },
+  {
+    "reference": "Xyce",
+    "both_completed": 13,
+    "historical_agree": 8,
+    "strict_screen_agree": 4,
+    "strict_complete": 13,
+    "strict_numerical_disagreements": 9,
+    "strict_incomplete_or_unreadable": 0,
+    "geomean_all_completed": 3.7156855305769803,
+    "geomean_historical_agree": 3.632828398931099,
+    "geomean_strict_agree": 14.280844143151361,
+    "scaling_strict_agree": 4,
+    "geomean_scaling_strict_agree": 14.280844143151361,
+    "faster_strict_agree": 4,
+    "unavailable": {}
+  }
+]

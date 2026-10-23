@@ -495,6 +495,40 @@ const MhbTests = struct {
         }
     }
 
+    test "mhb fold: the one-tone folded pair is the dense pair to roundoff, subharmonic lines included" {
+        const a = testing.allocator;
+        var prng = std.Random.DefaultPrng.init(0xf01d);
+        const r = prng.random();
+        inline for (.{ .{ 1, 1 }, .{ 7, 1 }, .{ 32, 1 }, .{ 5, 2 } }) |c| {
+            const spec = try impl.spectrum(a, &.{f1}, &.{c[0]}, 0, c[1]);
+            defer spec.deinit(a);
+            const nf = 2 * spec.freqs.len - 1;
+            const nt = impl.test_access.transformSamples(spec);
+            const buf = try a.alloc(f64, nt + 2 * nt * nf);
+            defer a.free(buf);
+            const dense = try impl.test_access.transform(spec, &.{f1}, buf, a);
+            var folded = dense;
+            const fold = try impl.test_access.Fold.init(a, spec, dense);
+            defer fold.deinit(a);
+            folded.fold = fold;
+            const n = 3;
+            const v = try a.alloc(f64, 2 * n * nf + 2 * n * nt);
+            defer a.free(v);
+            const coef = v[0 .. n * nf];
+            const back = v[n * nf ..][0 .. n * nf];
+            const td = v[2 * n * nf ..][0 .. n * nt];
+            const td2 = v[2 * n * nf + n * nt ..][0 .. n * nt];
+            for (coef) |*x| x.* = 2 * r.float(f64) - 1;
+            impl.test_access.idft(dense, nf, coef, td);
+            impl.test_access.idft(folded, nf, coef, td2);
+            for (td, td2) |x, y| try testing.expectApproxEqAbs(x, y, 1e-13);
+            impl.test_access.dft(folded, nf, td, back);
+            for (coef, back) |x, y| try testing.expectApproxEqAbs(x, y, 1e-13);
+            impl.test_access.dft(dense, nf, td2, coef);
+            for (coef, back) |x, y| try testing.expectApproxEqAbs(x, y, 1e-13);
+        }
+    }
+
     // The conversion-matrix Krylov path's oracle is the dense LU, forward
     // (PAC) and adjoint (PXF), on a pumped diode ladder with charge.
     test "pac: the Krylov conversion solve matches the dense LU both ways" {
@@ -588,6 +622,90 @@ const MhbTests = struct {
         try testing.expect((try hb.solveSpectrum(&ckt, dense, &.{}, opts, a)).status.converged);
         try testing.expect((try impl.solveOneTone(&ckt, krylov, opts, a)).converged);
         for (dense, krylov) |d, k| try testing.expectApproxEqAbs(d, k, 1e-9);
+    }
+
+    test "GPU HB: sampled mixed points keep failed and already converged peers isolated" {
+        const artifacts = @import("gompute_kernels");
+        if (comptime !artifacts.has_cuda and !artifacts.has_hip) return error.SkipZigTest;
+        const a = testing.allocator;
+        var result_arena = std.heap.ArenaAllocator.init(a);
+        defer result_arena.deinit();
+        var lib = try Library.init(a);
+        defer lib.deinit();
+        var b = try Builder.init(a, &lib);
+        const vin = try b.addNode();
+        try b.addDevice(models.vsource, "", &.{ .dc = 0, .waveform = 2, .sin_vo = 0, .sin_va = 0.005, .sin_freq = 1e3 }, &.{}, .{ vin, analysis.GROUND });
+        var prev = vin;
+        for (0..18) |_| {
+            const node = try b.addNode();
+            try b.addDevice(models.resistor, "", &.{ .r = 100 }, &.{}, .{ prev, node });
+            try b.addDevice(models.capacitor, "", &.{ .c = 1e-9 }, &.{}, .{ node, analysis.GROUND });
+            prev = node;
+        }
+        try b.addDevice(models.resistor, "", &.{ .r = 2000 }, &.{}, .{ prev, analysis.GROUND });
+        try b.addDevice(models.diode, "", &.{ .is = 1e-14 }, &.{}, .{ prev, analysis.GROUND });
+        var prepared = try b.compile();
+        defer prepared.deinit();
+        const amplitudes = [_]f64{ 0, 0.005, 5, 0.005, 0 };
+        const N = amplitudes.len;
+        var circuits: [2 * N]analysis.Circuit = undefined;
+        var initialized: usize = 0;
+        defer for (circuits[0..initialized]) |*ckt| ckt.deinit();
+        var contexts: [2 * N]analysis.RunCtx = undefined;
+        for (&circuits, &contexts, 0..) |*ckt, *ctx, i| {
+            ckt.* = try analysis.Circuit.instantiate(&prepared, a);
+            initialized += 1;
+            const params = try ckt.collectParams();
+            const amp_ref: u32 = for (params, 0..) |param, index| {
+                if (std.mem.eql(u8, param.param_name, "sin_va")) break @intCast(index);
+            } else return error.TestUnexpectedResult;
+            try ckt.setParams(&.{amp_ref}, &.{amplitudes[i % N]}, true);
+            try ckt.computeBaseline();
+            ctx.* = .{
+                .circuit = ckt,
+                .x_op = &.{},
+                .probes = &.{prev},
+                .source_node = vin,
+                .source_branch = 0,
+                .allocator = result_arena.allocator(),
+                .scratch_allocator = a,
+            };
+        }
+        // A zero-amplitude point finishes before Krylov is requested.
+        // A small signal is solved in one Newton step, while the large
+        // diode swing needs more than this two-iteration budget.
+        const options: impl.Options = .{ .f0 = 1e3, .n_harmonics = 4, .max_iter = 2 };
+        var expected: [N]impl.LaneOutcome = undefined;
+        for (contexts[0..N], &expected) |*ctx, *out| out.* = hb.run(ctx, options);
+        var got: [N]impl.LaneOutcome = undefined;
+        const before = impl.gpu_test_access.admitted.load(.monotonic);
+        const backtracks = impl.gpu_test_access.backtracks.load(.monotonic);
+        hb.runGpuLanes(contexts[N..], options, &got);
+        try testing.expect(impl.gpu_test_access.admitted.load(.monotonic) >= before + N);
+        try testing.expect(impl.gpu_test_access.backtracks.load(.monotonic) > backtracks);
+        var completed: usize = 0;
+        for (expected, got) |want, actual| {
+            if (want) |w| {
+                const g = try actual;
+                try testing.expectEqual(w.npoints, g.npoints);
+                try testing.expectEqual(w.is_complex, g.is_complex);
+                try testing.expectEqual(w.data.len, g.data.len);
+                try testing.expectEqual(@as(usize, 2), w.varnames.len);
+                var peaks: [2]f64 = @splat(0);
+                for (w.data, 0..) |value, j| peaks[j % 2] = @max(peaks[j % 2], @abs(value));
+                for (w.data, g.data, 0..) |wv, gv, j| {
+                    try testing.expect(std.math.isFinite(gv));
+                    try testing.expectApproxEqAbs(wv, gv, 1e-8 * @abs(wv) + 1e-10 * peaks[j % 2] + 1e-24);
+                }
+                completed += 1;
+            } else |err| {
+                try testing.expectError(err, actual);
+            }
+        }
+        try testing.expectEqual(@as(usize, N - 1), completed);
+        try testing.expectError(error.HbDidNotConverge, got[2]);
+        try testing.expectEqualSlices(u64, @ptrCast((try got[0]).data), @ptrCast((try got[4]).data));
+        try testing.expectEqualSlices(u64, @ptrCast((try got[1]).data), @ptrCast((try got[3]).data));
     }
 
     test "mhb: gvProduct over the pattern matches the dense product bit for bit" {

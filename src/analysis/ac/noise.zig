@@ -105,7 +105,7 @@ pub const PerSource = struct { dens: []f64, out: []f64, in: []f64 };
 /// Every work buffer comes from and returns to `allocator`; error.QueryCancelled unwinds at a checkpoint.
 /// `pre` is the stream's solutions solved up front (`freq.Stream.pre`), or
 /// empty to solve as it goes.
-pub fn sweep(
+fn sweep(
     ckt: *root.Circuit,
     x_op: []const f64,
     noise_sources: []const NoiseSource,

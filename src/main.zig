@@ -17,6 +17,12 @@ pub const vera_validate_contract = @import("builtin").mode == .debug;
 
 /// `--version`; a test pins it to build.zig.zon's `.version`.
 const version = "1.2.0";
+/// The backends compiled in, for `--version`; a GPU one also needs its
+/// device at run time.
+const backends = blk: {
+    const k = @import("gompute_kernels");
+    break :blk "cpu" ++ (if (k.has_cuda) ", cuda" else "") ++ (if (k.has_hip) ", hip" else "");
+};
 
 /// glibc's `mallopt` (malloc.h); M_MMAP_THRESHOLD is -3.
 extern "c" fn mallopt(param: c_int, value: c_int) c_int;
@@ -37,9 +43,11 @@ pub fn main(init: std.process.Init) !u8 {
     defer paths.deinit(init.gpa);
     var vpi_apps: std.ArrayList([]const u8) = .empty;
     defer vpi_apps.deinit(init.gpa);
+    var include_dirs: std.ArrayList([]const u8) = .empty;
+    defer include_dirs.deinit(init.gpa);
     var dialect: ?problem.Dialect = null;
     var selection: problem.Selection = .{};
-    var backend: problem.Request = .cpu;
+    var backend_arg: ?problem.Request = null;
     var lanes = false;
     var explicit_gpu = false;
     var max_parallel: u16 = 0;
@@ -52,12 +60,15 @@ pub fn main(init: std.process.Init) !u8 {
     defer tangents.deinit(init.gpa);
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
+            // Help and version go to stdout, so `espice --version | ...` and
+            // `espice --help | less` see them.
+            var out: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &.{});
+            try out.interface.writeAll(
                 \\Usage: espice [OPTION]... FILE...
                 \\  -b, --batch                 Run all queries (default)
                 \\  -r, --rawfile=FILE          Result destination
                 \\      --format=FMT            binary|ascii|csv|touchstone|psf|fsdb|sst2|citi|print
-                \\      --backend=BE            cpu|auto|cuda|hip (default cpu)
+                \\      --backend=BE            cpu|auto|cuda|hip (default auto with GPU kernels, else cpu)
                 \\      --gpu                   Require an available GPU
                 \\      --jobs=N|auto           Maximum parallel queries (default auto: one per CPU)
                 \\      --print-dag             Print the next query frontier before running
@@ -72,21 +83,25 @@ pub fn main(init: std.process.Init) !u8 {
                 \\                              JITTER, .check/DOUT or a window without TO=)
                 \\      --abort-after=T         Fail a .tran still missing a .meas value past T seconds
                 \\      --abort-measure=NAME    Bound only .meas NAME with --abort-after
-                \\      --warm-start            Start each transient's OP from the nominal one
+                \\      --warm-start            Start each operating point (a transient's, an AC or DC sweep's, an .op) from the
+                \\                              nominal one: the same point within Newton's tolerances, faster on .step sweeps
                 \\      --tangents=P,...        Print d(.meas)/d(P) of the first .tran's cards for these .params
                 \\      --tangent-step=S        Relative step of --tangents (default 1e-6)
                 \\      --lanes                 Solve sweep points' OPs and .dc sweeps as SIMD lanes (CPU)
                 \\      --tokenizer=FMT         ngspice|hspice|spectre (default: detected from the deck, else ngspice)
                 \\      --vpi=APP               Load a VPI application (.so) for Verilog-A $systf calls; repeatable
-                \\  -v, --version               Version
+                \\  -I, --include=DIR           Search DIR for a .hdl model's `include files, after the model's own
+                \\                              directory; repeatable, in order
+                \\  -v, --version               Version, the VerA version and commit it was built with, and its backends
                 \\
-            , .{});
+            );
             return 0;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-            std.debug.print("espice " ++ version ++ "\n", .{});
+            var out: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &.{});
+            try out.interface.writeAll("espice " ++ version ++ " (VerA " ++ @import("contract").vera_version ++ " " ++ @import("vera_build").commit ++ "; backends: " ++ backends ++ ")\n");
             return 0;
         } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--batch")) {} else if (std.mem.eql(u8, arg, "--gpu")) {
-            backend = .auto;
+            backend_arg = .auto;
             explicit_gpu = true;
         } else if (std.mem.eql(u8, arg, "--plan")) {
             show_plan = true;
@@ -125,14 +140,17 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (optionValue(arg, "", "--format", &args)) |value| {
             selection.format = problem.parseFormat(value orelse return usageFail()) orelse return usageFail();
         } else if (optionValue(arg, "", "--backend", &args)) |value| {
-            backend = std.meta.stringToEnum(problem.Request, value orelse return usageFail()) orelse return usageFail();
-            explicit_gpu = explicit_gpu or backend == .cuda or backend == .hip;
+            const be = std.meta.stringToEnum(problem.Request, value orelse return usageFail()) orelse return usageFail();
+            backend_arg = be;
+            explicit_gpu = explicit_gpu or be == .cuda or be == .hip;
         } else if (optionValue(arg, "", "--jobs", &args)) |value| {
             const v = value orelse return usageFail();
             max_parallel = if (std.mem.eql(u8, v, "auto")) 0 else std.fmt.parseInt(u16, v, 10) catch return usageFail();
             if (max_parallel == 0 and !std.mem.eql(u8, v, "auto")) return usageFail();
         } else if (optionValue(arg, "", "--vpi", &args)) |value| {
             try vpi_apps.append(init.gpa, value orelse return usageFail());
+        } else if (optionValue(arg, "-I", "--include", &args)) |value| {
+            try include_dirs.append(init.gpa, value orelse return usageFail());
         } else if (optionValue(arg, "-tokenizer", "--tokenizer", &args)) |value| {
             dialect = problem.parseDialect(value orelse return usageFail()) orelse return usageFail();
         } else if (arg.len > 0 and arg[0] == '-') {
@@ -141,6 +159,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else try paths.append(init.gpa, arg);
     }
     if (paths.items.len == 0) return usageFail();
+    // With kernels in the build the default is `auto`, which prices each
+    // query and stays on the CPU, silently, unless the GPU pays.
+    const backend: problem.Request = backend_arg orelse if (problem.gpu_available) .auto else .cpu;
     if (max_parallel == 0) max_parallel = autoJobs();
     if (tangents.items.len == 0) point.tangent_step = 0 else if (point.tangent_step == 0) point.tangent_step = 1e-6;
 
@@ -168,6 +189,7 @@ pub fn main(init: std.process.Init) !u8 {
             .backend = .{
                 .backend = backend,
                 .gpu_explicit = explicit_gpu,
+                .gpu_quiet = backend_arg == null,
                 .solver_threads = @intCast(@min(envThreads("ESPICE_SOLVER_THREADS"), 16)),
                 .device_threads = envThreads("ESPICE_THREADS"),
                 // One deck, run once: no query is appended later.
@@ -175,13 +197,16 @@ pub fn main(init: std.process.Init) !u8 {
                 .lanes = lanes,
             },
             .max_parallel = max_parallel,
+            // Unset thread variables: large queries borrow lanes.
+            .auto_threads = std.c.getenv("ESPICE_THREADS") == null and std.c.getenv("ESPICE_SOLVER_THREADS") == null,
             .timing_in_depth = timing_in_depth,
             .point = point,
-            .auto_point = !full_waveforms,
+            .auto_point = !full_waveforms and !plan_only, // --plan solves nothing, not even the warm OP
             .live_params = tangents.items,
             .measures = .{ .out = &stdout.interface, .err = &stderr.interface },
             .vpi_apps = vpi_apps.items,
             .vpi = vpi,
+            .hdl_toolchain = .{ .include_dirs = include_dirs.items },
         }) catch |err| {
             std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
             failed = true;
@@ -207,8 +232,8 @@ pub fn main(init: std.process.Init) !u8 {
         for (0..p.query_count()) |i| {
             const id: problem.QueryId = @fromBackingInt(@intCast(i));
             if (!(try p.query_info(id)).requested) continue;
-            const result = try p.result(id);
-            std.debug.print("  {s}: {d} points, {d} variables\n", .{ result.plotname, result.npoints, result.varnames.len });
+            const s = try p.summary(id);
+            std.debug.print("  {s}: {d} points, {d} variables\n", .{ s.plotname, s.npoints, s.nvars });
         }
         const runs = try p.run_results(init.gpa);
         defer init.gpa.free(runs);

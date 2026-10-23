@@ -7,12 +7,14 @@
 //! from a right one in the results table.
 //!
 //! Two facts make a mechanical translation trustworthy:
-//!   1. `spice/*.osdi` is VACASK's build of the SPICE device set, with the
-//!      same equations and parameter names ngspice's `.model` cards take, so
+//!   1. `spice/*.osdi` is VACASK's build of the SPICE device set, accepting
+//!      the parameter names ngspice's `.model` cards take, so
 //!      `.model DMOD D(IS=1e-14 N=1)` becomes
 //!      `model dmod sp_diode (is=1e-14 n=1)` unchanged.
 //!   2. VACASK hard-errors on an unknown parameter instead of defaulting it,
 //!      so model parameters can pass through without a whitelist.
+//! Matching names do not ensure matching model versions or implementations:
+//! see docs/performance/comparison.md for known reference-model differences.
 //!
 //! Everything is lowercased: SPICE is case-insensitive and VACASK is not.
 //! compare.zig already lowercases raw-file column names.
@@ -20,13 +22,23 @@
 const std = @import("std");
 const common = @import("job.zig");
 pub const version_flag = "-h";
+/// Native controls apply only to VACASK, never injected into SPICE decks.
+pub const Options = struct {
+    tran_fs: ?f64 = null,
+    tran_step: ?f64 = null,
+};
 
 /// Translates `netlist` into `scratch`/runme.sim and returns the job that runs
 /// it there, or a refused job naming the untranslatable card. Translation is
 /// not timed.
-pub fn prepare(io: std.Io, a: std.mem.Allocator, bin: []const u8, netlist: []const u8, scratch: []const u8) common.Error!common.Job {
+pub fn prepare(io: std.Io, a: std.mem.Allocator, bin: []const u8, netlist: []const u8, scratch: []const u8, hspice_dialect: bool) common.Error!common.Job {
+    return prepareWithOptions(io, a, bin, netlist, scratch, hspice_dialect, .{});
+}
+
+pub fn prepareWithOptions(io: std.Io, a: std.mem.Allocator, bin: []const u8, netlist: []const u8, scratch: []const u8, hspice_dialect: bool, options: Options) common.Error!common.Job {
+    if (hspice_dialect) return .{ .refused = "VACASK adapter translates ngspice syntax, not HSPICE semantics" };
     const spice = std.Io.Dir.cwd().readFileAlloc(io, netlist, a, .unlimited) catch return error.DeckFailed;
-    const sim = switch (try translate(a, spice)) {
+    const sim = switch (try translateWithOptions(a, spice, options)) {
         .sim => |text| text,
         .refused => |reason| return .{ .refused = reason },
     };
@@ -48,7 +60,20 @@ pub const Output = union(enum) {
 };
 
 pub fn translate(gpa: std.mem.Allocator, spice: []const u8) error{OutOfMemory}!Output {
-    var x: Xlat = .{ .gpa = gpa };
+    return translateWithOptions(gpa, spice, .{});
+}
+
+pub fn translateWithOptions(gpa: std.mem.Allocator, spice: []const u8, options: Options) error{OutOfMemory}!Output {
+    var x: Xlat = .{ .gpa = gpa, .native_options = options };
+    if (options.tran_step) |step| {
+        if (!(step > 0) or !std.math.isFinite(step))
+            return .{ .refused = "VACASK tran_step must be finite and positive" };
+    }
+    if (options.tran_fs) |fs| {
+        if (!(fs > 0 and fs <= 1) or !std.math.isFinite(fs))
+            return .{ .refused = "VACASK tran_fs must be finite and in (0, 1]" };
+        try x.put(&x.opts, " tran_fs={e}", .{fs});
+    }
     x.run(spice) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Refused => return .{ .refused = x.reason },
@@ -155,6 +180,7 @@ const Buf = std.ArrayList(u8);
 
 const Xlat = struct {
     gpa: std.mem.Allocator,
+    native_options: Options = .{},
     reason: []const u8 = "",
 
     title: []const u8 = "translated from SPICE",
@@ -175,6 +201,8 @@ const Xlat = struct {
     ctl: Buf = .empty,
     /// `.save` outputs, rendered ahead of every analysis as SPICE applies them.
     saves: Buf = .empty,
+    /// Collected before analyses; duplicate assignments use the last value.
+    nodesets: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
 
     in_subckt: bool = false,
     analyses: usize = 0,
@@ -217,8 +245,15 @@ const Xlat = struct {
 
         // Pass 1 emits nothing: device cards need every model and subcircuit
         // name, and the analysis cards, before they can be translated.
+        var in_subckt = false;
         for (cards.items) |c| {
             const kw = c.tok(0) orelse continue;
+            if (std.mem.eql(u8, kw, ".subckt")) in_subckt = true;
+            if (std.mem.eql(u8, kw, ".ends")) in_subckt = false;
+            if (std.mem.eql(u8, kw, ".nodeset")) {
+                if (in_subckt) return x.refuse(".nodeset inside .subckt is not translated", .{});
+                try x.nodesetCard(c);
+            }
             if (eqlAny(kw, &.{ ".op", ".dc", ".ac", ".noise" })) x.static_analysis = true;
             if (std.mem.eql(u8, kw, ".tran") and x.tran_step == null) {
                 x.tran_step = c.tok(1);
@@ -386,13 +421,13 @@ const Xlat = struct {
         if (wf == .pwl)
             return x.refuse("{s}: PWL is not translated (VACASK's `type=\"pwl\"` aborts on this build)", .{name});
 
+        if (wf == .fm) return x.fmArgs(w, c, start, name);
+
         const order: []const []const u8 = switch (wf) {
             .pulse => &.{ "val0", "val1", "delay", "rise", "fall", "width", "period" },
             .sine => &.{ "sinedc", "ampl", "freq", "delay", "theta", "sinephase" },
             .exp => &.{ "val0", "val1", "delay", "tau1", "td2", "tau2" },
-            // The FM pedestal is `sinedc`. VACASK also accepts `offset` on an
-            // fm source but ignores it (measured mean 0.0001 instead of 2).
-            .fm => &.{ "sinedc", "ampl", "freq", "modindex", "modfreq" },
+            .fm => unreachable,
             .pwl => unreachable,
         };
         var i = start;
@@ -442,6 +477,33 @@ const Xlat = struct {
             try x.put(w, " period={e}", .{(pw + tr + tf) * (1 + 1e-7)});
         }
         return i - 1;
+    }
+
+    /// ngspice 45 §4.1.5: VO VA FM MDI FC, with defaults from TSTOP.
+    /// VACASK uses carrier `freq`, modulation `modfreq`, and different defaults.
+    fn fmArgs(x: *Xlat, w: *Buf, c: Card, start: usize, name: []const u8) Fail!usize {
+        var args: [5]f64 = .{ 0, 0, 0, 90, 0 };
+        var n: usize = 0;
+        while (c.tok(start + n)) |t| {
+            if (!isNumber(t)) break;
+            if (n == args.len)
+                return x.refuse("{s}: SFFM delay/phase arguments are not translated", .{name});
+            args[n] = parseSpice(t) orelse return x.refuse("{s}: invalid SFFM argument '{s}'", .{ name, t });
+            n += 1;
+        }
+        if (n < 2) return x.refuse("{s}: SFFM needs offset and amplitude", .{name});
+        if (args[2] <= 0 or args[4] <= 0) {
+            const stop = parseSpice(x.tran_stop orelse "") orelse return x.refuse("{s}: SFFM frequency defaults need .tran TSTOP", .{name});
+            if (stop <= 0) return x.refuse("{s}: SFFM needs positive TSTOP", .{name});
+            if (args[2] <= 0) args[2] = 5 / stop;
+            if (args[4] <= 0) args[4] = 500 / stop;
+        }
+        try x.value(w, "sinedc", c.tok(start).?);
+        try x.value(w, "ampl", c.tok(start + 1).?);
+        try x.put(w, " modfreq={e} freq={e} modindex={e}", .{
+            args[2], args[4], @max(0, @min(args[3], args[4] / args[2])),
+        });
+        return start + n - 1;
     }
 
     /// `D1 a c DMOD 2.0`, `Q1 c b 0 sub QMOD`, `M1 d g s b NM W=2u L=1u`.
@@ -548,6 +610,7 @@ const Xlat = struct {
         }
         if (std.mem.eql(u8, tail, "param")) return x.paramCard(c);
         if (std.mem.eql(u8, tail, "save")) return x.saveCard(c);
+        if (std.mem.eql(u8, tail, "nodeset")) return;
         if (eqlAny(tail, &.{ "options", "option", "opt" })) return x.optionsCard(c);
         if (std.mem.eql(u8, tail, "temp")) {
             if (c.len() != 2) return x.refuse(".temp with {d} values (a temperature sweep is not one analysis)", .{c.len() - 1});
@@ -614,8 +677,9 @@ const Xlat = struct {
         try x.raw(w, if (open) " )\n" else "\n");
     }
 
-    /// `.save v(a) i(v1)` keeps the same spelling in VACASK; `.save all`
-    /// (or no card) is VACASK's default.
+    /// Plain `.save v(a) i(v1)` keeps its spelling. Hierarchical voltage
+    /// paths use quoted native colon names: v(x1.q) -> v("x1:q").
+    /// `.save all` (or no card) is VACASK's default.
     /// The lexer splits `v(a)` into `v a`, so the fields come in pairs.
     fn saveCard(x: *Xlat, c: Card) Fail!void {
         if (c.len() == 2 and std.mem.eql(u8, c.tok(1).?, "all")) return;
@@ -625,7 +689,15 @@ const Xlat = struct {
         while (i < c.len()) : (i += 2) {
             const kind = c.tok(i).?;
             if (!eqlAny(kind, &.{ "v", "i" })) return x.refuse(".save {s}(...) is not translated", .{kind});
-            try x.put(&x.saves, " {s}({s})", .{ kind, c.tok(i + 1).? });
+            const name = c.tok(i + 1).?;
+            if (std.mem.eql(u8, kind, "v") and std.mem.indexOfScalar(u8, name, '.') != null) {
+                const native = try x.gpa.dupe(u8, name);
+                defer x.gpa.free(native);
+                std.mem.replaceScalar(u8, native, '.', ':');
+                try x.put(&x.saves, " v(\"{s}\")", .{native});
+            } else {
+                try x.put(&x.saves, " {s}({s})", .{ kind, name });
+            }
         }
         try x.raw(&x.saves, "\n");
     }
@@ -695,7 +767,51 @@ const Xlat = struct {
     /// named after it, so names must be distinct.
     fn analysis(x: *Xlat, kind: []const u8, verb: []const u8, args: []const u8) Fail!void {
         x.analyses += 1;
-        try x.put(&x.ctl, "  analysis {s}{d} {s}{s}\n", .{ kind, x.analyses, verb, args });
+        try x.put(&x.ctl, "  analysis {s}{d} {s}{s}", .{ kind, x.analyses, verb, args });
+        try x.nodesetArgs();
+        try x.raw(&x.ctl, "\n");
+    }
+
+    /// Deliberately accepts only top-level V(single resolved node)=number.
+    /// Parsing the original card retains parentheses so malformed and
+    /// differential assignments cannot be mistaken for single-node hints.
+    fn nodesetCard(x: *Xlat, c: Card) Fail!void {
+        var rest = std.mem.trim(u8, c.source[".nodeset".len..], " \t\r");
+        if (rest.len == 0) return x.refuse(".nodeset requires voltage assignments", .{});
+        while (rest.len > 0) {
+            if (rest[0] != 'v') return x.refuse(".nodeset supports only V(node)=number", .{});
+            rest = std.mem.trimStart(u8, rest[1..], " \t");
+            if (rest.len == 0 or rest[0] != '(') return x.refuse(".nodeset requires V(node)", .{});
+            const end = std.mem.indexOfScalar(u8, rest, ')') orelse
+                return x.refuse(".nodeset has no closing parenthesis", .{});
+            const node = std.mem.trim(u8, rest[1..end], " \t");
+            if (node.len == 0 or std.mem.indexOfAny(u8, node, " \t,()'\"[]=;{}") != null)
+                return x.refuse(".nodeset requires one resolved node", .{});
+            rest = std.mem.trimStart(u8, rest[end + 1 ..], " \t");
+            if (rest.len == 0 or rest[0] != '=') return x.refuse(".nodeset requires a value", .{});
+            rest = std.mem.trimStart(u8, rest[1..], " \t");
+            const cut = std.mem.indexOfAny(u8, rest, " \t\r") orelse rest.len;
+            const hint_value = rest[0..cut];
+            if (std.mem.indexOfAny(u8, hint_value, "(){}*/^'\"=,;") != null)
+                return x.refuse(".nodeset expressions are not translated", .{});
+            const number_value = parseSpice(hint_value) orelse return x.refuse(".nodeset value must be numeric", .{});
+            if (!std.math.isFinite(number_value)) return x.refuse(".nodeset value must be finite", .{});
+            const native = try x.gpa.dupe(u8, node);
+            std.mem.replaceScalar(u8, native, '.', ':');
+            try x.nodesets.put(x.gpa, native, hint_value);
+            rest = std.mem.trimStart(u8, rest[cut..], " \t\r");
+        }
+    }
+
+    fn nodesetArgs(x: *Xlat) Fail!void {
+        if (x.nodesets.count() == 0) return;
+        try x.raw(&x.ctl, " nodeset=[");
+        for (x.nodesets.keys(), x.nodesets.values(), 0..) |node, hint_value, i| {
+            if (i != 0) try x.raw(&x.ctl, "; ");
+            try x.put(&x.ctl, "\"{s}\"; ", .{node});
+            try x.number(&x.ctl, hint_value);
+        }
+        try x.raw(&x.ctl, "]");
     }
 
     /// `.tran TSTEP TSTOP [TSTART [TMAX]] [UIC]`.
@@ -708,7 +824,9 @@ const Xlat = struct {
         const step = c.tok(1) orelse return x.refuse(".tran with no step", .{});
         const stop = c.tok(2) orelse return x.refuse(".tran with no stop time", .{});
         var args: Buf = .empty;
-        try x.value(&args, "step", step);
+        if (x.native_options.tran_step) |native_step| {
+            try x.put(&args, " step={e}", .{native_step});
+        } else try x.value(&args, "step", step);
         try x.value(&args, "stop", stop);
 
         var i: usize = 3;
@@ -757,7 +875,9 @@ const Xlat = struct {
         x.analyses += 1;
         if (c.len() == 9) try x.sweepBlock(c, 5, "outersweep");
         try x.sweepBlock(c, 1, "vsweep");
-        try x.put(&x.ctl, "    analysis dc{d} op\n", .{x.analyses});
+        try x.put(&x.ctl, "    analysis dc{d} op", .{x.analyses});
+        try x.nodesetArgs();
+        try x.raw(&x.ctl, "\n");
     }
 
     /// One `sweep` block. `points` counts intervals, not samples. The endpoint
@@ -892,6 +1012,7 @@ const Xlat = struct {
 /// split into whitespace-delimited fields.
 pub const Card = struct {
     fields: []const []const u8,
+    source: []const u8 = "",
 
     fn len(c: Card) usize {
         return c.fields.len;
@@ -955,7 +1076,7 @@ fn flush(gpa: std.mem.Allocator, joined: *Buf, out: *std.ArrayList(Card)) error{
     var it = std.mem.tokenizeScalar(u8, flat.items, ' ');
     while (it.next()) |f| try fields.append(gpa, f);
     if (fields.items.len == 0) return;
-    try out.append(gpa, .{ .fields = fields.items });
+    try out.append(gpa, .{ .fields = fields.items, .source = try std.ascii.allocLowerString(gpa, joined.items) });
 }
 
 /// ngspice ends a line at a `;`, or at a `$` that follows whitespace (or opens
@@ -1215,6 +1336,29 @@ test "MOSFET LEVEL picks the module and never leaks into the parameters" {
     try has(psp, "load \"psp103v4.osdi\"");
     try has(psp, "model np psp103va ( type=-1 toxo=1.5e-9 )");
     try has(psp, "  save v(d) i(v1)\n  analysis op1 op");
+}
+
+test "hierarchical voltage saves use quoted native paths and preserve plain probes" {
+    var p: Probe = .init();
+    defer p.deinit();
+    const out = try p.sim(
+        \\hierarchical saves
+        \\.subckt cell a
+        \\R1 a q 1k
+        \\R2 q 0 1k
+        \\.ends
+        \\.subckt bank a
+        \\xcell a cell
+        \\.ends
+        \\V1 in 0 1
+        \\xb0_0 in cell
+        \\xbank in bank
+        \\.save v(in) V ( XB0_0.Q )
+        \\+ v(XBANK.XCELL.Q) i(v1)
+        \\.op
+        \\.end
+    );
+    try has(out, "  save v(in) v(\"xb0_0:q\") v(\"xbank:xcell:q\") i(v1)\n");
 }
 
 test "waveforms map positionally and stop where SPICE stopped" {
@@ -1502,13 +1646,77 @@ test "SFFM's pedestal is sinedc; `offset` is a parameter VACASK takes and ignore
         \\R1 in 0 1k
         \\.tran 100n 2m
         \\.end
-    ), "type=\"fm\" sinedc=2 ampl=1 freq=100k modindex=5 modfreq=1k");
+    ), "type=\"fm\" sinedc=2 ampl=1 modfreq=1e5 freq=1e3 modindex=1e-2");
+}
+
+test "SFFM defaults and nonpositive frequencies follow ngspice 45" {
+    var p: Probe = .init();
+    defer p.deinit();
+    try has(try p.sim("fm\nV1 a 0 SFFM(0 1)\nR1 a 0 1k\n.tran 1u 1m\n.end"), "modfreq=5e3 freq=5e5 modindex=9e1");
+    try has(try p.sim("fm\nV1 a 0 SFFM(0 1 0 -3 0)\nR1 a 0 1k\n.tran 1u 1m\n.end"), "modfreq=5e3 freq=5e5 modindex=0e0");
+}
+
+test "an untranslated HSPICE dialect is refused before reading the deck" {
+    const job = try prepare(std.testing.io, std.testing.allocator, "vacask", "unused", "unused", true);
+    try std.testing.expect(job.refused.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), job.argv.len);
 }
 
 test "a deck with no analysis is refused rather than run empty" {
     var p: Probe = .init();
     defer p.deinit();
     try has(try p.why("empty\nV1 in 0 1\nR1 in 0 1k\n.end"), "no analysis");
+}
+
+test "nodesets are collected before analyses with hierarchy, continuations and last assignment winning" {
+    var p: Probe = .init();
+    defer p.deinit();
+    const out = try p.sim(
+        \\nodeset collection
+        \\V1 vdd 0 1
+        \\R1 vdd q 1k
+        \\.op
+        \\.tran 1p 1n
+        \\.nodeset V(XB0_0.Q) = 100m V(q)=0
+        \\+ V(XB0_0.QB)=1
+        \\.nodeset v(Q)=250m
+        \\.end
+    );
+    try has(out, "analysis op1 op nodeset=[\"xb0_0:q\"; 100m; \"q\"; 250m; \"xb0_0:qb\"; 1]");
+    try has(out, "maxstep=1e-12 nodeset=[\"xb0_0:q\"; 100m; \"q\"; 250m; \"xb0_0:qb\"; 1]");
+}
+
+test "unsupported nodesets are refused instead of silently losing initialization" {
+    var p: Probe = .init();
+    defer p.deinit();
+    for ([_][]const u8{
+        ".nodeset",
+        ".nodeset v(a,b)=1",
+        ".nodeset v(a)=foo",
+        ".nodeset v(a)=1+2",
+        ".nodeset v(a)=1 v(b)",
+        ".nodeset i(v1)=1",
+        ".nodeset v(a=1",
+        ".subckt cell a\n.nodeset v(a)=1\n.ends",
+    }) |line| {
+        const deck = try std.fmt.allocPrint(p.arena.allocator(), "bad hint\nV1 a 0 1\n{s}\n.op\n.end\n", .{line});
+        try has(try p.why(deck), ".nodeset");
+    }
+}
+
+test "VACASK startup fraction is explicit native configuration" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source = "startup\nV1 in 0 1\nR1 in 0 1k\n.tran 2p 200p uic\n.end\n";
+    const out = try translateWithOptions(arena.allocator(), source, .{ .tran_fs = 0.001 });
+    try has(out.sim, "tran_fs=1e-3");
+    try has(out.sim, "step=2p stop=200p maxstep=2e-12");
+    const refined = try translateWithOptions(arena.allocator(), "startup\nV1 in 0 1\nR1 in 0 1k\n.tran 0.2p 200p 0 2p uic\n.end\n", .{ .tran_fs = 0.001, .tran_step = 2e-12 });
+    try has(refined.sim, "step=2e-12 stop=200p maxstep=2p");
+    for ([_]f64{ 0, -1, 1.01, std.math.nan(f64), std.math.inf(f64) }) |fs| {
+        const refused = try translateWithOptions(arena.allocator(), source, .{ .tran_fs = fs });
+        try testing.expect(refused == .refused);
+    }
 }
 
 test "scale suffixes: meg before m, and an exponent is not a suffix" {

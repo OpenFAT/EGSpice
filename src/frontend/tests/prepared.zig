@@ -105,6 +105,32 @@ test "deck temperature and tolerances reach statistical and noise jobs" {
     try std.testing.expectEqual(options.tol.reltol, temp_job.temp.dc_options.tol.reltol);
 }
 
+test "duration ceiling option is explicit and TMAX then DELMAX take precedence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nl = try parse(a, "ceiling\n.options tran_ceiling=duration\n.end\n");
+    for ([_]netlist.Dialect{ .ngspice, .hspice }) |dialect| {
+        const o = try analyses.deckOptions(nl.deck.config, dialect);
+        var implicit: Job = .{ .tran = .{ .t_stop = 100e-9, .t_start = 20e-9, .dt_init = 1e-9 } };
+        analyses.applyDeckOptions(&implicit, o);
+        try std.testing.expectApproxEqRel(@as(f64, 8e-9), implicit.tran.dt_max.?, 1e-15);
+        try std.testing.expectEqual((requests.Tran{ .t_stop = 1 }).tol, implicit.tran.tol);
+        var delmax = o;
+        delmax.delmax = 2e-9;
+        var d: Job = .{ .tran = .{ .t_stop = 100e-9 } };
+        analyses.applyDeckOptions(&d, delmax);
+        try std.testing.expectEqual(@as(f64, 2e-9), d.tran.dt_max.?);
+        var explicit: Job = .{ .tran = .{ .t_stop = 100e-9, .dt_max = 3e-9 } };
+        analyses.applyDeckOptions(&explicit, delmax);
+        try std.testing.expectEqual(@as(f64, 3e-9), explicit.tran.dt_max.?);
+    }
+    for ([_][]const u8{ "other", "1", "" }) |value| {
+        const bad = try parse(a, try std.fmt.allocPrint(a, "bad\n.options tran_ceiling={s}\n.end\n", .{value}));
+        try std.testing.expectError(error.InvalidAnalysisArguments, analyses.deckOptions(bad.deck.config, .ngspice));
+    }
+}
+
 test "deck options reject invalid numeric conversions before construction" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -467,7 +493,8 @@ test "prepared bindings retain model fields and exclude runtime state from param
     const refs = try @import("../variants.zig").collect(session.allocator(), &prepared.circuit);
     var saw_pub = false;
     var resistors: u32 = 0;
-    for (refs) |ref| {
+    for (0..refs.len) |i| {
+        const ref = refs.at(i);
         if (std.mem.eql(u8, ref.param_name, "pubZ")) {
             // 125 * 1e-20: ngspice INPevaluate bits for `1.25e-18`.
             try std.testing.expectEqual(@as(f64, 125) * @as(f64, 1e-20), ref.get());

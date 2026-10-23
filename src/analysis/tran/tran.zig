@@ -51,6 +51,8 @@ const Stats = struct {
     rej_lte: u64 = 0,
     order_drops: u64 = 0,
     bp_landings: u64 = 0,
+    first_dt: f64 = 0,
+    max_dt: f64 = 0,
     /// Accepted steps per integration order 1..6.
     by_order: [6]u64 = @splat(0),
 };
@@ -620,7 +622,7 @@ const Sim = struct {
 
         // ngspice tmax defaults to (tstop - tstart)/50; the circuit's minimum
         // delay caps it further.
-        s.effective_dt_max = options.dt_max orelse (options.t_stop - options.t_start) / 50.0;
+        s.effective_dt_max = options.requestedCeiling(.api);
         if (ckt.minDelay()) |td_min| s.effective_dt_max = @min(s.effective_dt_max, td_min);
         // The analysis' own CKTminBreak: delmin = 1e-11*maxStep and minBreak =
         // 10*delmin (traninit.c:36, dctran.c:170). Breakpoints closer than this
@@ -689,10 +691,23 @@ const Sim = struct {
         // differences read.
         s.dt_old = @splat(s.effective_dt_max);
         s.attempted_dt = dt;
+        if (s.stats_on) std.debug.print(
+            "tran-config: dt_init={e:.17} requested_ceiling={e:.17} effective_ceiling={e:.17} initial_dt={e:.17} dt_min={e:.17} method={s} lte={s} uic={} tol={any}\n",
+            .{ options.dt_init, options.requestedCeiling(.api), s.effective_dt_max, dt, options.dt_min, @tagName(options.method), if (s.n_qt > 0) "charge-tape" else "row", options.uic, options.tol },
+        );
     }
 
     /// Frees the scratch `init` allocated and clears `land_rejects`.
     fn deinit(s: *Sim) void {
+        // Every exit reports, including underflow, cancellation and errors.
+        // Output samples are deliberately separate from accepted solver steps.
+        if (s.stats_on) {
+            const st = s.st;
+            std.debug.print(
+                "tran-stats: complete={} resolved={} t={e:.17} stop={e:.17} samples={d} n_qt={d} accepted={d} attempts={d} nr_iters={d} rej[newton={d} lte={d} state={d} vpi={d}] order_drops={d} bp_landings={d} by_order={any} first_dt={e:.17} max_dt={e:.17} avg_dt={e:.17}\n",
+                .{ s.t >= s.options.t_stop or atStop(s.t, s.options.t_stop), s.resolved, s.t, s.options.t_stop, s.waveform.len, s.n_qt, s.steps, st.attempts, st.nr_iters, st.rej_newton, st.rej_lte, st.rej_state, st.rej_vpi, st.order_drops, st.bp_landings, st.by_order, st.first_dt, st.max_dt, if (s.steps > 0) s.t / @as(f64, @floatFromInt(s.steps)) else 0 },
+            );
+        }
         const a = s.allocator;
         a.free(s.lte_state);
         a.free(s.lte_zero);
@@ -816,6 +831,12 @@ const Sim = struct {
             if (s.order > 1) s.st.order_drops += 1;
             s.order = 1;
             s.dt = dt / 8.0;
+            // A sub-floor proposal does not prove the floor will fail. Try it
+            // once; rejection from the floor still terminates (dctran.c:974).
+            if (s.dt < options.dt_min and dt > options.dt_min and t + options.dt_min > t) {
+                if (s.stats_on) std.debug.print("tran-floor-retry: reason=newton t={e:.17} old_dt={e:.17} proposed={e:.17} retry={e:.17}\n", .{ t, dt, s.dt, options.dt_min });
+                s.dt = options.dt_min;
+            }
             if (s.dt < options.dt_min) {
                 // The stats block in `finish` is skipped by this return.
                 if (s.stats_on) std.debug.print(
@@ -880,6 +901,12 @@ const Sim = struct {
                 ops.bound(s, a, eff_method, lte);
             if (!(del >= 0.9 * dt)) {
                 s.st.rej_lte += 1;
+                // Reconstruct only from captured history, before rollback.
+                // GPU lanes own separate histories; report that limitation
+                // explicitly rather than inspect stale host ring storage.
+                if (s.ckt.knobs.tran_lte_trace and s.st.rej_lte <= 16) {
+                    if (@TypeOf(ops) == HostOps) s.traceLte(a, nr, lte, del) else std.debug.print("tran-lte: captured-history diagnostic unavailable for this lane backend\n", .{});
+                }
                 ops.revert(s);
                 // Retry at the LTE's dt and the same order (dctran.c:966
                 // `CKTdelta = newdelta`); only a Newton failure drops the
@@ -889,6 +916,12 @@ const Sim = struct {
                     s.order = 1;
                     s.dt = dt / 8.0;
                 } else s.dt = del;
+                // Recompute the unchanged LTE test at the existing floor
+                // before declaring failure, with the same retry guard as Newton.
+                if (s.dt < options.dt_min and dt > options.dt_min and t + options.dt_min > t) {
+                    if (s.stats_on) std.debug.print("tran-floor-retry: reason=lte t={e:.17} old_dt={e:.17} proposed={e:.17} retry={e:.17}\n", .{ t, dt, s.dt, options.dt_min });
+                    s.dt = options.dt_min;
+                }
                 if (s.dt < options.dt_min) {
                     if (s.stats_on) std.debug.print(
                         "tran-stats: DT UNDERFLOW (lte) at t={e:.6} dt={e:.3} accepted={d} attempts={d} nr_iters={d}\n",
@@ -988,6 +1021,8 @@ const Sim = struct {
         s.cur = s.trial;
         s.trial = stale;
         s.t = t + dt;
+        if (s.steps == 0) s.st.first_dt = dt;
+        s.st.max_dt = @max(s.st.max_dt, dt);
         s.steps += 1;
         const t_new = s.t;
         // §4.5.2 delay-line bookkeeping, once per accepted point
@@ -1094,15 +1129,45 @@ const Sim = struct {
             .next_step = if (s.t < options.t_stop) s.dt else 0,
             .accepted = s.steps,
         });
-        if (s.stats_on) {
-            const st = s.st;
-            std.debug.print(
-                "tran-stats: n_qt={d} accepted={d} attempts={d} nr_iters={d} rej[newton={d} lte={d} state={d} vpi={d}] order_drops={d} bp_landings={d} by_order={any} avg_dt={e:.3}\n",
-                .{ s.n_qt, s.steps, st.attempts, st.nr_iters, st.rej_newton, st.rej_lte, st.rej_state, st.rej_vpi, st.order_drops, st.bp_landings, st.by_order, if (s.steps > 0) s.t / @as(f64, @floatFromInt(s.steps)) else 0 },
-            );
-        }
         if (s.cur.ptr != s.x.ptr) num.copySimd(s.x, s.cur);
         return s.resolved or s.t >= options.t_stop or atStop(s.t, options.t_stop);
+    }
+
+    fn traceLte(s: *Sim, a: *const Attempt, nr: converger.Result, lte: integrator.LteIn, bound: f64) void {
+        const hit = integrator.diagnoseBound(a.method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);
+        const matches = @as(u64, @bitCast(hit.bound)) == @as(u64, @bitCast(bound)) or
+            (std.math.isNan(hit.bound) and std.math.isNan(bound));
+        std.debug.print(
+            "tran-lte: matches={} accepted_t={e:.17} trial_t={e:.17} dt={e:.17} bound={e:.17} diagnostic_bound={e:.17} method={s} order={d} nr_iters_attempt={d} index={d}\n",
+            .{ matches, s.t, s.t + s.dt, s.dt, bound, hit.bound, @tagName(a.method), integrator.order(a.method), nr.iterations, hit.index },
+        );
+        std.debug.assert(matches);
+        if (!matches) return;
+        if (s.n_qt == 0) {
+            std.debug.print("tran-lte-state: row={d}\n", .{hit.index});
+        } else if (hit.index >= s.n_qt) {
+            std.debug.print("tran-lte-state: appended_row={d}\n", .{s.lte_rows[hit.index - s.n_qt]});
+        } else {
+            var off: usize = 0;
+            for (s.ckt.batches, 0..) |b, bi| {
+                const tape = b.hooks.q_tape orelse continue;
+                const len = tape(b.ctx).len;
+                if (hit.index < off + len) {
+                    if (b.hooks.charge_identity) |identity| {
+                        const id = identity(b.ctx, hit.index - off);
+                        std.debug.print("tran-lte-state: batch={d} type={s} original_instance={d} generated_site={d} rows={any}\n", .{ bi, b.type_name, id.instance, id.site, id.rows });
+                    } else std.debug.print("tran-lte-state: batch={d} type={s} local_tape_index={d} identity_unavailable=true\n", .{ bi, b.type_name, hit.index - off });
+                    break;
+                }
+                off += len;
+            }
+        }
+        for (s.lteHist(), 0..) |h, k| std.debug.print("tran-lte-q: history={d} q={e:.17}\n", .{ k, h[hit.index] });
+        for (a.dts, 0..) |dt, k| std.debug.print("tran-lte-dt: history={d} dt={e:.17}\n", .{ k, dt });
+        std.debug.print(
+            "tran-lte-operands: ip={e:.17} i_new={e:.17} current_tol={e:.17} charge_tol={e:.17} tol={e:.17} dd={e:.17} lte_coefficient={e:.17} unrooted_bound={e:.17} ag0={e:.17} ag1={e:.17} ag2={e:.17} trtol={e:.17}\n",
+            .{ hit.i_prev, hit.i_new, hit.current_tol, hit.charge_tol, hit.tolerance, hit.difference, hit.coefficient, hit.unrooted_bound, a.c.ag0, a.c.ag1, a.c.ag2, lte.trtol },
+        );
     }
 };
 
@@ -1596,19 +1661,14 @@ pub fn runLanes(comptime width: usize, ctxs: []const root.RunCtx, opts: Options,
     }
 }
 
-const gpu_lanes = @import("../gpu_lanes.zig");
+const gpu_lanes = @import("../gpu/lanes.zig");
 
-/// Whether `runGpuLanes` can serve this circuit, after `Run.init`, and these
-/// options: every batch with a device payload and no host-side step hook
-/// (a `$bound_step` is read on the device and hands its lane back),
-/// and none of the features whose step-end numbers the device does not
-/// compute (phase 4 G7, plus Newton hooks the lane kernels do not run:
-/// `check_convergence`, `advance_iteration` and a load check).
-pub fn gpuLaneEligible(ckt: *const root.Circuit, opts: Options) bool {
-    return gpuLaneRefusal(ckt, opts) == null;
-}
-
-/// Why `gpuLaneEligible` is false, or null.
+/// Why `runGpuLanes` cannot serve this circuit, after `Run.init`, and these
+/// options, or null when it can: every batch needs a device payload and no
+/// host-side step hook (a `$bound_step` is read on the device and hands its
+/// lane back), and none of the features whose step-end numbers the device
+/// does not compute (phase 4 G7, plus Newton hooks the lane kernels do not
+/// run: `check_convergence`, `advance_iteration` and a load check).
 fn gpuLaneRefusal(ckt: *const root.Circuit, opts: Options) ?[]const u8 {
     if (!gpu_lanes.available) return "no GPU images";
     if (opts.uic or opts.snapshot or opts.sources_at_zero or opts.tangents.len != 0) return "uic, snapshot, OPtran or tangents";
@@ -1651,6 +1711,25 @@ fn gpuLaneRefusal(ckt: *const root.Circuit, opts: Options) ?[]const u8 {
 /// verdicts. Within tolerance of `runLanes`, not bitwise. Falls back to
 /// each lane's `run` when the lanes are not eligible or the device cannot
 /// take them; a lane whose device asks to reject a step reruns on the CPU.
+/// The unknowns lane `r` reads from an accepted row: its recorded probes
+/// and its `.meas` stream's columns, sorted and without repeats. Every
+/// lane of a batch shares the deck, so the first lane's set serves all.
+fn laneProbes(gpa: std.mem.Allocator, r: *const Run, fed_rows: bool) ![]u32 {
+    const rec = r.sim.probes;
+    const fed: []const u32 = if (!fed_rows) &.{} else if (r.stream) |sm| sm.nodes else &.{};
+    const out = try gpa.alloc(u32, rec.len + fed.len);
+    errdefer gpa.free(out);
+    @memcpy(out[0..rec.len], rec);
+    @memcpy(out[rec.len..], fed);
+    std.mem.sortUnstable(u32, out, {}, std.sort.asc(u32));
+    var k: usize = 0;
+    for (out, 0..) |p, i| if (i == 0 or p != out[k - 1]) {
+        out[k] = p;
+        k += 1;
+    };
+    return gpa.realloc(out, k);
+}
+
 pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
     const g = ctxs.len;
     std.debug.assert(g >= 1 and out.len == g);
@@ -1693,12 +1772,25 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
     defer if (ckts) |cs| gpa.free(cs);
     const sims = gpa.alloc(*Sim, g) catch null;
     defer if (sims) |ss| gpa.free(ss);
+    // Only the unknowns a lane's `record` and `.meas` feed read come down
+    // per round: under measures-only a few columns, not the deck's whole
+    // probe list. `GpuLanes` borrows it, so it is freed after `d.deinit`.
+    const all_probes = ctxs[first].probes;
+    // The `.meas` passes run on the device when every lane can (06 6.8):
+    // device step control, a measure bound only on all cards (the device
+    // knows when all its passes are over, not one card), and every card a
+    // one-row pass (`measure.Stream.deviceScans`). Their columns then stay
+    // there.
+    const dev_meas = eligible and deviceStepOk(ctxs[first].circuit, opts) and opts.point.abort_measure.len == 0 and devMeasOk(gpa, runs, live) and
+        !(@import("builtin").is_test and gpu_lanes.test_access.host_meas);
+    if (@import("builtin").is_test and dev_meas) _ = gpu_lanes.test_access.dev_meas.fetchAdd(1, .monotonic);
+    const probes = laneProbes(gpa, &runs[first], !dev_meas) catch all_probes;
+    defer if (probes.ptr != all_probes.ptr) gpa.free(probes);
     const dev: ?*gpu_lanes.GpuLanes = if (!eligible or ckts == null or sims == null or n_live != g) null else blk: {
         for (ckts.?, sims.?, runs) |*c, *s, *r| {
             c.* = r.sim.ckt;
             s.* = &r.sim;
         }
-        const probes = ctxs[first].probes;
         break :blk gpu_lanes.GpuLanes.init(gpa, ckts.?, sims.?, probes) catch |e| {
             std.log.warn("gpu lanes: {s}; running {d} transients on the CPU", .{ @errorName(e), g });
             break :blk null;
@@ -1741,42 +1833,95 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
         o.residual_tol = std.math.inf(f64);
         break :blk o;
     };
-    const Lane = struct {
-        fn done(rs: []Run, on: []bool, o: []LaneOutcome, l: usize, ok: bool) void {
-            o[l] = rs[l].take(ok);
-            rs[l].deinit();
-            on[l] = false;
+    const Lane = GpuLane;
+    // The two host passes per round, one lane per call. Each touches only
+    // lane l's run, outcome and slots of `d`, so `forLanes` may split them.
+    const Pass = struct {
+        runs: []Run,
+        live: []bool,
+        out: []LaneOutcome,
+        atts: []Attempt,
+        nr: []const gpu_lanes.LaneNewton,
+        d: *gpu_lanes.GpuLanes,
+        ctxs: []const root.RunCtx,
+        opts: Options,
+
+        fn begin(p: *const @This(), l: usize) void {
+            if (!p.live[l]) return;
+            const r = &p.runs[l];
+            const maybe = r.sim.begin(p.d.laneOps(l)) catch |e| return Lane.kill(p.runs, p.live, p.out, l, e);
+            p.atts[l] = maybe orelse {
+                const ok = r.sim.finish() catch |e| return Lane.kill(p.runs, p.live, p.out, l, e);
+                return Lane.done(p.runs, p.live, p.out, l, ok);
+            };
         }
-        fn kill(rs: []Run, on: []bool, o: []LaneOutcome, l: usize, err: LaneError) void {
-            o[l] = err;
-            rs[l].deinit();
-            on[l] = false;
-        }
-        fn failAll(rs: []Run, on: []bool, o: []LaneOutcome, err: LaneError) void {
-            for (0..rs.len) |l| if (on[l]) kill(rs, on, o, l, err);
+
+        fn end(p: *const @This(), l: usize) void {
+            if (!p.live[l] or p.d.round[l] == 0) return;
+            const r = &p.runs[l];
+            if (p.nr[l].reject) {
+                // The device asked for `reject_at` or a finite
+                // `$bound_step`, which the lanes do not take: this lane
+                // reruns alone on the CPU.
+                r.deinit();
+                p.live[l] = false;
+                p.d.detached[l] = true;
+                p.out[l] = run(&p.ctxs[l], p.opts);
+                return;
+            }
+            const v = r.sim.end(&p.atts[l], p.nr[l].result, p.d.laneOps(l)) catch |e| return Lane.kill(p.runs, p.live, p.out, l, e);
+            switch (v) {
+                .go => {},
+                .stop => {
+                    const ok = r.sim.finish() catch |e| return Lane.kill(p.runs, p.live, p.out, l, e);
+                    Lane.done(p.runs, p.live, p.out, l, ok);
+                },
+                .underflow => Lane.done(p.runs, p.live, p.out, l, false),
+            }
         }
     };
-    while (std.mem.indexOfScalar(bool, live, true) != null) {
+    const pass: Pass = .{ .runs = runs, .live = live, .out = out, .atts = atts, .nr = nr, .d = d, .ctxs = ctxs, .opts = opts };
+    // Threaded passes cannot call the worker's checkpoint, which parks the
+    // analysis thread: the lanes run without it and the driver makes one
+    // per round for the batch, from the first live lane. Every lane of a
+    // batch carries the batch's one callback (`executeGpuBatch`).
+    const threaded = forLanesThreads(g) > 1;
+    const progress = ctxs[first].circuit.progress;
+    if (threaded) for (ctxs) |c| {
+        c.circuit.progress = null;
+    };
+    defer if (threaded) for (ctxs) |c| {
+        c.circuit.progress = progress;
+    };
+    if (deviceStepOk(ctxs[first].circuit, opts)) device: {
+        const steps = gpa.alloc(LK.LaneStep, g) catch break :device;
+        defer gpa.free(steps);
+        for (runs, steps) |*r, *st| st.* = laneStep(&r.sim, opts, nr_opts.max_iter);
+        d.initSteps(steps) catch |e| {
+            std.log.warn("gpu lanes: {s}; keeping step control on the host", .{@errorName(e)});
+            if (dev_meas) return GpuLane.failAll(runs, live, out, gpuError(e));
+            break :device;
+        };
+        if (dev_meas) initDevMeasures(gpa, d, runs, opts.t_start) catch |e| return GpuLane.failAll(runs, live, out, gpuError(e));
+        return deviceLoop(.{ .runs = runs, .live = live, .out = out, .ctxs = ctxs, .opts = opts, .d = d, .gpa = gpa, .meas = dev_meas }, nr_opts, progress);
+    }
+    while (std.mem.indexOfScalar(bool, live, true)) |lead| {
         @memset(d.round, 0);
         for (d.sc) |*sc| sc.flags = 0;
-        var any = false;
-        for (runs, 0..) |*r, l| {
-            if (!live[l]) continue;
-            const maybe = r.sim.begin(d.laneOps(l)) catch |e| {
-                Lane.kill(runs, live, out, l, e);
-                continue;
-            };
-            atts[l] = maybe orelse {
-                const ok = r.sim.finish() catch |e| {
-                    Lane.kill(runs, live, out, l, e);
-                    continue;
-                };
-                Lane.done(runs, live, out, l, ok);
-                continue;
-            };
-            any = true;
-        }
-        if (!any) break;
+        if (threaded) if (progress) |cb| {
+            const s = &runs[lead].sim;
+            if (s.st.attempts != 0) cb.checkpoint(.{
+                .phase = .transient,
+                .completed = s.st.attempts,
+                .simulation_time = s.t,
+                .step_size = s.attempted_dt,
+                .next_step = s.dt,
+                .accepted = s.steps,
+            }) catch |e| return Lane.failAll(runs, live, out, e);
+        };
+        forLanes(g, &pass, Pass.begin);
+        // `Ops.attempt` marks every lane that attempts this round.
+        if (std.mem.indexOfScalar(u8, d.round, 1) == null) break;
         d.prof.rounds += 1;
         d.prof.lap(.host);
         d.predictRound() catch |e| return Lane.failAll(runs, live, out, gpuError(e));
@@ -1785,38 +1930,401 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
         d.prof.lap(.newton);
         d.probe() catch |e| return Lane.failAll(runs, live, out, gpuError(e));
         d.prof.lap(.probe);
-        for (runs, 0..) |*r, l| {
-            if (!live[l] or d.round[l] == 0) continue;
-            if (nr[l].reject) {
-                // The device asked for `reject_at` or a finite
-                // `$bound_step`, which the lanes do not take: this lane
-                // reruns alone on the CPU.
-                r.deinit();
-                live[l] = false;
-                d.detached[l] = true;
-                out[l] = run(&ctxs[l], opts);
-                continue;
-            }
-            const v = r.sim.end(&atts[l], nr[l].result, d.laneOps(l)) catch |e| {
-                Lane.kill(runs, live, out, l, e);
-                continue;
-            };
-            switch (v) {
-                .go => {},
-                .stop => {
-                    const ok = r.sim.finish() catch |e| {
-                        Lane.kill(runs, live, out, l, e);
-                        continue;
-                    };
-                    Lane.done(runs, live, out, l, ok);
-                },
-                .underflow => Lane.done(runs, live, out, l, false),
-            }
-        }
+        forLanes(g, &pass, Pass.end);
         d.prof.lap(.host);
         d.apply() catch |e| return Lane.failAll(runs, live, out, gpuError(e));
         d.prof.lap(.apply);
     }
+}
+
+const LK = @import("solver").lane_kernels;
+
+/// Whether every live lane measures with a stream whose cards all run on
+/// the device (`measure.Stream.deviceScans`); the deck is shared, so the
+/// first lane answers for all.
+fn devMeasOk(gpa: std.mem.Allocator, runs: []Run, live: []const bool) bool {
+    var first: ?*Run = null;
+    for (runs, live) |*r, on| if (on) {
+        if (r.stream == null) return false;
+        if (first == null) first = r;
+    };
+    const sm = (first orelse return false).stream.?;
+    const got = (sm.deviceScans(gpa) catch return false) orelse return false;
+    defer gpa.free(got.scans);
+    defer gpa.free(got.cols);
+    // `initDevMeasures` takes lane 0's columns for all: every lane must
+    // be at the same stage of the same cards.
+    for (runs, live) |*r, on| if (on and r != first.?) {
+        const other = (r.stream.?.deviceScans(gpa) catch return false) orelse return false;
+        defer gpa.free(other.scans);
+        defer gpa.free(other.cols);
+        if (got.cols.len != other.cols.len) return false;
+        for (got.cols, other.cols, got.scans, other.scans) |*a, *b, x, y| if (!a.eql(b) or x.kind != y.kind) return false;
+    };
+    return true;
+}
+
+/// Every lane's passes, lane-major, onto the device (`initMeasures`).
+fn initDevMeasures(gpa: std.mem.Allocator, d: *gpu_lanes.GpuLanes, runs: []Run, t_start: f64) !void {
+    const N = runs.len;
+    var cols: []measure.passes.DevColumns = &.{};
+    defer gpa.free(cols);
+    var all: []measure.passes.Dev = &.{};
+    defer gpa.free(all);
+    for (runs, 0..) |*r, l| {
+        const got = (try r.stream.?.deviceScans(gpa)) orelse return error.OutOfMemory;
+        defer gpa.free(got.scans);
+        defer gpa.free(got.cols);
+        if (l == 0) {
+            cols = try gpa.dupe(measure.passes.DevColumns, got.cols);
+            all = try gpa.alloc(measure.passes.Dev, got.scans.len * N);
+        }
+        std.debug.assert(got.scans.len == cols.len);
+        for (got.scans, 0..) |sc, k| all[k * N + l] = sc;
+    }
+    try d.initMeasures(all, cols, t_start);
+}
+
+/// Whether `runGpuLanes` hands step control to the device (`LK.LaneStep`):
+/// not under `ESPICE_GPU_HOST_STEP`, its oracle, nor under the step
+/// diagnostics, which print from `Sim` mid-step.
+fn deviceStepOk(ckt: *const root.Circuit, opts: Options) bool {
+    const k = ckt.knobs;
+    return !k.gpu_host_step and !k.tran_stats and !k.tran_lte_trace and opts.tangents.len == 0;
+}
+
+/// Lane `s`'s `LK.LaneStep` as `Sim.init` left it.
+fn laneStep(s: *const Sim, opts: Options, max_iter: u16) LK.LaneStep {
+    const Ctl = @import("device").abi.StateCtlOp;
+    const tran_kind: @FieldType(@import("device").abi.SimState, "kind") = .tran;
+    const st = s.st;
+    return .{
+        .t_stop = opts.t_stop,
+        .dt_min = opts.dt_min,
+        .xmu = opts.xmu,
+        .dt_max = s.effective_dt_max,
+        .delmin = s.delmin,
+        .min_break = s.min_break,
+        .state_eps = s.state_eps,
+        .reltol = opts.tol.reltol,
+        .abstol = opts.tol.abstol,
+        .chgtol = opts.tol.chgtol,
+        .trtol = opts.tol.trtol,
+        .t = s.t,
+        .dt = s.dt,
+        .dt_old = s.dt_old,
+        .attempted_dt = s.attempted_dt,
+        .bp_next = s.bp_next orelse std.math.inf(f64),
+        .bp_save_dt = s.bp_save_dt,
+        .t_new = s.t,
+        .dt_next = s.dt,
+        .attempts = st.attempts,
+        .nr_iters = st.nr_iters,
+        .rej_newton = st.rej_newton,
+        .rej_state = st.rej_state,
+        .rej_lte = st.rej_lte,
+        .order_drops = st.order_drops,
+        .bp_landings = st.bp_landings,
+        .by_order = st.by_order,
+        .first_dt = st.first_dt,
+        .max_dt = st.max_dt,
+        .steps = s.steps,
+        .order_run = s.order_run,
+        .max_steps = opts.max_steps,
+        .max_iter = max_iter,
+        .iteration = s.ckt.sim.iteration,
+        .order = s.order,
+        .run_order = s.run_order,
+        .bp_clamped = @intFromBool(s.bp_clamped),
+        .status = LK.step_run,
+        .top = switch (opts.method) {
+            .backward_euler => 0,
+            .trapezoidal => 1,
+            .gear_2 => 2,
+            else => unreachable, // gear-3..6 are not lane-eligible
+        },
+        .charge = @intFromBool(s.has_charge),
+        .state_q = @intFromBool(s.has_charge and s.ckt.has_state_q),
+        .event = LK.step_idle,
+        .op_revert = 1 + @as(u8, @backingInt(Ctl.revert)),
+        .op_commit = 1 + @as(u8, @backingInt(Ctl.commit)),
+        .kind_tran = @intFromEnum(tran_kind),
+    };
+}
+
+/// The device's step state back into lane `s` before `finish`: what
+/// `finish`, the stats line and `take` read.
+fn adoptStep(s: *Sim, st: LK.LaneStep) void {
+    s.t = st.t;
+    s.dt = st.dt;
+    s.dt_old = st.dt_old;
+    s.attempted_dt = st.attempted_dt;
+    s.steps = st.steps;
+    s.order = st.order;
+    s.run_order = st.run_order;
+    s.order_run = st.order_run;
+    s.bp_next = if (st.bp_next == std.math.inf(f64)) null else st.bp_next;
+    s.bp_clamped = st.bp_clamped != 0;
+    s.bp_save_dt = st.bp_save_dt;
+    s.st.attempts = st.attempts;
+    s.st.nr_iters = st.nr_iters;
+    s.st.rej_newton = st.rej_newton;
+    s.st.rej_state = st.rej_state;
+    s.st.rej_lte = st.rej_lte;
+    s.st.order_drops = st.order_drops;
+    s.st.bp_landings = st.bp_landings;
+    s.st.by_order = st.by_order;
+    s.st.first_dt = st.first_dt;
+    s.st.max_dt = st.max_dt;
+}
+
+/// What `deviceLoop` shares with its per-lane drain.
+const DeviceLanes = struct {
+    runs: []Run,
+    live: []bool,
+    out: []LaneOutcome,
+    ctxs: []const root.RunCtx,
+    opts: Options,
+    d: *gpu_lanes.GpuLanes,
+    gpa: std.mem.Allocator,
+    /// Per lane, what the drain left for the serial tail (`Fin`).
+    fin: []Fin = &.{},
+    /// Ring slots the last launch filled.
+    rounds: usize = 1,
+    /// The ring slot of each `.stop` lane's resolving row.
+    stop_slot: []u8 = &.{},
+    /// The `.meas` passes run on the device (`GpuLanes.initMeasures`).
+    meas: bool = false,
+    /// Per lane, its device passes all ended in an earlier launch.
+    meas_done: []bool = &.{},
+
+    const Fin = enum(u8) { none, finish, underflow, parked, stop };
+
+    /// `Sim.end`'s tail for each of lane l's accepted rows of the launch,
+    /// in round order: record, stream, the measure bound and early stop;
+    /// then what the device's last status asks.
+    fn drain(p: *const DeviceLanes, l: usize) void {
+        p.fin[l] = .none;
+        if (!p.live[l]) return;
+        const s = &p.runs[l].sim;
+        const opts = p.opts;
+        for (0..p.rounds) |r| {
+            const rep = p.d.slotReport(r, l);
+            if (rep.event != LK.step_accept) continue;
+            const t_new = rep.t_new;
+            const row = p.d.slotRow(r, l);
+            if (t_new >= opts.t_start) s.waveform.record(t_new, row, s.probes) catch |e| {
+                GpuLane.kill(p.runs, p.live, p.out, l, e);
+                return p.d.requestStop(l);
+            };
+            if (s.stream) |sm| if (t_new >= opts.t_start) {
+                if (p.meas) {
+                    // The device fed the row: the measure bound and early
+                    // stop read the round that finished every pass.
+                    const at = p.d.measResolved(l);
+                    if (opts.point.abort_after) |bound| if (t_new > bound and !p.meas_done[l] and (at == null or at.? > r)) {
+                        GpuLane.kill(p.runs, p.live, p.out, l, error.MeasureBoundExceeded);
+                        return p.d.requestStop(l);
+                    };
+                    if (opts.point.early_stop) if (at) |a| if (a == r) {
+                        s.resolved = true;
+                        p.fin[l] = .stop;
+                        p.stop_slot[l] = a;
+                        return;
+                    };
+                    continue;
+                }
+                sm.feed(t_new, row, s.waveform.data());
+                if (opts.point.abort_after) |bound| if (t_new > bound and sm.unresolved()) {
+                    GpuLane.kill(p.runs, p.live, p.out, l, error.MeasureBoundExceeded);
+                    return p.d.requestStop(l);
+                };
+                if (opts.point.early_stop and sm.open == 0) {
+                    s.resolved = true;
+                    p.fin[l] = .stop;
+                    p.stop_slot[l] = @intCast(r);
+                    return;
+                }
+            };
+        }
+        if (p.meas and p.d.measResolved(l) != null) p.meas_done[l] = true;
+        const rep = p.d.slotReport(p.rounds - 1, l);
+        p.fin[l] = switch (rep.status) {
+            LK.step_done => .finish,
+            LK.step_underflow => .underflow,
+            LK.step_parked => .parked,
+            else => .none,
+        };
+    }
+
+    /// A parked lane (`reject_at` or `$bound_step`) reruns alone on the CPU.
+    fn rerun(p: *const DeviceLanes, l: usize) void {
+        if (p.fin[l] != .parked) return;
+        p.runs[l].deinit();
+        p.live[l] = false;
+        p.d.detached[l] = true;
+        p.out[l] = run(&p.ctxs[l], p.opts);
+    }
+};
+
+/// `runGpuLanes`' rounds under device step control: `deviceLaunch`es of up
+/// to `GpuLanes.max_rounds` rounds, the drain of their accepted rows in
+/// round order, then the lanes that left. The worker's checkpoint fires
+/// once per launch, from the first live lane.
+fn deviceLoop(p_in: DeviceLanes, nr_opts: converger.Options, progress: anytype) void {
+    var p = p_in;
+    const g = p.runs.len;
+    const d = p.d;
+    p.fin = p.gpa.alloc(DeviceLanes.Fin, g) catch return GpuLane.failAll(p.runs, p.live, p.out, error.OutOfMemory);
+    defer p.gpa.free(p.fin);
+    p.stop_slot = p.gpa.alloc(u8, g) catch return GpuLane.failAll(p.runs, p.live, p.out, error.OutOfMemory);
+    defer p.gpa.free(p.stop_slot);
+    p.meas_done = p.gpa.alloc(bool, g) catch return GpuLane.failAll(p.runs, p.live, p.out, error.OutOfMemory);
+    defer p.gpa.free(p.meas_done);
+    @memset(p.meas_done, false);
+    // Early stop and the measure bound are the drain's verdicts, so a lane
+    // they end mid-launch has run past its resolving row. That is unseen
+    // (its rows stop there, its step state comes from that row's report,
+    // and its x is scratch it frees) unless a device can latch a status
+    // `refuseLatched` reads off the device rows: then one round per launch.
+    const host_stops = for (p.runs) |*r| {
+        if (r.sim.stream != null and (p.opts.point.early_stop or p.opts.point.abort_after != null)) break true;
+    } else false;
+    const latches = for (p.runs[0].sim.ckt.batches) |b| {
+        if (b.hooks.status != null) break true;
+    } else false;
+    const max_rounds: usize = if ((host_stops and latches) or !d.multiRound()) 1 else gpu_lanes.GpuLanes.max_rounds;
+    // Rounds in the next launch, doubling up to the ring.
+    var next: usize = 1;
+    while (std.mem.indexOfScalar(bool, p.live, true)) |lead| {
+        // No lane has attempted before the first launch.
+        if (progress) |cb| if (d.prof.rounds != 0) {
+            const rep = d.slotReport(p.rounds - 1, lead);
+            if (rep.attempts != 0) cb.checkpoint(.{
+                .phase = .transient,
+                .completed = rep.attempts,
+                .simulation_time = rep.t,
+                .step_size = rep.attempted_dt,
+                .next_step = rep.dt,
+                .accepted = rep.steps,
+            }) catch |e| return GpuLane.failAll(p.runs, p.live, p.out, e);
+        };
+        d.prof.lap(.host);
+        p.rounds = next;
+        d.deviceLaunch(nr_opts, @intCast(p.rounds)) catch |e| return GpuLane.failAll(p.runs, p.live, p.out, gpuError(e));
+        d.prof.lap(.newton);
+        const t_drain = gpu_lanes.Prof.now();
+        forLanes(g, @as(*const DeviceLanes, &p), DeviceLanes.drain);
+        if (d.prof.on) d.prof.drain_ns += gpu_lanes.Prof.now() - t_drain;
+        // The lanes that left, serially. A lane's x is scratch it frees, so
+        // only its step state comes back: the device's for a lane the device
+        // ended, its resolving row's report for one early stop ended.
+        for (p.fin, 0..) |f, l| if (f == .underflow or f == .stop) d.requestStop(l);
+        var left = false;
+        for (p.fin) |f| left = left or f != .none;
+        if (left) {
+            const steps = p.gpa.alloc(LK.LaneStep, g) catch return GpuLane.failAll(p.runs, p.live, p.out, error.OutOfMemory);
+            defer p.gpa.free(steps);
+            d.fetchSteps(steps) catch |e| return GpuLane.failAll(p.runs, p.live, p.out, gpuError(e));
+            // The device passes of the lanes that left go back to their streams.
+            if (p.meas) {
+                d.fetchMeasures() catch |e| return GpuLane.failAll(p.runs, p.live, p.out, gpuError(e));
+                const lane_passes = p.gpa.alloc(measure.passes.Dev, d.n_meas) catch return GpuLane.failAll(p.runs, p.live, p.out, error.OutOfMemory);
+                defer p.gpa.free(lane_passes);
+                for (p.fin, 0..) |f, l| if (f == .finish or f == .stop or f == .underflow) if (p.runs[l].sim.stream) |sm| {
+                    d.lanePasses(l, lane_passes);
+                    sm.adoptScans(lane_passes);
+                };
+            }
+            for (p.fin, 0..) |f, l| switch (f) {
+                .none, .parked => {},
+                .finish, .stop => {
+                    const s = &p.runs[l].sim;
+                    adoptStep(s, steps[l]);
+                    if (f == .stop) {
+                        const rep = d.slotReport(p.stop_slot[l], l);
+                        s.t = rep.t;
+                        s.dt = rep.dt;
+                        s.attempted_dt = rep.attempted_dt;
+                        s.steps = rep.steps;
+                        s.st.attempts = rep.attempts;
+                    }
+                    const ok = s.finish() catch |e| {
+                        GpuLane.kill(p.runs, p.live, p.out, l, e);
+                        continue;
+                    };
+                    GpuLane.done(p.runs, p.live, p.out, l, ok);
+                },
+                .underflow => {
+                    adoptStep(&p.runs[l].sim, steps[l]);
+                    GpuLane.done(p.runs, p.live, p.out, l, false);
+                },
+            };
+            forLanes(g, @as(*const DeviceLanes, &p), DeviceLanes.rerun);
+        }
+        next = @min(2 * p.rounds, max_rounds);
+        d.prof.lap(.host);
+    }
+}
+
+/// `runGpuLanes`' lane outcomes: a lane leaves `live` once, with its
+/// result or error in `out`.
+const GpuLane = struct {
+    fn done(rs: []Run, on: []bool, o: []LaneOutcome, l: usize, ok: bool) void {
+        o[l] = rs[l].take(ok);
+        rs[l].deinit();
+        on[l] = false;
+    }
+    fn kill(rs: []Run, on: []bool, o: []LaneOutcome, l: usize, err: LaneError) void {
+        o[l] = err;
+        rs[l].deinit();
+        on[l] = false;
+    }
+    fn failAll(rs: []Run, on: []bool, o: []LaneOutcome, err: LaneError) void {
+        for (0..rs.len) |l| if (on[l]) kill(rs, on, o, l, err);
+    }
+};
+
+/// Lanes per claim in `forLanes`, and the fewest lanes per thread.
+const lanes_per_claim = 64;
+
+/// Threads `forLanes` uses for `n` lanes: one below 256 lanes, so small
+/// batches keep running serially on the analysis thread.
+fn forLanesThreads(n: usize) usize {
+    if (@import("builtin").single_threaded or n < 256) return 1;
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return @max(1, @min(cpus, n / lanes_per_claim, 64));
+}
+
+/// `f(ctx, l)` for every lane l < n, claimed `lanes_per_claim` at a time by
+/// `forLanesThreads(n)` threads. `f` must touch only lane l's state, so
+/// the split cannot change any lane's result.
+// ponytail: threads spawned per pass, two passes per round; a persistent
+// pool if spawning ever shows beside the passes' 20-40 ms at 10k lanes.
+fn forLanes(n: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize) void) void {
+    const t = forLanesThreads(n);
+    if (t <= 1) {
+        for (0..n) |l| f(ctx, l);
+        return;
+    }
+    const Work = struct {
+        fn run(next: *std.atomic.Value(usize), count: usize, c: @TypeOf(ctx)) void {
+            while (true) {
+                const lo = next.fetchAdd(lanes_per_claim, .monotonic);
+                if (lo >= count) return;
+                for (lo..@min(lo + lanes_per_claim, count)) |l| f(c, l);
+            }
+        }
+    };
+    var next = std.atomic.Value(usize).init(0);
+    var threads: [63]std.Thread = undefined;
+    var spawned: usize = 0;
+    // A failed spawn leaves fewer helpers; the calling thread still claims.
+    while (spawned < t - 1) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{ .stack_size = @import("../worker.zig").stack_size }, Work.run, .{ &next, n, ctx }) catch break;
+    }
+    Work.run(&next, n, ctx);
+    for (threads[0..spawned]) |th| th.join();
 }
 
 /// A driver failure mid-run, as the lanes' error: out of memory stays
@@ -1844,4 +2352,212 @@ fn almostEqualUlps(a: f64, b: f64, max_ulps: i64) bool {
         }
     }.f;
     return @abs(lex(a) - lex(b)) <= max_ulps;
+}
+
+// Controller tests use real generated devices and HostOps histories. Only the
+// LTE proposal/Newton outcome is injected, so each retry branch is deterministic.
+const FloorRetryTestOps = struct {
+    proposal: f64,
+    reverts: usize = 0,
+    advances: usize = 0,
+    commits: usize = 0,
+    fn revert(o: *@This(), s: *Sim) void {
+        o.reverts += 1;
+        (HostOps{}).revert(s);
+    }
+    fn rejectAt(_: *@This(), s: *Sim) ?f64 {
+        return (HostOps{}).rejectAt(s);
+    }
+    fn flipped(_: *@This(), s: *Sim, a: *const Attempt, ask: bool) bool {
+        return (HostOps{}).flipped(s, a, ask);
+    }
+    fn boundStep(_: *@This(), s: *Sim) ?f64 {
+        return (HostOps{}).boundStep(s);
+    }
+    fn charges(_: *@This(), s: *Sim, a: *const Attempt) void {
+        (HostOps{}).charges(s, a);
+    }
+    fn bound(o: *@This(), _: *Sim, _: *const Attempt, _: Method, _: integrator.LteIn) f64 {
+        return o.proposal;
+    }
+    fn boundGear(o: *@This(), _: *Sim, _: *const Attempt, _: Method, _: integrator.LteIn) f64 {
+        return o.proposal;
+    }
+    fn advance(o: *@This(), s: *Sim, a: *const Attempt) void {
+        o.advances += 1;
+        (HostOps{}).advance(s, a);
+    }
+    fn commit(o: *@This(), s: *Sim) void {
+        o.commits += 1;
+        (HostOps{}).commit(s);
+    }
+    fn rebase(_: *@This(), s: *Sim, a: *const Attempt) void {
+        (HostOps{}).rebase(s, a);
+    }
+    fn accepted(_: *@This(), s: *Sim) []const f64 {
+        return (HostOps{}).accepted(s);
+    }
+};
+
+fn checkFloorRetryController(newton_failure: bool, nonadvancing: bool, endpoint: bool, persistent_failure: bool) !void {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var lib = try @import("device").Library.init(gpa);
+    defer lib.deinit();
+    var b = try @import("builder").Builder.init(gpa, &lib);
+    const node = try b.addNode();
+    try b.addDevice(@import("models").vsource, "", &.{ .dc = 1 }, &.{}, .{ node, root.GROUND });
+    try b.addDevice(@import("models").capacitor, "", &.{ .c = 1e-12 }, &.{}, .{ node, root.GROUND });
+    var prepared = try b.compile();
+    defer prepared.deinit();
+    var ckt = try root.Circuit.instantiate(&prepared, gpa);
+    defer ckt.deinit();
+    const x = try gpa.alloc(f64, ckt.n);
+    defer gpa.free(x);
+    @memset(x, 0);
+    var wf = try Waveform.init(gpa, 1, 32);
+    defer wf.deinit();
+    var s: Sim = undefined;
+    try s.init(&ckt, x, &.{node}, &wf, .{ .t_stop = 2e-12, .dt_init = 2e-14, .dt_max = 2e-14, .dt_min = 1e-18, .uic = true }, gpa, null, null);
+    defer s.deinit();
+    // Seed an actual accepted point and both row/tape charge histories.
+    const first = (try s.begin(HostOps{})).?;
+    const first_nr = try converger.run(&ckt, s.ws, s.trial, first.t_dev, first.nr_opts, first.hook);
+    try testing.expect(first_nr.converged);
+    try testing.expectEqual(Verdict.go, try s.end(&first, first_nr, HostOps{}));
+    try testing.expectEqual(@as(u32, 1), s.steps);
+    try testing.expect(s.n_qt > 0);
+
+    s.dt = 4 * s.options.dt_min;
+    if (nonadvancing) {
+        // Small finite times, far from the 100-ulp stop tolerance: the old
+        // attempt advances by one ulp, but the requested floor rounds to t.
+        s.t = 1e-9;
+        s.options.t_stop = s.t + 1e-20;
+        s.options.dt_min = 4e-26;
+        s.dt = 2e-25;
+        try testing.expect(s.t + s.dt > s.t);
+        try testing.expectEqual(s.t, s.t + s.options.dt_min);
+    } else if (endpoint) {
+        s.options.t_stop = s.t + s.dt;
+        s.dt = s.options.t_stop - s.t;
+        s.uic_bp = null;
+    } else {
+        // Model an already-clipped pending breakpoint. `uic_bp` is an actual
+        // nextBp source, so the accepted short retry must rediscover it.
+        s.uic_bp = s.t + s.dt;
+        s.bp_next = s.uic_bp;
+        s.bp_clamped = true;
+        s.bp_save_dt = 8 * s.options.dt_min;
+    }
+    const old_t = s.t;
+    const old_dt = s.dt_old;
+    const old_steps = s.steps;
+    const old_cur = s.cur;
+    const old_prev = s.prev;
+    const old_bp = s.bp_next;
+    var rows: [8][]f64 = undefined;
+    var tapes: [8][]f64 = undefined;
+    for (1..s.n_hist) |k| {
+        rows[k - 1] = try gpa.dupe(f64, s.qHist()[k]);
+        tapes[k - 1] = try gpa.dupe(f64, s.qtHist()[k]);
+    }
+    defer for (1..s.n_hist) |k| {
+        gpa.free(rows[k - 1]);
+        gpa.free(tapes[k - 1]);
+    };
+    const ip = try gpa.dupe(f64, s.i_prev);
+    defer gpa.free(ip);
+    const qip = try gpa.dupe(f64, s.qt_i_prev);
+    defer gpa.free(qip);
+
+    var ops: FloorRetryTestOps = .{ .proposal = s.options.dt_min / 4 };
+    const a = (try s.begin(HostOps{})).?;
+    var nr = try converger.run(&ckt, s.ws, s.trial, a.t_dev, a.nr_opts, a.hook);
+    try testing.expect(nr.converged);
+    if (newton_failure) nr.converged = false;
+    try testing.expectEqual(if (nonadvancing) Verdict.underflow else Verdict.go, try s.end(&a, nr, &ops));
+    try testing.expectEqual(@as(usize, 1), ops.reverts);
+    try testing.expectEqual(@as(usize, 0), ops.advances);
+    try testing.expectEqual(@as(usize, 0), ops.commits);
+    try testing.expectEqual(old_t, s.t);
+    try testing.expectEqual(old_steps, s.steps);
+    try testing.expectEqualSlices(f64, &old_dt, &s.dt_old);
+    try testing.expectEqual(old_cur.ptr, s.cur.ptr);
+    try testing.expectEqual(old_prev.ptr, s.prev.ptr);
+    try testing.expectEqual(old_bp, s.bp_next);
+    for (1..s.n_hist) |k| {
+        try testing.expectEqualSlices(f64, rows[k - 1], s.qHist()[k]);
+        try testing.expectEqualSlices(f64, tapes[k - 1], s.qtHist()[k]);
+    }
+    try testing.expectEqualSlices(f64, ip, s.i_prev);
+    try testing.expectEqualSlices(f64, qip, s.qt_i_prev);
+    if (nonadvancing) return;
+    try testing.expectEqual(s.options.dt_min, s.dt);
+    const floor = s.dt;
+    ops.proposal = 2 * floor;
+    const retry = (try s.begin(HostOps{})).?;
+    try testing.expectEqual(old_t + floor, retry.t_dev);
+    nr = try converger.run(&ckt, s.ws, s.trial, retry.t_dev, retry.nr_opts, retry.hook);
+    try testing.expect(nr.converged);
+    if (persistent_failure) {
+        if (newton_failure) nr.converged = false else ops.proposal = floor / 4;
+        try testing.expectEqual(Verdict.underflow, try s.end(&retry, nr, &ops));
+        try testing.expectEqual(@as(usize, 2), ops.reverts);
+        try testing.expectEqual(@as(usize, 0), ops.advances);
+        try testing.expectEqual(@as(usize, 0), ops.commits);
+        try testing.expectEqual(old_t, s.t);
+        try testing.expectEqual(old_steps, s.steps);
+        try testing.expectEqualSlices(f64, &old_dt, &s.dt_old);
+        try testing.expect(s.dt < s.options.dt_min);
+        return;
+    }
+    try testing.expectEqual(Verdict.go, try s.end(&retry, nr, &ops));
+    try testing.expectEqual(@as(usize, 1), ops.advances);
+    try testing.expectEqual(@as(usize, 1), ops.commits);
+    try testing.expectEqual(old_steps + 1, s.steps);
+    try testing.expectEqual(old_t + floor, s.t);
+    try testing.expectEqual(floor, s.dt_old[0]);
+    try testing.expectEqual(old_dt[0], s.dt_old[1]);
+    try testing.expectEqualSlices(f64, rows[0], s.qHist()[2]);
+    try testing.expectEqualSlices(f64, tapes[0], s.qtHist()[2]);
+    if (!endpoint) {
+        try testing.expectEqual(old_bp, s.bp_next);
+        try testing.expectEqual(@as(u32, 0), s.st.bp_landings);
+    }
+    const target = if (endpoint) s.options.t_stop else old_bp.?;
+    // Continue genuine Newton solves under the controlled passing LTE bound.
+    // The floor retry must neither skip the pending event nor cross TSTOP.
+    var landed = false;
+    for (0..8) |_| {
+        const next = (try s.begin(HostOps{})) orelse break;
+        try testing.expect(next.t_dev <= target);
+        nr = try converger.run(&ckt, s.ws, s.trial, next.t_dev, next.nr_opts, next.hook);
+        try testing.expect(nr.converged);
+        try testing.expectEqual(Verdict.go, try s.end(&next, nr, &ops));
+        if (s.t == target) {
+            landed = true;
+            break;
+        }
+    }
+    try testing.expect(landed);
+    if (endpoint) {
+        try testing.expectEqual(@as(?Attempt, null), try s.begin(HostOps{}));
+    } else try testing.expectEqual(@as(u32, 1), s.st.bp_landings);
+}
+
+test "floor retry: rejected Newton and LTE preserve histories and pending breakpoint" {
+    for ([_]bool{ false, true }) |nr| try checkFloorRetryController(nr, false, false, false);
+}
+
+test "floor retry: Newton and LTE floor retries retain clipped endpoint" {
+    for ([_]bool{ false, true }) |nr| try checkFloorRetryController(nr, false, true, false);
+}
+
+test "floor retry: nonrepresentable floor aborts Newton and LTE at small finite time" {
+    for ([_]bool{ false, true }) |nr| try checkFloorRetryController(nr, true, false, false);
+}
+
+test "floor retry: persistent Newton and LTE rejection at the floor terminates" {
+    for ([_]bool{ false, true }) |nr| try checkFloorRetryController(nr, false, false, true);
 }

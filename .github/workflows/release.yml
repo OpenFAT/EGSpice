@@ -3,94 +3,174 @@ name: release
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      variant:
+        description: "Exact name from tools/release_matrix.py --list, or all (build only)"
+        default: all
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # x86_64 levels: v2 = SSE4.2 (fallback), v3 = AVX2+FMA, v4 = AVX-512.
-          - { name: linux-x86_64-v2, runner: ubuntu-24.04, target: x86_64-linux-gnu.2.28, cpu: x86_64_v2, cuda: sm_75, hip: gfx1100, check: sse4_2 }
-          - { name: linux-x86_64-v3, runner: ubuntu-24.04, target: x86_64-linux-gnu.2.28, cpu: x86_64_v3, cuda: sm_75, hip: gfx1100, check: avx2 }
-          - { name: linux-x86_64-v4, runner: ubuntu-24.04, target: x86_64-linux-gnu.2.28, cpu: x86_64_v4, cuda: sm_75, hip: gfx1100, check: avx512f }
-          # aarch64: ARMv8.0 baseline, and Neoverse N1 (Graviton2, Ampere Altra).
-          # No ROCm on Arm, so HIP is compiled out; CUDA covers Grace and Jetson.
-          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64-linux-gnu.2.28, cpu: generic, cuda: sm_75, hip: none, check: asimd }
-          - { name: linux-aarch64-neoverse-n1, runner: ubuntu-24.04-arm, target: aarch64-linux-gnu.2.28, cpu: neoverse_n1, cuda: sm_75, hip: none, check: asimddp }
-          # Every Apple silicon Mac is at least an M1. No CUDA or HIP on macOS.
-          - { name: macos-arm64, runner: macos-14, target: aarch64-macos, cpu: apple_m1, cuda: none, hip: none, check: "" }
-
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      version: ${{ steps.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - id: plan
+        env:
+          VARIANT: ${{ inputs.variant || 'all' }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || (github.ref_type == 'tag' && github.ref_name) || '' }}
+        run: |
+          python3 -m unittest discover -s tools -p 'test_release*.py'
+          python3 tools/release.py plan >> "$GITHUB_OUTPUT"
 
-      # The flake's Zig, the one test.yml and nix.yml build with.
+  validate:
+    needs: plan
+    uses: ./.github/workflows/test.yml
+
+  build:
+    name: ${{ matrix.name }}
+    needs: [plan, validate]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      VARIANT: ${{ matrix.name }}
+      TARGET: ${{ matrix.target }}
+      CPU: ${{ matrix.cpu }}
+      GPU: ${{ matrix.gpu }}
+      CUDA: ${{ matrix.cuda }}
+      HIP: ${{ matrix.hip }}
+      CPU_CHECK: ${{ matrix.check }}
+      PACKAGE: ${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-
       - uses: cachix/cachix-action@v15
         with:
           name: omarsiwy
           skipPush: true
 
-      - name: Build
+      # A GPU variant builds in the default shell, whose CUDA toolkit puts
+      # ptxas and fatbinary on PATH: Gompute then embeds SASS for
+      # -Dcuda-arch, so a matching card skips the driver's PTX JIT.
+      - name: Build native archive
         run: >
-          nix develop .#ci -c zig build
-          -Doptimize=ReleaseFast
-          -Dtarget=${{ matrix.target }}
-          -Dcpu=${{ matrix.cpu }}
-          -Dcuda-arch=${{ matrix.cuda }}
-          -Dhip-arch=${{ matrix.hip }}
-          --prefix out
+          nix develop "$([ "$GPU" = true ] && echo . || echo .#ci)" -c zig build
+          -Doptimize=ReleaseSafe -Dtarget="$TARGET" -Dcpu="$CPU"
+          -Dgpu="$GPU" -Dcuda-arch="$CUDA" -Dhip-arch="$HIP"
+          -j2 --prefix out --summary failures
 
-      # Run the binary only where the runner's CPU has the level's features;
-      # hosted runners do not guarantee AVX-512, and a missing feature is
-      # SIGILL, not a failed test.
-      - name: Smoke test
+      - name: Check runner CPU
+        id: cpu
         shell: bash
         run: |
-          if [ -n "${{ matrix.check }}" ] && ! grep -qw "${{ matrix.check }}" /proc/cpuinfo; then
-            echo "runner CPU lacks ${{ matrix.check }}; skipping run"
-            exit 0
+          runnable=true
+          for feature in $CPU_CHECK; do
+            if ! grep -qw "$feature" /proc/cpuinfo; then
+              runnable=false
+              echo "Runner lacks $feature" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          echo "runnable=$runnable" >> "$GITHUB_OUTPUT"
+          if [ "$runnable" = false ]; then
+            echo "Built $VARIANT; CPU smoke unavailable on this runner." >> "$GITHUB_STEP_SUMMARY"
           fi
-          out/bin/espice --version
-          out/bin/espice --backend cpu --rawfile op.raw tests/fixtures/op/device_hicum2.sp
 
-      - name: Package
+      - name: Smoke native executable and runtime Verilog-A
+        if: steps.cpu.outputs.runnable == 'true'
+        run: nix develop .#ci -c bash tools/release_smoke.sh "$PWD/out/bin/espice" "$PWD/tests/fixtures"
+
+      - name: Check CPU numerics at this instruction-set level
+        if: matrix.gpu == false && steps.cpu.outputs.runnable == 'true'
+        run: |
+          for suite in test-core test-solver; do
+            nix develop .#ci -c zig build "$suite" \
+              -Doptimize=ReleaseSafe -Dtarget="$TARGET" -Dcpu="$CPU" \
+              -Dgpu=false -Dcuda-arch=none -Dhip-arch=none -j2 --summary failures
+          done
+
+      - name: Package native archive
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          dir="espice-${version}-${{ matrix.name }}"
-          mv out "$dir"
-          cp README.md LICENSE CHANGELOGS.md "$dir"/
-          tar czf "$dir.tar.gz" "$dir"
+          mkdir -p dist
+          name="espice-${VERSION}-${VARIANT}"
+          cp README.md LICENSE CHANGELOGS.md out/
+          python3 tools/release.py metadata "$VARIANT" "$VERSION" "${{ steps.cpu.outputs.runnable }}" > out/BUILD.json
+          mv out "$name"
+          tar czf "dist/$name.tar.gz" "$name"
+
+      - name: Bundle Linux runtime closure
+        if: matrix.bundle
+        run: |
+          test "$(nix eval --raw ".#$PACKAGE.version")" = "$VERSION"
+          nix bundle --bundler . --out-link bundle ".#$PACKAGE" --cores 2 --max-jobs 1 --print-build-logs
+          test -f bundle
+          cp -L bundle "dist/espice-${VERSION}-${VARIANT}.run"
+          chmod +x "dist/espice-${VERSION}-${VARIANT}.run"
+
+      # No /nix mount and no network: the bundle must carry its own runtime,
+      # including Zig for .hdl. User namespaces are needed by nix-bundle.
+      - name: Smoke bundle outside Nix
+        if: matrix.bundle && steps.cpu.outputs.runnable == 'true'
+        run: |
+          docker build -t espice-bundle-smoke -f tools/release-container.Dockerfile tools
+          docker run --rm --network none \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            -v "$PWD/dist:/artifacts:ro" -v "$PWD/tests/fixtures:/fixtures:ro" \
+            -v "$PWD/tools/release_smoke.sh:/smoke.sh:ro" \
+            espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /fixtures' \
+            sh "/artifacts/espice-${VERSION}-${VARIANT}.run"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: espice-*.tar.gz
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+  publish:
+    needs: [plan, build]
+    if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          pattern: release-*
+          path: dist
           merge-multiple: true
-      - name: Checksums
-        run: sha256sum espice-*.tar.gz > SHA256SUMS
+      - name: Verify complete release and write checksums
+        run: python3 tools/release.py verify dist "$VERSION"
       - uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(needs.plan.outputs.version, '-') }}
           files: |
-            espice-*.tar.gz
-            SHA256SUMS
+            dist/*.tar.gz
+            dist/*.run
+            dist/SHA256SUMS
+            dist/BUILD-MATRIX.json

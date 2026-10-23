@@ -1,4 +1,5 @@
 * Diode high_injection
+* Reference-model difference: pinned VACASK ignores IKF; see docs/performance/comparison.md.
 * Expected results: diode_high_injection.expected.json
 Vin in 0 5
 R1 in out 100

@@ -8,6 +8,8 @@ pub const abi = @import("device_abi");
 pub const Circuit = @import("Circuit.zig");
 /// Runtime HDL compilation and dlopen; `Library.load` is its entry.
 pub const loader = @import("loader.zig");
+/// Device kernels for runtime `.hdl` models (01 1.8).
+pub const hdl_gpu = @import("hdl_gpu.zig");
 /// The per-Problem table of device types under dense ids.
 pub const Library = @import("Library.zig");
 /// A dense device-type id into a `Library`.
@@ -31,4 +33,5 @@ test {
     _ = Circuit;
     _ = Library;
     _ = loader;
+    _ = hdl_gpu;
 }

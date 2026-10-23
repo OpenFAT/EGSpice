@@ -36,8 +36,10 @@ between points).
 | Statistics | `agauss gauss unif aunif limit` (nominal value unless Monte Carlo is on; see [chapter 9](monte-carlo.md)) |
 
 `log` is the natural logarithm, like `ln`; use `log10` for base 10.
-`pow(x, y)` is |x|^y in the ngspice dialect, while `x^y` keeps the sign of
-x for an integer power, as ngspice does. `pwr(x, y)` is sign(x)·|x|^y.
+`pow(x, y)`, `x^y` and `x**y` use |x|^y in the ngspice dialect,
+including integer exponents. Use `x*x*x` for a signed cube.
+`pwr(x, y)` also uses |x|^y when its arguments are constant; a behavioural
+`pwr` call that reads a probe is currently unsupported.
 
 In a behavioural `B` source, expressions can also read `v(node)`,
 `v(a,b)`, `i(Vsource)`, `time` and `temper`.

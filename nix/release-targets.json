@@ -1,0 +1,297 @@
+{
+  "hosts": [
+    {
+      "name": "linux-x86_64-v1",
+      "system": "x86_64-linux",
+      "runner": "ubuntu-24.04",
+      "target": "x86_64-linux-gnu.2.28",
+      "cpu": "x86_64",
+      "check": "sse2"
+    },
+    {
+      "name": "linux-x86_64-v2",
+      "system": "x86_64-linux",
+      "runner": "ubuntu-24.04",
+      "target": "x86_64-linux-gnu.2.28",
+      "cpu": "x86_64_v2",
+      "check": "sse2 cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2"
+    },
+    {
+      "name": "linux-x86_64-v3",
+      "system": "x86_64-linux",
+      "runner": "ubuntu-24.04",
+      "target": "x86_64-linux-gnu.2.28",
+      "cpu": "x86_64_v3",
+      "check": "sse2 cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma abm movbe xsave"
+    },
+    {
+      "name": "linux-x86_64-v4",
+      "system": "x86_64-linux",
+      "runner": "ubuntu-24.04",
+      "target": "x86_64-linux-gnu.2.28",
+      "cpu": "x86_64_v4",
+      "check": "sse2 cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 avx avx2 bmi1 bmi2 f16c fma abm movbe xsave avx512f avx512bw avx512cd avx512dq avx512vl"
+    },
+    {
+      "name": "linux-aarch64",
+      "system": "aarch64-linux",
+      "runner": "ubuntu-24.04-arm",
+      "target": "aarch64-linux-gnu.2.28",
+      "cpu": "generic",
+      "check": "asimd"
+    },
+    {
+      "name": "linux-aarch64-neoverse-n1",
+      "system": "aarch64-linux",
+      "runner": "ubuntu-24.04-arm",
+      "target": "aarch64-linux-gnu.2.28",
+      "cpu": "neoverse_n1",
+      "check": "asimd atomics crc32 fphp asimdhp asimdrdm lrcpc dcpop asimddp"
+    },
+    {
+      "name": "macos-x86_64",
+      "system": "x86_64-darwin",
+      "runner": "macos-15-intel",
+      "target": "x86_64-macos",
+      "cpu": "x86_64_v2",
+      "check": ""
+    },
+    {
+      "name": "macos-arm64",
+      "system": "aarch64-darwin",
+      "runner": "macos-14",
+      "target": "aarch64-macos",
+      "cpu": "apple_m1",
+      "check": ""
+    }
+  ],
+  "backends": [
+    {
+      "name": "cpu",
+      "cuda": "none",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux",
+        "x86_64-darwin",
+        "aarch64-darwin"
+      ]
+    },
+    {
+      "name": "cuda-sm_75",
+      "cuda": "sm_75",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    {
+      "name": "cuda-sm_80",
+      "cuda": "sm_80",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    {
+      "name": "cuda-sm_86",
+      "cuda": "sm_86",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    {
+      "name": "cuda-sm_87",
+      "cuda": "sm_87",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    {
+      "name": "cuda-sm_89",
+      "cuda": "sm_89",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    {
+      "name": "cuda-sm_90",
+      "cuda": "sm_90",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    {
+      "name": "cuda-sm_100",
+      "cuda": "sm_100",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    {
+      "name": "cuda-sm_120",
+      "cuda": "sm_120",
+      "hip": "none",
+      "systems": [
+        "x86_64-linux",
+        "aarch64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx900",
+      "cuda": "none",
+      "hip": "gfx900",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx906",
+      "cuda": "none",
+      "hip": "gfx906",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx908",
+      "cuda": "none",
+      "hip": "gfx908",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx90a",
+      "cuda": "none",
+      "hip": "gfx90a",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx942",
+      "cuda": "none",
+      "hip": "gfx942",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx950",
+      "cuda": "none",
+      "hip": "gfx950",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1030",
+      "cuda": "none",
+      "hip": "gfx1030",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1031",
+      "cuda": "none",
+      "hip": "gfx1031",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1032",
+      "cuda": "none",
+      "hip": "gfx1032",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1100",
+      "cuda": "none",
+      "hip": "gfx1100",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1101",
+      "cuda": "none",
+      "hip": "gfx1101",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1102",
+      "cuda": "none",
+      "hip": "gfx1102",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1103",
+      "cuda": "none",
+      "hip": "gfx1103",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1150",
+      "cuda": "none",
+      "hip": "gfx1150",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1151",
+      "cuda": "none",
+      "hip": "gfx1151",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1152",
+      "cuda": "none",
+      "hip": "gfx1152",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1200",
+      "cuda": "none",
+      "hip": "gfx1200",
+      "systems": [
+        "x86_64-linux"
+      ]
+    },
+    {
+      "name": "hip-gfx1201",
+      "cuda": "none",
+      "hip": "gfx1201",
+      "systems": [
+        "x86_64-linux"
+      ]
+    }
+  ]
+}

@@ -38,7 +38,7 @@ fn lifecycle(allocator: std.mem.Allocator) !void {
     var params: std.ArrayList(ir.ParamRef) = .empty;
     defer params.deinit(allocator);
     try snapshot.hooks.collect_params(snapshot.ctx, allocator, &params).unwrap();
-    try t.expectEqual(@as(usize, 2), params.items.len);
+    try t.expectEqual(@as(usize, 1), params.items.len);
     var noise: std.ArrayList(ir.NoiseSource) = .empty;
     defer noise.deinit(allocator);
     try snapshot.hooks.collect_noise.?(snapshot.ctx, &.{ 0, 1 }, allocator, &noise).unwrap();

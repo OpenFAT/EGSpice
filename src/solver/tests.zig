@@ -953,6 +953,43 @@ const DenseLuTests = struct {
         return true;
     }
 
+    test "lane denseSolveNeg: dense_lu's pivots and singularity, x within rounding" {
+        const gpa = testing.allocator;
+        const lk = @import("kernels/lane.zig");
+        var prng = std.Random.DefaultPrng.init(0xDE5E);
+        const rand = prng.random();
+        for ([_]usize{ 1, 2, 5, 17, 39, 40, 64 }) |n| for (0..3) |trial| {
+            const a0 = try gpa.alloc(f64, n * n);
+            defer gpa.free(a0);
+            for (a0) |*v| v.* = rand.float(f64) - 0.5;
+            // trial 1: a zero diagonal, so every step pivots off it;
+            // trial 2: a repeated row, singular partway through.
+            if (trial == 1) for (0..n) |i| {
+                a0[i * n + i] = 0;
+            };
+            if (trial == 2 and n > 1) @memcpy(a0[(n - 1) * n ..][0..n], a0[0..n]);
+            const b = try gpa.alloc(f64, n);
+            defer gpa.free(b);
+            for (b) |*v| v.* = rand.float(f64) - 0.5;
+            const ak = try gpa.dupe(f64, a0);
+            defer gpa.free(ak);
+            const xk = try gpa.alloc(f64, n);
+            defer gpa.free(xk);
+            const want = factorizeSolveNeg(n, ak, b, xk);
+            const am = try gpa.dupe(f64, a0);
+            defer gpa.free(am);
+            const xm = try gpa.dupe(f64, b);
+            defer gpa.free(xm);
+            const ok = lk.denseSolveNeg(n, am.ptr, xm.ptr);
+            if (want) |_| {
+                try testing.expect(ok);
+                var scale: f64 = 0;
+                for (xk) |v| scale = @max(scale, @abs(v));
+                for (xk, xm) |k, m| try testing.expect(@abs(k - m) <= 1e-10 * scale);
+            } else |_| try testing.expect(!ok);
+        };
+    }
+
     test "dense_lu: blocked elimination is bitwise the scalar oracle" {
         const gpa = testing.allocator;
         var prng = std.Random.DefaultPrng.init(0xB10C);
@@ -1616,7 +1653,7 @@ const FreqSolveTests = struct {
         // SparseLu refactor of `setOmegaSparse`'s values, lane by lane, and
         // so does its W = 1 instantiation: the solves agree exactly (equal
         // as values; a zero may differ in sign, see `LaneLu.solve`).
-        const lane_lu = @import("lane_lu.zig");
+        const lane_lu = @import("lane/lu.zig");
         const b_lane = try allocator.alloc(@Vector(W, f64), nn2);
         defer allocator.free(b_lane);
         const x_lane = try allocator.alloc(@Vector(W, f64), nn2);
@@ -1964,7 +2001,7 @@ const FreqSolveTests = struct {
         // at w = 0, so neither tape replays the other and those lanes peel to
         // the serial path.
         const allocator = testing.allocator;
-        const lane_lu = @import("lane_lu.zig");
+        const lane_lu = @import("lane/lu.zig");
         const ta = FreqSolver.test_access;
         const W = ta.W;
         const n: u32 = 20;
@@ -2319,7 +2356,7 @@ const GmresTests = struct {
 };
 
 const LaneLuTests = struct {
-    const impl = @import("lane_lu.zig");
+    const impl = @import("lane/lu.zig");
     const Allocator = std.mem.Allocator;
     const LaneLu = impl.LaneLu;
     const sparse_lu = @import("sparse_lu.zig");
@@ -3406,13 +3443,13 @@ const TridiagTests = struct {
     }
 };
 
-/// The device LU's kernel bodies (lu_kernels.zig) on host threads against
+/// The device LU's kernel bodies (kernels/lu.zig) on host threads against
 /// their oracle, `refactorColumns` plus `solve`: bitwise, with the refactor
 /// on one thread (every ticket in order) and on four (real waits).
 /// dev/solvers/gpu-lu.md §4.6.
 const LuKernelTests = struct {
     const SparseLu = @import("sparse_lu.zig").SparseLu;
-    const K = @import("lu_kernels.zig");
+    const K = @import("kernels/lu.zig");
     const order = @import("order.zig");
 
     const Case = struct {
@@ -3544,11 +3581,13 @@ const LuKernelTests = struct {
         values(c, r, vals);
         try lu.factor(gpa, c.col_ptr, c.row_idx, vals, 1e-3);
         try testing.expect(std.mem.indexOfScalar(bool, lu.void_col, true) != null);
-        // Solves all head (the cost model's pick here), half tail, all tail.
+        // Solves all head (the cost model's pick here), half tail, all tail;
+        // a u16 dmap, then the u32 one.
         var failed: u32 = 0;
-        for ([_]?u32{ null, c.n / 2, 0 }) |tail| {
-            var tb = try K.build(gpa, &lu, c.col_ptr, 1e-12, .{ .tail = tail });
+        for ([_]?u32{ null, c.n / 2, 0, null }, 0..) |tail, run| {
+            var tb = try K.build(gpa, &lu, c.col_ptr, 1e-12, .{ .tail = tail, .dmap16 = run != 3 });
             defer tb.deinit(gpa);
+            try testing.expectEqual(@intFromBool(run != 3), tb.tab.dmap16);
             // Some column (the rail's) took the gather form, not all of them.
             const wlev = tb.idx[tb.tab.wlev..][0 .. c.n + 1];
             var gathered: u32 = 0;
@@ -3579,7 +3618,7 @@ const LuKernelTests = struct {
                 if (!try expectMatch(gpa, &lu, c, tb, vals, rhs, &stamp)) failed += 1;
             }
         }
-        try testing.expectEqual(3, failed);
+        try testing.expectEqual(4, failed);
     }
 
     test "lu kernels: HostRefactor on io tasks is bitwise refactor, failures included" {

@@ -1,0 +1,78 @@
+{
+  "timestamp_utc": "2026-10-20T16:12:35.448715+00:00",
+  "baseline_commit": "ec53a724d1e67adcb54927e46fbd13af40aed1eb",
+  "candidate_version": "espice 1.2.0",
+  "candidate_binary": "/tmp/espice-baseline-release/bin/espice",
+  "candidate_sha256": "82b6b56b4714c5bc0b8ce7e97d9b7fbea0578cd2ad2be149ab8afadbc49ca6bb",
+  "cpu": "Intel(R) Core(TM) i9-14900HX",
+  "logical_cpus": 32,
+  "meminfo": "MemTotal:       32558152 kB\nMemFree:         3777656 kB\nMemAvailable:   19672768 kB\nBuffers:          151552 kB\nCached:         15398388 kB\nSwapCached:         8392 kB\nActive:         10663816 kB\nInactive:       13461176 kB\nActive(anon):    8500632 kB\nInactive(anon):  1196720 kB\nActive(file):    2163184 kB\nInactive(file): 12264456 kB\nUnevictable:      646432 kB\nMlocked:           15668 kB\nSwapTotal:      32558076 kB\nSwapFree:       30472716 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:            624700 kB\nWriteback:             0 kB\nAnonPages:       9218684 kB\nMapped:           760740 kB\nShmem:           1002896 kB\nKReclaimable:    1936120 kB\nSlab:            2730264 kB\nSReclaimable:    1936120 kB\nSUnreclaim:       794144 kB\nKernelStack:       27824 kB\nPageTables:        65148 kB\nSecPageTables:      2056 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    48837152 kB\nCommitted_AS:   53527712 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:      400308 kB\nVmallocChunk:          0 kB\nPercpu:            24576 kB\nHardwareCorrupted:     0 kB\nAnonHugePages:         0 kB\nShmemHugePages:   665600 kB\nShmemPmdMapped:        0 kB\nFileHugePages:   1783808 kB\nFilePmdMapped:         0 kB\nCmaTotal:              0 kB\nCmaFree:               0 kB\nUnaccepted:            0 kB\nBalloon:               0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:    19958016 kB\nDirectMap2M:    13297664 kB\nDirectMap1G:           0 kB\n",
+  "governor": "powersave",
+  "fixture_count": 13,
+  "iterations": 3,
+  "warmups": 1,
+  "timeout_seconds": 120,
+  "cpu_worker_policy": "one per simulator; ESPICE_THREADS=1 ESPICE_LU_PAR=0 --jobs=1 --backend=cpu; OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1",
+  "build": "nix develop .#ci -c zig build -Doptimize=ReleaseFast -Dgpu=false -Dcuda-arch=none -Dhip-arch=none -j2 -p /tmp/espice-baseline-release",
+  "order": "serial; rotate engine order each repetition, and initial order per fixture",
+  "references": {
+    "ngspice": {
+      "binary": "/nix/store/zks09ghph193x3imsww3s8vnpr09nav8-ngspice-45/bin/ngspice",
+      "sha256": "9c05e382db0011ddf65f249ab645c21156240f676121925a41d18a3b51a680b4",
+      "version": "******\n** ngspice-45 : Circuit level simulation program\n** Compiled with KLU Direct Linear Solver\n** The U. C. Berkeley CAD Group\n** Copyright 1985-1994, Regents of the University of California.\n** Copyright 2001-2025, The ngspice team.\n** Please get your ngspice manual from https://ngspice.sourceforge.io/docs.html\n** Please file your bug-reports at http://ngspice.sourceforge.net/bugrep.html\n** Creation Date: Sun Aug 31 14:24:01 UTC 2025\n******"
+    },
+    "Xyce": {
+      "binary": "/nix/store/wssn1r1k10dlnkra48kc5nil5lqrv0m3-xyce-7.10.0/bin/Xyce",
+      "sha256": "313a99f6b912ede19ee142f094617d238368e1f420c007f30dc995c769bccd46",
+      "version": "Xyce Release 7.10.0-opensource"
+    }
+  },
+  "numpy": "2.4.4",
+  "matplotlib": "3.10.9",
+  "cpu_affinity": [
+    2
+  ],
+  "command": [
+    "taskset",
+    "-c",
+    "2",
+    "/tmp/espice-comparison-tools/bin/bench-runner",
+    "/tmp/espice-baseline-release/bin/espice",
+    "zig-out/comparison-scaling-fixtures",
+    "--espice",
+    "espice=ESPICE_THREADS=1,ESPICE_LU_PAR=0,--jobs=1,--backend=cpu,--full-waveforms",
+    "--ngspice-klu",
+    "--vacask",
+    "none",
+    "--xyce",
+    "Xyce",
+    "--iters",
+    "3",
+    "--timeout",
+    "120",
+    "--out",
+    "zig-out/comparison-scaling-2026-10-20/benchmark.md"
+  ],
+  "started_utc": "2026-10-20T16:49:35.986264+00:00",
+  "load_before": [
+    7.94921875,
+    14.3828125,
+    14.58544921875
+  ],
+  "load_after": [
+    9.734375,
+    15.31689453125,
+    16.103515625
+  ],
+  "ngspice_solver": "KLU",
+  "runner_sha256": "b845d7b18e0deb301ec10684fe1fc09d83ab7fd29d7793f6ab25c4f3fc71703b",
+  "environment_note": "Shared machine with concurrent development and tests; no idle-machine claim. Supplemental ngspice KLU and corrected Xyce output-selection adapter. ESPice rerun alongside references.",
+  "finished_utc": "2026-10-20T17:02:06.076278+00:00",
+  "exit_code": 0,
+  "load_observed_utc": [
+    "2026-10-20T16:49:35.998666+00:00",
+    "2026-10-20T17:02:01.075708+00:00"
+  ],
+  "measurement_conditions": "Shared development machine with concurrent builds, tests and desktop work. No processes were paused for this supplemental experiment.",
+  "xyce_adapter_note": "Uses native .PRINT FORMAT=RAW for .save selections. All13 Xyce cases completed."
+}

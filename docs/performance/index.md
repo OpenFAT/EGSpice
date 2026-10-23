@@ -3,6 +3,13 @@
 ESPice is checked two ways: against its own numeric corpus, and against
 ngspice and VACASK running the same decks.
 
+[Why simulator results can differ](comparison.md) separates reference-model
+differences, corrected implementation errors and unresolved numerical cases.
+
+The [20 October 2026 comparison](bench/2026-10-20/README.md) measures a
+frozen ESPice 1.2.0 build against ngspice 45, VACASK and Xyce 7.10.0, with
+individual timing samples, graphs, and an independent accuracy investigation.
+
 ## Accuracy
 
 `tests/fixtures/` holds 799 netlists in 43 categories, each with a

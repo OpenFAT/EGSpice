@@ -1,6 +1,6 @@
-//! Source to netlist to frozen circuit and queries: the frontend's entry
-//! points for the Problem facade. Cites no outside source; the run and
-//! variant plan follows dev/analysis/variants.md, the arenas AGENTS.md §2.12.
+//! The frontend module root: source to netlist to frozen circuit and
+//! queries, the entry points the Problem facade calls. Leaves never import
+//! this file. Cites no outside source.
 const std = @import("std");
 const core = @import("core");
 const requests = @import("core").query;
@@ -12,6 +12,10 @@ const variants = @import("variants.zig");
 const mosra = @import("mosra.zig");
 const Builder = builder.Builder;
 const Job = requests.Query;
+/// The per-Problem device library the facade fills before `build`.
+pub const Library = device.Library;
+/// HSPICE `OPTIMIZE=`: the optimizer's point-to-rows adapter (variants.zig).
+pub const Tuner = variants.Tuner;
 const Ic = core.Ic;
 const GROUND = core.GROUND;
 
@@ -99,12 +103,19 @@ pub fn detectDialect(text: []const u8) Dialect {
                 const master = std.mem.trimStart(u8, after, " \t");
                 if (master.len != 0 and master.len < after.len and std.ascii.isAlphabetic(master[0])) return .spectre;
             };
-            for (hspice_cards) |c| hspice = hspice or std.ascii.eqlIgnoreCase(card, c);
+            // Past the first HSPICE marker only a Spectre one can change
+            // the answer.
+            if (hspice) continue;
+            if (std.mem.startsWith(u8, card, ".")) for (hspice_cards) |c| {
+                hspice = hspice or std.ascii.eqlIgnoreCase(card, c);
+            };
             // `.lib 'file' tt`: a quoted path and a section.
             if (std.ascii.eqlIgnoreCase(card, ".lib") and tail.len != 0 and tail[0] == '\'') if (std.mem.indexOfScalarPos(u8, tail, 1, '\'')) |close| {
                 hspice = hspice or std.mem.trim(u8, tail[close + 1 ..], " \t").len != 0;
             };
         }
+        // Every word test below needs an `=` or a `sweep` on the line.
+        if (hspice or (std.mem.indexOfScalar(u8, rest, '=') == null and std.ascii.findIgnoreCase(rest, "sweep") == null)) continue;
         var words = std.mem.tokenizeAny(u8, rest, " \t");
         var sweep = false;
         while (words.next()) |w| {
@@ -601,4 +612,14 @@ test namesNoOutput {
     try std.testing.expect(namesNoOutput(.{ .kind = .pxf, .args = &.{} }));
     try std.testing.expect(!namesNoOutput(.{ .kind = .pxf, .args = &.{}, .sn = true }));
     try std.testing.expect(!namesNoOutput(.{ .kind = .ac, .args = &.{} }));
+}
+
+test {
+    _ = @import("tests/builder.zig");
+    _ = @import("tests/prepared.zig");
+    _ = @import("tests/models.zig");
+    _ = @import("tests/variants.zig");
+    _ = variants;
+    _ = analyses;
+    _ = mosra;
 }

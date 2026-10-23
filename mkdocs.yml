@@ -109,3 +109,17 @@ nav:
       - Zig package and Nix input: embed/packages.md
   - Accuracy and performance:
       - performance/index.md
+      - GPU batching of sweep points: performance/gpu-batching.md
+      - Performance TODO:
+          - Overview: performance/TODO/README.md
+          - Remaining: performance/TODO/REMAINING.md
+          - GPU-resident Newton: performance/TODO/01-gpu-resident-newton.md
+          - Linear solver: performance/TODO/02-linear-solver.md
+          - Device evaluation: performance/TODO/03-device-evaluation.md
+          - Newton and timestep: performance/TODO/04-newton-and-timestep.md
+          - Scheduling and parallelism: performance/TODO/05-scheduling-and-parallelism.md
+          - Sweeps and lanes: performance/TODO/06-sweeps-and-lanes.md
+          - Frontend and preparation: performance/TODO/07-frontend-and-preparation.md
+          - Output and memory: performance/TODO/08-output-and-memory.md
+          - Frequency and periodic: performance/TODO/09-frequency-and-periodic.md
+          - Measurement and gates: performance/TODO/10-measurement-and-gates.md

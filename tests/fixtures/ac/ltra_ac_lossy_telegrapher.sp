@@ -1,5 +1,4 @@
-* KNOWN GAP: an LTRA under .ac stamps its DC series resistance, not the frequency-dependent two-port (#111)
-* X01 pending fixture: AC of a genuinely lossy LTRA against the closed-form
+* Regression #111: AC of a genuinely lossy LTRA against the closed-form
 * telegrapher solution.  r=5 ohm/m over len=2 gives R_total=10 ohm, so this is
 * not a perturbation of the lossless line: at 12.5 MHz |v(b)| = 0.45416048
 * instead of 0.5 and v(a) = 0.5296370277-j0.0281790518 instead of 0.5.

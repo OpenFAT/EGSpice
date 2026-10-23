@@ -237,6 +237,18 @@ voltage source across the input port), `cur` a current injection. Plot
 `Pole-Zero Analysis`, one row of complex columns `pole(1)`, `pole(2)`,
 ..., `zero(1)`, ....
 
+Up to 1000 unknowns the result is every finite pole and zero. Above that
+a dense eigensolver is too slow, and `.pz` reports only the 20 poles and
+20 zeros nearest the origin (21 when the 20th is half of a complex pair),
+sorted by magnitude, found by shift-invert Arnoldi on the sparse LU. The
+plot name then says so and records the count wanted, the shift and the
+counts found, e.g. `Pole-Zero Analysis (partial: the 20 roots of each kind
+nearest s = 0 rad/s; found 20 poles, 20 zeros)`. The shift moves slightly
+off the origin when the transfer has a zero there. Fewer are found when the
+circuit has fewer finite roots, or when a zero is too ill-conditioned to
+separate from the transfer's zeros at infinity (the far end of a long
+ladder).
+
 ```text
 .pz in 0 out 0 vol pz
 ```
@@ -329,6 +341,42 @@ Plot `Transient Analysis`, first column `time`.
 ```text
 .tran 1n 10u
 ```
+
+The explicit `tmax` is independent of `tstep`. For example,
+`.tran 2p 2000p 0 200p` permits steps up to 200 ps while retaining the
+2 ps `tstep` used for default source edges. The adaptive error controller,
+device bounds and breakpoints can still require much smaller steps.
+Increasing this ceiling can reduce work when the default cap is binding,
+but it can also increase waveform and timing error. Compare against
+smaller-step results and choose error tolerances for the signals and
+measurements that matter. The
+[measured ceiling experiment](../performance/bench/2026-10-20/xyce-research.md)
+separates the speed gain from its accuracy tradeoff.
+
+ESPice also accepts `.options tran_ceiling=duration`. Without an explicit
+TMAX or DELMAX, this requests `(tstop - tstart)/10`; the default
+`tran_ceiling=compatibility` keeps `min(tstep, (tstop - tstart)/50)`.
+TMAX wins over DELMAX, which wins over the policy. The direct query API
+uses `Tran.ceiling_policy = .duration`; an explicit `dt_max` wins there too.
+The API's compatibility default remains `(tstop - tstart)/50`, without
+the deck's TSTEP cap. Integration still starts at zero, so changing TSTART
+can change the implicit ceiling even though TSTART suppresses output.
+
+For example, the measured ring controls can be expressed as:
+
+```text
+.options tran_ceiling=duration
+.options reltol=1e-5 abstol=1e-14 vntol=1e-8 chgtol=3e-17 trtol=1
+.tran 2p 2000p
+```
+
+This is equivalent to an explicit 200 ps TMAX with those same tolerances.
+The policy does not change tolerances or TSTEP. The effective cap also
+affects startup and breakpoint scales, just as explicit TMAX does.
+The recorded precise ring candidate was faster than equally tight
+2 ps settings, but slower than the default-tolerance control; the faster
+candidate with looser charge controls failed the strict pointwise screen.
+Neither result establishes a universal accuracy or speed improvement.
 
 ### `.four` { #four }
 

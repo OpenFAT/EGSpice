@@ -1,6 +1,7 @@
 // bsource: ngspice's B element (ASRC, asrc/asrcload.c). V(p,n) (or, with
-// BSRC_CURRENT defined, I(p,n), see bsource_i.va; with BSRC_CHARGE, the
-// charge whose ddt is I(p,n), see bsource_q.va) equals an arbitrary
+// BSRC_CURRENT defined, I(p,n) with no branch, as ngspice makes none
+// (asrcset.c:81-88); with BSRC_CHARGE, the charge whose ddt is I(p,n),
+// behind a behavioural VCCAP) equals an arbitrary
 // expression of node voltages, branch currents, time and temperature. The frontend compiles the card's expression
 // into a postfix tape held in the op_code/op_a/op_b/consts parameter arrays
 // (src/frontend/builder.zig compileTape); this module interprets it, and
@@ -20,10 +21,10 @@
 //  34 ceil  35 time  36 temper  37 pwl (a = const index of the table, b = its
 //  point count; see below)
 //
-// Semantics that differ from ngspice's defaults, on purpose:
-// - x^k with a constant integer k in [0, 255] keeps the sign of x (x*x*...*x),
-//   as ngspice's hspice/ltspice compat (ptfuncs.c PTpowerH) and the corpus
-//   oracles do; any other exponent is |x|^y, ngspice's default.
+// Expression semantics:
+// - powi multiplies its base repeatedly. For ngspice's default |x|^k
+//   semantics, the frontend inserts abs before this optimization; HSPICE's
+//   signed integer power uses it directly.
 // - sqrt/log of a negative argument and exp overflow follow IEEE (NaN/inf,
 //   caught by the solver's finiteness check) instead of ptfuncs.c's HUGE
 //   substitute. log(0) is PTlog's -1e99, finite, so Newton recovers from a
@@ -91,7 +92,9 @@ module bsource(p, n, c0, c1, c2, c3, c4, c5, c6, c7);
                         // ptfuncs.c PTdivide: the divisor moves 1e-32 away
                         // from zero, so 0/0 at an all-zero start is 0.
                         8: r = a / (b + ((b >= 0.0) ? 1e-32 : -1e-32));
-                        11: r = exp(ln((a < 0.0) ? -a : a) * b);
+                        // pow handles 0^0 at Newton's all-zero start; the
+                        // equivalent exp(b*ln(abs(a))) produces a NaN there.
+                        11: r = pow((a < 0.0) ? -a : a, b);
                         12: r = (a < b) ? 1.0 : 0.0;
                         13: r = (b < a) ? 1.0 : 0.0;
                         14: r = (a <= b) ? 1.0 : 0.0;

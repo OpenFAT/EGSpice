@@ -24,6 +24,8 @@ pub const detectDialect = frontend.detectDialect;
 /// Requested compute backend; `Problem.init` rejects one the build lacks; a
 /// query run with an explicit cuda/hip fails when no GPU is usable.
 pub const Request = analysis.ExecutionConfig.Backend;
+/// This build carries GPU kernel images.
+pub const gpu_available = analysis.gpu_available;
 /// A query's lifecycle state; `terminal()` says whether it can still run.
 pub const Status = analysis.session.Status;
 /// Which part of the DAG a call looks at: all, one query's chain, or one component.
@@ -54,10 +56,17 @@ pub const Options = struct {
     /// Where results go. `.save` and `.stim` files land in its path's directory.
     output: Selection = .{},
     /// Device backend and thread counts. `final_plan` lets a lone leading
-    /// transient or AC sweep stream to the output instead of being kept.
+    /// transient or AC sweep stream to the output instead of being kept,
+    /// and `run_all` frees each result once its plot and `.meas` block are
+    /// out (`summary` keeps its name and shape).
     backend: analysis.ExecutionConfig = .{},
     /// Queries `run_all` advances concurrently. Zero is `error.InvalidConcurrency`.
     max_parallel: u16 = 1,
+    /// Let a large query borrow extra device and refactor lanes from a
+    /// per-Problem pool of half the logical CPUs, in place of the fixed
+    /// `backend.device_threads` and `backend.solver_threads`. Results are
+    /// bitwise those of one thread.
+    auto_threads: bool = false,
     /// Print per-phase wall times to stderr.
     timing_in_depth: bool = false,
     /// The Zig compiler and `share/espice` directory a `.hdl` model builds
@@ -112,7 +121,7 @@ pub const VpiVerdict = frontend.Library.Verdict;
 /// file writer (`output.write`), `error.OutOfMemory` included. The session
 /// lookups' `error.InvalidQuery` and `error.ResultUnavailable` mean the
 /// query bookkeeping broke (a bug), reported instead of a panic.
-pub const DeliveryError = errorOf(output.Session.publish) || errorOf(output.Session.endStream) || errorOf(output.Session.finish) || errorOf(output.write) ||
+pub const DeliveryError = errorOf(output.Session.publish) || errorOf(output.Session.endStream) || errorOf(output.Session.endSide) || errorOf(output.Session.finish) || errorOf(output.write) ||
     errorOf(analysis.session.Session.info) || errorOf(analysis.session.Session.result) || errorOf(analysis.session.Session.query);
 
 fn errorOf(comptime f: anytype) type {
@@ -133,6 +142,11 @@ pub const Problem = struct {
     io: std.Io,
     /// Serializes `allocator` for query workers; see `workerAllocator`.
     allocation_mutex: std.Io.Mutex = .init,
+    /// Bytes the query workers hold through `workerAllocator` now, and the
+    /// most they held at once (`queryMemory`). Counted under
+    /// `allocation_mutex`.
+    query_live: usize = 0,
+    query_peak: usize = 0,
     /// Owns the prepared circuit and deck for the Problem's lifetime.
     arena: std.heap.ArenaAllocator,
     /// Every device type this problem can instantiate; outlives `prepared`.
@@ -144,10 +158,18 @@ pub const Problem = struct {
     /// Index into `session.outputs` of the next result to publish. Results
     /// publish in request order, so a finished query waits for earlier ones.
     next_output: usize = 0,
+    /// `final_plan`: the main session's outputs below this index were
+    /// released once written (`releaseDelivered`), and the shape of each
+    /// released result, for `summary`.
+    released_upto: usize = 0,
+    released: std.AutoHashMapUnmanaged(QueryId, Summary) = .empty,
     /// First output failure. Once set, nothing else is published.
     delivery_error: ?DeliveryError = null,
     /// The query whose rows stream to the output as it runs (`openStream`).
     streaming: ?QueryId = null,
+    /// Main-session queries whose rows stream to a side file as they run
+    /// (`openSide`), until delivered.
+    sides: std.AutoHashMapUnmanaged(QueryId, *output.Session.Stream) = .empty,
     /// The variant row `set_params` last made, which queries appended
     /// since then run at; null before any call.
     variant: ?u32 = null,
@@ -181,6 +203,12 @@ pub const Problem = struct {
     /// Whether a query of this Problem brought the GPU driver up, which every
     /// session's queries read through `ExecutionConfig.gpu_driver`.
     gpu_driver: analysis.GpuDriver = .{},
+    /// `Options.auto_threads`' pool, lent through `ExecutionConfig.thread_pool`.
+    thread_pool: analysis.ThreadPool = .{ .free = .init(0) },
+    /// The query threads every session's workers run on.
+    threads: analysis.Threads,
+    /// The solver workspaces sweep points hand on (`ExecutionConfig.ws_pool`).
+    ws_pool: analysis.WsPool,
     /// Each transient appended with `PointOptions.tangent_step`: the step
     /// of each live parameter its tangent rows took (`point_tangents`).
     tangent_steps: std.AutoHashMapUnmanaged(QueryId, []const f64) = .empty,
@@ -200,6 +228,9 @@ pub const Problem = struct {
     /// The next `.meas` block to print: whether the optimization summaries
     /// are out, the session (0 the main one, k the k-th run's) and its output.
     const MeasureCursor = struct { headed: bool = false, session: usize = 0, next: usize = 0 };
+
+    /// A result's name and shape, which outlive its release.
+    pub const Summary = struct { plotname: []const u8, npoints: usize, nvars: usize };
 
     /// Parses and prepares `options.source`, then queues the deck's analyses
     /// (a lone `.op` when the deck names none). Nothing runs yet.
@@ -226,8 +257,19 @@ pub const Problem = struct {
             .delivery = undefined,
             .limits = .{ .max_parallel = options.max_parallel },
             .parse_arena = .init(allocator),
+            .threads = undefined,
+            .ws_pool = undefined,
         };
+        self.threads = .init(self.workerAllocator(), io);
+        self.ws_pool = try .init(self.workerAllocator(), io, options.max_parallel);
+        errdefer self.ws_pool.deinit();
         errdefer self.arena.deinit();
+        if (analysis.gpu_available and options.backend.backend != .cpu and likelyGpu(options)) {
+            // The driver reads the JIT cache cap at its start.
+            raiseJitCache();
+            self.gpu_driver.prestart();
+        }
+        errdefer self.gpu_driver.deinit();
         const a = self.arena.allocator();
         self.origin = try a.dupe(u8, switch (options.source) {
             .file => |path| path,
@@ -273,8 +315,27 @@ pub const Problem = struct {
         var execution = options.backend;
         execution.timing_in_depth = options.timing_in_depth;
         execution.knobs = knobsFromEnv();
+        // A test whose oracle is the plain scalar run turns the bypass off.
+        execution.knobs.bypass = options.backend.knobs.bypass;
         execution.gpu_driver = &self.gpu_driver;
-        execution.gpu_lanes = analysis.gpu_lanes.policy(execution);
+        execution.threads = &self.threads;
+        execution.ws_pool = &self.ws_pool;
+        if (options.auto_threads and !@import("builtin").single_threaded) {
+            self.thread_pool = .init(std.Thread.getCpuCount() catch 1);
+            execution.thread_pool = &self.thread_pool;
+        }
+        // Under a bare `auto` the lane policy asks the driver for the FP64
+        // rate, a driver start (~250 ms); only a deck that can batch pays it.
+        execution.may_batch = mayBatch(&self.prepared, options);
+        execution.gpu_lanes = if (execution.backend == .auto and !execution.gpu_explicit and !execution.may_batch)
+            false
+        else
+            analysis.gpu_lanes.policy(execution);
+        if (execution.gpu_lanes) {
+            const cpus = std.Thread.getCpuCount() catch 1;
+            execution.gpu_share = analysis.gpu_lanes.share(cpus);
+            execution.gpu_static = analysis.gpu_lanes.staticPolicy(execution, cpus);
+        }
         if (analysis.gpu_available and execution.backend != .cpu) raiseJitCache();
         execution.display = options.display;
         self.measures_to = options.measures;
@@ -292,6 +353,10 @@ pub const Problem = struct {
             point.early_stop = true;
             point.warm_start = true;
         }
+        // A sweep's points start from the nominal operating point: the same
+        // point within Newton's tolerances, in a few iterations instead of
+        // the cold ladder (145 → 2 per point on a 20-stage CMOS chain).
+        if (options.auto_point and isSweep(&self.prepared.deck)) point.warm_start = true;
         if (self.save_path != null or self.prepared.deck.stims.len != 0) point.measures_only = false;
         // No analysis card runs an OP, unless it would have no columns (a
         // title-only deck): ngspice runs nothing there either.
@@ -357,12 +422,34 @@ pub const Problem = struct {
         return false;
     }
 
+    /// Whether `prepared` can hand the scheduler several transients of one
+    /// template to batch: two in the deck, a variant run, or a template
+    /// later points append to.
+    fn mayBatch(prepared: *const frontend.Prepared, options: Options) bool {
+        if (prepared.runs.len != 0 or prepared.tuning != null or options.live_params.len != 0) return true;
+        var trans: usize = 0;
+        for (prepared.deck.queries) |q| trans += @intFromBool(q == .tran);
+        return trans >= 2;
+    }
+
+    /// Whether any of `deck`'s queries runs a variant row (`.step`, `.data`,
+    /// `.mc`, `.alter` parameters, a temperature list).
+    fn isSweep(deck: *const core.Deck) bool {
+        for (deck.queries) |q| switch (q) {
+            inline else => |o| if (o.tol.variant != null or o.tol.temp_c != null) return true,
+        };
+        return false;
+    }
+
     /// A copy of `queries` whose transients carry `point`.
     fn withPoint(a: std.mem.Allocator, queries: []const Query, point: requests.PointOptions) ![]Query {
         const copy = try a.dupe(Query, queries);
-        for (copy) |*q| if (q.* == .tran) {
-            q.tran.point = point;
-        };
+        for (copy) |*q| {
+            if (q.* == .tran) q.tran.point = point;
+            if (point.warm_start) switch (q.*) {
+                inline else => |*o| o.tol.warm_op = true,
+            };
+        }
         return copy;
     }
 
@@ -373,7 +460,12 @@ pub const Problem = struct {
     pub fn deinit(self: *Problem) void {
         const a = self.allocator;
         for (self.runs) |*run| run.session.deinit();
+        self.released.deinit(a);
         self.session.deinit();
+        self.gpu_driver.deinit();
+        self.sides.deinit(a);
+        self.ws_pool.deinit();
+        self.threads.deinit();
         self.delivery.deinit();
         self.prepared.deinit();
         self.library.deinit();
@@ -585,6 +677,8 @@ pub const Problem = struct {
         const ids = try a.alloc(QueryId, jobs.len);
         _ = try self.session.appendAt(jobs, templates, ids);
         for (refused, 0..) |r, i| if (r) |err| for (ids[i * j ..][0..j]) |id| self.session.refuse(id, err) catch unreachable;
+        // A point owns its OP: nothing appended later reads either.
+        for (ids) |id| self.session.markFinal(id) catch unreachable;
         if (tangent) for (jobs, ids, 0..) |job, id, k| if (job == .tran and steps[k / j].len != 0) {
             try self.tangent_steps.put(self.arena.allocator(), id, steps[k / j]);
         };
@@ -636,17 +730,26 @@ pub const Problem = struct {
     /// so every point starts cold.
     fn solveWarmOp(self: *Problem, jobs: []const Query) !void {
         if (self.prepared.deck.warm_op.len != 0) return;
-        const tran = for (jobs) |job| {
-            if (job == .tran) break job.tran;
+        // Nothing reads it when every job starts from `.ic` (`uic`): on
+        // chain_bsim4_100k that cold OP alone ran for hours before a `uic`
+        // transient that needs none.
+        for (jobs) |job| {
+            if (!job.uic()) break;
         } else return;
-        var tol = tran.tol;
+        // A transient's flavour when the deck has one, else the first query's.
+        const tran_op, var tol = for (jobs) |job| {
+            if (job == .tran) break .{ true, job.tran.tol };
+        } else switch ((if (jobs.len == 0) return else jobs[0])) {
+            inline else => |o| .{ false, o.tol },
+        };
+        tol.warm_op = false;
         tol.variant = null;
         tol.temp_c = null;
         var deck = self.prepared.deck;
         var session = analysis.session.Session.init(self.workerAllocator(), self.io, &self.prepared.circuit, &deck, self.session.config);
         defer session.deinit();
         var id: [1]QueryId = undefined;
-        _ = try session.append(&.{.{ .op = .{ .tol = tol, .tran_op = true } }}, &id);
+        _ = try session.append(&.{.{ .op = .{ .tol = tol, .tran_op = tran_op } }}, &id);
         try session.runAll(.{ .quantum = .completion });
         const x = try session.operatingPoint(id[0]) orelse return;
         self.prepared.deck.warm_op = try self.arena.allocator().dupe(f64, x);
@@ -797,6 +900,12 @@ pub const Problem = struct {
         }
     }
 
+    /// Most points the executor runs together as one lane batch on this
+    /// Problem's backend (`analysis.batchWidth`). Advisory.
+    pub fn lane_width(self: *const Problem) u32 {
+        return analysis.batchWidth(self.session.config);
+    }
+
     /// The slopes d(card)/d(live parameter) of the `.tran` cards `names` at
     /// `count` points appended with `PointOptions.tangent_step`, starting
     /// at `first`, into `out` (`count` × `names.len` × live parameters,
@@ -936,10 +1045,11 @@ pub const Problem = struct {
         try self.optimize();
         try self.age();
         try self.openStream();
+        if (self.sidesAllowed()) self.session.stream_opener = .{ .ctx = self, .open = openSide };
         // Whole-query quanta: nothing here reads intermediate progress,
         // except the in-depth timing, which reports per checkpoint. The
         // variant runs share the pool, after the main session's ready queries.
-        var pool: analysis.session.Pool = try .init(self.allocator, self.io, .{ .max_parallel = self.limits.max_parallel, .quantum = if (self.session.config.timing_in_depth) .checkpoint else .completion });
+        var pool: analysis.session.Pool = try .init(self.allocator, self.io, .{ .max_parallel = self.limits.max_parallel, .quantum = if (self.session.config.timing_in_depth) .interval else .completion });
         defer pool.deinit();
         try pool.add(&self.session);
         for (self.runs) |*run| try pool.add(&run.session);
@@ -947,11 +1057,17 @@ pub const Problem = struct {
             pool.fill(&self.session);
             for (self.runs) |*run| pool.fill(&run.session);
             if (!pool.wait()) break;
+            // Refill the slots `wait` freed before encoding and printing,
+            // so workers run while the coordinator delivers.
+            pool.fill(&self.session);
+            for (self.runs) |*run| pool.fill(&run.session);
             self.deliverRuns();
             self.printReady();
+            self.releaseDelivered();
         }
         self.deliverRuns();
         self.printReady();
+        self.releaseDelivered();
         if (!self.finished()) return error.SchedulingFailure;
         for (self.runs) |*run| if (!run.session.finished()) return error.SchedulingFailure;
         if (self.first_failure == null) self.first_failure = self.session.failureFrom(self.checked_outputs);
@@ -959,6 +1075,10 @@ pub const Problem = struct {
         if (self.first_failure) |err| return err;
         for (self.runs) |*run| if (run.session.failure()) |err| return err;
         if (self.delivery_error != null) return error.DeliveryFailed;
+        if (self.session.config.timing_in_depth) {
+            const mem = self.queryMemory();
+            std.debug.print("timing: query memory: peak {d} B, {d} B held at the end\n", .{ mem.peak, mem.live });
+        }
         var output_lap = if (self.session.config.timing_in_depth) std.Io.Timestamp.now(self.io, .awake) else null;
         defer timingLap(self.io, &output_lap, "output finish");
         self.delivery.finish(self.io) catch |err| {
@@ -1067,6 +1187,36 @@ pub const Problem = struct {
         } }) orelse return;
         if (!try self.session.streamTo(id, writer)) return self.delivery.abortStream();
         self.streaming = id;
+    }
+
+    /// What `openStream` asks of the whole run before any plot streams: a
+    /// final plan, nothing that reads results after the run, and a probe
+    /// label per column.
+    fn sidesAllowed(self: *const Problem) bool {
+        const deck = &self.prepared.deck;
+        return self.session.config.final_plan and self.save_path == null and deck.stims.len == 0 and
+            self.prepared.tuner == null and deck.probe_labels.len == deck.probes.len;
+    }
+
+    /// `Session.stream_opener`: a transient or AC plot that no `.meas` card
+    /// and no tangent row reads streams to a side file of the output from
+    /// its worker, and `deliverOne` appends it in request order, so `-r`
+    /// over a sweep holds one row buffer per running point instead of
+    /// every waveform. Null (keep the rows) for anything else, or when the
+    /// side cannot open.
+    fn openSide(ctx: *anyopaque, id: QueryId, job: Query) ?*std.Io.Writer {
+        const self: *Problem = @ptrCast(@alignCast(ctx));
+        switch (job) {
+            .tran => |o| if (o.snapshot or o.tangents.len != 0) return null,
+            .ac => {},
+            else => return null, // else: only a transient or AC sweep streams its rows
+        }
+        if (self.streaming == id or self.tangent_steps.contains(id)) return null;
+        for (self.prepared.deck.measures) |m| if (m.analysis == job) return null;
+        self.sides.ensureUnusedCapacity(self.allocator, 1) catch return null;
+        const s = (self.delivery.beginSide(self.io) catch return null) orelse return null;
+        self.sides.putAssumeCapacity(id, s);
+        return s.writer();
     }
 
     /// Writes the node voltages of the main session's operating point as
@@ -1231,6 +1381,37 @@ pub const Problem = struct {
     /// `error.ResultUnavailable` until the query completes.
     pub fn result(self: *const Problem, id: QueryId) !Result {
         return self.session.result(id);
+    }
+
+    /// `id`'s plot name and shape, also after `run_all` released it.
+    pub fn summary(self: *const Problem, id: QueryId) !Summary {
+        if (self.released.get(id)) |s| return s;
+        const res = try self.result(id);
+        return .{ .plotname = res.plotname, .npoints = res.npoints, .nvars = res.varnames.len };
+    }
+
+    /// `final_plan`: frees each main-session query whose plot is written
+    /// and whose `.meas` block is printed, so a `-r` sweep holds the points
+    /// still running rather than the whole run. Nothing with `.save` or
+    /// `.stim`. Keeps the Monte Carlo
+    /// trials (`print_measures` reads them at the end), the tangent runs,
+    /// and a requested OP that later queries still read.
+    fn releaseDelivered(self: *Problem) void {
+        // `.save` and `.stim` read the results after the run.
+        if (!self.session.config.final_plan or self.save_path != null or self.prepared.deck.stims.len != 0) return;
+        const outputs = self.session.outputs.items;
+        const printed = if (self.prepared.deck.measures.len == 0 or self.measure_cursor.session > 0) outputs.len else self.measure_cursor.next;
+        const upto = @min(self.next_output, printed);
+        while (self.released_upto < upto) : (self.released_upto += 1) {
+            const id = outputs[self.released_upto];
+            if (self.tangent_steps.contains(id)) continue;
+            const s = self.summary(id) catch continue;
+            if (std.mem.indexOf(u8, s.plotname, "(monte=") != null) continue;
+            const kept: Summary = .{ .plotname = self.arena.allocator().dupe(u8, s.plotname) catch return, .npoints = s.npoints, .nvars = s.nvars };
+            self.released.ensureUnusedCapacity(self.allocator, 1) catch return;
+            self.session.release(id) catch continue;
+            self.released.putAssumeCapacity(id, kept);
+        }
     }
 
     /// Copies a result's data into `buffer` and returns its length
@@ -1489,6 +1670,16 @@ pub const Problem = struct {
             }
             const res = try session.result(id);
             try self.delivery.endStream(self.io, res.npoints, res.varnames.len);
+        } else if (session == &self.session and self.sides.contains(id)) {
+            const side = self.sides.fetchRemove(id).?.value;
+            if (status != .complete) {
+                self.delivery.dropSide(side);
+                return true;
+            }
+            const res = try session.result(id);
+            var lap = if (self.session.config.timing_in_depth) std.Io.Timestamp.now(self.io, .awake) else null;
+            defer timingLap(self.io, &lap, "output delivery");
+            try self.delivery.endSide(self.io, side, .{ .title = session.deck.title, .result = res });
         } else if (status == .complete) {
             const res = try session.result(id);
             var lap = if (self.session.config.timing_in_depth) std.Io.Timestamp.now(self.io, .awake) else null;
@@ -1532,25 +1723,46 @@ pub const Problem = struct {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
+    /// The query workers' allocations (sessions, executors, circuits,
+    /// results): bytes held now and the peak so far, in bytes requested.
+    /// The preparation (`Prepared`) is not counted.
+    pub fn queryMemory(self: *Problem) struct { live: usize, peak: usize } {
+        self.allocation_mutex.lockUncancelable(self.io);
+        defer self.allocation_mutex.unlock(self.io);
+        return .{ .live = self.query_live, .peak = self.query_peak };
+    }
+
+    /// Moves the counted bytes from `old` to `new`; under the mutex.
+    fn account(self: *Problem, old: usize, new: usize) void {
+        self.query_live = self.query_live - old + new;
+        self.query_peak = @max(self.query_peak, self.query_live);
+    }
+
     fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
         const self: *Problem = @ptrCast(@alignCast(ctx));
         self.allocation_mutex.lockUncancelable(self.io);
         defer self.allocation_mutex.unlock(self.io);
-        return self.allocator.rawAlloc(n, alignment, ret);
+        const p = self.allocator.rawAlloc(n, alignment, ret) orelse return null;
+        self.account(0, n);
+        return p;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, n: usize, ret: usize) bool {
         const self: *Problem = @ptrCast(@alignCast(ctx));
         self.allocation_mutex.lockUncancelable(self.io);
         defer self.allocation_mutex.unlock(self.io);
-        return self.allocator.rawResize(memory, alignment, n, ret);
+        if (!self.allocator.rawResize(memory, alignment, n, ret)) return false;
+        self.account(memory.len, n);
+        return true;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, n: usize, ret: usize) ?[*]u8 {
         const self: *Problem = @ptrCast(@alignCast(ctx));
         self.allocation_mutex.lockUncancelable(self.io);
         defer self.allocation_mutex.unlock(self.io);
-        return self.allocator.rawRemap(memory, alignment, n, ret);
+        const p = self.allocator.rawRemap(memory, alignment, n, ret) orelse return null;
+        self.account(memory.len, n);
+        return p;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
@@ -1558,6 +1770,7 @@ pub const Problem = struct {
         self.allocation_mutex.lockUncancelable(self.io);
         defer self.allocation_mutex.unlock(self.io);
         self.allocator.rawFree(memory, alignment, ret);
+        self.account(memory.len, 0);
     }
 };
 
@@ -1586,7 +1799,8 @@ fn queryFailure(session: *const analysis.session.Session, id: QueryId) !?anyerro
 fn monteTrials(gpa: std.mem.Allocator, session: *const analysis.session.Session, kind: requests.Kind, trials: *std.ArrayList(Result)) !void {
     for (session.outputs.items) |id| {
         const info = try session.info(id);
-        if (info.status != .complete or info.kind != kind) continue;
+        // `releaseDelivered` keeps every trial.
+        if (info.status != .complete or info.kind != kind or session.released(id)) continue;
         const res = try session.result(id);
         if (std.mem.indexOf(u8, res.plotname, "(monte=") != null) try trials.append(gpa, res);
     }
@@ -1726,6 +1940,12 @@ fn getenv(name: [*:0]const u8) ?[*:0]const u8 {
 /// `$XDG_CACHE_HOME/espice/hdl`, else `$HOME/.cache/espice/hdl`, else
 /// `$TMPDIR/espice-cache/hdl` (default `/tmp`). An empty variable counts as
 /// unset for the cache, as `$ZIG` never is.
+fn dupeAll(a: std.mem.Allocator, items: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, items.len);
+    for (out, items) |*o, s| o.* = try a.dupe(u8, s);
+    return out;
+}
+
 fn toolchainFromEnv(a: std.mem.Allocator, given: HdlToolchain) !HdlToolchain {
     const env = struct {
         fn get(name: [*:0]const u8) ?[]const u8 {
@@ -1746,6 +1966,7 @@ fn toolchainFromEnv(a: std.mem.Allocator, given: HdlToolchain) !HdlToolchain {
         .zig = if (zig) |z| try a.dupe(u8, z) else null,
         .share = if (given.share) |d| try a.dupe(u8, d) else null,
         .cache_dir = cache_dir,
+        .include_dirs = try dupeAll(a, given.include_dirs),
     };
 }
 
@@ -1756,6 +1977,31 @@ fn toolchainFromEnv(a: std.mem.Allocator, given: HdlToolchain) !HdlToolchain {
 /// driver's maximum. A user's own setting wins. It must run before the
 /// driver initializes, which the first GPU query of the process does, so
 /// `Problem.init` calls it whenever the backend may use the GPU.
+/// Whether a run will probably take the GPU, judged before parsing: an
+/// explicit `cuda`/`hip`, or a deck file of at least `likely_gpu_bytes`,
+/// the size where `auto`'s cost model starts admitting post-layout decks.
+// ponytail: the top file's size only; a small deck that includes a large
+// netlist starts the driver with its first query, as before 05 5.12.
+fn likelyGpu(options: Options) bool {
+    if (options.backend.gpu_explicit or options.backend.backend != .auto) return true;
+    const path = switch (options.source) {
+        .file => |p| p,
+        .bytes => |b| return b.data.len >= likely_gpu_bytes,
+    };
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return false;
+    const fd = std.c.open(z, .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return false;
+    defer _ = std.c.close(fd);
+    return std.c.lseek(fd, 0, std.c.SEEK.END) >= likely_gpu_bytes;
+}
+
+/// 1 MiB: post-layout decks (chain_bsim4_10k is 3.3 MB; `auto` takes the
+/// GPU for it, 6.6 → 6.2 s with the start overlapped). Below it `auto`
+/// mostly stays on the CPU, and a started context costs a CPU run its
+/// teardown (stress/scaling_parallel_inverters_2000, 199 KiB: 0.6 → 1.0 s).
+const likely_gpu_bytes = 1 << 20;
+
 fn raiseJitCache() void {
     const setenv = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
@@ -1786,6 +2032,7 @@ fn knobsFromEnv() analysis.Knobs {
     k.hb_trace = env.on("ESPICE_HB_TRACE");
     k.no_qtape = env.on("ZP_NO_QTAPE");
     k.tran_stats = env.on("ZP_TRAN_STATS");
+    k.tran_lte_trace = env.on("ZP_TRAN_LTE_TRACE");
     k.no_tangents = env.on("ZP_NO_TANGENTS");
     if (env.get("ESPICE_GPU_LU")) |v| k.gpu_lu = std.mem.eql(u8, v, "1");
     k.gpu_lu_check = env.on("ESPICE_GPU_LU_CHECK");
@@ -1800,6 +2047,8 @@ fn knobsFromEnv() analysis.Knobs {
     k.gpu_block = analysis.Knobs.parseBlock(env.get("ESPICE_GPU_BLOCK"));
     k.gpu_eval_check = env.on("ESPICE_GPU_EVAL_CHECK");
     k.gpu_nofuse = env.on("ESPICE_GPU_NOFUSE");
+    k.gpu_nographs = env.on("ESPICE_GPU_NOGRAPHS");
+    k.gpu_host_step = env.on("ESPICE_GPU_HOST_STEP");
     k.xdg_cache_home = env.get("XDG_CACHE_HOME");
     k.home = env.get("HOME");
     return k;

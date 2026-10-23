@@ -401,6 +401,10 @@ pub const Tolerances = struct {
     temp_c: ?f64 = null,
     /// Row of `Deck.variants` this query runs; null runs the nominal circuit.
     variant: ?u32 = null,
+    /// This query's operating point, its own or its prerequisite, starts
+    /// from `Deck.warm_op` (`--warm-start`) instead of the cold ladder: the
+    /// same point within Newton's tolerances, usually in a few iterations.
+    warm_op: bool = false,
 };
 
 test "bulk buffers preserve bits, common prefixes and exact aliases" {

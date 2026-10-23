@@ -1,8 +1,9 @@
 # GPU backend
 
-ESPice can evaluate device models on an NVIDIA (CUDA) or AMD (HIP) GPU.
-The device kernels are the same code as the CPU path, compiled for each
-target, so a GPU run computes the same device stamps as a CPU run.
+ESPice can evaluate device models and run batches of independent analyses
+on an NVIDIA (CUDA) or AMD (HIP) GPU. Device kernels use the same generated
+model code as the CPU. GPU and CPU results are compared within numerical
+tolerance; different transient step decisions can produce different grids.
 
 ```sh
 espice big.sp --backend=auto     # GPU if present and worth it, else CPU
@@ -15,12 +16,27 @@ The default is `--backend=cpu`.
 
 ## What runs on the GPU
 
-Per Newton iteration, the GPU evaluates the devices: every instance's
+For a single circuit, the GPU evaluates the devices per Newton iteration: every instance's
 currents, charges and their derivatives, summed into the circuit matrix
 and right-hand side in a fixed order. The sum is deterministic, so a
 Newton iteration sees the same matrix every time. The matrix solve, the
 Newton update, convergence checks and transient step control run on the
-CPU.
+CPU. Batches of independent points have additional device paths:
+
+| Analysis | GPU work | Host work |
+|---|---|---|
+| Transient lanes | Device evaluation, assembly, sparse LU replay, Newton updates and gates, charge history, LTE and probes | Each point's step control, breakpoints, measurements and early stop; exceptional LU re-pivoting |
+| AC, noise, SP, AC transfer functions and loop stability | Flattened `(point, frequency)` matrix assembly and forward/adjoint solves, including live margin refinement requests | Operating points, output construction, stability brackets and refinement control |
+| Shooting PSS | Fixed-step trapezoidal period integrations, including device commit/revert | Shooting iteration, finite-difference columns, per-lane period and Krylov directional integrations |
+| Driven HB/MHB lanes | Independent `(point, sample)` device evaluation, sampled Jacobian products and spectral transforms, harmonic factor replay, masked GMRES | Each point's nonlinear iteration and backtracking; sparse pivot candidates and output construction |
+| Periodic small signal | Retained harmonic preconditioner solves | Frequency sweep, outer Krylov control and Jacobian products |
+
+Transient Newton uses two captured graphs around the exceptional host LU
+re-pivoting step. Capture failure reports a warning and uses direct launches.
+Both paths keep the same arithmetic and convergence controls. Shooting PSS
+retains its finite residual gate and gmin. It preserves the final assembled
+charge of converged lanes while peers continue, and stages all device state
+downloads before publishing an accepted period to the host.
 
 For large circuits (10,000 unknowns or more) ESPice may also factor the
 matrix on the GPU: when the factorization is dense enough per column, or
@@ -28,15 +44,49 @@ large overall (about 50 million multiply-adds, which post-layout netlists
 reach near 100,000 transistors). `ESPICE_GPU_LU=1` forces that on under a GPU backend,
 `ESPICE_GPU_LU=0` keeps the factorization on the CPU.
 
-Nearly every device evaluates on the GPU. The exceptions run on the CPU and
-are added to the GPU's result, so a circuit can mix both: the lossy
-transmission lines (`O` LTRA, `P` CPL, `Y` TXL), the MVSG, ASM-HEMT and
-BSIM-SOI models, and a Verilog-A `$limit` function that keeps Newton
-history. Devices with state across time points (switches, delay lines,
-Laplace and pole sources) evaluate on the GPU and update that state on the
-CPU once per accepted time point. `auto` also estimates the
+The build no longer excludes MVSG, ASM-HEMT or BSIM-SOI solely for kernel
+frame size. Single-circuit evaluation can mix supported GPU batches with
+host batches. Devices with state across time points can update their state
+on the CPU. `auto` also estimates the
 cost: launching kernels and copying the solution vector each iteration has
 a fixed price, and a small circuit is faster on the CPU.
+
+GPU transient lanes require device payloads and supported device state
+kernels. UIC, snapshots, OPtran, tangents, gear orders above two, delay
+lines, coupled inductors and host-only Newton callbacks fall back to the
+scalar path. A lane requesting an unsupported step rejection reruns on the
+CPU. Shooting GPU lanes additionally refuse stateful charge and device
+state without GPU control kernels; a state rejection reruns the period on
+the CPU from its unchanged start. Frequency lanes require a compatible sparse
+pattern; small dense frequency solves remain on the CPU. HB/MHB sampled
+evaluation rejects history-dependent device state, host callbacks and device
+status hooks until their per-sample state and status can be combined safely.
+Those points retain CPU sampling. Finished or failed points are masked out
+of device evaluation and Krylov work. A forced GPU backend therefore does
+not imply every analysis used GPU lanes.
+
+Explicit `cuda`/`hip` enables eligible lanes unless `ESPICE_LANES=0`.
+`auto` admits lanes only when the reported FP64 rate is at least one quarter
+of FP32. It keeps CPU lanes on the tested RTX 4060 Laptop; this device's
+measurements do not predict datacenter GPU performance. A binary carrying
+both image families currently selects CUDA first and rejects an explicit
+HIP request when HIP is not its selected lane runtime. Use a HIP-only build
+for HIP lanes.
+
+## Lane controls and verification
+
+| Setting | Effect |
+|---|---|
+| `ESPICE_LANES=0` | Disable lane batching |
+| `ESPICE_GPU_STATS=1` | Admission, rounds, Newton ticks, graph replay, peels and idle fractions |
+| `ESPICE_GPU_STATS=phases` | Direct launches with waits between stages; useful for diagnosis, changes timing |
+| `ESPICE_GPU_NOGRAPHS=1` | Direct launches without graph capture, for comparison |
+
+The execution configuration's `gpu_lane_cap` defaults to 16,384 device
+lanes. It has no environment-variable override.
+
+`zig build test-gpu` runs the fixture corpus under `--backend cuda`, one
+deck at a time; GPU results are compared within each fixture's tolerance.
 
 ## What fails, and when
 
@@ -85,14 +135,16 @@ always run on the CPU.
 
 ## Getting a GPU build
 
-The release tarballs for Linux include CUDA kernels for `sm_75` (Turing)
-and later, and the x86-64 ones also HIP kernels for `gfx1100` (RDNA3). To
-build for your own card:
+Linux release artifacts select one GPU target each: a `cuda-sm_*` build
+contains only that CUDA target, and a `hip-gfx*` build contains only that
+HIP target. CPU-only variants carry neither. See the
+[release catalogue and portable bundles](install.md#release-tarballs) for
+the available CPU instruction sets and GPU targets. To build for your own card:
 
 ```sh
 nix develop                      # CUDA and ROCm toolchains
-zig build -Dcuda-arch=sm_89      # or auto, to probe this machine
-zig build -Dhip-arch=gfx90a
+zig build -Doptimize=Debug -Dgpu=true -Dcuda-arch=sm_89 -Dhip-arch=none
+zig build -Doptimize=Debug -Dgpu=true -Dcuda-arch=none -Dhip-arch=gfx90a
 ```
 
 `-Dcuda-arch=none` or `-Dhip-arch=none` leaves a target out. The machine

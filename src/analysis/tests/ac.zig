@@ -31,7 +31,7 @@ const StreamTests = struct {
             completed: u16 = 0,
             cancel: bool = false,
 
-            fn checkpoint(ctx: *anyopaque, event: @import("../progress.zig").Event) error{QueryCancelled}!void {
+            fn checkpoint(ctx: *anyopaque, event: @import("../worker.zig").Event) error{QueryCancelled}!void {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 self.calls += 1;
                 self.completed = @intCast(event.completed);

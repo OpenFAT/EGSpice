@@ -10,7 +10,7 @@ const Deck = core.Deck;
 const Circuit = @import("device").Circuit;
 const ParamRef = @import("device").abi.ParamRef;
 const execution = @import("executor.zig");
-const progress = @import("progress.zig");
+const progress = @import("worker.zig");
 const types = @import("types.zig");
 const temp_sweep = @import("sweep/temp_sweep.zig");
 const Result = types.Result;
@@ -92,7 +92,11 @@ pub const Advance = struct {
     failure: ?Failure = null,
 };
 const Row = struct {
-    job: requests.Query,
+    /// Index into `Session.jobs`; a lane row names its split query's.
+    job: u32,
+    /// The `tol.variant` the row runs, which `jobs` leaves out so a
+    /// sweep's points share one entry; `no_variant` for none.
+    variant: u32 = no_variant,
     dependency: QueryId = none,
     component: u32,
     requested: bool,
@@ -119,11 +123,15 @@ const Row = struct {
     owner: QueryId = none,
     /// `release` dropped its executor and result.
     released: bool = false,
+    /// No query appended later reads its state (`markFinal`), so it is
+    /// treated as under `Config.final_plan`.
+    final: bool = false,
     /// Its position in `outputs`, or `no_output` when not requested.
     output: u32 = no_output,
 };
 
 const no_output = std.math.maxInt(u32);
+const no_variant = std.math.maxInt(u32);
 
 /// The query graph over one prepared circuit and deck, both borrowed for the
 /// session's lifetime. `QueryId` is the row index; every call that takes one
@@ -137,8 +145,12 @@ pub const Session = struct {
     rows: std.MultiArrayList(Row) = .empty,
     /// Requested queries in first-request order, for delivery.
     outputs: std.ArrayList(QueryId) = .empty,
-    /// One arena per `append`, holding its copied query options.
-    request_arenas: std.ArrayList(std.heap.ArenaAllocator) = .empty,
+    /// Every distinct job appended, its `tol.variant` cleared, deep-copied
+    /// into `job_arena`: a row holds an index and its variant (8.7), so a
+    /// sweep's points and their OPs hold one copy of their options.
+    jobs: std.ArrayList(requests.Query) = .empty,
+    job_index: JobIndex = .empty,
+    job_arena: std.heap.ArenaAllocator,
     /// Round-robin start for `readyQueries`.
     cursor: u32 = 0,
     /// Every OP row by template and options, for `append` to share one.
@@ -172,11 +184,16 @@ pub const Session = struct {
     /// A transient or AC query that writes its rows to `writer` as it records them
     /// instead of keeping them; its Result has empty `data`. Set by `streamTo`.
     stream: ?struct { id: QueryId, writer: *std.Io.Writer } = null,
+    /// Asked once for each requested query as it first launches on its own
+    /// (no lane peers, not a lane row) and no `streamTo` writer took it:
+    /// a writer for its rows, as `streamTo` gives, or null to keep them.
+    /// Runs on the thread that calls `Pool.fill`.
+    stream_opener: ?StreamOpener = null,
 
     /// An empty session. Allocates nothing; `topology` and `deck` must
     /// outlive it.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, topology: *const Circuit, deck: *const Deck, config: execution.Config) Session {
-        return .{ .allocator = allocator, .io = io, .topology = topology, .deck = deck, .config = config };
+        return .{ .allocator = allocator, .io = io, .topology = topology, .deck = deck, .config = config, .job_arena = .init(allocator) };
     }
 
     /// Marks this session as the last reader of `topology`'s device state
@@ -187,6 +204,11 @@ pub const Session = struct {
         self.last_template_reader = true;
     }
 
+    pub const StreamOpener = struct {
+        ctx: *anyopaque,
+        open: *const fn (ctx: *anyopaque, id: QueryId, job: requests.Query) ?*std.Io.Writer,
+    };
+
     /// Makes transient or AC query `id` write its rows to `writer` as it
     /// records them, its Result keeping empty `data`. False, and nothing
     /// set, once `id` has started: its rows already went elsewhere (#13).
@@ -194,7 +216,7 @@ pub const Session = struct {
     pub fn streamTo(self: *Session, id: QueryId, writer: *std.Io.Writer) !bool {
         const i = try self.index(id);
         std.debug.assert(self.stream == null);
-        const job = self.rows.items(.job)[i];
+        const job = self.kindAt(i);
         std.debug.assert(job == .tran or job == .ac);
         if (self.rows.items(.executor)[i] != null) return false;
         self.stream = .{ .id = id, .writer = writer };
@@ -216,8 +238,9 @@ pub const Session = struct {
         self.ops.deinit(self.allocator);
         self.queue.deinit(self.allocator);
         self.urgent.deinit(self.allocator);
-        for (self.request_arenas.items) |*arena| arena.deinit();
-        self.request_arenas.deinit(self.allocator);
+        self.jobs.deinit(self.allocator);
+        self.job_index.deinit(self.allocator);
+        self.job_arena.deinit();
         self.* = undefined;
     }
 
@@ -245,29 +268,33 @@ pub const Session = struct {
         for (jobs) |job| added = std.math.add(usize, added, 2 + @as(usize, splitLanes(job))) catch return error.TooManyQueries;
         const max_rows = std.math.add(usize, self.rows.len, added) catch return error.TooManyQueries;
         if (max_rows >= std.math.maxInt(u32)) return error.TooManyQueries;
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        errdefer arena.deinit();
-        const a = arena.allocator();
         const old_len = self.rows.len;
-        // Everything that can fail first: copies, then room for every row,
-        // OP index entry and output, so the rows below change infallibly.
-        const owned = try a.alloc(requests.Query, jobs.len);
-        for (jobs, owned) |job, *o| {
-            try validateDeck(job, self.topology.n, self.deck);
-            o.* = try copyValue(a, job);
+        for (jobs) |job| try validateDeck(job, self.topology.n, self.deck);
+        // Everything that can fail first: interning, then room for every
+        // row, OP index entry and output, so the rows below change
+        // infallibly. A failed append leaves at most unread `jobs` entries.
+        const refs = try self.allocator.alloc(JobRef, jobs.len);
+        defer self.allocator.free(refs);
+        for (jobs, refs) |job, *r| {
+            const stripped, const variant = withoutVariant(job);
+            r.* = .{
+                .job = try self.intern(stripped),
+                .variant = variant,
+                .op = if (prerequisite(stripped)) |op| try self.intern(.{ .op = op }) else no_variant,
+            };
         }
         try self.rows.ensureTotalCapacity(self.allocator, max_rows);
         try self.ops.ensureUnusedCapacity(self.allocator, @intCast(max_rows - old_len));
         try self.outputs.ensureUnusedCapacity(self.allocator, jobs.len);
-        try self.request_arenas.ensureUnusedCapacity(self.allocator, 1);
         try self.urgent.ensureTotalCapacity(self.allocator, max_rows);
         var roots: u32 = 0;
-        for (owned, ids[0..jobs.len], 0..) |job, *id, k| {
+        for (refs, ids[0..jobs.len], 0..) |r, *id, k| {
             const template = if (templates) |t| t[k] else self.template;
             std.debug.assert(template <= self.templates.items.len);
+            const job = self.jobs.items[r.job];
             // An explicit OP can expose an already shared prerequisite product.
             if (job == .op) {
-                if (self.ops.get(.{ .template = template, .op = job.op })) |existing| {
+                if (self.ops.get(.{ .template = template, .job = r.job, .variant = r.variant })) |existing| {
                     const e = @backingInt(existing);
                     id.* = existing;
                     if (!self.rows.items(.requested)[e]) {
@@ -279,15 +306,8 @@ pub const Session = struct {
                 }
             }
             const n_lanes = splitLanes(job);
-            for (0..n_lanes) |l| {
-                var lane = job;
-                switch (lane) {
-                    inline .mc, .temp => |*o| o.lane = @intCast(l),
-                    else => unreachable,
-                }
-                _ = self.addRow(lane, template, false, &roots);
-            }
-            id.* = self.addRow(job, template, true, &roots);
+            for (0..n_lanes) |_| _ = self.addRow(r, true, template, false, &roots);
+            id.* = self.addRow(r, false, template, true, &roots);
             if (n_lanes != 0) {
                 const g = @backingInt(id.*);
                 self.rows.items(.lanes)[g] = n_lanes;
@@ -298,27 +318,76 @@ pub const Session = struct {
             }
         }
         self.root_readers += roots;
-        self.request_arenas.appendAssumeCapacity(arena);
         return jobs.len;
     }
 
-    /// Appends `job` after the OP it needs, shared when one matches, and
+    /// One appended job: its `jobs` entry, its variant, and its
+    /// prerequisite OP's entry (`no_variant` without one).
+    const JobRef = struct { job: u32, variant: u32, op: u32 };
+
+    /// `job`'s index in `jobs`, appending a deep copy when no equal entry
+    /// exists (slices by content, floats by bits).
+    fn intern(self: *Session, job: requests.Query) !u32 {
+        const jobs = self.jobs.items;
+        const got = try self.job_index.getOrPutContextAdapted(self.allocator, job, JobKey{ .jobs = jobs }, .{ .jobs = jobs });
+        if (got.found_existing) return got.key_ptr.*;
+        errdefer self.job_index.removeByPtr(got.key_ptr);
+        try self.jobs.ensureUnusedCapacity(self.allocator, 1);
+        const k: u32 = @intCast(self.jobs.items.len);
+        self.jobs.appendAssumeCapacity(try copyValue(self.job_arena.allocator(), job));
+        got.key_ptr.* = k;
+        return k;
+    }
+
+    /// Row `i`'s query as it was appended: its variant set and, on a lane
+    /// row, its lane.
+    fn jobAt(self: *const Session, i: usize) requests.Query {
+        var job = self.jobs.items[self.rows.items(.job)[i]];
+        const v = self.rows.items(.variant)[i];
+        switch (job) {
+            inline else => |*o| o.tol.variant = if (v == no_variant) null else v,
+        }
+        const owner = self.rows.items(.owner)[i];
+        if (owner != none) {
+            const g = @backingInt(owner);
+            const lane: u32 = @intCast(i - (g - self.rows.items(.lanes)[g]));
+            switch (job) {
+                inline .mc, .temp => |*o| o.lane = lane,
+                else => unreachable, // else: only `.mc` and `.temp` split (`splitLanes`)
+            }
+        }
+        return job;
+    }
+
+    fn kindAt(self: *const Session, i: usize) requests.Kind {
+        return self.jobs.items[self.rows.items(.job)[i]];
+    }
+
+    fn opKey(self: *const Session, i: usize) OpKey {
+        return .{ .template = self.rows.items(.template)[i], .job = self.rows.items(.job)[i], .variant = self.rows.items(.variant)[i] };
+    }
+
+    /// Appends job `r` after the OP it needs, shared when one matches, and
     /// returns its id; a `requested` row joins `outputs`. A split query
-    /// (`splitLanes`) reads its OP only through its lanes, so it is not one
-    /// of the OP's readers. Infallible: `appendAt` reserved every row, OP
-    /// index entry and output first.
-    fn addRow(self: *Session, job: requests.Query, template: u32, requested: bool, roots: *u32) QueryId {
+    /// (`splitLanes`) reads its OP only through its `lane` rows, so it is
+    /// not one of the OP's readers. Infallible: `appendAt` reserved every
+    /// row, OP index entry and output first.
+    fn addRow(self: *Session, r: JobRef, lane: bool, template: u32, requested: bool, roots: *u32) QueryId {
+        const job = self.jobs.items[r.job];
+        const split = if (lane) 0 else splitLanes(job);
         var dependency = none;
-        if (prerequisite(job)) |op| {
-            dependency = self.ops.get(.{ .template = template, .op = op }) orelse blk: {
+        if (r.op != no_variant) {
+            const key: OpKey = .{ .template = template, .job = r.op, .variant = r.variant };
+            dependency = self.ops.get(key) orelse blk: {
                 const dep: QueryId = @fromBackingInt(@intCast(self.rows.len));
                 self.rows.appendAssumeCapacity(.{
-                    .job = .{ .op = op },
+                    .job = r.op,
+                    .variant = r.variant,
                     .component = @backingInt(dep),
                     .requested = false,
                     .template = template,
                 });
-                self.ops.putAssumeCapacity(.{ .template = template, .op = op }, dep);
+                self.ops.putAssumeCapacity(key, dep);
                 roots.* += 1;
                 break :blk dep;
             };
@@ -326,16 +395,17 @@ pub const Session = struct {
         const id: QueryId = @fromBackingInt(@intCast(self.rows.len));
         var sibling = none;
         if (dependency == none) {
-            std.debug.assert(splitLanes(job) == 0);
+            std.debug.assert(split == 0);
             roots.* += 1;
-        } else if (splitLanes(job) == 0) {
+        } else if (split == 0) {
             const d = @backingInt(dependency);
             self.rows.items(.readers)[d] += 1;
             sibling = self.rows.items(.child)[d];
             self.rows.items(.child)[d] = id;
         }
         self.rows.appendAssumeCapacity(.{
-            .job = job,
+            .job = r.job,
+            .variant = r.variant,
             .dependency = dependency,
             .component = if (dependency == none) @backingInt(id) else self.rows.items(.component)[@backingInt(dependency)],
             .requested = requested,
@@ -344,8 +414,24 @@ pub const Session = struct {
             .output = if (requested) @intCast(self.outputs.items.len) else no_output,
         });
         if (requested) self.outputs.appendAssumeCapacity(id);
-        if (job == .op) self.ops.putAssumeCapacity(.{ .template = template, .op = job.op }, id);
+        if (job == .op) self.ops.putAssumeCapacity(.{ .template = template, .job = r.job, .variant = r.variant }, id);
         return id;
+    }
+
+    /// Marks query `id` and its prerequisite final: the caller appends
+    /// nothing that reads their state (a point of `Problem.append_points`
+    /// owns its OP), so a dependent may take the OP's state instead of
+    /// copying it and each circuit is freed once nothing reads it, as under
+    /// `Config.final_plan`. Results stay.
+    pub fn markFinal(self: *Session, id: QueryId) !void {
+        const i = try self.index(id);
+        self.rows.items(.final)[i] = true;
+        const dep = self.rows.items(.dependency)[i];
+        if (dep != none) self.rows.items(.final)[@backingInt(dep)] = true;
+    }
+
+    fn final(self: *const Session, i: usize) bool {
+        return self.config.final_plan or self.rows.items(.final)[i];
     }
 
     /// Ends pending query `id`, and its pending prerequisite, with `err`
@@ -403,7 +489,7 @@ pub const Session = struct {
         const status = self.effectiveStatus(i);
         return .{
             .id = id,
-            .kind = std.meta.activeTag(self.rows.items(.job)[i]),
+            .kind = self.kindAt(i),
             .status = status,
             .dependency = if (dep == none) null else dep,
             .component = self.rows.items(.component)[i],
@@ -489,9 +575,9 @@ pub const Session = struct {
             self.io,
             if (template == 0) self.topology else self.templates.items[template - 1],
             self.deck,
-            self.rows.items(.job)[i],
+            self.jobAt(i),
             initial,
-            self.config.final_plan and last,
+            (if (dep == none) self.config.final_plan else self.final(@backingInt(dep))) and last,
             self.config,
         );
         if (self.stream) |s| if (@backingInt(s.id) == i) {
@@ -517,10 +603,10 @@ pub const Session = struct {
     fn gather(self: *Session, i: usize) void {
         const lane_width = execution.lane_width;
         const config = self.config;
-        if (config.gpu_lanes and self.rows.items(.job)[i] == .tran and self.rows.items(.executor)[i] == null) return self.gatherWide(i);
+        if (config.gpu_lanes and (self.kindAt(i) == .tran or self.kindAt(i) == .pss or self.kindAt(i) == .hb or execution.gpuFreqLaneKind(self.kindAt(i)) or self.staticWide(i)) and self.rows.items(.executor)[i] == null) return self.gatherWide(i);
         if (!execution.lanesOn(config) or config.backend != .cpu or config.device_threads != 1 or config.timing_in_depth) return;
-        const jobs = self.rows.items(.job);
-        if (!batchable(jobs[i]) or self.rows.items(.executor)[i] != null) return;
+        const ji = self.jobAt(i);
+        if (!batchable(ji) or self.rows.items(.executor)[i] != null) return;
         var peers: [lane_width - 1]usize = undefined;
         var n: usize = 0;
         // A finished batch's dependents wait in `urgent`, newest last.
@@ -533,7 +619,7 @@ pub const Session = struct {
             if (j == i or !self.ready(j) or self.rows.items(.running)[j] or self.rows.items(.executor)[j] != null) continue;
             if (self.rows.items(.template)[j] != self.rows.items(.template)[i]) continue;
             if ((self.rows.items(.dependency)[j] == none) != (self.rows.items(.dependency)[i] == none)) continue;
-            if (!sameLaneJob(jobs[i], jobs[j])) continue;
+            if (!sameLaneJob(ji, self.jobAt(j))) continue;
             peers[n] = j;
             n += 1;
         }
@@ -551,19 +637,37 @@ pub const Session = struct {
         leader.peers = list[0..taken];
     }
 
+    /// Row i is an operating point or `.dc` sweep that batches as GPU
+    /// lanes (`Config.gpu_static`).
+    fn staticWide(self: *const Session, i: usize) bool {
+        const job = self.kindAt(i);
+        return self.config.gpu_static and (job == .op or job == .dc);
+    }
+
     /// The GPU lane form of `gather`: up to `gpu_lane_cap - 1` ready,
-    /// never-started `.tran` rows of row i's template and options, from all
-    /// of `urgent` and the queue (a sweep's transients are ready together
+    /// never-started transient, shooting, HB or AC-family rows of row i's
+    /// template and options, from all of `urgent` and the queue (the rows are ready together
     /// under breadth-first order). A row whose executor cannot be built is
     /// left to run alone.
-    /// ponytail: an ineligible sweep (`tran.gpuLaneEligible`) still gathers
+    /// ponytail: an ineligible sweep (`tran.gpuLaneRefusal`) still gathers
     /// and then runs its lanes one after another on one worker; check the
     /// template before gathering if that ever costs a `--jobs` run.
     fn gatherWide(self: *Session, i: usize) void {
-        const jobs = self.rows.items(.job);
+        const ji = self.jobAt(i);
         var peers: std.ArrayList(usize) = .empty;
         defer peers.deinit(self.allocator);
-        const cap = self.config.gpu_lane_cap - 1;
+        // Bound the actual GPU lanes: frequencies for AC, collocation
+        // samples for HB. The full tone box is an upper bound after
+        // frequency merging/truncation; one tone uses 2x oversampling.
+        const width: u32 = if (execution.gpuFreqLaneKind(ji))
+            @import("solver").freq_solve.FreqSolver.W
+        else if (ji == .hb) blk: {
+            var samples: u32 = 2 * (2 * @as(u32, ji.hb.n_harmonics) + 1);
+            for (ji.hb.extra_harmonics) |h|
+                samples = std.math.mul(u32, samples, 2 * @as(u32, h) + 1) catch std.math.maxInt(u32);
+            break :blk samples;
+        } else 1;
+        const cap = @max(self.config.gpu_lane_cap / width, 1) - 1;
         const queued = self.queue.items[@min(self.queue_head, self.queue.items.len)..];
         for ([_][]const u32{ self.urgent.items, queued }) |list| for (list) |j32| {
             if (peers.items.len == cap) break;
@@ -572,9 +676,13 @@ pub const Session = struct {
             if (std.mem.indexOfScalar(usize, peers.items, j) != null) continue;
             if (self.rows.items(.template)[j] != self.rows.items(.template)[i]) continue;
             if ((self.rows.items(.dependency)[j] == none) != (self.rows.items(.dependency)[i] == none)) continue;
-            if (!sameLaneJob(jobs[i], jobs[j])) continue;
+            if (!sameLaneJob(ji, self.jobAt(j))) continue;
             peers.append(self.allocator, j) catch break;
         };
+        // Lanes in row order, whatever order the OPs finished in, so lane 0
+        // (the LU plan's source) and the host share are the same each run.
+        std.mem.sortUnstable(usize, peers.items, {}, std.sort.asc(usize));
+        self.shareWithHost(&peers);
         if (peers.items.len == 0) return;
         self.makeExecutor(i) catch return;
         const leader = self.rows.items(.executor)[i].?;
@@ -587,6 +695,30 @@ pub const Session = struct {
             self.rows.items(.running)[j] = true;
         }
         leader.peers = list[0..taken];
+        // Under a final plan a member nothing reads drops its circuit with
+        // its wave (`Executor.executeGpuBatch`), as `releaseIfRead` would
+        // once the batch ends.
+        leader.no_readers = self.final(i) and self.rows.items(.readers)[i] == 0;
+        for (leader.peers) |p| p.no_readers = self.final(p.row) and self.rows.items(.readers)[p.row] == 0;
+    }
+
+    /// `Config.gpu_share` f: of a GPU batch leader and its gathered
+    /// `peers`, the first ceil(f * all) stay on the device and the rest
+    /// leave `peers` with a CPU executor, which the pool runs alongside the
+    /// batch. The split is by row order, so a run is reproducible.
+    fn shareWithHost(self: *Session, peers: *std.ArrayList(usize)) void {
+        const f = self.config.gpu_share;
+        if (!(f > 0 and f < 1)) return;
+        const all: f64 = @floatFromInt(1 + peers.items.len);
+        const keep: usize = @intFromFloat(@max(1, @ceil(f * all)) - 1);
+        if (keep >= peers.items.len) return;
+        for (peers.items[keep..]) |j| {
+            self.makeExecutor(j) catch continue;
+            const e = self.rows.items(.executor)[j].?;
+            e.config.backend = .cpu;
+            e.config.gpu_lanes = false;
+        }
+        peers.shrinkRetainingCapacity(keep);
     }
 
     /// Settles the peers of batch leader `i`, which has stopped: each takes
@@ -619,7 +751,14 @@ pub const Session = struct {
     fn launch(self: *Session, i: usize, quantum: Quantum, signal: *std.Io.Semaphore) bool {
         const started = blk: {
             self.makeExecutor(i) catch |err| break :blk err;
-            self.rows.items(.executor)[i].?.start(quantum, signal) catch |err| break :blk err;
+            const exec = self.rows.items(.executor)[i].?;
+            if (self.stream_opener) |o| if (exec.stream == null and exec.peers.len == 0 and
+                self.rows.items(.status)[i] == .pending and self.rows.items(.output)[i] != no_output and
+                self.rows.items(.owner)[i] == none)
+            {
+                exec.stream = o.open(o.ctx, @fromBackingInt(@intCast(i)), self.jobAt(i));
+            };
+            exec.start(quantum, signal) catch |err| break :blk err;
             self.rows.items(.running)[i] = true;
             return true;
         };
@@ -686,7 +825,7 @@ pub const Session = struct {
             }
             npoints += self.rows.items(.executor)[l].?.result().?.npoints;
         }
-        const job = self.rows.items(.job)[g];
+        const job = self.jobAt(g);
         const template = self.rows.items(.template)[g];
         const e = try execution.Executor.create(self.allocator, self.io, if (template == 0) self.topology else self.templates.items[template - 1], self.deck, job, null, false, self.config);
         self.rows.items(.executor)[g] = e;
@@ -723,7 +862,7 @@ pub const Session = struct {
     /// Under a final plan nothing reads a finished query's circuit once
     /// its dependents have copied it; its result lives elsewhere.
     fn releaseIfRead(self: *Session, i: usize) void {
-        if (self.config.final_plan and self.rows.items(.status)[i] == .complete and self.rows.items(.readers)[i] == 0)
+        if (self.final(i) and self.rows.items(.status)[i] == .complete and self.rows.items(.readers)[i] == 0)
             self.rows.items(.executor)[i].?.circuit.release();
     }
 
@@ -797,8 +936,8 @@ pub const Session = struct {
     /// OP's dependent first, so each point's OP and analysis run back to
     /// back, then the queue in row order.
     fn nextReady(self: *Session) ?usize {
-        // Breadth-first under GPU lanes: OPs drain before their transients,
-        // so the transients become ready together and gather N wide.
+        // Breadth-first under GPU lanes: OPs drain before their dependents,
+        // so the analyses become ready together and gather N wide.
         if (!self.config.gpu_lanes) while (self.urgent.pop()) |i| if (self.ready(i) and !self.rows.items(.running)[i]) return i;
         while (self.queue_head < self.queue.items.len) {
             const i = self.queue.items[self.queue_head];
@@ -806,12 +945,17 @@ pub const Session = struct {
             if (self.ready(i) and !self.rows.items(.running)[i]) return i;
         }
         if (self.config.gpu_lanes) {
-            // A transient waits while anything still runs, so the rest of
+            // A laned analysis waits while anything still runs, so the rest of
             // its sweep's OPs finish and it gathers with all of them.
             // ponytail: one scan of `running` per call; count it if a sweep
             // of 100k points makes the scan show.
             const top = self.urgent.getLastOrNull() orelse return null;
-            if (self.rows.items(.job)[top] == .tran and std.mem.indexOfScalar(bool, self.rows.items(.running), true) != null) return null;
+            // A row `shareWithHost` gave the CPU already has its executor and runs now.
+            const laned = (self.kindAt(top) == .tran or self.kindAt(top) == .pss or self.kindAt(top) == .hb or execution.gpuFreqLaneKind(self.kindAt(top)) or self.staticWide(top)) and
+                self.rows.items(.executor)[top] == null;
+            if (laned and std.mem.indexOfScalar(bool, self.rows.items(.running), true) != null) return null;
+            // The batch leader is the lowest ready row, not the last OP to finish.
+            if (laned) std.mem.sortUnstable(u32, self.urgent.items, {}, std.sort.desc(u32));
             while (self.urgent.pop()) |i| if (self.ready(i) and !self.rows.items(.running)[i]) return i;
         }
         return null;
@@ -921,9 +1065,8 @@ pub const Session = struct {
         if (self.rows.items(.executor)[i]) |worker| worker.destroy();
         self.rows.items(.executor)[i] = null;
         self.rows.items(.released)[i] = true;
-        const job = self.rows.items(.job)[i];
-        if (job == .op) {
-            const key: OpKey = .{ .template = self.rows.items(.template)[i], .op = job.op };
+        if (self.kindAt(i) == .op) {
+            const key = self.opKey(i);
             if (self.ops.get(key)) |at| if (@backingInt(at) == i) {
                 _ = self.ops.remove(key);
             };
@@ -962,7 +1105,7 @@ pub const Session = struct {
     /// Returns the request `id` was appended as. Its slices live until
     /// `deinit`.
     pub fn query(self: *const Session, id: QueryId) !requests.Query {
-        return self.rows.items(.job)[try self.index(id)];
+        return self.jobAt(try self.index(id));
     }
 
     /// Returns a completed query's result, valid until `deinit`. Fails with
@@ -1131,7 +1274,10 @@ pub const Pool = struct {
     pub fn fill(pool: *Pool, session: *Session) void {
         while (pool.running.items.len < pool.limit) {
             const i = session.nextReady() orelse return;
-            session.gather(i);
+            // A batch publishes peer outcomes only when its leader ends.
+            // Interactive checkpoint quanta must keep independent workers:
+            // a parked leader has not completed or cancelled its peers.
+            if (pool.quantum == .completion) session.gather(i);
             if (session.launch(i, pool.quantum, &pool.signal)) {
                 pool.running.appendAssumeCapacity(.{ .session = session, .row = @intCast(i) });
             } else if (session.rows.items(.executor)[i]) |leader| {
@@ -1171,6 +1317,9 @@ const lane_window = 8 * execution.lane_width;
 /// each lane builds reads. Slices compare by content, floats by bits.
 fn sameLaneJob(a: requests.Query, b: requests.Query) bool {
     return switch (a) {
+        // HB's GPU provider owns its Newton rounds; it is deliberately not
+        // CPU-batchable, so ordinary CPU query workers remain independent.
+        .hb => |o| b == .hb and sameDeep(stripTol(o), stripTol(b.hb)),
         // The AC family's list is `execution.freqLaneKind`'s; keep the two adjacent in review.
         inline .op, .dc, .mc, .temp, .tran, .pss, .ac, .noise, .sp, .stb, .lstb, .acxf, .tf, .dcxf, .dcinc, .sens, .dcmatch, .dcsens, .acmatch => |o, tag| b == tag and batchable(b) and sameDeep(stripTol(o), stripTol(@field(b, @tagName(tag)))),
         else => false,
@@ -1230,28 +1379,67 @@ fn sameDeep(a: anytype, b: @TypeOf(a)) bool {
     }
 }
 
-const OpKey = struct { template: u32, op: requests.Op };
-const OpIndex = std.HashMapUnmanaged(OpKey, QueryId, struct {
-    pub fn hash(_: @This(), key: OpKey) u64 {
-        var h: std.hash.Wyhash = .init(0);
-        hashFields(&h, key);
-        return h.final();
+/// An OP row's template, `jobs` entry and variant: equal keys are equal
+/// OPs.
+const OpKey = struct { template: u32, job: u32, variant: u32 };
+const OpIndex = std.AutoHashMapUnmanaged(OpKey, QueryId);
+
+/// `Session.jobs` indices, hashed and compared by the entry they name.
+const JobIndex = std.HashMapUnmanaged(u32, void, struct {
+    jobs: []const requests.Query,
+    pub fn hash(c: @This(), k: u32) u64 {
+        return JobKey.hash(.{ .jobs = c.jobs }, c.jobs[k]);
     }
-    pub fn eql(_: @This(), a: OpKey, b: OpKey) bool {
-        return std.meta.eql(a, b);
+    pub fn eql(_: @This(), a: u32, b: u32) bool {
+        return a == b;
     }
 }, std.hash_map.default_max_load_percentage);
 
-/// Feeds `value` to `h` field by field, floats by their bits, which
-/// `std.hash.autoHash` refuses. `-0.0` and `0.0` hash apart though `eql`
-/// matches them, which only costs a second OP.
+/// `JobIndex` looked up by a query.
+const JobKey = struct {
+    jobs: []const requests.Query,
+    pub fn hash(_: JobKey, job: requests.Query) u64 {
+        var h: std.hash.Wyhash = .init(0);
+        hashFields(&h, job);
+        return h.final();
+    }
+    pub fn eql(c: JobKey, job: requests.Query, k: u32) bool {
+        return sameDeep(job, c.jobs[k]);
+    }
+};
+
+/// `job` with `tol.variant` cleared, and the variant (`no_variant` for none).
+fn withoutVariant(job: requests.Query) struct { requests.Query, u32 } {
+    var j = job;
+    switch (j) {
+        inline else => |*o| {
+            const v = o.tol.variant orelse no_variant;
+            o.tol.variant = null;
+            return .{ j, v };
+        },
+    }
+}
+
+/// Feeds `value` to `h` as `sameDeep` compares it: slices by content,
+/// floats by their bits (which `std.hash.autoHash` refuses).
 fn hashFields(h: *std.hash.Wyhash, value: anytype) void {
     switch (@typeInfo(@TypeOf(value))) {
         .@"struct" => |s| inline for (s.field_names) |name| hashFields(h, @field(value, name)),
+        .@"union" => switch (value) {
+            inline else => |payload, tag| {
+                std.hash.autoHash(h, tag);
+                hashFields(h, payload);
+            },
+        },
         .optional => if (value) |v| {
             h.update(&.{1});
             hashFields(h, v);
         } else h.update(&.{0}),
+        .pointer => |p| if (p.size != .slice) std.hash.autoHash(h, value) else {
+            std.hash.autoHash(h, value.len);
+            if (p.child == u8) h.update(value) else for (value) |x| hashFields(h, x);
+        },
+        .array => for (value) |x| hashFields(h, x),
         .float => h.update(std.mem.asBytes(&value)),
         else => std.hash.autoHash(h, value),
     }
@@ -1281,9 +1469,10 @@ fn splitLanes(job: requests.Query) u32 {
 /// itself and a `uic` start.
 fn prerequisite(job: requests.Query) ?requests.Op {
     if (job == .op or job.uic()) return null;
-    return .{ .tol = switch (job) {
+    const tol = switch (job) {
         inline else => |o| o.tol,
-    }, .tran_op = @as(requests.Kind, job).transient(), .warm_start = job == .tran and job.tran.point.warm_start };
+    };
+    return .{ .tol = tol, .tran_op = @as(requests.Kind, job).transient(), .warm_start = tol.warm_op or (job == .tran and job.tran.point.warm_start) };
 }
 
 fn connector(ascii: bool, last: bool) []const u8 {
@@ -1350,6 +1539,12 @@ pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *c
             defer refs.deinit(allocator);
             var n: usize = 0;
             for (topology.batches) |b| {
+                // The layout leaves the template's Model rows shared.
+                if (b.hooks.param_layout) |layout| {
+                    const l = try layout(b.ctx).unwrap();
+                    for (l.fields) |f| n += l.count * @intFromBool(@import("sweep/sens.zig").isSensParam(b.type_name, f.name));
+                    continue;
+                }
                 refs.clearRetainingCapacity();
                 try b.hooks.collect_params(b.ctx, allocator, &refs).unwrap();
                 for (refs.items) |r| n += @intFromBool(@import("sweep/sens.zig").isSensParam(b.type_name, r.param_name));
@@ -1369,8 +1564,18 @@ pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *c
             if (groups != 0) break :blk groups + extra;
             var refs: std.ArrayList(ParamRef) = .empty;
             defer refs.deinit(allocator);
-            try types.Circuit.collectTyped(topology.batches, topology.batch_types, allocator, &refs);
-            break :blk refs.items.len + extra;
+            var n: usize = 0;
+            for (topology.batches) |b| {
+                if (b.hooks.param_layout) |layout| {
+                    const l = try layout(b.ctx).unwrap();
+                    n += l.count * l.fields.len;
+                    continue;
+                }
+                refs.clearRetainingCapacity();
+                try b.hooks.collect_params(b.ctx, allocator, &refs).unwrap();
+                n += refs.items.len;
+            }
+            break :blk n + extra;
         },
         else => deck.probes.len + 1,
     };

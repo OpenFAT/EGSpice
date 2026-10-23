@@ -3,6 +3,11 @@
 Newest first. Bullets only, one line each. Every fix cites its GitHub issue,
 `(#123)`; open one first if none exists.
 
+## Unreleased
+
+- Device ABI 34: `ParamRef.ptr` is a bare `*f64` (VerA emits no f32 parameter) and `Hooks.linear_rc` is gone with the opt-in `ESPICE_LINEAR_CACHE` R/C host cache; the evaluator keeps no path for hand-written Zig devices (`isVera`, `jac_f32_host`, `mc_param`, `unrevertible_state`) and `-Dbsim4-narrow` is removed. `models/ltra_ac.zig` stays as the one host-side model term: the lossy LTRA small-signal kernel is transcendental in jω, which no Verilog-A operator (`laplace_*`, `absdelay`, `zi_*`) expresses.
+- Source layout: the GPU contexts live in `src/analysis/gpu/`, the W-wide CPU lane solves in `src/solver/lane/` and the std-only kernel bodies in `src/solver/kernels/` (the two kernel roots stay in `src/solver/`, where a module root must be); `src/frontend/prepare.zig` is the frontend root. The `test-gpu-lanes`, `test-gpu-frequency`, `test-gpu-pss` and `test-gpu-periodic` steps, whose scripts left the tree, are removed; `test-gpu` runs the corpus under CUDA.
+
 ## 1.2.0 (2026-10-20)
 
 - `.mc`, `.dc DATA=`, `.dc MONTE=` and a `.temp` range run each trial, variant or temperature as its own query row, which spreads across `--jobs` and batches into lanes, then assemble the sweep in order; output is the same at every `--jobs`. A plain `.mc` draw is keyed by (seed, trial, variable), so trials draw different values than before, and a `.dc DATA=`/`MONTE=` point starts from the nominal OP instead of the previous point, which moves its results by roundoff (#213).
@@ -234,7 +239,7 @@ Newest first. Bullets only, one line each. Every fix cites its GitHub issue,
   `MatexDidNotConverge` (#51).
 - VBIC decks are checked against VACASK running the VBIC 1.3 reference Verilog-A; the
   ngspice VBIC 1.2/45 differences (avalm, excess phase, noise density total) are recorded
-  in dev/devices/models.md (#16, #86).
+  in the model's header comment (#16, #86).
 - MOS1 has noise (RD/RS, channel per NLEV with GDSNOI, flicker per NLEV, KF/AF); MOS3 takes
   mos3noi.c's NLEV forms; BSIM4 matches ngspice 45's default NOIC (8.75e9), clamps the
   flicker DelClm and the tnoiMod=1 npart_theta, and scales Rd/Rs noise as b4noi.c does;

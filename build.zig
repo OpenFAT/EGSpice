@@ -24,7 +24,7 @@ pub fn build(b: *Build) void {
 
     // The runtime .hdl loader rebuilds src/device/eval.zig against these roots.
     const bopts = b.addOptions();
-    bopts.addOption([]const u8, "contract_path", pathFromRoot(b, vera.builder, "tools/contract.zig"));
+    bopts.addOption([]const u8, "contract_path", pathFromRoot(b, vera.builder, "lib/contract.zig"));
     bopts.addOption([]const u8, "dyn_path", pathFromRoot(b, b, "src/device/eval.zig"));
     bopts.addOption([]const u8, "device_abi_path", pathFromRoot(b, b, "src/device/abi.zig"));
     bopts.addOption([]const u8, "core_path", pathFromRoot(b, b, "src/core/root.zig"));
@@ -32,6 +32,9 @@ pub fn build(b: *Build) void {
     bopts.addOption(bool, "certify", b.option(bool, "certify", "Certify every converged Newton point against its KCL residual") orelse false);
     bopts.addOption(bool, "lu_instrument", b.option(bool, "lu-instrument", "Compile the LU census (ZP_LU_STATS) and the device-LU bench (ESPICE_GPU_LU_BENCH)") orelse false);
     const bo = bopts.createModule();
+    // Its own module, so a new VerA commit recompiles main.zig alone.
+    const vera_build = b.addOptions();
+    vera_build.addOption([]const u8, "commit", veraCommit(b, vera.builder));
 
     const M: Cfg = .{
         .b = b,
@@ -52,7 +55,7 @@ pub fn build(b: *Build) void {
             run.addArgs(&.{ "--emit-zig", "--allow=W0650", "--allow=W0651", "--allow=W0850", "--color=never", "--check", "--display=drop" });
             if (escape_models.has(m.name)) run.addArg("--allow=W0149");
             run.addArgs(&.{ "--zig", b.graph.zig_exe, "--contract" });
-            run.addFileArg(vera.path("tools/contract.zig"));
+            run.addFileArg(vera.path("lib/contract.zig"));
         }
         if (m.include) |inc| {
             run.addArgs(&.{ "-I", pathFromRoot(b, b, "models") });
@@ -74,6 +77,13 @@ pub fn build(b: *Build) void {
     }
 
     const g = graph(M, vera, gompute.module("gompute"), models, gen, bo);
+    // Warm the same objects consumed by every host test, CLI and library.
+    // No separate archive/configuration: Zig owns their content-addressed cache.
+    const build_models = b.step("build-models", "Compile and cache the shared host model objects without linking a simulator");
+    for (g.objs) |obj| {
+        _ = obj.getEmittedBin();
+        build_models.dependOn(&obj.step);
+    }
 
     const frontend_bench = b.addExecutable(.{
         .name = "frontend-bench",
@@ -93,25 +103,26 @@ pub fn build(b: *Build) void {
             .{ .name = "vera_vpi", .module = vera.module("vpi") },
             .{ .name = "fastvaf", .module = vera.module("vera") },
             contract,
+            .{ .name = "vera_build", .module = vera_build.createModule() },
         }),
     });
     exe.root_module.link_libc = true;
     exe.rdynamic = true; // dlopen'd VPI apps resolve vpi_* against the exe
     for (g.objs) |o| exe.root_module.addObject(o);
     b.installArtifact(exe);
+    b.step("build-cli", "Build and install the simulator CLI without the static library").dependOn(&b.addInstallArtifact(exe, .{}).step);
+    b.step("compile-cli", "Compile the simulator CLI without installing a duplicate").dependOn(&exe.step);
     for ([_]struct { Build.LazyPath, []const u8 }{
         .{ b.path("src/core"), "core" },
         .{ b.path("src/device"), "device" },
         .{ gompute.path("src"), "gompute" },
         .{ vera.path("lib"), "vera/lib" },
-        .{ vera.path("src/sim"), "vera/src/sim" },
     }) |dir| b.installDirectory(.{
         .source_dir = dir[0],
         .install_dir = .prefix,
         .install_subdir = b.fmt("share/espice/{s}", .{dir[1]}),
         .include_extensions = &.{".zig"},
     });
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(vera.path("tools/contract.zig"), .prefix, "share/espice/vera/tools/contract.zig").step);
 
     var roots: std.ArrayList(gompute_build.KernelRoot) = .empty;
     const lane_opts = b.addOptions();
@@ -129,16 +140,62 @@ pub fn build(b: *Build) void {
         }) catch @panic("OOM");
     }
     roots.append(b.allocator, .{ .name = "lu", .root = b.path("src/solver/lu_device.zig") }) catch @panic("OOM");
-    if (gpu_lanes) roots.append(b.allocator, .{ .name = "lane", .root = b.path("src/solver/lane_device.zig") }) catch @panic("OOM");
+    // The lane root runs `.meas` passes on the device (06 6.8) from the file
+    // measure.zig shares with it.
+    const lane_scan = b.allocator.dupe(Import, &.{.{ .name = "measure_scan", .module = b.createModule(.{ .root_source_file = b.path("src/output/scan.zig"), .strip = true }) }}) catch @panic("OOM");
+    if (gpu_lanes) roots.append(b.allocator, .{ .name = "lane", .root = b.path("src/solver/lane_device.zig"), .imports = &laneKernelImports, .imports_ctx = @ptrCast(lane_scan.ptr) }) catch @panic("OOM");
     gompute_build.emitKernels(b, gompute, exe, .{
         .kernel_roots = roots.items,
         .heavy_lanes = 2,
         .target = target,
-        .cuda = gpuArch(cuda_arch),
-        .hip = gpuArch(hip_arch),
+        // -Dgpu=false disables solver kernels as well as model kernels.
+        // Gompute embeds SASS for the target whenever ptxas and fatbinary
+        // are on PATH (the default shell); `.#ci` builds keep PTX only.
+        .cuda = if (gpu_kernels) gpuArch(cuda_arch) else .{ .enabled = false },
+        .hip = if (gpu_kernels) gpuArch(hip_arch) else .{ .enabled = false },
         .optimize = if (optimize == .debug) .fast else optimize,
     });
     g.analysis.addImport("gompute_kernels", exe.root_module.import_table.get("gompute_kernels").?);
+
+    // Compile the coupled-line state kernels on CPU-only CI runners too.
+    // LLVM's AMDGPU frame lowering has failed here even when host tests pass.
+    const hip_codegen = b.step("test-hip-codegen", "Compile coupled-line HIP kernels, including lane state kernels");
+    const hip_probe_target = b.resolveTargetQuery(std.Target.Query.parse(.{
+        .arch_os_abi = "amdgcn-amdhsa",
+        .cpu_features = "gfx1100+trap_handler",
+    }) catch unreachable);
+    const hip_probe_lanes = b.addOptions();
+    hip_probe_lanes.addOption(bool, "enabled", true);
+    var previous_hip_probe: ?*Compile = null;
+    for (models, g.kernel_models) |m, one| {
+        if (!std.mem.eql(u8, m.name, "coupled_ltra") and
+            !std.mem.eql(u8, m.name, "coupled_ltra3") and
+            !std.mem.eql(u8, m.name, "coupled_ltra4")) continue;
+        const probe = b.addObject(.{
+            .name = b.fmt("hip_codegen_{s}", .{m.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/device/eval.zig"),
+                .target = hip_probe_target,
+                .optimize = .fast,
+                .strip = true,
+                .imports = &.{
+                    .{ .name = "gompute", .module = gompute.module("gompute_device") },
+                    .{ .name = "models", .module = one },
+                    g.kernel_contract,
+                    g.kernel_abi,
+                    .{ .name = "lane_options", .module = hip_probe_lanes.createModule() },
+                },
+            }),
+        });
+        _ = probe.getEmittedBin(); // Type-checking or IR emission alone misses the LLVM abort.
+        const symbols = b.addCheckFile(probe.getEmittedLlvmIr(), .{ .expected_matches = &.{
+            b.fmt("define amdgpu_kernel void @arp_lim_{s}(", .{m.name}),
+            b.fmt("define amdgpu_kernel void @arp_llim_{s}(", .{m.name}),
+        } });
+        if (previous_hip_probe) |previous| probe.step.dependOn(&previous.step);
+        previous_hip_probe = probe;
+        hip_codegen.dependOn(&symbols.step);
+    }
 
     const espice_h = b.addTranslateC(.{ .root_source_file = b.path("include/espice.h"), .target = target, .optimize = optimize }).createModule();
     const c_api_mod = M.make(b.path("src/c_api.zig"), &.{
@@ -149,7 +206,10 @@ pub fn build(b: *Build) void {
     c_api_mod.link_libc = true;
     for (g.objs) |o| c_api_mod.addObject(o);
     const c_api_lib = b.addLibrary(.{ .name = "espice", .linkage = .static, .root_module = c_api_mod, .use_llvm = exe.use_llvm, .use_lld = exe.use_lld });
-    b.installArtifact(c_api_lib);
+    // Installed as files, not with `installArtifact`, so that a dependent's
+    // `artifact("espice")` names the CLI alone.
+    b.getInstallStep().dependOn(&b.addInstallLibFile(c_api_lib.getEmittedBin(), c_api_lib.out_filename).step);
+    b.getInstallStep().dependOn(&b.addInstallHeaderFile(b.path("include/espice.h"), "espice.h").step);
     c_api_lib.installHeader(b.path("include/espice.h"), "espice.h");
     b.addNamedLazyPath("libespice", c_api_lib.getEmittedBin());
 
@@ -170,7 +230,13 @@ pub fn build(b: *Build) void {
     b.step("vera", "Run the vera CLI (any .va/.v/.sv/.vhd)").dependOn(&run_vera.step);
 
     const test_step = b.step("test", "Run every suite and the numeric SPICE fixtures");
-    const t: HostTest = .{ .b = b, .exe = exe, .objs = g.objs, .check = b.step("check", "Type-check every test root without emitting binaries (use with --watch -fincremental)") };
+    const t: HostTest = .{
+        .b = b,
+        .exe = exe,
+        .objs = g.objs,
+        .check = b.step("check", "Type-check every test root without emitting binaries (use with --watch -fincremental)"),
+        .filters = if (b.option([]const u8, "test-filter", "Run unit tests whose names contain this text")) |filter| &.{filter} else &.{},
+    };
 
     const c_api_test_mod = M.make(b.path("src/tests/c_api.zig"), &.{.{ .name = "espice_h", .module = espice_h }});
     c_api_test_mod.link_libc = true;
@@ -178,7 +244,7 @@ pub fn build(b: *Build) void {
     const run_c_api_tests = t.run(c_api_test_mod, &.{}, false);
     run_c_api_tests.setEnvironmentVariable("ZIG", b.graph.zig_exe);
     const run_c_api_unit_tests = t.run(c_api_mod, &.{}, false);
-    const run_espice_tests = t.run(M.make(b.path("src/tests/espice.zig"), &.{ .{ .name = "espice", .module = g.espice }, .{ .name = "core", .module = g.core } }), &.{}, true);
+    const run_espice_tests = t.run(M.make(b.path("src/tests/espice.zig"), &.{ .{ .name = "espice", .module = g.espice }, .{ .name = "core", .module = g.core }, .{ .name = "analysis", .module = g.analysis } }), &.{}, true);
     run_espice_tests.setEnvironmentVariable("ZIG", b.graph.zig_exe);
 
     const limiter_gen = b.addRunArtifact(vera_exe);
@@ -233,8 +299,9 @@ pub fn build(b: *Build) void {
                 .{ .name = "device_eval", .module = g.eval },
                 contract,
                 .{ .name = "models", .module = g.models },
-            }), &.{}, false),
+            }), &.{}, true),
             t.run(error_tests_mod, &.{}, false),
+            t.run(M.make(b.path("models/ltra_ac.zig"), &.{}), &.{}, false),
         } },
         .{ "test-grammar", "Check every input grammar against the frontend", &.{run_grammar} },
     }) |s| {
@@ -297,7 +364,8 @@ pub fn build(b: *Build) void {
     }
 
     const bench_runner = b.addExecutable(.{ .name = "bench-runner", .root_module = MH.make(b.path("tests/benchmark/runner.zig"), &.{}) });
-    b.step("bench", "Compare ESPice with ngspice and VACASK (nix develop .#benchmarking)").dependOn(&corpus(b, bench_runner, exe, null, &.{"tests/fixtures"}).step);
+    b.step("build-benchmark", "Build the standalone simulator comparison runner").dependOn(&b.addInstallArtifact(bench_runner, .{}).step);
+    b.step("bench", "Compare ESPice with ngspice, VACASK and optional --xyce BIN (nix develop .#benchmarking)").dependOn(&corpus(b, bench_runner, exe, null, &.{"tests/fixtures"}).step);
 
     const gen_postlayout = b.addSystemCommand(&.{ "python3", "tests/benchmark/postlayout/gen.py", "zig-out/postlayout" });
     gen_postlayout.setCwd(b.path("."));
@@ -415,6 +483,17 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     dev.strip = true;
     const contract: Import = .{ .name = "contract", .module = vera.module("contract") };
     const gomp: Import = .{ .name = "gompute", .module = gompute };
+    // emitKernels mutates the public Gompute module to import all GPU blobs.
+    // Standalone CPU objects only use its math and host no-ops. Keep their
+    // import graph free of artifacts so changing any kernel, GPU architecture
+    // or lane option cannot invalidate every host model (or wait on ptxas).
+    const object_gomp: Import = .{ .name = "gompute", .module = b.createModule(.{
+        .root_source_file = gompute.root_source_file,
+        .target = gompute.resolved_target,
+        .optimize = gompute.optimize,
+        .strip = gompute.strip,
+        .single_threaded = gompute.single_threaded,
+    }) };
     const build_options: Import = .{ .name = "build_options", .module = bo };
     const core: Import = .{ .name = "core", .module = c.make(b.path("src/core/root.zig"), &.{}) };
     const abi: Import = .{ .name = "device_abi", .module = c.make(b.path("src/device/abi.zig"), &.{ contract, core }) };
@@ -427,7 +506,6 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     const eval = c.make(b.path("src/device/eval.zig"), &.{ contract, gomp, abi });
     eval.link_libc = libc;
 
-    const wf = b.addWriteFiles();
     var agg: std.ArrayList(u8) = .empty;
     const dev_mods = b.allocator.alloc(*Module, models.len) catch @panic("OOM");
     const kernel_models = b.allocator.alloc(*Module, models.len) catch @panic("OOM");
@@ -446,16 +524,30 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
         // The device kernels compile at .fast, where VerA's Debug-only Model
         // field (`su_ok`) does not exist; `gpu_kernels` makes the host's
         // device object drop it too, so a Model row has one size on both sides.
-        const one_src = wf.add(b.fmt("{s}/models.zig", .{m.name}), if (c.gpu_kernels) b.fmt("{s}pub const gpu_kernels = true;\n", .{line}) else line);
+        // Each wrapper needs its own cache entry. A shared WriteFiles step
+        // changes every wrapper's path when just one model/option changes.
+        // Outside Debug the contract checks are already off, so CPU and GPU
+        // builds can use the exact same host object and wrapper.
+        // ltra also gets models/ltra_ac.zig, its exact AC term (eval.zig AcTerms).
+        const ltra = std.mem.eql(u8, m.name, "ltra");
+        const one_src = b.addWriteFiles().add(b.fmt("{s}/models.zig", .{m.name}), b.fmt("{s}{s}{s}", .{
+            line,
+            if (c.gpu_kernels or c.optimize != .debug) "pub const gpu_kernels = true;\n" else "",
+            if (ltra) "pub const ltra_ac = @import(\"ltra_ac\");\n" else "",
+        }));
         const one = dev.make(one_src, &.{.{ .name = m.name, .module = dm.* }});
         kone.* = kmake(b, one_src, &.{.{ .name = m.name, .module = kmake(b, src, &.{k_contract}) }});
-        const host = dev.make(b.path("src/device/eval.zig"), &.{ contract, .{ .name = "models", .module = one }, .{ .name = "device_abi", .module = abi_dev }, gomp });
+        if (ltra) {
+            one.addImport("ltra_ac", dev.make(b.path("models/ltra_ac.zig"), &.{}));
+            kone.*.addImport("ltra_ac", kmake(b, b.path("models/ltra_ac.zig"), &.{}));
+        }
+        const host = dev.make(b.path("src/device/eval.zig"), &.{ contract, .{ .name = "models", .module = one }, .{ .name = "device_abi", .module = abi_dev }, object_gomp });
         host.link_libc = libc;
         // The callconv(.auto) vtable gains a hidden *StackTrace when tracing is on.
         host.error_tracing = c.optimize == .debug;
         obj.* = b.addObject(.{ .name = b.fmt("dev_{s}", .{m.name}), .root_module = host, .use_llvm = c.use_llvm });
     }
-    const models_mod = c.make(wf.add("models.zig", agg.items), &.{});
+    const models_mod = c.make(b.addWriteFiles().add("models.zig", agg.items), &.{});
     for (models, dev_mods) |m, dm| models_mod.addImport(m.name, dm);
 
     const device: Import = .{ .name = "device", .module = c.make(b.path("src/device/root.zig"), &.{
@@ -475,7 +567,7 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     analysis.link_libc = libc;
     const netlist: Import = .{ .name = "netlist", .module = c.make(b.path("src/frontend/netlist.zig"), &.{core}) };
     const builder: Import = .{ .name = "builder", .module = c.make(b.path("src/frontend/builder.zig"), &.{ core, device, netlist }) };
-    const frontend = c.make(b.path("src/frontend/root.zig"), &.{ core, device, netlist, builder });
+    const frontend = c.make(b.path("src/frontend/prepare.zig"), &.{ core, device, netlist, builder });
     const output = c.make(b.path("src/output/root.zig"), &.{ core, measure });
     return .{
         .core = core.module,
@@ -552,6 +644,7 @@ const HostTest = struct {
     exe: *Compile,
     objs: []const *Compile,
     check: *Build.Step,
+    filters: []const []const u8,
 
     fn run(self: HostTest, m: *Module, extra: []const Import, devices: bool) *Build.Step.Run {
         self.check.dependOn(&self.b.addTest(.{ .name = "check", .root_module = self.copy(m, extra), .use_llvm = false }).step);
@@ -559,7 +652,7 @@ const HostTest = struct {
         mod.link_objects.appendSlice(self.b.allocator, m.link_objects.items) catch @panic("OOM");
         mod.include_dirs.appendSlice(self.b.allocator, m.include_dirs.items) catch @panic("OOM");
         if (devices) for (self.objs) |o| mod.addObject(o);
-        return self.b.addRunArtifact(self.b.addTest(.{ .root_module = mod, .use_llvm = self.exe.use_llvm, .use_lld = self.exe.use_lld }));
+        return self.b.addRunArtifact(self.b.addTest(.{ .root_module = mod, .filters = self.filters, .use_llvm = self.exe.use_llvm, .use_lld = self.exe.use_lld }));
     }
 
     fn copy(self: HostTest, m: *Module, extra: []const Import) *Module {
@@ -600,60 +693,70 @@ const hdl_by_ext = std.StaticStringMap(Hdl).initComptime(.{
     .{ ".vhdl", .digital },
 });
 
-/// models/ wrappers that `include another models/ file.
-const model_includes = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "bsource_i", "bsource.va" },
-    .{ "bsource_q", "bsource.va" },
-    .{ "vccs_laplace", "vcvs_laplace.va" },
-    .{ "vcvs_pole", "vcvs_laplace.va" },
-    .{ "vccs_pole", "vcvs_laplace.va" },
-    .{ "sparam_2", "sparam_1.va" },
-    .{ "sparam_3", "sparam_1.va" },
-    .{ "sparam_4", "sparam_1.va" },
-    .{ "wline_2", "wline_1.va" },
-    .{ "wline_3", "wline_1.va" },
-    .{ "wline_4", "wline_1.va" },
-    .{ "coupled_ltra3", "coupled_ltra.va" },
-    .{ "coupled_ltra4", "coupled_ltra.va" },
-});
+/// Variants of one models/ body, compiled as `defines` then `include "base"`.
+/// A module's ports and output branch are fixed, so each port count or output
+/// kind stays its own device; only the source is shared.
+const model_variants = [_]struct { name: []const u8, base: []const u8, defines: []const u8 }{
+    .{ .name = "bsource_i", .base = "bsource.va", .defines = "`define BSRC_CURRENT\n" },
+    .{ .name = "bsource_q", .base = "bsource.va", .defines = "`define BSRC_CHARGE\n" },
+    .{ .name = "vccs_laplace", .base = "vcvs_laplace.va", .defines = "`define LAPLACE_CURRENT\n" },
+    .{ .name = "vcvs_pole", .base = "vcvs_laplace.va", .defines = "`define LAPLACE_ZP\n" },
+    .{ .name = "vccs_pole", .base = "vcvs_laplace.va", .defines = "`define LAPLACE_ZP\n`define LAPLACE_CURRENT\n" },
+    .{ .name = "sparam_2", .base = "sparam_1.va", .defines = "`define SP_N 2\n`define SP_2\n" },
+    .{ .name = "sparam_3", .base = "sparam_1.va", .defines = "`define SP_N 3\n`define SP_3\n" },
+    .{ .name = "sparam_4", .base = "sparam_1.va", .defines = "`define SP_N 4\n`define SP_4\n" },
+    .{ .name = "wline_2", .base = "wline_1.va", .defines = "`define W_N 2\n`define W_2\n" },
+    .{ .name = "wline_3", .base = "wline_1.va", .defines = "`define W_N 3\n`define W_3\n" },
+    .{ .name = "wline_4", .base = "wline_1.va", .defines = "`define W_N 4\n`define W_4\n" },
+    .{ .name = "coupled_ltra3", .base = "coupled_ltra.va", .defines = "`define CPL_N 3\n`define CPL_MODULE coupled_ltra3\n" },
+    .{ .name = "coupled_ltra4", .base = "coupled_ltra.va", .defines = "`define CPL_N 4\n`define CPL_MODULE coupled_ltra4\n" },
+};
 
-/// Unedited upstream releases; `dep` names the build.zig.zon entry.
+/// Third-party model releases, vendored in models/ as one file each (the
+/// release's include files inlined; licence files as `<release>_LICENSE.txt`).
+/// Their module names and keyword sets differ from the file stems, so they
+/// are listed here and skipped by the directory scan.
 const upstream_models = [_]struct {
     name: []const u8,
-    dep: []const u8,
     file: []const u8,
     module: []const u8,
-    inc: []const [2][]const u8 = &.{},
     std: ?[]const u8 = null,
 }{
-    .{ .name = "psp103", .dep = "psp_103", .file = "vacode/psp103.va", .module = "PSP103VA", .inc = &.{.{ "psp_104", "vacode" }} },
-    .{ .name = "psp103_nqs", .dep = "psp_103", .file = "vacode/psp103_nqs.va", .module = "PSPNQS103VA", .inc = &.{.{ "psp_104", "vacode" }} },
-    .{ .name = "psp103t", .dep = "psp_103", .file = "vacode/psp103t.va", .module = "PSP103TVA", .inc = &.{.{ "psp_104", "vacode" }} },
-    .{ .name = "juncap200", .dep = "psp_103", .file = "vacode/juncap200.va", .module = "JUNCAP200", .inc = &.{.{ "psp_104", "vacode" }} },
-    .{ .name = "psp104", .dep = "psp_104", .file = "vacode/psp104.va", .module = "PSP104VA" },
-    .{ .name = "psp104_nqs", .dep = "psp_104", .file = "vacode/psp104_nqs.va", .module = "PSPNQS104VA" },
-    .{ .name = "psp104t", .dep = "psp_104", .file = "vacode/psp104t.va", .module = "PSP104TVA" },
-    .{ .name = "bsimimg", .dep = "bsim_img", .file = "code/bsimimg.va", .module = "bsimimg" },
-    .{ .name = "bsimcmg", .dep = "bsim_cmg", .file = "code/bsimcmg.va", .module = "bsimcmg_va", .std = "VAMS-2.3" },
-    .{ .name = "bsimbulk", .dep = "bsim_bulk", .file = "code/bsimbulk.va", .module = "bsimbulk" },
-    .{ .name = "bsimsoi_va", .dep = "bsim_soi", .file = "code/bsimsoi.va", .module = "bsimsoi" },
-    .{ .name = "l_utsoi", .dep = "l_utsoi", .file = "vacode/L_UTSOI_102.va", .module = "l_utsoi" },
-    .{ .name = "hisimhv_va", .dep = "hisim_hv", .file = "HiSIM_HV_2.5.1_VA-Code/hisimhv_va/hisimhv.va", .module = "hisimhv_va" },
-    .{ .name = "hisimsoi", .dep = "hisim_soi", .file = "HiSIM_SOI_1.5.0_VA-Code/hisimsoi_va/hisimsoi.va", .module = "hisimsoi_va", .std = "VAMS-2.3" },
-    .{ .name = "hisimsotb", .dep = "hisim_sotb", .file = "HiSIM_SOTB_1.3.0_VA-Code/hisimsotb_va/hisimsotb.va", .module = "hisimsotb_va", .std = "VAMS-2.3" },
-    .{ .name = "mosvar", .dep = "mosvar", .file = "mosvar.va", .module = "mosvar" },
-    .{ .name = "hicumL2_va", .dep = "hicum_l2", .file = "hicumL2_v320.va", .module = "hicumL2va" },
-    .{ .name = "hicumL0", .dep = "hicum_l0", .file = "hicumL0_v2p1p0.va", .module = "hicumL0va" },
-    .{ .name = "mextram", .dep = "mextram", .file = "bjt505.va", .module = "bjt505_va" },
-    .{ .name = "mextram_t", .dep = "mextram", .file = "bjt505t.va", .module = "bjt505t_va" },
-    .{ .name = "diode_cmc", .dep = "diode_cmc", .file = "vacode/diode_cmc.va", .module = "DIODE_CMC" },
-    .{ .name = "r2_cmc", .dep = "r2_cmc", .file = "r2_cmc.va", .module = "r2_cmc" },
-    .{ .name = "r3_cmc", .dep = "r3_cmc", .file = "r3_cmc_release1.1.2_2023Jun16/r3_cmc.va", .module = "r3_cmc" },
-    .{ .name = "asmhemt", .dep = "asm_hemt", .file = "vacode/asmhemt.va", .module = "asmhemt" },
-    .{ .name = "mvsg", .dep = "mvsg", .file = "vacode/mvsg_cmc_5.0.0.va", .module = "mvsg_cmc" },
-    .{ .name = "asmesd", .dep = "asm_esd", .file = "asmesd.va", .module = "asmesd" },
-    .{ .name = "asmesd_dio", .dep = "asm_esd", .file = "asmesd_dio.va", .module = "asmesd_dio" },
+    .{ .name = "psp103", .file = "psp103.va", .module = "PSP103VA" },
+    .{ .name = "psp103_nqs", .file = "psp103_nqs.va", .module = "PSPNQS103VA" },
+    .{ .name = "psp103t", .file = "psp103t.va", .module = "PSP103TVA" },
+    .{ .name = "juncap200", .file = "juncap200.va", .module = "JUNCAP200" },
+    .{ .name = "psp104", .file = "psp104.va", .module = "PSP104VA" },
+    .{ .name = "psp104_nqs", .file = "psp104_nqs.va", .module = "PSPNQS104VA" },
+    .{ .name = "psp104t", .file = "psp104t.va", .module = "PSP104TVA" },
+    .{ .name = "bsimimg", .file = "bsimimg.va", .module = "bsimimg" },
+    .{ .name = "bsimcmg", .file = "bsimcmg.va", .module = "bsimcmg_va", .std = "VAMS-2.3" },
+    .{ .name = "bsimbulk", .file = "bsimbulk.va", .module = "bsimbulk" },
+    .{ .name = "bsimsoi_va", .file = "bsimsoi.va", .module = "bsimsoi" },
+    .{ .name = "l_utsoi", .file = "L_UTSOI_102.va", .module = "l_utsoi" },
+    .{ .name = "hisimhv_va", .file = "hisimhv.va", .module = "hisimhv_va" },
+    .{ .name = "hisimsoi", .file = "hisimsoi.va", .module = "hisimsoi_va", .std = "VAMS-2.3" },
+    .{ .name = "hisimsotb", .file = "hisimsotb.va", .module = "hisimsotb_va", .std = "VAMS-2.3" },
+    .{ .name = "mosvar", .file = "mosvar.va", .module = "mosvar" },
+    .{ .name = "hicumL2_va", .file = "hicumL2_v320.va", .module = "hicumL2va" },
+    .{ .name = "hicumL0", .file = "hicumL0_v2p1p0.va", .module = "hicumL0va" },
+    .{ .name = "mextram", .file = "bjt505.va", .module = "bjt505_va" },
+    .{ .name = "mextram_t", .file = "bjt505t.va", .module = "bjt505t_va" },
+    .{ .name = "diode_cmc", .file = "diode_cmc.va", .module = "DIODE_CMC" },
+    .{ .name = "r2_cmc", .file = "r2_cmc.va", .module = "r2_cmc" },
+    .{ .name = "r3_cmc", .file = "r3_cmc.va", .module = "r3_cmc" },
+    .{ .name = "asmhemt", .file = "asmhemt.va", .module = "asmhemt" },
+    .{ .name = "mvsg", .file = "mvsg_cmc_5.0.0.va", .module = "mvsg_cmc" },
+    .{ .name = "asmesd", .file = "asmesd.va", .module = "asmesd" },
+    .{ .name = "asmesd_dio", .file = "asmesd_dio.va", .module = "asmesd_dio" },
 };
+
+/// Whether the models/ scan skips `file`: an upstream release, built from
+/// `upstream_models` instead.
+fn upstreamFile(file: []const u8) bool {
+    for (upstream_models) |u| if (std.mem.eql(u8, u.file, file)) return true;
+    return false;
+}
 
 /// Source size from which a model's GPU compile goes on the serial heavy lanes.
 const heavy_model_bytes: u64 = 20 * 1024;
@@ -676,13 +779,10 @@ fn discoverModels(b: *Build) []const Model {
     while (it.next(io) catch @panic("models/ iterate failed")) |e| {
         if (e.kind != .file) continue;
         const hdl = hdl_by_ext.get(std.fs.path.extension(e.name)) orelse continue;
+        if (upstreamFile(e.name)) continue;
         const name = std.fs.path.stem(e.name);
-        const include = model_includes.get(name);
-        var size: u64 = 0;
-        for ([_]?[]const u8{ e.name, include }) |f| if (f) |file| {
-            b.dependOnFileMetadata(b.path(b.fmt("models/{s}", .{file})));
-            size += (dir.statFile(io, file, .{}) catch @panic("models/ stat failed")).size;
-        };
+        b.dependOnFileMetadata(b.path(b.fmt("models/{s}", .{e.name})));
+        const size = (dir.statFile(io, e.name, .{}) catch @panic("models/ stat failed")).size;
         out.append(b.allocator, .{
             .name = b.dupe(name),
             .file = b.dupe(e.name),
@@ -690,19 +790,26 @@ fn discoverModels(b: *Build) []const Model {
             .module = b.dupe(name),
             .hdl = hdl,
             .heavy = size >= heavy_model_bytes,
-            .include = include,
+        }) catch @panic("OOM");
+    }
+    for (model_variants) |v| {
+        const size = (dir.statFile(io, v.base, .{}) catch @panic("models/ stat failed")).size;
+        out.append(b.allocator, .{
+            .name = v.name,
+            .file = v.base,
+            .src = b.addWriteFiles().add(b.fmt("{s}.va", .{v.name}), b.fmt("{s}`include \"{s}\"\n", .{ v.defines, v.base })),
+            .module = v.name,
+            .hdl = .verilog_a,
+            .heavy = size >= heavy_model_bytes,
+            .include = v.base,
         }) catch @panic("OOM");
     }
     for (upstream_models) |u| {
-        const dep = b.dependency(u.dep, .{});
-        const dir_name = std.fs.path.dirname(u.file) orelse ".";
-        const inc_dirs = b.allocator.alloc(Build.LazyPath, u.inc.len + 1) catch @panic("OOM");
-        inc_dirs[0] = dep.path(dir_name);
-        for (inc_dirs[1..], u.inc) |*d, i| d.* = b.dependency(i[0], .{}).path(i[1]);
+        const inc_dirs = b.allocator.dupe(Build.LazyPath, &.{b.path("models")}) catch @panic("OOM");
         out.append(b.allocator, .{
             .name = u.name,
             .file = u.file,
-            .src = dep.path(u.file),
+            .src = b.path(b.fmt("models/{s}", .{u.file})),
             .module = u.module,
             .std = u.std,
             .inc_dirs = inc_dirs,
@@ -733,7 +840,30 @@ fn deviceKernelImports(_: *Build, _: Build.ResolvedTarget, _: std.lang.Optimize,
     return imports[0..4];
 }
 
+fn laneKernelImports(_: *Build, _: Build.ResolvedTarget, _: std.lang.Optimize, ctx: ?*anyopaque) []const Import {
+    const imports: [*]const Import = @ptrCast(@alignCast(ctx.?));
+    return imports[0..1];
+}
+
 /// Absolute `sub_path` under `owner`'s package root, resolved against `b`'s.
+/// The VerA commit `espice --version` names: the one build.zig.zon pins,
+/// or for a `--fork=<VerA>` checkout its `git describe` ("-dirty" with
+/// uncommitted edits), or the fork's path when it is no git checkout.
+fn veraCommit(b: *Build, vera: *Build) []const u8 {
+    const root = pathFromRoot(b, vera, "");
+    if (std.mem.eql(u8, std.fs.path.basename(root), vera.pkg_hash)) {
+        const url = @import("build.zig.zon").dependencies.vera.url;
+        return url[std.mem.lastIndexOfScalar(u8, url, '#').? + 1 ..];
+    }
+    // HEAD and the working tree are configure inputs Zig cannot track.
+    b.graph.poisonCache();
+    // Not a checkout of its own: git would describe an enclosing repository.
+    std.Io.Dir.cwd().access(b.graph.io, pathFromRoot(b, vera, ".git"), .{}) catch return root;
+    var code: u8 = undefined;
+    const out = b.runAllowFail(&.{ "git", "-C", root, "describe", "--always", "--dirty", "--abbrev=40", "--exclude=*" }, &code, .ignore) catch return root;
+    return std.mem.trimEnd(u8, out, "\n");
+}
+
 fn pathFromRoot(b: *Build, owner: *Build, sub_path: []const u8) []u8 {
     const top = b.root.root_dir.path orelse ".";
     const dep = owner.root.root_dir.path orelse ".";
