@@ -11,6 +11,7 @@ const gompute = @import("gompute");
 const solver = @import("solver");
 const numerics = @import("core").numerics;
 const Knobs = @import("../Circuit.zig").Knobs;
+const devices = @import("devices.zig");
 
 const K = solver.lu_kernels;
 const direct = solver.direct;
@@ -22,6 +23,7 @@ const backend: ?gompute.Backend = if (artifacts.has_cuda) .cuda else if (artifac
 const Raw = if (backend) |be| gompute.RawByName(be) else void;
 const Buffer = if (backend != null) Raw.Buffer else void;
 const Stream = if (backend != null) Raw.Stream else void;
+const GraphExec = if (backend != null) Raw.GraphExec else void;
 const Event = if (backend != null) Raw.Event else void;
 
 fn nowNs() u64 {
@@ -85,6 +87,10 @@ pub const GpuLu = struct {
     flops: u64 = 0,
     /// Done-stamp value of the next launch; grows by one per call.
     stamp: u32 = 0,
+    /// The current epoch's call (`launchCall`) captured once, without and
+    /// with the refactor (02 2.7): the sync buffer cleared and stamp 1, so
+    /// one graph replays every call. Dropped with the tables.
+    graphs: [2]?GraphExec = .{ null, null },
     /// `direct.Solver.gen` whose factors the device holds, if any.
     dev_gen: ?u32 = null,
     /// A driver call failed: the rest of the query solves on the host.
@@ -110,17 +116,19 @@ pub const GpuLu = struct {
     pub fn init(gpa: std.mem.Allocator, n: u32, nnz: u32, knobs: Knobs) !*Self {
         if (comptime backend == null) return error.NoGpuArtifacts;
         const be = backend.?;
-        var k_ref = try gompute.rawKernelByName(be, "arp_lu_refactor", 0);
+        // On this thread's device (`devices.place`), as the query's eval.
+        const ord = devices.ordinal;
+        var k_ref = try gompute.rawKernelByName(be, "arp_lu_refactor", ord);
         errdefer k_ref.deinit();
-        var k_ref16 = try gompute.rawKernelByName(be, "arp_lu_refactor16", 0);
+        var k_ref16 = try gompute.rawKernelByName(be, "arp_lu_refactor16", ord);
         errdefer k_ref16.deinit();
-        var k_lh = try gompute.rawKernelByName(be, "arp_lu_lhead", 0);
+        var k_lh = try gompute.rawKernelByName(be, "arp_lu_lhead", ord);
         errdefer k_lh.deinit();
-        var k_uh = try gompute.rawKernelByName(be, "arp_lu_uhead", 0);
+        var k_uh = try gompute.rawKernelByName(be, "arp_lu_uhead", ord);
         errdefer k_uh.deinit();
-        var k_lp = try gompute.rawKernelByName(be, "arp_lu_lpanel", 0);
+        var k_lp = try gompute.rawKernelByName(be, "arp_lu_lpanel", ord);
         errdefer k_lp.deinit();
-        var k_up = try gompute.rawKernelByName(be, "arp_lu_upanel", 0);
+        var k_up = try gompute.rawKernelByName(be, "arp_lu_upanel", ord);
         errdefer k_up.deinit();
         const pin_a = try pinnedF64(&k_ref, nnz);
         errdefer freePinnedF64(&k_ref, pin_a);
@@ -222,6 +230,10 @@ pub const GpuLu = struct {
     }
 
     fn dropTables(self: *Self) void {
+        if (comptime backend != null) for (&self.graphs) |*g| if (g.*) |*exec| {
+            exec.deinit();
+            g.* = null;
+        };
         if (self.epoch != 0 and !self.declined) {
             self.d_idx.free();
             self.d_val.free();
@@ -305,11 +317,54 @@ pub const GpuLu = struct {
     }
 
     /// The refactor (when `refactor`) from `d_a` and both solves from
-    /// `d_rhs`, then dx and the fail word down and the wait.
+    /// `d_rhs`, then dx and the fail word down and the wait. Replays the
+    /// epoch's captured graph where the driver has graphs (not under
+    /// `ESPICE_GPU_NOGRAPHS` or the bench, whose events sit between the
+    /// launches): the same launches, so the same bits.
     fn launchCall(self: *Self, refactor: bool) !void {
+        if (self.benchOf() == null and !self.knobs.gpu_nographs and self.k_ref.hasGraphs()) {
+            const g = &self.graphs[@intFromBool(refactor)];
+            if (g.* == null) g.* = try self.captureCall(refactor);
+            try g.*.?.launch(&self.stream);
+            // The graph left stamp 1 in the done words; a later direct call
+            // must stamp past it.
+            self.stamp = 1;
+            return self.stream.synchronize();
+        }
+        try self.enqueueCall(refactor, self.stamp);
+        try self.stream.synchronize();
+    }
+
+    /// `launchCall`'s graph, captured on a scratch stream: the whole sync
+    /// buffer cleared, so stamp 1 is fresh on every replay, then
+    /// `enqueueCall`.
+    fn captureCall(self: *Self, refactor: bool) !GraphExec {
+        var capture_stream = try self.k_ref.createStreamNonBlocking();
+        defer capture_stream.deinit();
+        std.mem.swap(Stream, &self.stream, &capture_stream);
+        defer std.mem.swap(Stream, &self.stream, &capture_stream);
+        try self.stream.beginCapture(.thread_local);
+        var capturing = true;
+        defer if (capturing) {
+            // An invalidated capture still ends before its stream goes.
+            if (self.stream.endCapture()) |abandoned| {
+                var graph = abandoned;
+                graph.deinit();
+            } else |_| {}
+        };
+        try self.d_sync.fillAsync(0, @as(usize, self.tab.syncLen()) * 4, &self.stream);
+        try self.enqueueCall(refactor, 1);
+        const ended = self.stream.endCapture();
+        capturing = false;
+        var graph = try ended;
+        defer graph.deinit();
+        return graph.instantiate();
+    }
+
+    fn enqueueCall(self: *Self, refactor: bool, stamp_in: u32) !void {
         const n = self.n;
         var tab = self.tab;
-        var stamp = self.stamp;
+        var stamp = stamp_in;
         const k_ref = if (tab.dmap16 != 0) &self.k_ref16 else &self.k_ref;
         if (refactor) try k_ref.launchOn(&self.stream, .{ .x = n }, .{ .x = K.refactor_block }, 0, &.{
             gompute.interface.arg(&tab), self.d_idx.argPtr(), self.d_val.argPtr(), self.d_a.argPtr(), self.d_sync.argPtr(), gompute.interface.arg(&stamp),
@@ -332,7 +387,6 @@ pub const GpuLu = struct {
         if (self.benchOf()) |b| try b.ev[3].record(&self.stream);
         try self.d_dx.downloadAtAsync(self.pin_dx.ptr, 0, n * 8, &self.stream);
         try self.d_sync.downloadAtAsync(self.pin_fail.ptr, 4, 4, &self.stream);
-        try self.stream.synchronize();
     }
 
     /// Whether the device holds the resident tables `solveResident` needs
@@ -429,9 +483,9 @@ pub const GpuLu = struct {
             return r;
         }
         const be = backend.?;
-        var combine = try gompute.rawKernelByName(be, "arp_gc_combine", 0);
+        var combine = try gompute.rawKernelByName(be, "arp_gc_combine", self.k_ref.context.ordinal);
         errdefer combine.deinit();
-        var scatter = try gompute.rawKernelByName(be, "arp_gc_scatter", 0);
+        var scatter = try gompute.rawKernelByName(be, "arp_gc_scatter", self.k_ref.context.ordinal);
         errdefer scatter.deinit();
         const pin_ov = try pinnedF64(&self.k_ref, nk);
         errdefer freePinnedF64(&self.k_ref, pin_ov);
@@ -472,8 +526,8 @@ pub const GpuLu = struct {
 
     /// Builds and uploads the tables of `slv`'s current pivot epoch, or
     /// declines it (`declined`) when they do not fit in host or device
-    /// memory (or u32 offsets) or, unless `forced`, under both
-    /// `min_per_col` flops per column and `min_flops`.
+    /// memory (or u32 offsets) or, unless `forced`, under `min_flops` and
+    /// under either `min_per_col` flops per column or `min_call_flops`.
     fn load(self: *Self, slv: *direct.Solver) !void {
         const lu = slv.sparse().?;
         self.dropTables();
@@ -523,7 +577,7 @@ pub const GpuLu = struct {
     /// the host) that do not fit decline in `load`.
     fn admits(flops: u64, n: u32, forced: bool) bool {
         if (n == 0) return false;
-        return forced or flops >= min_per_col * @as(u64, n) or flops >= min_flops;
+        return forced or flops >= min_flops or (flops >= min_per_col * @as(u64, n) and flops >= min_call_flops);
     }
 
     /// Below this F/n the columns form a chain and every handoff is a
@@ -534,9 +588,18 @@ pub const GpuLu = struct {
     /// chain_bsim4_10k (63) 11.6 against 9.9 s,
     /// ring_bsim4_10k (87) 24.4 against 20.1 s, and the E2 100k decks
     /// (about 160) lost too (dev/solvers/gpu-lu.md, "E3, host").
-    /// ponytail: no deck measured between 166 and 1,600; refit the bar if
-    /// one lands there.
+    /// logic_bsim4_2k (834) and sram_bsim4_5k (1,976) win 1.7x and 1.3x.
+    /// ponytail: no deck of 5M flops or more measured between F/n 182 and
+    /// 834; refit the bar if one lands there.
     const min_per_col = 500;
+
+    /// The F/n bar admits nothing smaller: a device call costs about 1.3-1.5
+    /// ms whatever its size (launches, uploads, the solve chain) and the host
+    /// LU 0.4-0.8 ns per flop. LU ms per Newton iteration, host against
+    /// device, RTX 4060 Laptop: sram_bsim4_1k (F 0.8M) 0.60 against 1.40,
+    /// sram_bsim4_2k (1.7M, F/n 509) 1.35 against 1.80, sram_bsim4_3k
+    /// (5.1M) a tie, logic_bsim4_2k (6.5M) 4.90 against 2.88.
+    const min_call_flops = 5_000_000;
 
     /// At this many flops the device LU wins whatever F/n, since its solve
     /// heads run across the grid (#141). LU time over the transient, host
@@ -544,8 +607,9 @@ pub const GpuLu = struct {
     /// 33.0 against 16.4 s, ring_bsim4_100k (69M) 61.4 against 32.2 s,
     /// chain_psp103_100k (107M) 29.7 against 16.0-18.5 s,
     /// chain_psp103_300k (734M) 134.7 against 98.9 s. The 10k chains and
-    /// rings (F 3-5M) still lose or tie. ponytail: nothing measured between
-    /// 5M and 69M; the bar sits low in that gap.
+    /// rings (F 3-5M) still lose or tie, ring_bsim4_60k (34M, F/n 129) 30.2
+    /// against 34.5 ms per iteration, chain_bsim4_60k (49M) 55.7 against
+    /// 35.0 (host time under load).
     const min_flops = 50_000_000;
 
     /// `ESPICE_GPU_LU_CHECK`: refactors and solves on the host from the same
@@ -713,9 +777,13 @@ test "GpuLu.init without kernel images is NoGpuArtifacts" {
 
 test "GpuLu.admits: the flop bars and the empty matrix" {
     const admits = GpuLu.admits;
-    const n: u32 = 1000;
+    const n: u32 = 20_000;
+    try std.testing.expect(GpuLu.min_call_flops <= GpuLu.min_per_col * @as(u64, n));
     try std.testing.expect(admits(GpuLu.min_per_col * n, n, false));
     try std.testing.expect(!admits(GpuLu.min_per_col * n - 1, n, false));
+    // A small dense refactor stays on the host whatever its F/n.
+    try std.testing.expect(admits(GpuLu.min_call_flops, 1000, false));
+    try std.testing.expect(!admits(GpuLu.min_call_flops - 1, 1000, false));
     // A big enough refactor goes whatever its F/n.
     const wide: u32 = 1_000_000;
     try std.testing.expect(GpuLu.min_flops < GpuLu.min_per_col * @as(u64, wide));

@@ -17,10 +17,16 @@ integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](d
   `nix flake update conformance`.
 - **Commit the working tree.** 1.2.0 plus both performance rounds are uncommitted; vera-26 needs
   an ESPice SHA to pin, and the merge above needs a committed base.
-- **`.pz` at large n** (TODO 09 9.6): approved; agent `pz-sparse` builds a shift-and-invert
-  Arnoldi path for large n (dense path and its output unchanged below the size threshold).
+- **`.pz` at large n** (09 9.6): done. Above 1000 unknowns `.pz` uses shift-invert Arnoldi on the
+  sparse LU and returns the 20 poles and 20 zeros nearest s = 0 (plot name says "partial"); the
+  dense path and its output are unchanged below. Not done: complex shifts, a `.pz` parameter for
+  k or the shift.
 
 ## Release and pins
+
+Nothing is pushed or tagged until ESPice, VerA and Gompute sync perfectly (user decision); until
+then pins are local: ESPice `dev/performance` (local), VerA via a local tarball of the integration
+worktree, then one coordinated push of all three.
 
 - **VerA v0.13.0**: session vera-26 merges the full updated VerA to main and pushes/tags it;
   the `vera` agent hands it its gated commits beyond ed42ca34. Then bump ESPice's pin and apply
@@ -31,6 +37,15 @@ integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](d
   then main, push, tag, ESPice pin, and the 6.11 colour-threshold patch (40 × SMs).
 - **VerA `flake.nix`**: the user's earlier uncommitted change is no longer in the VerA working
   tree (flake.nix == HEAD); the `vera` agent is checking where it went.
+
+- **VerA side, ready for the local pin**: the frame fix ed42ca34 (bsimcmg GPU frame 20.8 → 9.8 KB,
+  bsimbulk 17.2 → 7.1 KB, eval −7.6% / −6.1% at N = 4096, bitwise) and `sim_reads`; the ESPice side
+  is `$S/agents/vera/espice-sim-reads.patch`, applied with the VerA pin bump. The `vera` agent's own
+  v0.13.0 candidate (4d392efa) is superseded by the VerA session's integration branch.
+- **Gompute experiments for a later release** (from the `vera` agent): `-maxrregcount=128` on heavy
+  roots (`gompute-maxrreg128.patch`: occupancy up to 2×, static frames +3–12%) and a bit-identical
+  log without `?f64` (`gompute-log-optional.patch`: bsimcmg frame 9,840 → 9,072 B); measure with
+  `$S/agents/vera/gpurun.sh` before adopting.
 
 ## Final gates still owed
 

@@ -30,6 +30,7 @@ const StateCtlOp = device_ir.StateCtlOp;
 const passes = @import("measure").passes;
 const lane_color = @import("lane_color.zig");
 const hdl = @import("hdl.zig");
+const devices = @import("devices.zig");
 const artifacts = @import("gompute_kernels");
 const backend: ?gompute.Backend = if (artifacts.has_cuda)
     .cuda
@@ -86,30 +87,35 @@ pub fn policy(config: anytype) bool {
 }
 
 /// `Config.gpu_share` for a Problem whose transients batch as GPU lanes,
-/// with `cpus` host threads beside the card: the card's work over all of
-/// it, each counted in host cores. E1 measured the RTX 4060 Laptop (FP64 at
-/// 1/64 of FP32) at the work of about 13 host cores per instance
-/// evaluation; FP64 throughput scales that. 1 (the device keeps every
-/// point) when the ratio is unknown.
+/// with `cpus` host threads beside the cards: the cards' work over all of
+/// it, each counted in host cores (`devices.table`). 1 (the devices keep
+/// every point) when no device reports its FP64 ratio.
 pub fn share(cpus: usize) f64 {
     if (@import("builtin").is_test) return test_access.share;
-    const ratio = fp64Ratio() orelse return 1;
-    const card = 13.0 * 64.0 / @as(f64, @floatFromInt(@max(ratio, 1)));
-    return card / (card + @as(f64, @floatFromInt(@max(cpus, 1))));
+    const cards = devices.totalCap() orelse return 1;
+    return cards / (cards + @as(f64, @floatFromInt(@max(cpus, 1))));
 }
 
 /// Whether `GpuLanes.init` evaluates a thread per (instance colour, lane)
 /// (`lane_color.zig`): while N lanes underfill the card. Measured on the RTX
 /// 4060 Laptop (24 SMs) with 80 mos6 in 9 colours: Newton -29 % at 512
 /// lanes, +13 % at 1,335, +20 % at 4,096, +40 % at 8,665, so the crossover
-/// is near 40 lanes per SM; an FP64-class part (100-132 SMs) gets 4,096.
-// ponytail: FP64 class stands in for the SM count; gompute exposes no
-// multiprocessor count yet (`Context.multiprocessorCount` would let this
-// read 40 x SMs).
+/// is near 40 lanes per SM: the bar is 40 x SMs (960 here, 4,000-5,300 on
+/// a 100-132 SM part), 1,024 when the driver does not say.
+// ponytail: one card and one model measured; refit the 40 on another.
 fn colorPolicy(n_lanes: usize) bool {
     if (@import("builtin").is_test and test_access.force_color) return true;
-    const limit: usize = if (fp64RatioAtMost(4)) 4096 else 1024;
-    return n_lanes < limit;
+    const sms = multiprocessorCount() orelse return n_lanes < 1024;
+    return n_lanes < 40 * @as(usize, sms);
+}
+
+/// The device's streaming multiprocessors (compute units on HIP 6.0+), or
+/// null (older HIP, no driver).
+fn multiprocessorCount() ?u32 {
+    if (comptime @import("builtin").cpu.arch.isWasm()) return null;
+    var compute = gompute.runtime.dynamic.Compute.init(null) catch return null;
+    defer compute.deinit();
+    return compute.multiprocessorCount() catch null;
 }
 
 /// The device's FP64:FP32 ratio, or null (HIP, no driver).
@@ -347,7 +353,7 @@ const Kernels = struct {
             if (i < done) @field(k, f).deinit();
         };
         inline for (@typeInfo(Kernels).@"struct".field_names) |f| {
-            @field(k, f) = gompute.rawKernelByName(backend.?, "arp_lane_" ++ f, 0) catch |e| return if (e == error.KernelNotFound) Error.NoLaneImage else e;
+            @field(k, f) = gompute.rawKernelByName(backend.?, "arp_lane_" ++ f, devices.ordinal) catch |e| return if (e == error.KernelNotFound) Error.NoLaneImage else e;
             done += 1;
         }
         return k;
@@ -574,6 +580,23 @@ pub const GpuLanes = struct {
 
     const Self = @This();
 
+    /// `init`'s pivot tape from `c0`'s first step matrix (`dt` as `Sim.init`
+    /// left it), factored on `c0`'s host solver.
+    fn ownTape(gpa: std.mem.Allocator, c0: *Circuit, dt: f64, n_hist: usize) !devices.Tape {
+        const nnz: usize = c0.nnz;
+        const lead = &c0.ws.?.slv;
+        {
+            const a0 = try gpa.alloc(f64, nnz);
+            defer gpa.free(a0);
+            if (c0.has_charge and n_hist != 0) c0.combineGC(1 / dt, a0) else @memcpy(a0, c0.g_vals[0..nnz]);
+            lead.factor(a0, c0.solver_execution) catch return Error.NoLaneTape;
+        }
+        const lu0 = lead.sparse() orelse return Error.NoLaneTape;
+        if (!lu0.factored) return Error.NoLaneTape;
+        const built = try lk.buildTab(gpa, lu0, lead.col_ptr, lead.params.refactor_growth_limit, direct.pivot_tol);
+        return .{ .idx = built.idx, .tab = built.tab };
+    }
+
     /// Uploads every lane after its `Sim.init`: the pattern's tapes, each
     /// batch's packed rows, x_op, the charge rings and histories. `sims[l]`
     /// is lane l's step machine (`tran.Sim`), read for its rings. Fails with
@@ -611,17 +634,15 @@ pub const GpuLanes = struct {
 
         // The LU tape: lane 0's pivot order on its first step's matrix, G +
         // C/dt at x_op as `Sim.init` left the planes (G alone without charge).
-        const lead = &c0.ws.?.slv;
-        {
-            const a0 = try gpa.alloc(f64, nnz);
-            defer gpa.free(a0);
-            if (c0.has_charge and n_hist != 0) c0.combineGC(1 / s0.dt, a0) else @memcpy(a0, c0.g_vals[0..nnz]);
-            lead.factor(a0, c0.solver_execution) catch return Error.NoLaneTape;
-        }
-        const lu0 = lead.sparse() orelse return Error.NoLaneTape;
-        if (!lu0.factored) return Error.NoLaneTape;
-        const built = try lk.buildTab(gpa, lead.sparse().?, lead.col_ptr, lead.params.refactor_growth_limit, direct.pivot_tol);
+        // A slice of a batch split across devices (`devices.tape`) replays
+        // the tape of the batch's lane 0 instead of its own lane 0's.
+        const shared = if (devices.tape) |ts| (if (devices.tape_builds) null else try ts.take(gpa)) else null;
+        const built: devices.Tape = shared orelse ownTape(gpa, c0, s0.dt, n_hist) catch |e| {
+            if (devices.tape) |ts| ts.fail();
+            return e;
+        };
         defer gpa.free(built.idx);
+        if (shared == null) if (devices.tape) |ts| ts.publish(built.tab, built.idx);
         const t = built.tab;
 
         const self = try gpa.create(Self);

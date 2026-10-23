@@ -661,6 +661,9 @@ pub const Executor = struct {
                 if (n_live != 0) {
                     if (comptime tag == .lstb)
                         M.runGpuLanes(ctxs, opts, self.config.backend, ran)
+                    else if (comptime tag == .tran)
+                        // Every usable device takes a slice (multi-GPU stage 1).
+                        @import("gpu/multi.zig").runLanes(M, self.allocator, self.config.threads, ctxs, opts, ran)
                     else
                         M.runGpuLanes(ctxs, opts, ran);
                 }
@@ -908,6 +911,10 @@ pub const Executor = struct {
             self.circuit.par_eval = null;
             if (par) |*p| p.deinit();
         }
+        // The query's device eval and device LU open on the least loaded
+        // device (multi-GPU stage 2); one device keeps them on it.
+        const placed = @import("gpu/devices.zig").place();
+        defer placed.release();
         const gpu_context = try self.prepareGpu(lanes);
         // The bypass serves host evaluations only.
         if (self.config.knobs.bypass and gpu_context == null) {

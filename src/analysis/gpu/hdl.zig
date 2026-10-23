@@ -5,15 +5,17 @@
 const std = @import("std");
 const gompute = @import("gompute");
 const hdl_gpu = @import("device").hdl_gpu;
+const devices = @import("devices.zig");
 /// A build with CUDA images; the runtime path is CUDA only.
 const on = hdl_gpu.enabled and @import("gompute_kernels").has_cuda;
 
-/// `gompute.rawKernelByName(be, name, 0)`, or, when no built-in image has
+/// `gompute.rawKernelByName` on this thread's device (`devices.ordinal`), or,
+/// when no built-in image has
 /// `name`, the kernel of that name in the runtime PTX of the loaded model
 /// whose library holds `payload_fn` (its `Hooks.gpu_payload`). Fails with
 /// `error.KernelNotFound` when neither has it, as a built-in miss does.
 pub fn kernel(comptime be: gompute.Backend, payload_fn: *const anyopaque, name: []const u8) !gompute.RawByName(be) {
-    return gompute.rawKernelByName(be, name, 0) catch |e| {
+    return gompute.rawKernelByName(be, name, devices.ordinal) catch |e| {
         if (comptime be != .cuda or !on) return e;
         if (e != error.KernelNotFound) return e;
         return runtimeKernel(payload_fn, name) catch e;
@@ -22,7 +24,7 @@ pub fn kernel(comptime be: gompute.Backend, payload_fn: *const anyopaque, name: 
 
 fn runtimeKernel(payload_fn: *const anyopaque, name: []const u8) !gompute.RawByName(.cuda) {
     const rt = gompute.runtime.cuda;
-    var context = try rt.Context.init(0);
+    var context = try rt.Context.init(devices.ordinal);
     errdefer context.deinit();
     const image = hdl_gpu.ptx(payload_fn, try context.computeCapability()) orelse return error.KernelNotFound;
     // Cached per image by the runtime: one JIT per process.

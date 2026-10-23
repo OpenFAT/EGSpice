@@ -810,7 +810,8 @@ pub const HostRefactor = struct {
     /// Builds the tables for `lu`'s current factor (4 bytes per flop).
     /// Caller owns the result; free with `deinit`.
     pub fn init(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, growth: f64) !HostRefactor {
-        var tb = try build(gpa, lu, col_ptr, growth, .{});
+        // No solve runs from these tables: skip the tail cut search.
+        var tb = try build(gpa, lu, col_ptr, growth, .{ .tail = lu.n });
         errdefer tb.deinit(gpa);
         const val = try gpa.alloc(f64, tb.tab.n_val);
         errdefer gpa.free(val);
@@ -1052,21 +1053,25 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
         }
     }
 
-    // The tail cut: the cheapest of t0 = n, n - 16, n - 32, ..., down to
-    // n - tail_max.
+    // The tail cut: the cheapest of t0 = n - m for m = 0, then 16, 24, 32,
+    // 48, ... (powers of two and the halfway steps), ending at
+    // min(n, tail_max).
     const level = try ar.alloc(u32, n);
     const len = try ar.alloc(u32, n);
     const scratch = try ar.alloc(u32, 2 * @as(usize, n) + 2);
     var t0 = n;
     if (opt.tail) |cut| t0 = cut else {
+        const top = @min(n, tail_max);
         var best = solveCost(lu, n, level, len, scratch);
         var m: u32 = 16;
-        while (m <= @min(n, tail_max)) : (m *= 2) {
-            const c = solveCost(lu, n - m, level, len, scratch);
+        while (true) : (m = if (m & (m - 1) == 0) m + m / 2 else m / 3 * 4) {
+            const cut = @min(m, top);
+            const c = solveCost(lu, n - cut, level, len, scratch);
             if (c < best) {
                 best = c;
-                t0 = n - m;
+                t0 = n - cut;
             }
+            if (m >= top) break;
         }
     }
     assert(t0 <= n);
@@ -1184,10 +1189,14 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
 
 /// Solve-cost units (one dependent load or flop on the device) per head
 /// level (a barrier and the index loads before the first y load) and per
-/// tail column (a barrier and one load). ponytail: fixed guesses, like the
-/// gather costs above; fit them from E2 if the cut matters.
+/// tail column (its share of a 64-row panel's handoff). Fit on an RTX 4060
+/// Laptop against the measured best cut (`ESPICE_GPU_LU_TAIL`): the cut
+/// this picks is the fastest of 512-5120 on logic_bsim4_2k/3k/10k,
+/// sram_bsim4_10k/30k and within 2% on logic_psp103_10k; the one-block
+/// sweep's 3 per column kept tails half as long, with solves 10-34% slower
+/// (sram_bsim4_30k 18.2 against 12.0 ms).
 const head_level_cost = 4;
-const tail_step_cost = 3;
+const tail_step_cost = 1;
 
 /// Levels of the head schedule for tail cut t0 into `level` (rows below
 /// t0 for U, all rows for L, whose tail rows run their head part) and the

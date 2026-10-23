@@ -265,6 +265,15 @@ fn gmresAdvance(shape: gmres_lanes.Shape, layout: gmres_lanes.Layout, states: P(
     gmresRequest(point, GB.advance(shape, layout, states, b, x, work, input, output, point), matvec_mask, precond_mask, counts);
 }
 
+/// `gmresAdvance` for the points `only` selects, whose request the host
+/// just served; the others keep theirs. `only` may alias a request mask:
+/// each point reads its own entry before rewriting it.
+fn gmresAdvanceOnly(shape: gmres_lanes.Shape, layout: gmres_lanes.Layout, states: P(gmres_lanes.State), b: P(f64), x: P(f64), work: P(f64), input: P(f64), output: P(f64), matvec_mask: P(u8), precond_mask: P(u8), counts: P(u32), only: P(u8)) callconv(gompute.kernel_callconv) void {
+    const point = gompute.globalIdX(block);
+    if (point >= shape.points or only[point] == 0) return;
+    gmresRequest(point, GB.advance(shape, layout, states, b, x, work, input, output, point), matvec_mask, precond_mask, counts);
+}
+
 /// The ground pin, then the companion rows and the combined matrix, per
 /// (row or slot, lane), lanes innermost: thread t < n * N does row t / N,
 /// the rest slot (t - n N) / N. Row 0 takes `rhs += x` and slot `d0` `g +=
@@ -642,6 +651,7 @@ comptime {
         gompute.exportRaw("arp_periodic_copy", &periodicCopy);
         gompute.exportRaw("arp_gmres_start", &gmresStart);
         gompute.exportRaw("arp_gmres_advance", &gmresAdvance);
+        gompute.exportRaw("arp_gmres_advance_only", &gmresAdvanceOnly);
         gompute.exportRaw("arp_lane_assemble", &assemble);
         gompute.exportRaw("arp_lane_update", &update);
         gompute.exportRaw("arp_lane_gates", &gates);

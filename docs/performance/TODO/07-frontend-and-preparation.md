@@ -57,6 +57,7 @@ once per template makes the per-point write O(written fields)
 plain deck's creation time and memory; the GPU rows coalesce again.
 **Gate.** Bitwise (the same values land in the same fields). **Effort.** 1 week.
 **Status (2026-10-22): done.** `param_layout` is a read-only view over shared rows (`model_of`); `Hooks.write_params` writes a shared row in place when all its readers get the same writes, else appends a private row per written instance. chain_bsim4_10k + `.step`: creation 1.1-2.7 s → 0.45 s, 1.36 → 0.48 GB; chain_bsim4_1k 16-point `.step`: 20.4 s / 335 MB → 7.4 s / 96 MB (ReleaseFast). `.sens`, dcmatch/acmatch, CPU MC lanes and tangents still unshare their own query copy.
+**Status (2026-10-23):** dcmatch/acmatch with a variation block (`Hooks.isolate_rows`, `Circuit.isolatedParams`), CPU MC variant lanes and DC tangent rows (`setParams`) no longer unshare: chain_bsim4_1k `.dc monte=16` 1.04 GB → 0.19 GB. Still unsharing: `.sens` (a column per instance parameter), MC trials (a draw per instance), transient tangents (whole `SavedState` swaps).
 
 ### 7.2 Local model cards read once per parameter environment — P0
 
@@ -87,6 +88,7 @@ re-expands and re-parses (`prepare.zig:199-201`). Tokenize each subcircuit
 body once into field slices and folded numbers, memoize a default's folded
 value per (expression, scope signature), hash the port list, cache `.lib`
 sections by (file, section). **Effort.** 1 week.
+**Status (2026-10-23): two stages done.** A subcircuit past 16 ports looks pins up in a port index (a 5000-port wrapper of 200k resistors: frontend 1.9 s → 70 ms), and the parse tables are reserved for the flattened deck (`expandedExtra`), so expansion never regrows them (chain_bsim4_100k parse arena 589 → 321 MB). Body tokenization memo, default-value memo and the `.lib` cache: not done.
 
 ### 7.4 Stage a row once, not a Model copy per instance — P1
 
@@ -107,6 +109,7 @@ labels. At 1.14M devices creation is 3-4x the parse (1.8-2.3 s); with 8
 P-cores and the items above, under 0.5 s is plausible (estimate). Take the
 threads from the budget of [05](05-scheduling-and-parallelism.md) 5.1.
 **Status (2026-10-22): partial, memoized instead of threaded.** Equal device cards bind once (`NetBuilder.memo`, `proto_add_row`) and `partitionCollapsed` reuses a collapse answer per (row, Instance): chain_bsim4_100k creation 1.9-2.6 s → 0.76-0.92 s (ReleaseFast). Threads not done.
+**Status (2026-10-23):** `PatternBuilder.toCsc` is a counting sort by column (280 → 209 ms median at 13.3M keys) and `detectDialect` skips what cannot change its answer (82 → 50 ms). Threads still not done: the parse is `readDevice` (630-780 ms on chain_bsim4_100k), whose cost is name interning, tokenizing and number folding against shared tables.
 
 ### 7.6 Setup per query — P1
 

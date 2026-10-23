@@ -66,6 +66,7 @@ not the run. Lift the four conditions on `openStream` that are not about
 the format. **Expect.** steps × probes × points → one window per running
 query. **Gate.** Byte-identical files. **Effort.** 1-2 weeks.
 **Status (2026-10-22): done for transient/AC in binary and ASCII raw (CLI).** Each such plot that nothing reads after the run writes its rows to a side file from its worker (`Session.beginSide`/`endSide`, `Session.stream_opener`), published in request order with its real header. 200-point `.step` RC ladder with `-r`: 3.37 GB → 49 MB, file identical. Still kept in memory: plots a `.meas`/`.save`/`.stim`/optimizer reads, lane batches, the C API.
+**Status (2026-10-23):** CSV and `.print` stream too (`Session.copySide`; CSV into each plot's own numbered file): `rc_step200.sp` `--format csv` 973 MB → 52 MB, `print` 1008 MB → 51 MB, files identical. Still in memory: psf/fsdb/sst2/Touchstone/CITI plots, plots a `.meas`/`.save`/`.stim`/optimizer reads, lane batches.
 
 ### 8.2 Release what was delivered — P0, small
 
@@ -74,6 +75,7 @@ with 8.1 unnecessary, until then release a query's result and circuit as
 soon as its plot is written. Give the C API the final-plan behaviours
 (state moves, early circuit release, streaming) as options
 ([06](06-sweeps-and-lanes.md) 6.15).
+**Status (2026-10-23): C API part closed by its contract.** Results stay valid until destroy and a later append may read any OP, so nothing is moved, released or streamed automatically; `append_points` marks its points final and `espice_release_points` frees them.
 
 ### 8.3 Encoding off the critical path, computed once — P1
 
@@ -111,6 +113,7 @@ removed for a single run. Keep the replacement open across batches.
 The 16-byte name headers per probe per point, the kept label and variant
 row (2.5 KB per released point: 2.5 GB at a million points), the AC lane
 precompute in the work arena. Intern and borrow; release with the point.
+**Status (2026-10-23): session rows done.** A row holds a `Session.jobs` index (interned, deep-compared) and its variant instead of a 424-byte `Query`; OP keys are 12 bytes. CLI `.step` 6.9 → 5.0 KB per point; C API released point 2.5 KB → 0.84 KB.
 
 ### 8.8 Memory accounting — see [10](10-measurement-and-gates.md)
 

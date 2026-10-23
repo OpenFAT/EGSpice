@@ -19,6 +19,7 @@ const gompute = @import("gompute");
 const walk = @import("../par_eval.zig");
 
 const Knobs = @import("../Circuit.zig").Knobs;
+const devices = @import("devices.zig");
 const gpu_lu = @import("lu.zig");
 const direct = @import("solver").direct;
 const Planes = device_ir.Planes;
@@ -194,6 +195,10 @@ pub const Driver = struct {
         var compute = gompute.runtime.dynamic.Compute.init(if (backend.? == .cuda) .cuda else .hip) catch return;
         compute.deinit();
         self.up.store(true, .monotonic);
+        // Every other device's context too: the device table opens each one
+        // (multi-GPU stage 1). ponytail: one after another; a thread per
+        // device when a box has many.
+        _ = devices.table();
     }
 
     /// The driver is up, or `prestart` is bringing it up beside the
@@ -311,6 +316,9 @@ const Audit = struct {
     /// Where the verdict is kept for the next run (`CostCache`).
     key: u64,
     knobs: Knobs,
+    /// False under an explicit `cuda`/`hip`: the audit only measures, for a
+    /// circuit `auto` declined on its probe (`CostCache.learn`).
+    demote: bool = true,
 
     /// The first evals pay cold caches and the module's first launches.
     const from: u64 = 10;
@@ -346,37 +354,15 @@ const CostCache = struct {
         return h.final();
     }
 
-    /// The first NVIDIA card's /proc description, hashed; 0 where there is
-    /// none to read. ponytail: a HIP card or another OS keys as 0, which
-    /// is right on a one-card machine.
+    /// The uuid of the card this thread's queries open on
+    /// (`devices.place`), hashed; 0 without one.
     fn cardId() u64 {
-        if (comptime @import("builtin").os.tag != .linux) return 0;
-        const linux = std.os.linux;
-        const dir = std.c.open("/proc/driver/nvidia/gpus", .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
-        if (dir < 0) return 0;
-        defer _ = std.c.close(dir);
-        var ents: [1024]u8 align(8) = undefined;
-        const got = linux.getdents64(dir, &ents, ents.len);
-        if (@as(isize, @bitCast(got)) <= 0) return 0;
-        var off: usize = 0;
-        while (off < got) {
-            const d: *align(1) const linux.dirent64 = @ptrCast(&ents[off]);
-            off += d.reclen;
-            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&d.name)), 0);
-            if (name[0] == '.') continue;
-            var buf: [256]u8 = undefined;
-            const info_path = std.fmt.bufPrintSentinel(&buf, "/proc/driver/nvidia/gpus/{s}/information", .{name}, 0) catch return 0;
-            const fd = std.c.open(info_path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
-            if (fd < 0) return 0;
-            defer _ = std.c.close(fd);
-            var info: [512]u8 = undefined;
-            const len = std.c.read(fd, &info, info.len);
-            if (len <= 0) return 0;
-            // The first line is the model; the rest holds the IRQ.
-            const text = info[0..@intCast(len)];
-            return std.hash.Wyhash.hash(0, text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len]);
-        }
-        return 0;
+        const be = backend orelse return 0;
+        const dyn = gompute.runtime.dynamic;
+        var c = dyn.Compute.initDevice(if (be == .cuda) .cuda else .hip, devices.ordinal) catch return 0;
+        defer c.deinit();
+        const info = c.info() catch return 0;
+        return std.hash.Wyhash.hash(0, &info.uuid);
     }
 
     fn path(buf: []u8, k: u64, knobs: Knobs) ?[:0]const u8 {
@@ -394,8 +380,21 @@ const CostCache = struct {
         defer _ = std.c.close(fd);
         var rec: [2]f64 = undefined;
         if (std.c.read(fd, @ptrCast(&rec), @sizeOf([2]f64)) != @sizeOf([2]f64)) return null;
-        if (!(rec[0] > 0) or !(rec[1] > 0)) return null;
+        // gpu_us 0: `auto` declined on the probe; nothing measured the device.
+        if (!(rec[0] > 0) or !(rec[1] >= 0)) return null;
         return .{ .cpu_us = rec[0], .gpu_us = rec[1] };
+    }
+
+    /// The measuring audit for an explicit `cuda`/`hip` query of a circuit
+    /// `auto` priced before (a record exists): it books the device's cost
+    /// per eval beside the host's, so the next `auto` run decides from both
+    /// measurements instead of the estimate that declined it. Null for a
+    /// circuit with no record.
+    fn learn(host: Host, threads: u32, evals: f64, knobs: Knobs) ?Audit {
+        if (evals < 20) return null;
+        const k = key(host, threads, evals);
+        const rec = read(k, knobs) orelse return null;
+        return .{ .cpu_us = rec.cpu_us, .key = k, .knobs = knobs, .demote = false };
     }
 
     /// Best effort, as `markWarm`: a missing record only means the next
@@ -1083,7 +1082,7 @@ pub const GpuContext = struct {
             .prof = .{ .on = knobs.gpu_stats != .off, .phases = knobs.gpu_stats == .phases },
             .fuse = !knobs.gpu_nofuse,
             .lu_check = knobs.gpu_lu_check,
-            .audit = if (auto_price) |p| .{ .cpu_us = p.cpu_us, .key = p.key, .knobs = knobs } else null,
+            .audit = if (auto_price) |p| .{ .cpu_us = p.cpu_us, .key = p.key, .knobs = knobs } else CostCache.learn(host, threads, evals, knobs),
         };
         if (driver) |d| d.up.store(true, .monotonic);
         // A failure here unwinds through the errdefers above.
@@ -1139,7 +1138,7 @@ pub const GpuContext = struct {
         errdefer if (qtp_kernel) |*k| k.deinit();
         var q_kernel: ?Raw = null;
         if (b.has_charge) if (renamed(&qtp_name, p.kernel, "arp_qonly_")) |name| {
-            q_kernel = gompute.rawKernelByName(backend.?, name, 0) catch |e| switch (e) {
+            q_kernel = gompute.rawKernelByName(backend.?, name, devices.ordinal) catch |e| switch (e) {
                 error.KernelNotFound => null,
                 else => return e, // else: any other driver error is fatal for the batch
             };
@@ -1147,7 +1146,7 @@ pub const GpuContext = struct {
         errdefer if (q_kernel) |*k| k.deinit();
         var const_kernel: ?Raw = null;
         if (b.has_const_jacobian and !knobs.gpu_nofuse) if (renamed(&qtp_name, p.kernel, "arp_evalc_")) |name| {
-            const_kernel = gompute.rawKernelByName(backend.?, name, 0) catch |e| switch (e) {
+            const_kernel = gompute.rawKernelByName(backend.?, name, devices.ordinal) catch |e| switch (e) {
                 error.KernelNotFound => null,
                 else => return e, // else: any other driver error is fatal for the batch
             };
@@ -1245,14 +1244,14 @@ pub const GpuContext = struct {
             // that cannot repay the setup.
             if (evals < 20) return decline(stats, 0, 0, "too few evals");
             const key = CostCache.key(host, threads, evals);
-            if (CostCache.read(key, host.knobs)) |rec| {
+            if (CostCache.read(key, host.knobs)) |rec| if (rec.gpu_us > 0) {
                 if (!measuredWins(rec, evals, init_us)) return decline(stats, rec.cpu_us, rec.gpu_us, "measured on this card");
                 if (stats) std.debug.print(
                     "gpu-stats: cost per eval cpu={d:.0} us gpu={d:.0} us (measured on this card), {d:.0} evals, setup {d:.0} ms: GPU\n",
                     .{ rec.cpu_us, rec.gpu_us, evals, init_us * 1e-3 },
                 );
                 return .{ .cpu_us = rec.cpu_us, .key = key };
-            }
+            };
             var slots: u64 = 0;
             for (host.batches) |b| {
                 const get = b.hooks.gpu_payload orelse continue;
@@ -1296,7 +1295,12 @@ pub const GpuContext = struct {
                 stage_bytes / cost_stage_b_per_us + host_us * cost_kernel_ratio;
             const lanes = 1.0 + cost_lane_gain * @as(f64, @floatFromInt(@max(1, threads) - 1));
             const cpu_us = host_us / lanes;
-            if (!gpuWins(cpu_us, gpu_us, evals, init_us)) return decline(stats, cpu_us, gpu_us, "the CPU is priced faster");
+            if (!gpuWins(cpu_us, gpu_us, evals, init_us)) {
+                // The host's price, for an explicit device run to set beside
+                // its measured one (`CostCache.learn`).
+                CostCache.write(key, host.knobs, .{ .cpu_us = cpu_us, .gpu_us = 0 });
+                return decline(stats, cpu_us, gpu_us, "the CPU is priced faster");
+            }
             if (stats) std.debug.print(
                 "gpu-stats: cost per eval cpu={d:.0} us gpu={d:.0} us, {d:.0} evals, setup {d:.0} ms: GPU\n",
                 .{ cpu_us, gpu_us, evals, init_us * 1e-3 },
@@ -1801,9 +1805,9 @@ pub const GpuContext = struct {
     fn gcAlloc(self: *Self, diag: []const u32, nnz: u32) !Gc {
         const be = backend.?;
         std.debug.assert(diag.len == self.n);
-        var combine = try gompute.rawKernelByName(be, "arp_gc_combine", 0);
+        var combine = try gompute.rawKernelByName(be, "arp_gc_combine", self.batches[0].kernel.context.ordinal);
         errdefer combine.deinit();
-        var gather = try gompute.rawKernelByName(be, "arp_gc_gather", 0);
+        var gather = try gompute.rawKernelByName(be, "arp_gc_gather", self.batches[0].kernel.context.ordinal);
         errdefer gather.deinit();
         const k0 = &self.batches[0].kernel;
         const nk: usize = @max(diag.len, 1);
@@ -2149,7 +2153,7 @@ pub const GpuContext = struct {
         const losing = gpu_us > a.cpu_us;
         CostCache.write(a.key, a.knobs, .{ .cpu_us = a.cpu_us, .gpu_us = gpu_us });
         if (self.prof.on) std.debug.print("gpu-stats: measured {d:.0} us per device eval against the CPU's {d:.0}: {s}\n", .{ gpu_us, a.cpu_us, if (losing) "the rest of the query runs on the CPU" else "GPU" });
-        if (losing) self.demote();
+        if (losing and a.demote) self.demote();
     }
 
     /// Moves the rest of the query to the host through the fault fallback,
@@ -3006,6 +3010,10 @@ test "CostCache: a record reads back under its key and nowhere else" {
     try std.testing.expectEqual(@as(f64, 120), rec.cpu_us);
     try std.testing.expectEqual(@as(f64, 30), rec.gpu_us);
     try std.testing.expect(CostCache.read(43, knobs) == null);
+    // A declined probe books the host's price alone; it reads back for
+    // `learn`, with no device price to admit on.
+    CostCache.write(44, knobs, .{ .cpu_us = 120, .gpu_us = 0 });
+    try std.testing.expectEqual(@as(f64, 0), (CostCache.read(44, knobs) orelse return error.TestUnexpectedResult).gpu_us);
     try std.testing.expect(GpuContext.Cost.measuredWins(rec, 1000, 0));
     try std.testing.expect(!GpuContext.Cost.measuredWins(.{ .cpu_us = 30, .gpu_us = 120 }, 1000, 0));
 }

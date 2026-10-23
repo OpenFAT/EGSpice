@@ -25,6 +25,7 @@ pub fn Engine(comptime backend: gompute.Backend) type {
         allocator: std.mem.Allocator,
         start_kernel: Raw,
         advance_kernel: Raw,
+        advance_only_kernel: Raw,
         stream: Raw.Stream,
         buffers: [@typeInfo(Id).@"enum".field_names.len]Storage = @splat(.{}),
         count: usize = 0,
@@ -35,8 +36,10 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             errdefer start_kernel.deinit();
             var advance_kernel = try gompute.rawKernelByName(backend, "arp_gmres_advance", 0);
             errdefer advance_kernel.deinit();
+            var advance_only_kernel = try gompute.rawKernelByName(backend, "arp_gmres_advance_only", 0);
+            errdefer advance_only_kernel.deinit();
             const stream = try start_kernel.createStream();
-            return .{ .allocator = allocator, .start_kernel = start_kernel, .advance_kernel = advance_kernel, .stream = stream };
+            return .{ .allocator = allocator, .start_kernel = start_kernel, .advance_kernel = advance_kernel, .advance_only_kernel = advance_only_kernel, .stream = stream };
         }
 
         pub fn deinit(self: *Self) void {
@@ -45,6 +48,7 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             self.stream.deinit();
             self.start_kernel.deinit();
             self.advance_kernel.deinit();
+            self.advance_only_kernel.deinit();
             self.* = undefined;
         }
 
@@ -119,6 +123,21 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             var pending = try self.counts();
             var stats: Stats = .{};
             while (pending[0] != 0 or pending[1] != 0) {
+                if (comptime has_precond) {
+                    if (pending[1] != 0) {
+                        // A preconditioned point's next request is a matvec or
+                        // done: advance those points alone, then serve every
+                        // matvec in the same wait. Each point's operations and
+                        // their order are unchanged.
+                        try op.precond(self.buffer(.input), self.buffer(.output), self.buffer(.precond_mask), &self.stream);
+                        stats.precond_rounds += 1;
+                        try self.advance_only_kernel.launchOn(&self.stream, gompute.Dim3.linear(@intCast(count), block), .{ .x = block }, 0, &.{
+                            scalar(&shape),   scalar(&layout),   self.arg(.states),      b.argPtr(),              x.argPtr(),        self.arg(.work),
+                            self.arg(.input), self.arg(.output), self.arg(.matvec_mask), self.arg(.precond_mask), self.arg(.counts), self.arg(.precond_mask),
+                        });
+                        pending = .{ 1, 0 };
+                    }
+                }
                 if (pending[0] != 0) {
                     try op.matvec(self.buffer(.input), self.buffer(.output), self.buffer(.matvec_mask), &self.stream);
                     stats.matvec_rounds += 1;
