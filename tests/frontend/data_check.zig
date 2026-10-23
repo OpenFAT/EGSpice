@@ -1,4 +1,4 @@
-//! tests/grammar/extdata.peg -> the table an external `.data` card stands
+//! tests/frontend/grammar/extdata.peg -> the table an external `.data` card stands
 //! for, checked against `netlist.source.expand` (which writes it out as an
 //! inline `.data` block) on the corpus decks, targeted cases and
 //! bounded-exhaustive cards and data files. The oracle merges by CR .DATA
@@ -14,7 +14,7 @@ const peg = @import("peg.zig");
 
 fn grammar(a: Allocator) !peg.Grammar {
     var d: peg.Diag = .{};
-    return peg.compile(a, @embedFile("extdata.peg"), &d) catch |err| {
+    return peg.compile(a, @embedFile("grammar/extdata.peg"), &d) catch |err| {
         std.debug.print("extdata.peg: {t} at byte {d} {s}\n", .{ err, d.offset, d.name });
         return err;
     };

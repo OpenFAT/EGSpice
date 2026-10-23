@@ -2,7 +2,7 @@
 # dev/research/data-file-syntax.md §3 (SA = HSPICE Simulation and Analysis
 # User Guide Ch.9 p.261-271, CR = Command Reference Ch.4 p.735-766);
 # checked against `vec.expand`, through `.vec` expansion, by
-# tests/grammar/vec_check.zig.
+# tests/frontend/vec_check.zig.
 #
 # Captures: one row per statement (Radix Vname Io Tunit Period Tskip Enable
 # Cbc Wave Vref Row) and its fields (Digits Bus Id Group From To IoChars

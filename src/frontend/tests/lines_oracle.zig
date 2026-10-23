@@ -28,7 +28,7 @@ fn nextPhysicalLine(rest: *[]const u8) ?[]const u8 {
 /// ngspice: title line, case folded, `*` comments, `$`/`;` tails, `+` continuation.
 pub const ngspice = struct {
     /// Logical-line iterator; a joined line is allocated in `arena`.
-    /// tests/grammar/ngspice_lines.peg is the spec; section numbers cite
+    /// tests/frontend/grammar/ngspice_lines.peg is the spec; section numbers cite
     /// dev/research/ngspice-syntax.md.
     pub const Lines = struct {
         rest: []const u8,
@@ -132,7 +132,7 @@ pub const ngspice = struct {
 
 /// HSPICE: like ngspice, but `"` also quotes, `$` starts a comment only after
 /// a separator or a number, and a trailing `\` or `\\` continues the line
-/// (tests/grammar/hspice_lines.peg is the spec; rule ids L2-L6 cite
+/// (tests/frontend/grammar/hspice_lines.peg is the spec; rule ids L2-L6 cite
 /// dev/research/hspice-syntax.md).
 pub const hspice = struct {
     /// Logical-line iterator; a joined line is allocated in `arena`.
@@ -269,7 +269,7 @@ pub const hspice = struct {
 
 /// Spectre: the title line, case kept, `*` comment lines, `//` comments, `\`
 /// or `+` continuation, and HSPICE's rules in a `simulator lang=spice`
-/// region (tests/grammar/spectre_lines.peg is the spec; § cite
+/// region (tests/frontend/grammar/spectre_lines.peg is the spec; § cite
 /// dev/research/spectre-syntax.md).
 pub const spectre = struct {
     /// Logical-line iterator; a joined line is allocated in `arena`.

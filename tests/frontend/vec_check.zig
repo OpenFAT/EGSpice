@@ -1,4 +1,4 @@
-//! The `.vec` oracle: tests/grammar/vec.peg's tree, lowered here to the
+//! The `.vec` oracle: tests/frontend/grammar/vec.peg's tree, lowered here to the
 //! netlist text a vector file stands for (a PWL source per input bit, a
 //! `.dout` per output bit), against `vec.expand` reached the way a deck
 //! reaches it, through `.vec` expansion (`netlist.source.expand`).
@@ -398,7 +398,7 @@ test "vec: cases, corpus, exhaustive, coverage" {
     defer arena.deinit();
     const a = arena.allocator();
     var d: peg.Diag = .{};
-    const g = peg.compile(a, @embedFile("vec.peg"), &d) catch |err| {
+    const g = peg.compile(a, @embedFile("grammar/vec.peg"), &d) catch |err| {
         std.debug.print("vec.peg: {t} at byte {d} {s}\n", .{ err, d.offset, d.name });
         return err;
     };

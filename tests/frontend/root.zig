@@ -25,7 +25,7 @@ fn grammar(arena: std.mem.Allocator, comptime file: []const u8) !peg.Grammar {
 /// read as one rule set.
 fn grammarOf(arena: std.mem.Allocator, comptime files: []const []const u8) !peg.Grammar {
     comptime var text: []const u8 = "";
-    inline for (files) |f| text = text ++ @embedFile(f) ++ "\n";
+    inline for (files) |f| text = text ++ @embedFile("grammar/" ++ f) ++ "\n";
     var d: peg.Diag = .{};
     return peg.compile(arena, text, &d) catch |err| {
         std.debug.print("{s}: {t} at byte {d} {s}\n", .{ files[files.len - 1], err, d.offset, d.name });
@@ -205,7 +205,7 @@ fn checkLines(comptime d: netlist.Dialect, comptime file: []const u8, cases: []c
 /// `grammar\trule\tnode` row each. The hand cases above reach every one of
 /// them (the `peg.gaps` gate); a row here is syntax no simulated deck
 /// checks end to end. Removing one means adding a fixture that reaches it.
-const fixture_gaps_path = "tests/grammar/FIXTURE_GAPS.tsv";
+const fixture_gaps_path = "tests/frontend/FIXTURE_GAPS.tsv";
 
 /// `g`'s gaps after the fixture decks alone, against its rows (`key`) in
 /// `FIXTURE_GAPS.tsv`. Returns how many rows are new or stale.
@@ -247,12 +247,12 @@ fn checkWorklist(a: std.mem.Allocator, path: []const u8, key: []const u8, rows: 
     return mismatches;
 }
 
-/// The vendored Spectre corpus (tests/grammar/spectre_corpus), each deck
+/// The vendored Spectre corpus (tests/frontend/spectre_fixtures), each deck
 /// after a title line: NetlistParse.rs reads line 1 as a statement.
 const NamedDeck = struct { name: []const u8, src: []const u8 };
 
 fn spectreDecks(a: std.mem.Allocator) ![]const NamedDeck {
-    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, "tests/grammar/spectre_corpus", .{ .iterate = true });
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, "tests/frontend/spectre_fixtures", .{ .iterate = true });
     defer dir.close(std.testing.io);
     var walker = try dir.walk(a);
     defer walker.deinit();
@@ -1064,7 +1064,7 @@ fn generated(comptime d: netlist.Dialect, comptime lines_file: []const u8, compt
 /// The generator's disagreement groups, one `dialect\tgroup` row each, with
 /// the cause on the comment line above it. A group no row names, or a row no
 /// group fills, fails the generated tests.
-const generated_path = "tests/grammar/GENERATED.tsv";
+const generated_path = "tests/frontend/GENERATED.tsv";
 
 /// A deck's group name: its first card's dot keyword (letters only), or
 /// its element letter.

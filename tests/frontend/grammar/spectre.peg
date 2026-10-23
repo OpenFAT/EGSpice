@@ -5,7 +5,7 @@
 # captured whole (SpiceCard) and read by the HSPICE card grammar, as Spectre's
 # SPICE reader is closest to it (§3.2).
 #
-# Captures the lowering reads (tests/grammar/lower_spectre.zig):
+# Captures the lowering reads (tests/frontend/lower_spectre.zig):
 #   statements  Simulator SpiceRegion SpiceCard Include AhdlInclude Library
 #               Section Global Parameters ParamDecl Model Group Subckt Ends
 #               Function FArg Save Ic Nodeset Signal If Else Statistics

@@ -1,5 +1,5 @@
 //! PEG grammar text -> a rule table; a rule table + input bytes -> parse tree
-//! rows. The interpreter behind the grammar oracle: each `tests/grammar/*.peg`
+//! rows. The interpreter behind the grammar oracle: each `tests/frontend/*.peg`
 //! is the executable spec of one input syntax, as Zig's
 //! `doc/langref/grammar.peg` is of Zig, and the oracle's tree is checked
 //! against what the real frontend reads (dev/frontend.md, "Grammar oracle").

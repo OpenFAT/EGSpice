@@ -2,7 +2,7 @@
 #
 # The executable spec of dev/research/spectre-syntax.md §1 and §3.1 (UG =
 # Spectre User Guide 5.1.41), checked against `lines.spectre.Lines` by
-# tests/grammar/lines.zig. Spectre mode keeps case (§2.1).
+# tests/frontend/lines.zig. Spectre mode keeps case (§2.1).
 #
 # Captures: Title; Line, a Spectre-mode statement, made of Piece (joined to
 # the previous part with a blank); SpiceLine, a statement in a `simulator

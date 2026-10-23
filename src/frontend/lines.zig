@@ -3,7 +3,7 @@
 //! a `{...}` or quoted field keeps its delimiters (its kind is its first
 //! byte), and anything else is a word.
 //!
-//! Cites tests/grammar/{ngspice,hspice,spectre}_lines.peg (the line rules),
+//! Cites tests/frontend/grammar/{ngspice,hspice,spectre}_lines.peg (the line rules),
 //! dev/research/{ngspice,hspice,spectre}-syntax.md (§ and rule ids), ngspice
 //! inpeval.c INPevaluate and the HSPICE User Guide B-2008.09 for number
 //! literals, and glibc's pow(10, e) for the scale (#36).
@@ -338,7 +338,7 @@ pub const ngspice = struct {
     pub const Split = Fields("'", true);
 
     /// Logical-line iterator; a joined line is allocated in `arena`.
-    /// tests/grammar/ngspice_lines.peg is the spec; section numbers cite
+    /// tests/frontend/grammar/ngspice_lines.peg is the spec; section numbers cite
     /// dev/research/ngspice-syntax.md.
     pub const Lines = struct {
         rest: []const u8,
@@ -459,7 +459,7 @@ pub const ngspice = struct {
 
 /// HSPICE: like ngspice, but `"` also quotes, `$` starts a comment only after
 /// a separator or a number, and a trailing `\` or `\\` continues the line
-/// (tests/grammar/hspice_lines.peg is the spec; rule ids L2-L6 cite
+/// (tests/frontend/grammar/hspice_lines.peg is the spec; rule ids L2-L6 cite
 /// dev/research/hspice-syntax.md).
 pub const hspice = struct {
     /// The first line is the deck title, not a card.
@@ -619,7 +619,7 @@ pub const hspice = struct {
     /// factor (`1e-6u`), which HSPICE forbids (hspice-syntax.md T3, UG08
     /// p. 49): a deck that writes one is refused (#203). A number starts
     /// after a byte that cannot continue a name, so `n1e3k` is a name.
-    /// tests/grammar/lower.zig refuses the same lines.
+    /// tests/frontend/lower.zig refuses the same lines.
     pub fn exponentWithScale(line: []const u8) bool {
         for (0..line.len) |i| {
             if (i > 0 and (std.ascii.isAlphanumeric(line[i - 1]) or line[i - 1] == '_' or line[i - 1] == '.')) continue;
@@ -691,15 +691,15 @@ test "hspice.exponentWithScale finds a number with an exponent and a scale (#203
 
 /// Spectre: the title line, case kept, `*` comment lines, `//` comments, `\`
 /// or `+` continuation, and HSPICE's rules in a `simulator lang=spice`
-/// region (tests/grammar/spectre_lines.peg is the spec; § cite
+/// region (tests/frontend/grammar/spectre_lines.peg is the spec; § cite
 /// dev/research/spectre-syntax.md).
 pub const spectre = struct {
     /// §1.2: line 1 of the top-level netlist is the title (UG p.29, p.50).
     pub const title_line = true;
     /// Operator bytes beyond `* /` at their level: `%`, which ESPice reads
-    /// (tests/grammar/spectre.peg MulOp); `\` is no Spectre operator (#203).
+    /// (tests/frontend/grammar/spectre.peg MulOp); `\` is no Spectre operator (#203).
     pub const remainder_ops = "%";
-    /// Unary `!`, which ESPice reads (tests/grammar/spectre.peg SignOp).
+    /// Unary `!`, which ESPice reads (tests/frontend/grammar/spectre.peg SignOp).
     pub const unary_not = true;
     /// Cards are case-sensitive: the text is parsed as written.
     pub const fold_case = false;

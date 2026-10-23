@@ -51,7 +51,7 @@ pub const Network = struct {
 pub const Error = error{ OutOfMemory, InvalidTouchstone, SingularSParameters };
 
 /// A Touchstone 1.0 file as written: the option line's settings and the
-/// network records, before any conversion. tests/grammar/touchstone.peg is
+/// network records, before any conversion. tests/frontend/grammar/touchstone.peg is
 /// the syntax; the rules cite dev/research/data-file-syntax.md §1 (TS1.1 =
 /// Touchstone 1.1, TS2.0 = 2.0).
 pub const Raw = struct {

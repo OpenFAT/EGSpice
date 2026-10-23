@@ -263,7 +263,7 @@ pub fn build(b: *Build) void {
     error_tests_mod.addObject(b.addObject(.{ .name = "device_errors", .root_module = error_object_mod, .use_llvm = use_llvm }));
 
     const wfit_mod = M.make(b.path("src/frontend/wfit.zig"), &.{ .{ .name = "core", .module = g.core }, .{ .name = "netlist", .module = g.netlist } });
-    const run_grammar = t.run(M.make(b.path("tests/grammar/root.zig"), &.{
+    const run_grammar = t.run(M.make(b.path("tests/frontend/root.zig"), &.{
         .{ .name = "netlist", .module = g.netlist },
         .{ .name = "wfit", .module = wfit_mod },
     }), &.{}, false);

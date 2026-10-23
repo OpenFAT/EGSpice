@@ -1,7 +1,7 @@
 //! HSPICE digital vector files [SA Ch.9 "Specifying a Digital Vector File
 //! and Mixed Mode Stimuli"; CR .VEC]: `.vec 'file'` becomes netlist text,
 //! a PWL voltage source per input bit and a `.dout` card per output bit,
-//! as HSPICE converts them. tests/grammar/vec.peg is the spec. Read: RADIX,
+//! as HSPICE converts them. tests/frontend/grammar/vec.peg is the spec. Read: RADIX,
 //! VNAME (buses in any nesting of `[] {} () <>` around the `[hi:lo]`
 //! range; V1, V2, ... when absent), IO with `i`, `o` and `u`, TUNIT (with a
 //! multiplier), PERIOD, TSKIP, TDELAY, IDELAY, ODELAY, SLOPE, TRISE, TFALL,

@@ -7,7 +7,7 @@
 # Sources: dev/research/ngspice-syntax.md (§ numbers), hspice-syntax.md (rule
 # ids). `# ESPice:` marks where ESPice reads more than the dialect does.
 #
-# Captures the lowering reads (tests/grammar/lower.zig):
+# Captures the lowering reads (tests/frontend/lower.zig):
 #   statements  Element Model Subckt Param Func Options Temp Ic Nodeset Global
 #               Include Save Analysis Cond Control Block Other
 #   fields      Name Word Number Pair Key Group Expr Str

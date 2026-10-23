@@ -2,7 +2,7 @@
 #
 # The executable spec of the line layer in dev/research/ngspice-syntax.md §1
 # (section numbers below), checked against `lines.ngspice.Lines` by
-# tests/grammar/lines.zig. Case is folded after this stage (§1.4).
+# tests/frontend/lines.zig. Case is folded after this stage (§1.4).
 #
 # Captures: Title; Line, one logical statement, made of Piece (joined to
 # the previous part with a blank: ngspice joins every continuation so).

@@ -2,7 +2,7 @@
 #
 # The executable spec of the line rules in dev/research/hspice-syntax.md §1
 # (rule ids L1-L9 below), checked against `lines.hspice.Lines` by
-# tests/grammar/lines.zig. Case is folded after this stage (L7).
+# tests/frontend/lines.zig. Case is folded after this stage (L7).
 #
 # Captures: Title; Line, one logical statement, made of Piece (joined to
 # the previous part with a blank) and Glue (joined with nothing, after

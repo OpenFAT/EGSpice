@@ -7,7 +7,7 @@
 //! Cites ngspice (inpcom.c, inp.c recifeval, subckt.c modtranslate,
 //! INPgetModBin) for the ngspice dialect, the HSPICE manuals ([SA], [CR])
 //! for the HSPICE cards, and dev/research/{ngspice,hspice,spectre}-syntax.md
-//! (§ and rule ids) for the grammar; tests/grammar/ngspice.peg, hspice.peg
+//! (§ and rule ids) for the grammar; tests/frontend/grammar/ngspice.peg, hspice.peg
 //! and spectre.peg are its oracle.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -1680,7 +1680,7 @@ fn Reader(comptime S: type) type {
         /// HSPICE reads an unquoted value only as a number or as an
         /// expression that starts with a letter and holds no blank
         /// (`lines.hspice.bareValue`); anything else is refused by name
-        /// (#203). tests/grammar/lower.zig `strictValue` refuses the same.
+        /// (#203). tests/frontend/lower.zig `strictValue` refuses the same.
         fn checkBare(r: *R, text: []const u8) Error!void {
             if (r.dialect != .hspice or lines.hspice.bareValue(text)) return;
             // A quoted expression is no bare one.
@@ -2894,7 +2894,7 @@ fn Reader(comptime S: type) type {
         /// ESPice refuses it by name instead of reading a name `%3` (#200).
         /// In HSPICE, which has no `%` or `\` operator, a field led by one
         /// is refused the same way (#203). Node fields are names and stay
-        /// read, as do X cards and dot cards. tests/grammar/lower.zig
+        /// read, as do X cards and dot cards. tests/frontend/lower.zig
         /// `element` refuses the same fields.
         fn refuseOperatorField(r: *R, line: []const u8, t: []const u8) Error!void {
             if (!F.isWord(t)) return;
@@ -3656,7 +3656,7 @@ fn Reader(comptime S: type) type {
             var f = f_in;
             // HSPICE quotes these expressions (`VOL='...'`, `TABLE '...'`);
             // a brace is a name byte there, and the form takes no name with
-            // one (#203). tests/grammar/lower.zig `element` refuses the same.
+            // one (#203). tests/frontend/lower.zig `element` refuses the same.
             if (r.dialect == .hspice and std.mem.indexOfScalar(u8, f.rest(), '{') != null)
                 return r.unsupported(line, "a braced expression (HSPICE quotes expressions: '...')");
             r.nodes.clearRetainingCapacity();

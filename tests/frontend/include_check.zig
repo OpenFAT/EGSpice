@@ -1,4 +1,4 @@
-//! tests/grammar/include.peg -> an include expander driven by its tree,
+//! tests/frontend/grammar/include.peg -> an include expander driven by its tree,
 //! checked against `netlist.source.expand` (SPICE) and `expandSpectre`
 //! (Spectre) on the fixture corpus, the vendored Spectre corpus, targeted
 //! cases and bounded-exhaustive library files. The grammar classifies each
@@ -24,7 +24,7 @@ const depth_max = 32;
 
 fn grammar(a: Allocator) !peg.Grammar {
     var d: peg.Diag = .{};
-    return peg.compile(a, @embedFile("include.peg"), &d) catch |err| {
+    return peg.compile(a, @embedFile("grammar/include.peg"), &d) catch |err| {
         std.debug.print("include.peg: {t} at byte {d} {s}\n", .{ err, d.offset, d.name });
         return err;
     };
@@ -485,7 +485,7 @@ test "include expansion: grammar oracle against source.expand" {
     }
     // The vendored Spectre corpus, a title line first as root.zig reads it.
     {
-        var dir = try Io.Dir.cwd().openDir(io, "tests/grammar/spectre_corpus", .{ .iterate = true });
+        var dir = try Io.Dir.cwd().openDir(io, "tests/frontend/spectre_fixtures", .{ .iterate = true });
         defer dir.close(io);
         var walker = try dir.walk(a);
         defer walker.deinit();
@@ -493,7 +493,7 @@ test "include expansion: grammar oracle against source.expand" {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".scs")) continue;
             _ = scratch.reset(.retain_capacity);
             const s = scratch.allocator();
-            const origin = try std.fmt.allocPrint(s, "tests/grammar/spectre_corpus/{s}", .{entry.path});
+            const origin = try std.fmt.allocPrint(s, "tests/frontend/spectre_fixtures/{s}", .{entry.path});
             const body = try dir.readFileAlloc(io, entry.path, s, .limited(1 << 20));
             if (!try check(s, io, g, true, origin, origin, try std.mem.concat(s, u8, &.{ "// title\n", body }))) bad += 1;
         }

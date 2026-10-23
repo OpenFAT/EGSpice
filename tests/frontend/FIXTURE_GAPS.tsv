@@ -1,5 +1,5 @@
 # The fixture-coverage worklist: grammar alternatives no tests/conformance/tests/netlist deck
-# exercises (tests/grammar/root.zig checkFixtureGaps). Columns: grammar, rule,
+# exercises (tests/frontend/root.zig checkFixtureGaps). Columns: grammar, rule,
 # grammar node. The test fails on a missing or stale row.
 hspice.peg	Assign	s
 hspice.peg	Block	(!('.enddata' !namechar) rest nl)

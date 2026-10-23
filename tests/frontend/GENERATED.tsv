@@ -1,4 +1,4 @@
-# The grammar generator's disagreement groups (tests/grammar/root.zig
+# The grammar generator's disagreement groups (tests/frontend/root.zig
 # `generated`): dialect, verdict, derived or mutant, leading card. Each is a
 # deck the two readers take differently; the test fails on a new or stale row.
 hspice	differ derived .mc

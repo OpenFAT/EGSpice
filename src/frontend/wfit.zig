@@ -20,7 +20,7 @@
 
 const std = @import("std");
 /// The S-element reader and fitter this file builds on, re-exported for
-/// the grammar oracle (tests/grammar), which imports this module alone.
+/// the grammar oracle (tests/frontend), which imports this module alone.
 pub const sparam = @import("sparam.zig");
 const plainNumber = @import("netlist").lines.plainNumber;
 const Cx = std.math.Complex(f64);
@@ -51,7 +51,7 @@ pub const RlgcError = error{ InvalidRlgcFile, TooManyConductors };
 /// Reads an RLGC file. `*` comments out the rest of a line; blanks, tabs,
 /// newlines, `,`, `;` and brackets separate numbers, which are plain or
 /// scientific with no scale suffix [SI p.107, p.109].
-/// tests/grammar/rlgc.peg is the syntax.
+/// tests/frontend/grammar/rlgc.peg is the syntax.
 pub fn readRlgcFile(bytes: []const u8) RlgcError!RlgcFile {
     var nums: [1 + 6 * 10]f64 = undefined;
     var count: usize = 0;

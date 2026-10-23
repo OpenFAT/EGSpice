@@ -1,7 +1,7 @@
 //! Spectre statements -> SPICE cards: the Spectre dialect's reader, run on
 //! the logical lines before netlist.zig reads any card, as pattern.zig
 //! rewrites PAT sources. dev/frontend.md "Spectre dialect" is the mapping;
-//! § numbers cite dev/research/spectre-syntax.md, and tests/grammar/spectre.peg
+//! § numbers cite dev/research/spectre-syntax.md, and tests/frontend/grammar/spectre.peg
 //! is the syntax. A Spectre instance name says nothing about its device, so
 //! each rewritten device card's letter is kept beside it (`Translated.kinds`).
 const std = @import("std");
