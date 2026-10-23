@@ -1217,6 +1217,48 @@ const TranTests = struct {
         }
         try testing.expectEqualStrings("", lines.rest());
     }
+
+    // A display task reads the Model row's `setup` cache (VerA device ABI 6),
+    // so the row must be set up before the first accepted point prints.
+    test "transient: a display task sees the Model row after setup" {
+        const gpa = testing.allocator;
+        const D = struct {
+            pub const U = enum(u8) { p, n };
+            pub const num_ports: usize = 2;
+            pub const Model = struct { su: f64 = 0 };
+            pub const Instance = struct {};
+            pub fn setup(comptime _: type, m: *Model) void {
+                m.su = 42;
+            }
+            pub fn eval(comptime S: type, xv: *const [2]S.V, _: *const Model, _: *const Instance, _: contract.SimState) contract.Rows(@This(), S) {
+                const v = contract.probes(@This(), S, xv);
+                const current = v[0].sub(v[1]);
+                return contract.rows(@This(), S, .{ current, current.neg() });
+            }
+            pub const say_sites = [_]contract.SaySite{.{ .fmt = "%m su=%.17g\n", .file = "t.va", .line = 1, .nargs = 1 }};
+            pub fn say(comptime S: type, _: *const [2]S.V, m: *const Model, _: *const Instance, _: contract.SimState, out: *contract.Say) void {
+                out.put(0, &.{m.su});
+            }
+        };
+        var ckt = try oneDevice(D, gpa);
+        defer ckt.deinit();
+        var sink: std.Io.Writer.Allocating = .init(gpa);
+        defer sink.deinit();
+        var display: root.Display = .{ .names = &.{&.{"n1"}}, .staged = .init(gpa), .out = &sink.writer };
+        defer display.staged.deinit();
+        ckt.display = &display;
+        const x = try gpa.alloc(f64, 2);
+        defer gpa.free(x);
+        @memset(x, 0);
+        const probes = [_]u32{1};
+        var wf = try Waveform.init(gpa, 1, 64);
+        defer wf.deinit();
+        try testing.expect(try simulate(&ckt, x, &probes, &wf, .{ .t_stop = 0.3, .dt_init = 0.1, .uic = true }, gpa));
+        var lines = std.mem.splitScalar(u8, sink.written(), '\n');
+        const first = lines.next() orelse return error.TestMissingLine;
+        try testing.expect(std.mem.startsWith(u8, first, "n1 su="));
+        try testing.expectEqual(@as(f64, 42), try std.fmt.parseFloat(f64, first["n1 su=".len..]));
+    }
 };
 
 const TranNoiseTests = struct {
