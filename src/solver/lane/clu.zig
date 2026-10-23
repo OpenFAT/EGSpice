@@ -1,6 +1,6 @@
 //! W complex sparse LU factorizations at once on one n x n pivot tape: the
 //! AC family's A(ω) = G + jωC solved in complex arithmetic instead of the
-//! stacked-real 2n form (docs/performance/TODO/02-linear-solver.md 2.10).
+//! stacked-real 2n form.
 //! One index per complex entry where the stacked form reads four, and a
 //! complex multiply-add is 4 real multiplies against the 2x2 block's 8.
 //!

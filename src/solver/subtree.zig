@@ -26,7 +26,7 @@
 //! is wide enough: on chain_bsim4_10k and ring_bsim4_10k the model finds
 //! 2.1-2.6x at 8 lanes, the supply columns' tail holding the rest. A
 //! level-structure nested dissection was tried for more and filled 116x
-//! against AMD's 2.6x there (docs/performance/TODO/02-linear-solver.md 2.4).
+//! against AMD's 2.6x there.
 
 const std = @import("std");
 const assert = std.debug.assert;

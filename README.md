@@ -71,8 +71,6 @@ so running ESPice on the CPU needs nothing beyond the base system.
 ## Performance
 
 <!-- bench:start -->
-![ESPice speedup by circuit size](docs/performance/bench/corpus/headline.svg)
-
 | Compared with | Decks both ran | ESPice faster | Median speedup | Agree / differ |
 |---|---:|---:|---:|---:|
 | ngspice | 473 | 466 | 3.3x | 424 / 13 |
@@ -80,8 +78,6 @@ so running ESPice on the CPU needs nothing beyond the base system.
 
 Median of 3 runs after a warm-up, process startup included, CPU backend, 32 x Intel(R) Core(TM) i9-14900HX, commit `3a57edf3`, 2026-07-29 (local run; `.github/workflows/bench.yml` regenerates this on each release).
 <!-- bench:end -->
-
-Full report and per-analysis charts: [docs/performance](docs/performance/index.md).
 
 ## Tests
 

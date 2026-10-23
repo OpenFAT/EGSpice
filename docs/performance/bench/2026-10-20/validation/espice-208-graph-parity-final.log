@@ -1,8 +1,0 @@
-PASS tests/fixtures/tran/bench_tran_rc_pulse.sp: worst 0x tolerance
-PASS tests/fixtures/tran/rc_pulse_history_gear.sp: worst 0x tolerance
-PASS tests/fixtures/tran/device_inductor.sp: worst 0x tolerance
-PASS tests/fixtures/tran/device_mos1_large_signal.sp: worst 0x tolerance
-PASS tests/fixtures/tran/device_mos6_simpleinv.sp: worst 0x tolerance
-PASS tests/fixtures/tran/pwl_triangle.sp: worst 0x tolerance
-PASS tests/fixtures/tran/bench_tran_exp_source.sp: worst 0x tolerance
-7 decks, 7 passed GPU parity, 0 failed, 0 skipped; worst 0x tolerance (rtol 0.001)

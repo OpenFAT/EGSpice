@@ -12,7 +12,7 @@ In one benchmark run over its 795-deck test corpus it was a median 3.3x
 faster than ngspice and 3.5x faster than VACASK on the decks each could
 run, and it agreed with ngspice on 424 of the 437 decks where the two
 reached a verdict. The
-[benchmarks](performance/index.md) have the details and the caveats.
+benchmarks in the README have the details.
 
 ## Quick start
 
@@ -56,7 +56,6 @@ RC low-pass filter: 3 devices
 | read the results in another tool | [Output](using/output.md) |
 | simulate on a GPU | [GPU backend](using/gpu.md) |
 | call ESPice from C or Zig | [Embedding ESPice](embed/c-api.md) |
-| see how fast and how accurate it is | [Accuracy and performance](performance/index.md) |
 
 ESPice is Apache-2.0. Its source, issues and releases are on
 [GitHub](https://github.com/OmarSiwy/ESPice). The developer reference, on

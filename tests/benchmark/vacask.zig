@@ -14,7 +14,6 @@
 //!   2. VACASK hard-errors on an unknown parameter instead of defaulting it,
 //!      so model parameters can pass through without a whitelist.
 //! Matching names do not ensure matching model versions or implementations:
-//! see docs/performance/comparison.md for known reference-model differences.
 //!
 //! Everything is lowercased: SPICE is case-insensitive and VACASK is not.
 //! compare.zig already lowercases raw-file column names.

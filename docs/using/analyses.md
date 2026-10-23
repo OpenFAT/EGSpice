@@ -349,9 +349,8 @@ device bounds and breakpoints can still require much smaller steps.
 Increasing this ceiling can reduce work when the default cap is binding,
 but it can also increase waveform and timing error. Compare against
 smaller-step results and choose error tolerances for the signals and
-measurements that matter. The
-[measured ceiling experiment](../performance/bench/2026-10-20/xyce-research.md)
-separates the speed gain from its accuracy tradeoff.
+measurements that matter. A measured
+ceiling experiment separated the speed gain from its accuracy tradeoff.
 
 ESPice also accepts `.options tran_ceiling=duration`. Without an explicit
 TMAX or DELMAX, this requests `(tstop - tstart)/10`; the default

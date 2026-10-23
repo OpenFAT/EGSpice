@@ -18,7 +18,6 @@ obj_dir/
 
 # Logs / dumps
 *.log
-!docs/performance/bench/**/*.log
 /core
 core.[0-9]*
 *.dump

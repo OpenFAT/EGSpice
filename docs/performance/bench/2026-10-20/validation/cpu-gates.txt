@@ -1,8 +1,0 @@
-test-espice: exit 0; 279/279 build steps;112/113 tests passed,1 GPU-only skip.
-Log:/tmp/espice-integrated-espice-final.log. Earlier overlapping build output was overwritten/interleaved; use this final summary and tool exit status.
-test-analysis: exit 0;264/269 tests passed,5 GPU-only skips.
-Log:/tmp/espice-integrated-analysis-recovery-final.log.
-test-solver:158/158 passed; subsequent focused recovery/OOM guard2/2 passed.
-Logs:/tmp/espice-held-recovery-solver.log,/tmp/espice-held-recovery-solver-final.log.
-comparison_accuracy unit regressions:16/16 passed.
-Log:/tmp/espice-accuracy-unit.log.
