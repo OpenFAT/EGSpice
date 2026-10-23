@@ -912,8 +912,11 @@ pub const Executor = struct {
             if (par) |*p| p.deinit();
         }
         // The query's device eval and device LU open on the least loaded
-        // device (multi-GPU stage 2); one device keeps them on it.
-        const placed = @import("gpu/devices.zig").place();
+        // device (multi-GPU stage 2); one device keeps them on it. An
+        // explicit `--backend cpu` opens no device: reading the device table
+        // starts the driver, ~140 ms a run on a machine with a GPU.
+        const devices = @import("gpu/devices.zig");
+        const placed: devices.Placement = if (self.config.backend == .cpu) .{ .slot = null, .prev = devices.ordinal } else devices.place();
         defer placed.release();
         const gpu_context = try self.prepareGpu(lanes);
         // The bypass serves host evaluations only.
