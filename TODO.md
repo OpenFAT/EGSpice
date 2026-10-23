@@ -27,20 +27,14 @@ Nothing is pushed or tagged until ESPice, VerA and Gompute sync perfectly (user 
 then pins are local: ESPice `dev/performance` (local), VerA via a local tarball of the integration
 worktree, then one coordinated push of all three.
 
-- **VerA v0.13.0**: session vera-26 merges the full updated VerA to main and pushes/tags it;
-  the `vera` agent hands it its gated commits beyond ed42ca34. Then bump ESPice's pin and apply
-  the ESPice patches that need it (`sim_reads` replacing the `bypass_models` allowlist, which also
-  makes 11 models bypass-eligible that a name mismatch had excluded).
+- **VerA v0.13.0**: the candidate is VerA branch `dev/performance` (release commit f9ff7a2e,
+  2759/2759 fixtures; includes sim_reads, the status-device fix and ab74c6ae's GPU-safe history;
+  the suite at 3dad22b). The user refines it and merges to VerA main; pin ESPice to that merged
+  main tip (not a branch commit), then apply `$S/agents/vera/espice-sim-reads.patch`
+  (`sim_reads` replacing the `bypass_models` allowlist, 11 more models bypass-eligible).
 - **Gompute 1.4.0** (in progress): `multiprocessorCount` and multi-GPU stage 0 (device table,
   handles carrying their ordinal, fake-device test contexts); testing with Gompute's own Zig 0.17,
   then main, push, tag, ESPice pin, and the 6.11 colour-threshold patch (40 × SMs).
-- **VerA `flake.nix`**: the user's earlier uncommitted change is no longer in the VerA working
-  tree (flake.nix == HEAD); the `vera` agent is checking where it went.
-
-- **VerA side, ready for the local pin**: the frame fix ed42ca34 (bsimcmg GPU frame 20.8 → 9.8 KB,
-  bsimbulk 17.2 → 7.1 KB, eval −7.6% / −6.1% at N = 4096, bitwise) and `sim_reads`; the ESPice side
-  is `$S/agents/vera/espice-sim-reads.patch`, applied with the VerA pin bump. The `vera` agent's own
-  v0.13.0 candidate (4d392efa) is superseded by the VerA session's integration branch.
 - **Gompute experiments for a later release** (from the `vera` agent): `-maxrregcount=128` on heavy
   roots (`gompute-maxrreg128.patch`: occupancy up to 2×, static frames +3–12%) and a bit-identical
   log without `?f64` (`gompute-log-optional.patch`: bsimcmg frame 9,840 → 9,072 B); measure with
