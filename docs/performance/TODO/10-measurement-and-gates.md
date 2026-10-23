@@ -28,7 +28,7 @@ tell:
 | Regime | Decks | Generator |
 |---|---|---|
 | One large circuit, post-layout | chain, ring, logic, sram × bsim4, psp103 × 1k, 10k, 100k (300k chain); real c7552_sky130, c7552_ihp, tdc_sky130 | `tests/benchmark/postlayout/gen.py`, `fetch.sh` |
-| Large linear | `stress/scaling_rc_ladder_100k`, `scaling_resistor_grid_100x100`, the power-grid suite | fixtures, `tests/suites/powergrid` |
+| Large linear | `stress/scaling_rc_ladder_100k`, `scaling_resistor_grid_100x100`, the power-grid suite | fixtures, `tests/conformance/external/spice-bench/powergrid` |
 | Small nonlinear, many steps | `stress/vacask_{rc,mul,graetz,ring}`, `tran/bench_ngspice_mosamp`, `device_mesa_oscillator` | fixtures |
 | Many points of a small circuit | asap7 24-stage bsimcmg chain at N = 1k-32k points; `stress/sweep_opamp_wl_5000` | `gen_lanes.py`, `gen_chain.py`, `lockstep.py` (HEAD `dev/research/gpu-lane-e1/`, `dev/research/lane-batched-simulation/`: restore them under `tests/benchmark/` when the `dev/` move lands) |
 | AC family | `ac/bench_medium_ladder_filter`, `stress/sweep_opamp_wl_5000`, the 222 AC-family corpus decks | fixtures |
@@ -51,7 +51,7 @@ tell:
 | callgrind | instruction counts (Ir), the stable metric on a loaded machine | `-Doptimize=ReleaseFast -Ddebug-info -Dcpu=x86_64_v3 -Dcuda-arch=none -Dhip-arch=none` (native emits GFNI, which valgrind cannot decode) |
 | `perf stat` | FP64 operation counts (`fp_arith_inst_retired.*_double`), cache and TLB misses | any |
 | `ptxas -v`, `cuobjdump -sass`, `tools/asm_probe.py`, `llvm-readobj --notes` | kernel registers, stack frame, spills, instruction mix; host codegen probes | GPU build |
-| `zig build bench`, `bench-postlayout`, `bench-suites` | medians against ngspice 45, VACASK, Xyce 7.10 (`nix develop .#benchmarking`) | ReleaseFast |
+| `zig build test-conformance` (oracles, then espice CPU/GPU against every simulator on PATH), `bench`, `bench-postlayout`, `bench-suites` | medians against ngspice 45, VACASK, Xyce 7.10 (`nix develop .#benchmarking`) | ReleaseFast |
 
 ## Counters to add
 

@@ -75,7 +75,6 @@ const GROUND = analysis.GROUND;
 
 test "gminFactor: thresholds are the Newton budget's quarters" {
     const gminFactor = @import("../dc/op.zig").gminFactor;
-    const t = std.testing;
     // The 100-iteration budget: 25 accelerates, 26-75 holds, 76 slows.
     try t.expectEqual(@min(4 * @sqrt(4.0), 10.0), gminFactor(4, 25, 100));
     try t.expectEqual(@as(f64, 4), gminFactor(4, 26, 100));

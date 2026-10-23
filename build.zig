@@ -14,7 +14,7 @@ pub fn build(b: *Build) void {
     const cuda_arch = b.option([]const u8, "cuda-arch", "CUDA arch (sm_75, ...), `auto` to probe the build machine, `none` to omit") orelse "auto";
     const hip_arch = b.option([]const u8, "hip-arch", "HIP arch (gfx1100, ...), `none` to omit") orelse "gfx1100";
     const gpu_lanes = b.option(bool, "gpu-lanes", "Also compile the GPU lane kernels (phase 4; default true, ~2x ptxas time)") orelse true;
-    const suite = b.option([]const u8, "suite", "bench-suites: one suite under tests/suites (default: all)");
+    const suite = b.option([]const u8, "suite", "bench-suites: one suite under tests/conformance/external/spice-bench (default: all)");
     const use_llvm = optimize != .debug;
 
     const gompute = b.dependency("gompute", .{});
@@ -373,7 +373,7 @@ pub fn build(b: *Build) void {
     run_postlayout.step.dependOn(&gen_postlayout.step);
     b.step("bench-postlayout", "Time ESPice on synthetic post-layout decks against ngspice and VACASK").dependOn(&run_postlayout.step);
 
-    const fetch_suites = b.addSystemCommand(&.{ "bash", "tests/suites/fetch.sh", "zig-out/suites" });
+    const fetch_suites = b.addSystemCommand(&.{ "bash", "tests/conformance/external/spice-bench/fetch.sh", "zig-out/suites" });
     if (suite) |name| fetch_suites.addArg(name);
     fetch_suites.setCwd(b.path("."));
     fetch_suites.has_side_effects = true;
@@ -381,6 +381,18 @@ pub fn build(b: *Build) void {
     const run_suites = corpus(b, bench_runner, exe, null, &.{ suites_dir, "--out", "zig-out/suites-results.md" });
     run_suites.step.dependOn(&fetch_suites.step);
     b.step("bench-suites", "Fetch the external SPICE suites and time ESPice on them against ngspice and VACASK").dependOn(&run_suites.step);
+
+    // The conformance suite in one step: the oracles first, then every deck
+    // timed and compared against each simulator installed (a missing one
+    // drops out), espice on the CPU and, in a GPU build, on CUDA. Serial
+    // after the oracles, so the timings run on a quiet machine.
+    const conformance_args: []const []const u8 = if (gpu_kernels)
+        &.{ "tests/conformance/tests/netlist", "--out", "zig-out/conformance-results.md", "--espice", "espice-cpu=--backend=cpu", "--espice", "espice-gpu=--backend=cuda", "--ngspice", "auto", "--vacask", "auto", "--xyce", "auto", "--hspice", "auto", "--spectre", "auto" }
+    else
+        &.{ "tests/conformance/tests/netlist", "--out", "zig-out/conformance-results.md", "--espice", "espice-cpu=--backend=cpu", "--ngspice", "auto", "--vacask", "auto", "--xyce", "auto", "--hspice", "auto", "--spectre", "auto" };
+    const run_conformance_bench = corpus(b, bench_runner, exe, null, conformance_args);
+    run_conformance_bench.step.dependOn(&run_correctness.step);
+    b.step("test-conformance", "The conformance suite: oracles, then a benchmark against every simulator on PATH (Xyce, VACASK, Spectre, ngspice, HSPICE) and espice CPU/GPU").dependOn(&run_conformance_bench.step);
 
     const run_bench_tests = t.run(bench_runner.root_module, &.{}, false);
     b.step("test-benchmark", "Test reference adapters and benchmark comparison").dependOn(&run_bench_tests.step);

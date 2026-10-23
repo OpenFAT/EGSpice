@@ -7,10 +7,15 @@ integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](d
 
 - **Conformance suite: merged (2026-10-23).** `tests/fixtures/` is now the submodule
   `tests/conformance` (VAMS Conformance Suite), decks under `tests/conformance/tests/netlist/`.
-  dev/performance's 68 fixture changes are suite commit a46e5ca (local branch
-  `espice-dev-performance`, not on GitHub). Before the push: push that suite commit, then
+  dev/performance's 68 fixture changes are suite commit a46e5ca, and the A09 decks (ex
+  `tests/pending/`) plus the bench-suites fetch scripts (ex `tests/suites/`, now
+  `external/spice-bench/`) are 71e56e0 (local branch `espice-dev-performance`, not on
+  GitHub). Before the push: push those suite commits, then
   `nix flake update conformance` (flake.lock still pins 166282e), and run `zig build test`
   for what the path move breaks. New or fixed decks go into the suite, then a submodule bump.
+- **A09 host bug B1** (3 XFAIL decks, `hdl/a09_idt_{bystander,self,lte}_reject`): a rejected
+  transient step leaves an idt/event accumulator advanced; see the suite's
+  `docs/a09-accepted-rejected-lifecycle.md`. Drop each `KNOWN GAP` line when it passes.
 - **`.pz` at large n** (09 9.6): done. Above 1000 unknowns `.pz` uses shift-invert Arnoldi on the
   sparse LU and returns the 20 poles and 20 zeros nearest s = 0 (plot name says "partial"); the
   dense path and its output are unchanged below. Not done: complex shifts, a `.pz` parameter for

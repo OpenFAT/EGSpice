@@ -7,7 +7,9 @@
 //! flag, or an environment assignment when it has `=` and no leading `-`.
 //! Without it the one column is `espice=--backend=cpu`. `--ngspice none` or
 //! `--vacask none` drops that reference; `--xyce BIN`, `--hspice BIN` and `--spectre BIN`
-//! add one.
+//! add one. `auto` for any of them takes the tool from PATH when it is
+//! installed and drops it when not (`zig build test-conformance`); an
+//! HSPICE or Spectre found that way moves the report to `vendor-NAME.md`.
 //!   zig build bench-postlayout -- --espice cpu8=ESPICE_THREADS=8,--backend=cpu
 const std = @import("std");
 const Io = std.Io;
@@ -60,6 +62,16 @@ const Ref = enum {
             .xyce => "Xyce",
             .hspice => "HSPICE",
             .spectre => "Spectre",
+        };
+    }
+    /// The executable `auto` looks for on PATH.
+    fn binary(r: Ref) []const u8 {
+        return switch (r) {
+            .ngspice => "ngspice",
+            .vacask => "vacask",
+            .xyce => "Xyce",
+            .hspice => "hspice",
+            .spectre => "spectre",
         };
     }
     /// These references report their own run and analysis times.
@@ -428,8 +440,18 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
     if (cfg.vacask_tran_step) |step| {
         if (!std.math.isFinite(step) or step <= 0) return error.InvalidArgument;
     }
+    var auto_vendor = false;
+    for (std.enums.values(Ref)) |r| if (std.mem.eql(u8, cfg.refs.get(r), "auto")) {
+        const found = if (binaryPath(a, io, r.binary())) |_| true else |_| false;
+        cfg.refs.set(r, if (found) r.binary() else "none");
+        auto_vendor = auto_vendor or (found and r.vendor());
+    };
     // A reference that reports its own times writes only to a
     // `vendor-*.md` file; keep those files out of the repository.
+    if (!privateReport(cfg) and auto_vendor) {
+        const dir = std.fs.path.dirname(cfg.report) orelse ".";
+        cfg.report = try std.fmt.allocPrint(a, "{s}/vendor-{s}", .{ dir, std.fs.path.basename(cfg.report) });
+    }
     if (!privateReport(cfg)) {
         std.debug.print("--hspice/--spectre write only to a vendor-*.md report: pass --out zig-out/vendor-NAME.md\n", .{});
         return error.VendorReportNotPrivate;
