@@ -32,9 +32,8 @@ worktree, then one coordinated push of all three.
   the suite at 3dad22b). The user refines it and merges to VerA main; pin ESPice to that merged
   main tip (not a branch commit), then apply `$S/agents/vera/espice-sim-reads.patch`
   (`sim_reads` replacing the `bypass_models` allowlist, 11 more models bypass-eligible).
-- **Gompute 1.4.0** (in progress): `multiprocessorCount` and multi-GPU stage 0 (device table,
-  handles carrying their ordinal, fake-device test contexts); testing with Gompute's own Zig 0.17,
-  then main, push, tag, ESPice pin, and the 6.11 colour-threshold patch (40 × SMs).
+- **Gompute 1.4.0**: done and pushed (tag 0.17.0-v1.4.0), pinned in build.zig.zon. Still owed:
+  the flake's zigDeps `outputHash` for that pin, and the 6.11 colour-threshold patch (40 × SMs).
 - **Gompute experiments for a later release** (from the `vera` agent): `-maxrregcount=128` on heavy
   roots (`gompute-maxrreg128.patch`: occupancy up to 2×, static frames +3–12%) and a bit-identical
   log without `?f64` (`gompute-log-optional.patch`: bsimcmg frame 9,840 → 9,072 B); measure with
