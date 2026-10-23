@@ -1227,13 +1227,27 @@ fn Reader(comptime S: type) type {
             try r.net_of.ensureTotalCapacity(arena, names_hint + 1);
             try r.values.ensureTotalCapacity(arena, line_hint);
             // One `key=value` row per `=` of a flat deck.
-            try r.kvs.ensureTotalCapacity(arena, std.mem.countScalar(u8, text, '='));
+            const eq_hint = std.mem.countScalar(u8, text, '=');
+            try r.kvs.ensureTotalCapacity(arena, eq_hint);
 
             var top_devices: std.ArrayList(u32) = .empty;
             try top_devices.ensureTotalCapacityPrecise(arena, r.lines.items.len);
             var model_lines: std.ArrayList(ModelLine) = .empty;
             var directive_lines: std.ArrayList(u32) = .empty;
             try r.declarations(&top_devices, &model_lines, &directive_lines);
+            // Flattened, a hierarchical deck holds more cards than lines:
+            // sized for that too, so `expand` never regrows the tables (an
+            // arena regrowth copies them and keeps the old block).
+            const extra = try r.expandedExtra(top_devices.items);
+            if (extra.cards != 0) {
+                const flat = line_hint + extra.cards;
+                try r.hg.ensureTotalCapacity(arena, flat + 1, flat, 3 * flat);
+                const names: u32 = @intCast(@min(2 * flat, none - 1));
+                try r.pool.reserve(arena, names);
+                try r.net_of.ensureTotalCapacity(arena, names + 1);
+                try r.values.ensureTotalCapacity(arena, flat);
+                try r.kvs.ensureTotalCapacity(arena, eq_hint + extra.kvs);
+            }
             const top: Frame = .{ .scopes = &r.global_scopes };
             // A MONTE sweep draws the distributions per trial, so the models
             // read next (a PDK's shared bins) keep their sites: the analysis
@@ -4077,6 +4091,79 @@ fn Reader(comptime S: type) type {
                 if (card == .cond) try r.branch(&branches, card.cond, &f, &child);
             }
             if (branches.depth != 0) return error.ParseError;
+        }
+
+        /// Cards and `key=value` rows that flattening the `X` cards among
+        /// lines `top` adds, counted off each subcircuit's body (its own
+        /// lines, and its `X` cards' subcircuits in turn). A reservation
+        /// estimate: both arms of a body's `.if` count, and an `X` card whose
+        /// subcircuit this cannot name counts nothing.
+        /// ponytail: capped at 16M cards, so a deep or cyclic hierarchy
+        /// that `expand` refuses reserves nothing absurd.
+        fn expandedExtra(r: *R, top: []const u32) Error!struct { cards: usize, kvs: usize } {
+            if (r.subckts.items.len == 0) return .{ .cards = 0, .kvs = 0 };
+            const sizes = try r.arena.alloc(Size, r.subckts.items.len);
+            @memset(sizes, .{});
+            var total: Size = .{};
+            for (top) |i| if (r.xTarget(i)) |id| total.add(r.bodySize(sizes, id, 0));
+            const cap = 1 << 24;
+            return .{ .cards = @min(total.cards, cap), .kvs = @min(total.kvs, 8 * cap) };
+        }
+
+        const Size = struct {
+            cards: usize = 0,
+            kvs: usize = 0,
+            state: enum { new, busy, done } = .new,
+
+            fn add(a: *Size, b: Size) void {
+                a.cards +|= b.cards;
+                a.kvs +|= b.kvs;
+            }
+        };
+
+        /// Subcircuit `id` flattened: its body's cards and `=` signs, its
+        /// `X` cards' subcircuits included. Memoized in `sizes`; a
+        /// subcircuit reached again while counting (a cycle) or past
+        /// `expand`'s depth counts nothing.
+        fn bodySize(r: *R, sizes: []Size, id: u16, depth: u8) Size {
+            if (sizes[id].state == .done) return sizes[id];
+            if (sizes[id].state == .busy or depth >= 32) return .{};
+            sizes[id].state = .busy;
+            const sub = r.subckts.items[id];
+            var size: Size = .{};
+            var nested: u32 = 0;
+            for (r.lines.items[sub.first..sub.end], sub.first..) |line, i| {
+                if (line[0] == '.') {
+                    if (!sub.has_nested) continue;
+                    var f = F.init(line);
+                    const card = cardOf(f.next().?[1..]) orelse continue;
+                    _ = skipNested(card, &nested);
+                    continue;
+                }
+                if (nested != 0) continue;
+                size.add(.{ .cards = 1, .kvs = std.mem.countScalar(u8, line, '=') });
+                if (r.xTarget(i)) |x| size.add(r.bodySize(sizes, x, depth + 1));
+            }
+            size.state = .done;
+            sizes[id] = size;
+            return size;
+        }
+
+        /// The subcircuit line `i` instantiates when it is an `X` card
+        /// whose last word before its parameters names one, else null.
+        fn xTarget(r: *const R, i: usize) ?u16 {
+            const line = r.lines.items[i];
+            const letter = if (r.kindOf(i) != 0) r.kindOf(i) else std.ascii.toLower(line[0]);
+            if (letter != 'x') return null;
+            var f = F.init(line);
+            _ = f.next();
+            var last: ?[]const u8 = null;
+            while (true) {
+                const t = f.next() orelse break;
+                if (!F.isWord(t) or f.takeEq()) break;
+                if (!std.mem.eql(u8, t, "params:")) last = t;
+            }
+            return r.subckt_ids.get(last orelse return null);
         }
 
         /// Tracks nested `.subckt` ... `.ends` while reading a body: true

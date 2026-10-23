@@ -724,6 +724,37 @@ test "nested .subckt definitions flatten through both levels (#121)" {
     _ = try device(nl, "r.x2.r2");
 }
 
+test "hierarchies flatten whole, and a subcircuit that instantiates itself is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Sized from the bodies (2 x 3 x 2 resistors, plus the top one) before
+    // any is read; the parse is the same as without the reservation.
+    const nl = try parse(arena.allocator(),
+        \\t
+        \\.subckt leaf a b
+        \\r1 a b 1k
+        \\r2 a b r=2k
+        \\.ends leaf
+        \\.subckt mid a b
+        \\x1 a m leaf
+        \\x2 m n leaf
+        \\x3 n b leaf
+        \\.ends mid
+        \\x1 in out mid
+        \\x2 out 0 mid
+        \\r0 in 0 1
+    );
+    try std.testing.expectEqual(@as(usize, 13), nl.deviceCount());
+    _ = try device(nl, "r.x2.x3.r2");
+    try std.testing.expectError(error.ParseError, parse(arena.allocator(),
+        \\t
+        \\.subckt rec a
+        \\x1 a rec
+        \\.ends rec
+        \\x1 n rec
+    ));
+}
+
 test "a subcircuit past 16 ports maps its pins as the scan does, a repeated port by its first position" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
