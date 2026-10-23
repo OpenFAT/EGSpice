@@ -39,7 +39,7 @@ def main():
     parser.add_argument("--variant", default="all", help="exact variant name, or all")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
-    rows = variants(json.loads((ROOT / "nix/release-targets.json").read_text()))
+    rows = variants(json.loads((ROOT / "tools/release-targets.json").read_text()))
     if args.variant != "all":
         rows = [row for row in rows if row["name"] == args.variant]
         if not rows:

@@ -28,7 +28,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertTrue(any(row['system'] == system and not row['gpu'] for row in rows))
 
     def test_refuses_mixed_backend_and_duplicate_artifacts(self):
-        data = json.loads((release.ROOT / 'nix/release-targets.json').read_text())
+        data = json.loads((release.ROOT / 'tools/release-targets.json').read_text())
         mixed = copy.deepcopy(data)
         mixed['backends'][0].update(cuda='sm_75', hip='gfx1100')
         with self.assertRaises(ValueError):

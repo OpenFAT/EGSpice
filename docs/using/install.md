@@ -49,7 +49,7 @@ file, for each tagged release on the
     The 1.0.0 release has no tarballs: its release build failed. Until a
     release carries them, install with Nix or build from source.
 
-The release catalogue is [nix/release-targets.json](https://github.com/OmarSiwy/ESPice/blob/main/nix/release-targets.json).
+The release catalogue is [tools/release-targets.json](https://github.com/OmarSiwy/ESPice/blob/main/tools/release-targets.json).
 It currently configures **128 variants**, with separate CPU and GPU choices:
 
 | Host | CPU targets | Backends |

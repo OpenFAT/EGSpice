@@ -91,8 +91,8 @@
         );
         gpuLibPath = lib.makeLibraryPath ([ "/run/opengl-driver" ] ++ gpuPkgs);
 
-        openvafPkg = import ./nix/openvaf.nix { inherit pkgs; };
-        vacaskPkg = import ./nix/vacask.nix { inherit pkgs openvafPkg; };
+        # The reference simulators come from the conformance suite's flake.
+        refPkgs = conformance.packages.${system};
 
         devShells = rec {
           ci = pkgs.mkShell {
@@ -117,8 +117,8 @@
               (pkgs.python3.withPackages (ps: [ ps.matplotlib ]))
               pkgs.ngspice
               pkgs.xyce
-              openvafPkg
-              vacaskPkg
+              refPkgs.openvaf-r
+              refPkgs.vacask
               pkgs.perf
               pkgs.inferno
             ];
@@ -126,7 +126,7 @@
           };
         };
 
-        releaseTargets = builtins.fromJSON (builtins.readFile ./nix/release-targets.json);
+        releaseTargets = builtins.fromJSON (builtins.readFile ./tools/release-targets.json);
         releaseVariants = lib.concatMap (
           host:
           map (

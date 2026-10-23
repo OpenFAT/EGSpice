@@ -14,7 +14,7 @@ from release_matrix import ROOT, variants
 
 
 def catalogue():
-    return variants(json.loads((ROOT / 'nix/release-targets.json').read_text()))
+    return variants(json.loads((ROOT / 'tools/release-targets.json').read_text()))
 
 
 def version():
