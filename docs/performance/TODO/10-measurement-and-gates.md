@@ -27,7 +27,7 @@ tell:
 
 | Regime | Decks | Generator |
 |---|---|---|
-| One large circuit, post-layout | chain, ring, logic, sram × bsim4, psp103 × 1k, 10k, 100k (300k chain); real c7552_sky130, c7552_ihp, tdc_sky130 | `tests/benchmark/postlayout/gen.py`, `fetch.sh` |
+| One large circuit, post-layout | chain, ring, logic, sram × bsim4, psp103 × 1k, 10k, 100k (300k chain); real c7552_sky130, c7552_ihp, tdc_sky130 | `tests/conformance/external/spice-bench/postlayout/gen.py`, `fetch.sh` |
 | Large linear | `stress/scaling_rc_ladder_100k`, `scaling_resistor_grid_100x100`, the power-grid suite | fixtures, `tests/conformance/external/spice-bench/powergrid` |
 | Small nonlinear, many steps | `stress/vacask_{rc,mul,graetz,ring}`, `tran/bench_ngspice_mosamp`, `device_mesa_oscillator` | fixtures |
 | Many points of a small circuit | asap7 24-stage bsimcmg chain at N = 1k-32k points; `stress/sweep_opamp_wl_5000` | `gen_lanes.py`, `gen_chain.py`, `lockstep.py` (HEAD `dev/research/gpu-lane-e1/`, `dev/research/lane-batched-simulation/`: restore them under `tests/benchmark/` when the `dev/` move lands) |

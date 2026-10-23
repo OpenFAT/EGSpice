@@ -5,14 +5,14 @@ integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](d
 
 ## Decisions waiting on the owner
 
-- **Conformance suite: merged (2026-10-23).** `tests/fixtures/` is now the submodule
-  `tests/conformance` (VAMS Conformance Suite), decks under `tests/conformance/tests/netlist/`.
-  dev/performance's 68 fixture changes are suite commit a46e5ca, and the A09 decks (ex
-  `tests/pending/`) plus the bench-suites fetch scripts (ex `tests/suites/`, now
-  `external/spice-bench/`) are 71e56e0 (local branch `espice-dev-performance`, not on
-  GitHub). Before the push: push those suite commits, then
-  `nix flake update conformance` (flake.lock still pins 166282e), and run `zig build test`
-  for what the path move breaks. New or fixed decks go into the suite, then a submodule bump.
+- **Conformance suite: merged and pushed (2026-10-23).** `tests/fixtures/` is now the submodule
+  `tests/conformance` (VAMS Conformance Suite), decks under `tests/conformance/tests/netlist/`;
+  the A09 decks (ex `tests/pending/`), the bench-suites fetch scripts (ex `tests/suites/`) and
+  the post-layout generator (ex `tests/benchmark/postlayout/`) are under the suite's
+  `external/spice-bench/` and `tests/netlist/hdl/`. Suite `main` is at 650a3ed (pushed),
+  `flake.lock` pins it. New or fixed decks go into the suite, then a submodule bump and
+  `nix flake update conformance`. VerA still pins the suite's pre-rewrite 166282e
+  (same tree as upstream 3dad22b); bump it after v0.13.0.
 - **A09 host bug B1** (3 XFAIL decks, `hdl/a09_idt_{bystander,self,lte}_reject`): a rejected
   transient step leaves an idt/event accumulator advanced; see the suite's
   `docs/a09-accepted-rejected-lifecycle.md`. Drop each `KNOWN GAP` line when it passes.

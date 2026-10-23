@@ -367,7 +367,7 @@ pub fn build(b: *Build) void {
     b.step("build-benchmark", "Build the standalone simulator comparison runner").dependOn(&b.addInstallArtifact(bench_runner, .{}).step);
     b.step("bench", "Compare ESPice with ngspice, VACASK and optional --xyce BIN (nix develop .#benchmarking)").dependOn(&corpus(b, bench_runner, exe, null, &.{"tests/conformance/tests/netlist"}).step);
 
-    const gen_postlayout = b.addSystemCommand(&.{ "python3", "tests/benchmark/postlayout/gen.py", "zig-out/postlayout" });
+    const gen_postlayout = b.addSystemCommand(&.{ "python3", "tests/conformance/external/spice-bench/postlayout/gen.py", "zig-out/postlayout" });
     gen_postlayout.setCwd(b.path("."));
     const run_postlayout = corpus(b, bench_runner, exe, null, &.{ "zig-out/postlayout", "--out", "zig-out/postlayout-results.md" });
     run_postlayout.step.dependOn(&gen_postlayout.step);
