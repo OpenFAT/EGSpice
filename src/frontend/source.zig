@@ -40,7 +40,9 @@ pub fn expand(io: Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, origin: 
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try appendContents(io, gpa, .{ .dirs = try searchDirs(arena, origin, src), .deck = origin }, origin, src, null, 0, &out);
+    var files: Files = .{};
+    defer files.deinit(gpa);
+    try appendContents(io, gpa, .{ .dirs = try searchDirs(arena, origin, src), .deck = origin, .files = &files }, origin, src, null, 0, &out);
     return try arena.dupe(u8, out.items);
 }
 
@@ -248,7 +250,40 @@ fn searchDirs(arena: std.mem.Allocator, origin: []const u8, src: []const u8) ![]
 /// Where a file a deck names is looked for: beside the file naming it, then
 /// in `dirs`; `deck` is the top-level deck, whose stem names `.load`'s
 /// default file.
-const Search = struct { dirs: []const []const u8, deck: []const u8 };
+const Search = struct {
+    dirs: []const []const u8,
+    deck: []const u8,
+    /// The files `appendFile` has read, so a library named by several
+    /// `.lib` cards (one per section) is read once; null reads each time.
+    files: ?*Files = null,
+};
+
+/// File bytes by resolved path, owned by the expansion's scratch allocator.
+const Files = struct {
+    map: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    /// `path`'s bytes, read on first use.
+    fn get(self: *Files, io: Io, gpa: std.mem.Allocator, path: []const u8) ![]const u8 {
+        const got = try self.map.getOrPut(gpa, path);
+        if (got.found_existing) return got.value_ptr.*;
+        errdefer self.map.removeByPtr(got.key_ptr);
+        const key = try gpa.dupe(u8, path);
+        errdefer gpa.free(key);
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+        got.key_ptr.* = key;
+        got.value_ptr.* = bytes;
+        return bytes;
+    }
+
+    fn deinit(self: *Files, gpa: std.mem.Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            gpa.free(e.key_ptr.*);
+            gpa.free(e.value_ptr.*);
+        }
+        self.map.deinit(gpa);
+    }
+};
 
 /// `name` beside `path`, else in the first search directory holding it;
 /// beside `path` when none does, so the open reports the usual error.
@@ -428,6 +463,7 @@ pub fn foreignKindForPath(path: []const u8) ?ForeignKind {
 fn appendFile(io: Io, gpa: std.mem.Allocator, search: Search, path: []const u8, section: ?[]const u8, depth: u8, out: *std.ArrayList(u8)) anyerror!void {
     // ponytail: bounded recursion; iterative include stack if real PDKs exceed 32.
     if (depth == 32) return error.IncludeDepthExceeded;
+    if (search.files) |files| return appendContents(io, gpa, search, path, try files.get(io, gpa, path), section, depth, out);
     const src = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(src);
     try appendContents(io, gpa, search, path, src, section, depth, out);

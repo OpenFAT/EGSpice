@@ -88,7 +88,7 @@ re-expands and re-parses (`prepare.zig:199-201`). Tokenize each subcircuit
 body once into field slices and folded numbers, memoize a default's folded
 value per (expression, scope signature), hash the port list, cache `.lib`
 sections by (file, section). **Effort.** 1 week.
-**Status (2026-10-23): two stages done.** A subcircuit past 16 ports looks pins up in a port index (a 5000-port wrapper of 200k resistors: frontend 1.9 s → 70 ms), and the parse tables are reserved for the flattened deck (`expandedExtra`), so expansion never regrows them (chain_bsim4_100k parse arena 589 → 321 MB). Body tokenization memo, default-value memo and the `.lib` cache: not done.
+**Status (2026-10-23): four stages done.** A subcircuit past 16 ports looks pins up in a port index (a 5000-port wrapper of 200k resistors: frontend 1.9 s → 70 ms), and the parse tables are reserved for the flattened deck (`expandedExtra`), so expansion never regrows them (chain_bsim4_100k parse arena 589 → 321 MB). A library named by several `.lib` cards is read once (`source.zig` `Files`). A parameter's or `.func`'s text is compiled once per distinct text (`compiledText`), not per reference per instance; exact, since compiling reads only the text (a default's folded value is not memoized: a `.num` scope entry would change the model-sharing key). Not done: the body tokenization memo (on chain_bsim4_100k the `X` part is mostly name interning, 150 ms in all).
 
 ### 7.4 Stage a row once, not a Model copy per instance — P1
 

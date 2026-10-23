@@ -73,6 +73,19 @@ test "generated limiter: failed trial rollback and retry match an untried circui
 const testing = std.testing;
 const GROUND = analysis.GROUND;
 
+test "gminFactor: thresholds are the Newton budget's quarters" {
+    const gminFactor = @import("../dc/op.zig").gminFactor;
+    const t = std.testing;
+    // The 100-iteration budget: 25 accelerates, 26-75 holds, 76 slows.
+    try t.expectEqual(@min(4 * @sqrt(4.0), 10.0), gminFactor(4, 25, 100));
+    try t.expectEqual(@as(f64, 4), gminFactor(4, 26, 100));
+    try t.expectEqual(@as(f64, 4), gminFactor(4, 75, 100));
+    try t.expectEqual(@as(f64, 2), gminFactor(4, 76, 100));
+    // Capped at 10, floored at 1.00005.
+    try t.expectEqual(@as(f64, 10), gminFactor(9, 1, 100));
+    try t.expectEqual(@as(f64, 1.00005), gminFactor(1.00001, 99, 100));
+}
+
 test "jfnk vs newton: divider OP agrees to 1e-9" {
     var lib = try Library.init(testing.allocator);
     defer lib.deinit();

@@ -161,9 +161,10 @@ fn afterPlain(
     var total_iter: u16 = if (plain) |p| p.iterations else 0;
 
     // Rung 2: dynamic gmin stepping (ngspice cktop.c dynamic_gmin). Descend
-    // gmin by `factor`; on a failed step, back up toward the last good gmin
-    // with the 4th root of the factor and retry from the last converged x;
-    // give up once the factor is ~1.
+    // gmin by `factor` (`gminFactor`); on a failed step, back up toward the
+    // last good gmin with the 4th root of the factor (the square root when
+    // the LU refused the matrix) and retry from the last converged x; give
+    // up once the factor is ~1.
     {
         // The planes still hold the plain rung's last assembly, which is
         // where ngspice's preorder reads its twins.
@@ -177,12 +178,20 @@ fn afterPlain(
         var good_gmin = options.tol.gmin_start; // upper bound to back up toward
         var gmin_val = good_gmin / factor;
         var have_good = false;
+        // The Newton budget each step gets: NIiter's floor of 100 over itl2.
+        const budget = converger.optionsFromTolerances(options.tol, options.tol.itl2).max_iter;
         var solves: u32 = 0;
-        while (solves < 100) : (solves += 1) {
+        // ngspice has no step cap: the factor floor ends the rung. This one
+        // only bounds a pathological ladder.
+        while (solves < max_ladder_solves) : (solves += 1) {
             ckt.setHomotopy(gmin_val, 1.0);
             try ckt.computeBaseline();
+            var refused = false;
             const r = newtonRun(ckt, ws, x, options.tol, hold, gmin_val, stamps, options.tol.itl2, !have_good) catch |e| switch (e) {
-                error.SingularMatrix => failed,
+                error.SingularMatrix => blk: {
+                    refused = true;
+                    break :blk failed;
+                },
                 else => return e, // else: only a singular Jacobian is a failed step
             };
             total_iter +|= r.iterations;
@@ -206,23 +215,17 @@ fn afterPlain(
                 @memcpy(x_good, x);
                 have_good = true;
                 good_gmin = gmin_val;
-                // An easy step accelerates (capped at the start factor); a
-                // hard one (over 3/4 of the budget) slows down before it
-                // fails, so folds are approached with shrinking steps.
-                // Thresholds, floor and final clamp are cktop.c:207-222, on
-                // the itl2 budget these solves run with.
-                if (r.iterations <= options.tol.itl2 / 4) {
-                    factor = @min(factor * @sqrt(factor), 10.0);
-                } else if (r.iterations > 3 * options.tol.itl2 / 4) {
-                    factor = @max(@sqrt(factor), 1.00005);
-                }
+                factor = gminFactor(factor, r.iterations, budget);
                 if (gmin_val < factor * gtarget) {
                     factor = gmin_val / gtarget;
                     gmin_val = gtarget;
                 } else gmin_val /= factor;
             } else {
                 if (factor < 1.00005) break; // wedged against the last good step
-                factor = @sqrt(@sqrt(factor));
+                // A matrix the LU refused (a singular or fill-capped
+                // factor at it = 0) says less about the step than a Newton
+                // that ran out: back up by the square root only.
+                factor = if (refused) @sqrt(factor) else @sqrt(@sqrt(factor));
                 gmin_val = good_gmin / factor;
                 if (have_good) @memcpy(x, x_good) else coldStart(ckt, x);
             }
@@ -242,11 +245,11 @@ fn afterPlain(
         var lambda_good: f64 = -1.0; // none converged yet
         var delta: f64 = 0.25;
         var solves: u32 = 0;
-        while (solves < 100) : (solves += 1) {
+        while (solves < max_ladder_solves) : (solves += 1) {
             ckt.setHomotopy(options.tol.gmin, lambda);
             try ckt.rebuildBaseline();
             for (scaled, hold) |*s, h| s.value = h.value * lambda;
-            const sr = newtonRun(ckt, ws, x, options.tol, scaled, 0.0, &.{}, options.tol.itl2, lambda_good < 0.0) catch |e| switch (e) {
+            var sr = newtonRun(ckt, ws, x, options.tol, scaled, 0.0, &.{}, options.tol.itl2, lambda_good < 0.0) catch |e| switch (e) {
                 error.SingularMatrix => failed,
                 else => { // else: only a singular Jacobian is a failed step; the rest unwinds the sources
                     ckt.setHomotopy(options.tol.gmin, 1.0);
@@ -257,6 +260,13 @@ fn afterPlain(
             total_iter +|= sr.iterations;
             if (ws.knobs.opdbg)
                 std.debug.print("ladder: src lambda={e:.3} conv={} it={d}\n", .{ lambda, sr.converged, sr.iterations });
+            if (!sr.converged and lambda_good < 0.0) {
+                sr.converged = sourcesOffGmin(ckt, ws, x, options, scaled, &total_iter) catch |e| {
+                    ckt.setHomotopy(options.tol.gmin, 1.0);
+                    try ckt.rebuildBaseline();
+                    return e;
+                };
+            }
             if (sr.converged) {
                 if (lambda >= 1.0) break; // full sources reached
                 lambda_good = lambda;
@@ -303,6 +313,53 @@ fn afterPlain(
     var result = try transientOp(ckt, ws, x, options, hold);
     result.iterations +|= total_iter;
     return result;
+}
+
+/// Solves at most per stepping rung. ngspice has no cap (each rung ends on
+/// its step floor); 100 ended chain_bsim4_100k's gmin stepping at 1.35e-6
+/// while every step still converged.
+const max_ladder_solves = 1000;
+
+/// The next gmin step factor after a step that converged in `iterations`
+/// of a Newton `budget` (cktop.c:207-222): an easy step (a quarter of the
+/// budget or less) accelerates, capped at 10; a hard one (over three
+/// quarters) slows down before it fails, floored at 1.00005. ngspice
+/// compares with itl2 (50) while NIiter raises the budget to 100, so steps
+/// of 13-37 iterations never moved the factor; the thresholds here are the
+/// budget's.
+pub fn gminFactor(factor: f64, iterations: u16, budget: u16) f64 {
+    if (iterations <= budget / 4) return @min(factor * @sqrt(factor), 10.0);
+    if (iterations > 3 * (budget / 4)) return @max(@sqrt(factor), 1.00005);
+    return factor;
+}
+
+/// ngspice gillespie_src's second try at the sources-off start: when the
+/// plain solve at lambda = 0 fails, solve it again under a diagonal gmin
+/// from 1e10 times the deck's gmin down to the deck's, a decade per solve,
+/// each from the last. True when all eleven converge; `x` then holds the
+/// last, the start source stepping raises from. Without it a circuit whose
+/// supplies-off state is floating (every MOSFET off, as on
+/// chain_bsim4_100k) failed its whole source-stepping rung at lambda = 0.
+fn sourcesOffGmin(ckt: *root.Circuit, ws: *converger.Workspace, x: []f64, options: Options, hold: []const converger.Force, total_iter: *u16) !bool {
+    if (!(options.tol.gmin > 0)) return false; // no gmin to step down to
+    const gpa = ws.slv.gpa;
+    // The planes hold the failed lambda = 0 assembly: the twins' values.
+    const stamps = try gminStamps(ckt, gpa);
+    defer gpa.free(stamps);
+    coldStart(ckt, x);
+    var g = options.tol.gmin * 1e10;
+    for (0..11) |i| {
+        const r = newtonRun(ckt, ws, x, options.tol, hold, g, stamps, options.tol.itl2, i == 0) catch |e| switch (e) {
+            error.SingularMatrix => failed,
+            else => return e, // else: only a singular Jacobian is a failed step
+        };
+        total_iter.* +|= r.iterations;
+        if (ws.knobs.opdbg)
+            std.debug.print("ladder: src-off gmin={e:.3} conv={} it={d}\n", .{ g, r.converged, r.iterations });
+        if (!r.converged) return false;
+        g /= 10;
+    }
+    return true;
 }
 
 /// Rung 5, ngspice OPtran (optran.c): a real transient with full sources

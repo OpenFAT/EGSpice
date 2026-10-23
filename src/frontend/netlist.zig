@@ -1154,6 +1154,8 @@ fn Reader(comptime S: type) type {
         positional: std.ArrayList(Value) = .empty,
         card_kv: std.ArrayList(Kv) = .empty,
         scratch: expr.Scratch = .{},
+        /// Parameter and function texts compiled once each (`compiledText`).
+        compiled_texts: std.StringHashMapUnmanaged(*const expr.Scratch) = .empty,
         stack: std.ArrayList(expr.Val) = .empty,
         /// Open `name(` groups in the value being read.
         group_depth: u8 = 0,
@@ -2591,7 +2593,7 @@ fn Reader(comptime S: type) type {
             const start = r.ops.items.len;
             const sites = r.site_ops.items.len;
             const top: Frame = .{ .scopes = &r.global_scopes };
-            try r.subst(mark.ops, r.scratch.ops.items.len, &top, &r.global_scopes, 0);
+            try r.subst(&r.scratch, mark.ops, r.scratch.ops.items.len, &top, &r.global_scopes, 0);
             const ops = r.ops.items[start..];
             const probe = try expr.fold(r.arena, &r.stack, ops, r.consts.items, false, &.{ 1, 1, 1 });
             var drawn = r.site_ops.items.len != sites;
@@ -3197,7 +3199,7 @@ fn Reader(comptime S: type) type {
             const ops_mark = r.ops.items.len;
             const consts_mark = r.consts.items.len;
             const sites_mark = r.site_ops.items.len;
-            try r.subst(from, r.scratch.ops.items.len, frame, frame.scopes, 0);
+            try r.subst(&r.scratch, from, r.scratch.ops.items.len, frame, frame.scopes, 0);
             const ops = r.ops.items[ops_mark..];
             const v = try expr.fold(r.arena, &r.stack, ops, r.consts.items, geometry, r.live_nominal.items);
             if (v.known) {
@@ -3230,21 +3232,21 @@ fn Reader(comptime S: type) type {
             return null;
         }
 
-        /// Copies scratch ops `from..to` into the netlist's ops. A name a scope
+        /// Copies `src`'s ops `from..to` into the netlist's ops. A name a scope
         /// defines is replaced by its definition, read in the scope that
         /// defined it; probe nets are mapped through `frame`.
-        fn subst(r: *R, from: usize, to: usize, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
+        fn subst(r: *R, src: *const expr.Scratch, from: usize, to: usize, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
             if (depth == 64) return error.ParseError;
             // `expr.Code.ident`'s final operand: declared geometry, then the
             // B-source tape's simulator variables.
             const ident_class = std.StaticStringMap(u32).initComptime(.{ .{ "l", 1 }, .{ "w", 1 }, .{ "mult", 1 }, .{ "time", 2 }, .{ "temper", 3 } });
             var i = from;
             while (i < to) : (i += 1) {
-                const op = r.scratch.ops.items[i];
+                const op = src.ops.items[i];
                 switch (op.code) {
-                    .num => try r.emitNum(r.scratch.consts.items[op.a]),
+                    .num => try r.emitNum(src.consts.items[op.a]),
                     .ident => {
-                        const name = r.scratch.names.items[op.a];
+                        const name = src.names.items[op.a];
                         // A formal of the function being expanded: its argument.
                         if (bound(r.bindings.items, name)) |ops| {
                             try r.ops.appendSlice(r.arena, ops);
@@ -3261,9 +3263,7 @@ fn Reader(comptime S: type) type {
                         switch (hit.entry) {
                             .num => |n| try r.emitNum(n),
                             .text => |text| {
-                                const mark = r.scratch.mark();
-                                defer r.scratch.reset(mark);
-                                try expr.compileAll(S, r.arena, &r.scratch, text);
+                                const code = try r.compiledText(text);
                                 // Calls inside a parameter's text draw once per
                                 // scope that defines it: globally, or per instance.
                                 const owner = r.site_owner;
@@ -3279,15 +3279,15 @@ fn Reader(comptime S: type) type {
                                 const saved = r.bindings;
                                 r.bindings = .empty;
                                 defer r.bindings = saved;
-                                try r.subst(mark.ops, r.scratch.ops.items.len, frame, scopes[0 .. hit.level + 1], depth + 1);
+                                try r.subst(code, 0, code.ops.items.len, frame, scopes[0 .. hit.level + 1], depth + 1);
                             },
                         }
                     },
-                    .ucall => try r.inline_(op, frame, scopes, depth),
+                    .ucall => try r.inline_(src, op, frame, scopes, depth),
                     // The device by its flattened card name (`commit`), for a B-source tape.
                     .iprobe => {
                         const a = if (op.a == none) none else a: {
-                            const dev = r.scratch.names.items[op.a];
+                            const dev = src.names.items[op.a];
                             const flat = if (frame.path) |path| try r.joined(&.{ dev[0..1], ".", path, ".", dev }) else dev;
                             break :a (try r.internName(flat)).index();
                         };
@@ -3295,8 +3295,8 @@ fn Reader(comptime S: type) type {
                     },
                     .vprobe => try r.ops.append(r.arena, .{
                         .code = .vprobe,
-                        .a = if (op.a == none) none else (try r.netOf(frame, r.scratch.names.items[op.a])).index(),
-                        .b = if (op.b == none) none else (try r.netOf(frame, r.scratch.names.items[op.b])).index(),
+                        .a = if (op.a == none) none else (try r.netOf(frame, src.names.items[op.a])).index(),
+                        .b = if (op.b == none) none else (try r.netOf(frame, src.names.items[op.b])).index(),
                     }),
                     else => {
                         if (r.monte and op.code == .call and expr.isDistribution(@fromBackingInt(@intCast(op.a)))) {
@@ -3324,8 +3324,8 @@ fn Reader(comptime S: type) type {
         /// expands to its body with each formal bound to its argument (the
         /// arguments' final ops, the last `op.b` subtrees emitted); any
         /// other stays a `call` of `Fn.other`, which nothing folds.
-        fn inline_(r: *R, op: expr.Op, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
-            const name = r.scratch.names.items[op.a];
+        fn inline_(r: *R, src: *const expr.Scratch, op: expr.Op, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
+            const name = src.names.items[op.a];
             const func = r.funcs.get(name) orelse
                 return r.ops.append(r.arena, .{ .code = .call, .a = @backingInt(expr.Fn.other), .b = op.b });
             if (func.formals.len != op.b) return error.ParseError;
@@ -3340,13 +3340,30 @@ fn Reader(comptime S: type) type {
                 end = start;
             }
             r.ops.shrinkRetainingCapacity(end);
-            const mark = r.scratch.mark();
-            defer r.scratch.reset(mark);
-            try expr.compileAll(S, r.arena, &r.scratch, func.body);
+            const code = try r.compiledText(func.body);
             const outer = r.bindings.items.len;
             defer r.bindings.shrinkRetainingCapacity(outer);
             for (func.formals, args) |formal, a| try r.bindings.append(r.arena, .{ .name = formal, .ops = a });
-            try r.subst(mark.ops, r.scratch.ops.items.len, frame, scopes, depth + 1);
+            try r.subst(code, 0, code.ops.items.len, frame, scopes, depth + 1);
+        }
+
+        /// `text` compiled, once per distinct text: a parameter's or a
+        /// function's text is read wherever it is named, once per instance
+        /// under a subcircuit. Compiling reads nothing but the text, so a
+        /// cached copy is what a fresh compile gives; a text that fails to
+        /// compile is not kept and fails the same way again.
+        fn compiledText(r: *R, text: []const u8) Error!*const expr.Scratch {
+            const got = try r.compiled_texts.getOrPut(r.arena, text);
+            if (got.found_existing) return got.value_ptr.*;
+            errdefer r.compiled_texts.removeByPtr(got.key_ptr);
+            // Its names are slices of the text, so the key owns a copy.
+            const key = try r.arena.dupe(u8, text);
+            const code = try r.arena.create(expr.Scratch);
+            code.* = .{};
+            try expr.compileAll(S, r.arena, code, key);
+            got.key_ptr.* = key;
+            got.value_ptr.* = code;
+            return code;
         }
 
         /// The instance path whose scope sits at `level` of `frame`'s
