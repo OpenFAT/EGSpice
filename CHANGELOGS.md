@@ -1,334 +1,48 @@
 # Changelog
 
-Newest first. Bullets only, one line each. Every fix cites its GitHub issue,
-`(#123)`; open one first if none exists.
+Newest first.
 
 ## Unreleased
 
-- Device ABI 34: `ParamRef.ptr` is a bare `*f64` (VerA emits no f32 parameter) and `Hooks.linear_rc` is gone with the opt-in `ESPICE_LINEAR_CACHE` R/C host cache; the evaluator keeps no path for hand-written Zig devices (`isVera`, `jac_f32_host`, `mc_param`, `unrevertible_state`) and `-Dbsim4-narrow` is removed. `models/ltra_ac.zig` stays as the one host-side model term: the lossy LTRA small-signal kernel is transcendental in jω, which no Verilog-A operator (`laplace_*`, `absdelay`, `zi_*`) expresses.
-- Source layout: the GPU contexts live in `src/analysis/gpu/`, the W-wide CPU lane solves in `src/solver/lane/` and the std-only kernel bodies in `src/solver/kernels/` (the two kernel roots stay in `src/solver/`, where a module root must be); `src/frontend/prepare.zig` is the frontend root. The `test-gpu-lanes`, `test-gpu-frequency`, `test-gpu-pss` and `test-gpu-periodic` steps, whose scripts left the tree, are removed; `test-gpu` runs the corpus under CUDA.
+- `espice --version` prints the ESPice and VerA versions and the GPU backends built in.
+- `-I DIR` / `--include=DIR` adds a search directory for `.hdl` includes.
+- `.pz` on circuits above 1000 unknowns returns the 20 poles and 20 zeros nearest s = 0 (the plot is named "partial").
+- A `.tran ... uic` run no longer solves an operating point it does not use: a 100k-transistor chain started in seconds instead of hours.
+- Operating points: gmin stepping and source stepping follow ngspice more closely; a few decks that needed them converge with slightly different iteration counts.
+- Faster and leaner on large decks: quicker sparse LU, faster parsing of large hierarchies (a 100k-transistor chain parses in half the memory), CSV and `.print` sweeps stream to disk (a 200-point sweep: ~1 GB → ~50 MB), and Monte Carlo shares unchanged model rows (1.04 → 0.19 GB on a 1k chain).
+- The compact models ship in the source tree; building no longer downloads them.
+- Cached `.hdl` builds rebuild once (new device ABI).
+- Removed: the `ESPICE_LINEAR_CACHE` variable, the `-Dbsim4-narrow` build option and the `test-gpu-*` build steps (`test-gpu` runs the corpus on CUDA).
 
 ## 1.2.0 (2026-10-20)
 
-- `.mc`, `.dc DATA=`, `.dc MONTE=` and a `.temp` range run each trial, variant or temperature as its own query row, which spreads across `--jobs` and batches into lanes, then assemble the sweep in order; output is the same at every `--jobs`. A plain `.mc` draw is keyed by (seed, trial, variable), so trials draw different values than before, and a `.dc DATA=`/`MONTE=` point starts from the nominal OP instead of the previous point, which moves its results by roundoff (#213).
-- CLI defaults: `--jobs` is one per CPU (`--jobs=auto`); `--measures-only`, `--early-stop` and `--warm-start` turn on by themselves when nothing reads the transient waveforms (no `-r`, `.save`, `.stim`, optimization, `--tangents` or display task; `--full-waveforms` turns them off); `--tokenizer` defaults to the dialect detected from the deck's HSPICE- or Spectre-only markers, else ngspice.
-- `OPTIMIZE=` on a `.tran` card takes its Jacobian from tangents integrated along the trial point's own transient, without its time-grid noise: a 32-stage MOS1 chain fit 1.49x fewer instructions and an RSS of 7e-11 instead of 4e-5; `ZP_NO_TANGENTS` restores the finite difference (#97).
-- C API points: `espice_append_points`, `espice_copy_point_measures`, `espice_copy_point_tangents`, `espice_release_points`, `espice_lane_width` and the `espice_reason` codes run many parameter points on one template and read each point's `.meas` values, reason and d(meas)/d(param); a failed point never spoils the others.
-- `espice_points_options` (48 bytes): `abort_measure` names the card `abort_after` bounds, `abort_after` NaN is off and 0 a valid bound, `tangent_step` appended after MATCHA's 40-byte layout.
-- Measurement-only mode (`--measures-only`, automatic when nothing reads the waveforms): `.meas` cards stream over the accepted steps, bitwise equal to the recorded evaluation; a 1000-row RC-ladder sweep peaks at 168 MB instead of 6.5 GB.
-- Early stop (`--early-stop`) ends a `.tran` once every `.meas` card has resolved, and `--abort-after=T` / `--abort-measure=NAME` fail a point still unresolved at T; `.meas` values are unchanged.
-- `--warm-start` seeds every sweep point's operating point from the template's nominal one: DC Newton iterations per point 8.5 → 2.0.
-- `--tangents=P,...` and `--tangent-step=S` print d(.meas)/d(P) of the first `.tran`; tangents are refused under Gear-3..6.
-- Sweeps run on a refilling pool: each point's OP and transient run back to back and threads never idle between waves, about 2x points/s at 4–32 jobs with flat memory (5000 points at 16 jobs: 2.96 GB → 134 MB); graph setup is linear in the row count.
-- `run_all` prints each sweep point's `.meas` block as it finishes, labelled with its row (`point 3 (rv=1000, cv=2.5e-13)`), and prints NaN for a measure that does not resolve.
-- `run_all` on a long-lived handle costs only what was appended since the last call, and the C API allocates with glibc malloc where libc is linked.
-- A variant row re-derives only the device batches it writes, and a live value crossing zero rebuilds once per sign pattern instead of once per point (#214).
-- Lane batching (`--lanes`, `ESPICE_LANES=1`) of operating points, `.dc`, `.tran`, `.pss` and the AC family over sweep points, bitwise equal to the unbatched run on the CPU; off by default there, where it measured break-even (#207, #209, #210, #211).
-- GPU lanes (`--backend cuda`/`hip`): each sweep point of a transient runs as one GPU thread, 32 points of one transistor per warp, matching the CPU lanes within the corpus tolerance; under `auto` only FP64-class GPUs take them (#208).
-- A Debug `-Dgpu=true` build uploaded Model rows at the kernels' stride, so a second voltage or current source stamped 0 under `--backend cuda`; release builds were unaffected.
-- `.meas op name find i(vdd)` reads leakage from the operating point.
-- VerA v0.11.4: the dense value family is gone, device evaluation is sparse everywhere, and every compact model's CUDA eval kernel fits the stack limit; a unary operator's operand must be a primary, so a user `.hdl` model writing `- -x` needs `-(-x)`.
-- `.hdl` reads Verilog-AMS 2023 again; a 2.3-era model that uses a 2023 keyword as a name compiles inside `begin_keywords "VAMS-2.3"`; a card that omits a module's trailing ports leaves them floating, as ngspice OSDI does.
-- psp103_nqs and psp104_nqs run on the host under the GPU backends: their gfx1100 eval kernels exceeded the 262,136 B stack limit.
-- A title-only deck runs nothing and succeeds, as ngspice does, instead of failing delivery with DataLengthMismatch.
-- espice.wasm links again and matches native espice bit for bit on the corpus (#8).
-- Gear orders 3 to 6, NaN-propagating norms and LU non-finite checks, and Zig 0.18's vectorizer in place of stdpp (cleanup pass).
+- Sweeps (`.step`, `.mc`, `.dc DATA=`/`MONTE=`, `.temp` ranges) run their points in parallel across `--jobs`, about 2x faster with flat memory; output is the same at every `--jobs`. Monte Carlo draws differ from 1.1 (#213).
+- New CLI defaults: `--jobs` is one per CPU, and `--measures-only`, `--early-stop` and `--warm-start` turn on by themselves when nothing reads the transient waveforms; `--full-waveforms` turns them off. `--tokenizer` detects the dialect.
+- `--measures-only`: `.meas` without storing waveforms (a 1000-row sweep: 6.5 GB → 168 MB). `--early-stop` ends a `.tran` once every `.meas` resolves; `--abort-after`/`--abort-measure` fail a point that has not.
+- `--tangents=P,...` prints d(.meas)/d(P); `OPTIMIZE=` on `.tran` uses them for a cleaner Jacobian (#97).
+- C API points: run many parameter points on one template and read each point's measures, tangents and status (`espice_append_points` and friends).
+- `--lanes` batches sweep points (bitwise equal on the CPU); on the GPU each sweep point of a transient runs as one thread (#207–#211).
+- `.meas op ... find i(vdd)` reads from the operating point.
+- VerA v0.11.4: a user `.hdl` model writing `- -x` needs `-(-x)`. `.hdl` reads Verilog-AMS 2023, and 2.3-era models compile inside `begin_keywords "VAMS-2.3"`.
+- A title-only deck succeeds, as in ngspice; espice.wasm works again (#8).
 
 ## 1.1.0 (2026-10-19)
 
-- VPI applications: the LRM §12.31.3 analog callbacks run in `.op` and `.tran`: acbAbsTime/acbElapsedTime force a solution at their time, an acbConvergenceTest rejection or vpiRejectTransientStep backs up to half the step, vpiTransientFailConverge solves it again, and acbInitialStep/acbAcceptedPoint/acbFinalStep fire on each accepted solution; calltf reads the analysis time (#198).
-- VerA is pinned at v0.10.3 and Zig 0.18 is the toolchain: `vera_version` replaces `contract_abi`, and VPI calls go through VerA's `analog_run.Binding` (#206).
-- A Debug espice loads runtime `.hdl` models, building each with its own backend; a loaded model links the host's libc, so the Nix package loads one inside the sandbox.
-- OPtran's static solve holds one node per floating component, so an island holding a DC element (a source behind a series short, a subcircuit resistor) converges again.
-- A JFNK solve takes at least one GMRES step, so a small preconditioned residual no longer stalls it (#190).
-- HSPICE dialect: a bare expression may hold blanks inside a call's parentheses, as the manual's `AGAUSS(1k, 100, 3)` does (#203).
-- ngspice dialect: an X card's `params:` keyword is read.
-- `ltra` evaluates on the GPU, as the other lossy lines do (#171).
-- The device layout hash covers the GPU payload and scatter tapes, and the unused `held` payload flag is gone; device ABI 29, so cached `.hdl` builds rebuild once (#186).
-- `.tf` reads a resistance whose branch current is below 1e-20 A as `1e20`, as ngspice does (a 1e-30 S input path printed 1e30); `.dcxf` and `.acxf` keep VACASK's exact-zero rule but no longer print `inf` for an immittance below about 1e-154 (#199).
-- `.tf` prints an infinite input or output resistance (a source that moves no current) as `1e20`, as ngspice does, instead of `inf` (#193).
-- `.qpss` runs on multi-tone harmonic balance (`.hb TONES=`): preconditioned GMRES from the operating point instead of a second two-tone solver; the API `Qpss` drops its unused `gmres_*` fields (#189).
-- HSPICE dialect: an E/F/G/H behavioural form (`VOL=`, `CUR=`, `VALUE=`, `TABLE`, ...) or a `.meas`/`.check`/`.power`/`.stim` card holding a brace is refused; a malformed HSPICE measure with braces is no longer skipped with a warning (#203).
-- HSPICE dialect: braces are name bytes again, as HSPICE's manual reads them, so `{expr}` is no longer an expression and `R1 a 0 {rv}` is refused; this reverses #153's reading (#203, #153).
-- HSPICE dialect: an unquoted expression after `key=` must start with a letter and hold no blank, as HSPICE requires; any other (`w=2*l`, `w=l * 2`) is refused and needs quotes (#203).
-- HSPICE dialect: a unary `!` is refused, as HSPICE's manual has none (`!=` stays) (#203).
-- HSPICE dialect: a number with both an exponent and a scale factor (`1e-6u`) is refused, as HSPICE forbids it (#203).
-- HSPICE dialect: `%` and `\` are no longer expression operators, as HSPICE's manual has neither; a card that uses one is refused by name. Spectre keeps `%` and drops `\` (#203).
-- ngspice dialect: a device field that starts with an operator (`R1 a b 10 %3`) is refused, as ngspice refuses it, instead of being dropped; `r=10%3` reads 10, as ngspice reads it, instead of 1 (#200).
-- A raw or `.print` file that takes many plots (a `.step` sweep) is written once and replaced at the end of the run, instead of being copied and replaced per plot, which made a sweep of P plots write O(P²) bytes; until then the old file stays whole (#179).
-- An unbraced `key=` value continues past a blank before `%` or `\` as it does before `*` or `/`: `r=7k %4k` is 3k, where it read 7k and refused `%4k` (#180).
-- API: an `.hbxf` or `.hbac` query with a `v(a,b)` reference (`out_neg`) is refused as invalid, as its netlist card is, instead of silently reading v(a) (#201).
-- A multi-tone `.hb` that runs out of memory while building its spectrum reports `OutOfMemory` instead of freeing a table twice (#202).
-- VPI applications: `--vpi app.so` or `.options vpi="app.so"` loads a C VPI application whose analog system functions a Verilog-A model's `$systf` calls reach (LRM 12.32); a call no application registers is refused by name, `UnregisteredSystf`, where a release build used to call through a null binding. Limits: inside calltf the analog time reads 0 (until VerA#83), a non-argument net reads NaN, analog callbacks registered mid-run are not caught, and one `$systf` module per run with a stateless calltf (#197).
-- A refactor that runs out of memory during its replay check no longer lets the next `factor` with the previous values skip refactoring onto the overwritten LU (#182).
-- BSIM2 (LEVEL=5) gate, bulk and drain charges follow ngspice's b2eval.c: the gate capacitance read 30% high in saturation, and a reversed device charged the wrong source side (#168).
-- `.tran ... uic` lands on `tstep` and restarts at order 1 there, as ngspice does: Gear-2 on an LC tank read vmax 5% above ngspice 45 (#166).
-- `.tran` with a `tstart` saves no extra row at `tstart` itself: the rows are ngspice's, the accepted steps from `tstart` on (#167).
-- C API: `espice_result_view` sets `*data` to NULL and `*len` to 0 on a NULL or stale handle too; `ESPICE_CANCELLED` is documented as reserved, since no C call cancels a query (#76).
-- `--format=touchstone` on an `.sp` whose ports have different z0 writes Touchstone 2.0 with each port's `[Reference]`, instead of `R 50` for all (#60).
-- CLI: `-tokenizer=hspice` (single dash, joined value) works as the docs say; a streamed transient or AC run without an output path checks its row count too (#88).
-- API: queries appended through `Problem` or the C API are checked as the netlist checks them: node and branch rows in range for every analysis, temperatures above absolute zero, `xmu` in [0, 0.5], `0 <= tstart < tstop`; a batch past the row space is `TooManyQueries` (#55).
-- `.meas sp` measures the S-parameter plot, AT= may name an earlier result (`find v(a) at=t50`), PARAM prints six significant digits as ngspice does, and `.dout` reports running out of memory instead of a malformed card (#69).
-- CSV quotes headers such as `S(1,1)_re`, PSF escapes quotes and backslashes, and CITIfile declares `VAR FREQ` and every `DATA` up front with one `BEGIN`/`END` block each, so scikit-rf reads it (#61).
-- `.meas tran_cont x find v(a) at=1n` (and DERIV) prints its one value instead of looping forever (#68).
-- On a GPU backend, sources, switches, transmission and delay lines, Laplace and pole filters, S-parameter and W elements, mosvar and r3_cmc evaluate on the GPU instead of the host (#139).
-- On a GPU backend, MVSG devices evaluate on the CPU: their kernel's stack frame (432 KB) is over CUDA's limit, so the launch failed (#139).
-- mosvar, hicumL2_va, asmesd and asmesd_dio get GPU kernels; a source-size gate that counted their whole upstream release left them out (#139).
-- `--backend auto` runs a deck whose large GPU kernel the driver has not compiled yet entirely on the CPU, instead of leaving that one model on the host (#139).
-- `ESPICE_THREADS` > 1 gives the same bytes as one thread: threaded device evaluation sums every stamp in the serial order, and threads claim work dynamically instead of a fixed split; device ABI 28 (#137, #138).
-- `set_params` runs a point on an earlier call's circuit when it selects the same model bins, so a sizing loop that keeps crossing a bin edge holds two circuits instead of one per crossing (#129).
-- Monte Carlo: a B source reading a sampled `.param` takes each trial's draw, as a resistor reading it does; it kept the nominal value (#133).
-- `.step` and `set_params` points, and `.dcmatch` groups from a PDK's mismatch, keep the parameter-write path when a live value sits at zero (sky130's mismatch terms at the nominal corner) instead of rebuilding the circuit per point or per site (#130).
-- `--backend cuda` stages device state at the converged iterate like the CPU, not one limit pass ahead: `tran/device_hfet_inverter` drifted 0.34% (#15).
-- The bordered-block-diagonal solver refines its solves when a block is ill-conditioned and falls back to the sparse LU when refinement cannot recover them; it could lose 5 digits silently (#136).
-- An operating point with unknowns past 1e9 (a 1e12 V source, a 1e-12 ohm resistor) solves instead of publishing zeros with exit 0, and JFNK no longer accepts x = 0 on a V source's row (#152).
-- `.tran ... UIC` publishes a t = 0 row that satisfies KVL around the held capacitor voltages, not the zero vector (#161).
-- A node that only a B-source expression reads is refused as `FloatingNode` before any analysis runs, instead of `.op` publishing and HB reading undefined memory (#92).
-- Equal V sources in parallel are refused as `NonuniqueOperatingPoint`; current sources that cancel on a capacitor node make an island, not a `CurrentSourceCutset` (#70).
-- A capacitor island behind a 0 V source or a series resistor starts at its charge-division voltage, as a plain divider does; the transient operating point holds sources at their t = 0 values (#90).
-- An `.envelope` or `.noise` query reports its real column count before it runs, so a format with a column limit refuses it up front; HB with a NaN residual no longer converges; an allocation failure in a batched AC solve is reported (#83).
-- `.fft` WINDOW=KAISER and GAUSS use the symmetric NP-1 indexing of the cosine windows; Kaiser side lobes now match Harris 1978 (-69 dB at ALFA=3) (#82).
-- `.sens` lists a V or I source's `dc` alone, no waveform or table entries (`v(v1:pwl_timesZ5b0Z5d)`), and prints parameter names in lower case (#154).
-- `.sens` reports 0 for a parameter at its "infinite" default of 0 (BJT VAF, VAR, IKF, IKR), as ngspice does, instead of a huge value whose sign followed line order (#91).
-- `.acmatch`, `.dcmatch` and `.sens` step a parameter by 1e-6 of its value (1e-12 only at 0), so a diode IS column no longer flips sign from a 100x step (#85).
-- Debug builds load `.hdl` Verilog and Verilog-A devices instead of panicking in `Thread.spawn` (#24).
-- A sparse LU replay that kept a pivot below 1e-3 of its column is checked with a probe solve and re-factored when its scaled residual misses the threshold-pivoting bar (a block-κ 1e15 replay reached 1.5e6, a fresh factor 0.019) (#45, #136).
-- C API: a destroyed or foreign `espice_problem` returns the new `ESPICE_INVALID_HANDLE` instead of undefined behaviour; `espice_destroy` returns a status (#143).
-- `--backend cuda` evaluates BSIM4 (LEVEL 14/54, sky130), VBIC and MOS levels 1/2/3/6/9 on the GPU: held variables and limiting now live in device state; device ABI 27 (#140).
-- API: `Options.hdl_toolchain.cache_dir` sets where `.hdl` builds are cached, in place of `$ESPICE_CACHE` and its fallbacks.
-- A resistor `.model` card's `TC1`, `TC2`, `TCE` and `TNOM` apply to its instances; they were ignored (#159).
-- Spectre `tran` maps `method=`, `skipdc=yes|no` and `errpreset=moderate`, and refuses any other parameter by name instead of dropping it (#151).
-- `.options abstol=0`, `vntol=0` and `chgtol=0` run as in ngspice; `reltol=0` and `trtol=0` fail at their card instead of as a bare `InvalidQueryOptions` (#150).
-- `.tf` with a current output `i(Vx)` reports the resistance Vx sees, where it reported the negated conductance (#149).
-- `.options tnom` (and HSPICE's default TNOM of 25 C) reaches R `tc1`/`tc2`; it was ignored at 27 C (#146).
-- `.four` phases use ngspice's sine reference: `sin(0 1 1k)` reads 0 degrees, was -90 (#148).
-- `.four` analyses the last period of the deck's `.tran` (stop time, `uic`, `.ic`) instead of its own 5-period run (#147).
-- C and L instance `ic=` seeds a `.tran ... uic` start instead of being dropped (#145).
-- The device layout hash covers structs held by value across the device boundary (`NoiseSource.table`); device ABI 28, so cached `.hdl` builds rebuild once (#32).
-- `.hdl`/`.include` load `.vams` and `.veriloga` files, and any HDL extension in upper or mixed case, as the frontend already routed them (#34).
-- `models/psp103_nqs.va` carries the PSP/CMC notice, and `models/LICENSES.md` records where `vbic13_4t` comes from (#17).
-- The `.hdl` build cache keys a `.va` and a `.v` source apart, so one can no longer be handed the other's cached device (#33).
-- The device layout hash covers structs held by value across the device boundary (`NoiseSource.table`); device ABI 27, so cached `.hdl` builds rebuild once (#32).
-- Bench: VACASK plots pair by point count before file order, and its subcircuit nets (`x1:inner`) are scored as `v(x1.inner)` (#109).
-- Bench: poles and zeros are scored as sets, and a repeated signal name (CPL/TXL port currents) is scored by its last column (#87).
-- Bench: the ngspice and VACASK adapters read decks of any size, and the power-grid suite's `.spiceinit` turns on KLU (#7).
-- Bench: ngspice reads a `.spiceinit` beside the deck instead of always running with `-n` (#6).
-- A transient whose operating point needs OPtran (a capacitor-only node) starts from an x that satisfies KCL at
-  t = 0, not from the 1 us settle's sources and timers (#53).
-- Playground: espice.wasm gets a 16 MiB stack (the corpus peaks at 1.2 MiB, past the 1 MiB default), pole-zero runs with no poles and `.load`/`.vec`/`FILE=` decks report cleanly, and `zig build wasm-compare` checks it against the native espice over the corpus (#8).
-- On 32-bit targets (the wasm playground) `.tran` with MATEX and envelope runs no longer fail `InvalidQueryOptions`, and Monte Carlo draws match the 64-bit build; `-Dsingle-threaded` builds and tests the playground's code paths natively (#8).
-- Optimized parameters can stay on a grid: `opt1(init, lo, hi, dels, grid)`, an ESPice extension, keeps every simulated value and the result on multiples of `grid` (#95).
-- An optimization whose start point fails prints the goal errors it measured, not uninitialized memory; the docs explain PARMIN for SI-unit sizing (#96).
-- An LM optimization whose trial point cannot be simulated or measured fails, keeping the best point so far, instead of retrying it (#29).
-- BISECTION and PASSFAIL optimization over a window near the f64 range no longer test inf as the midpoint (#30).
-- A `.meas` TRIG or TARG without VAL never fires, as in ngspice (its level is 1e99, not 0) (#28).
-- `.matex` starts from the transient operating point, as `.tran` does, not the `.dc` one (#27).
-- `.options gmin` (HSPICE `gmindc`) is the junction shunt of the diode, BJT, JFET, MESFET, HFET, VDMOS and MOS level 1/2/3/9 devices, as in ngspice; they kept 1e-12 S (#78).
-- `.tran` follows ngspice's step options: `maxord=1` is backward Euler under trap too, and the default tmax is min(tstep, (tstop - tstart)/50) (#56).
-- `.options rshunt=R` adds a resistor from every node to ground, as in ngspice (#11).
-- `.ac dec` ends on `fstop` as ngspice does (`.ac dec 3 10 730` ends at 730), and `lin N f f` is one point (#26).
-- `.ac`, `.noise` and `.tf` on a small circuit with a disabled device branch (HICUM/L2 with RBX, RE and RCX at 0) run instead of failing `Singular` (#160).
-- MOS level 3 and 9 report channel thermal noise; with RD/RS absent only the load resistor's noise was reported (#155).
-- MOS level 2 takes NLEV (default 2) and GDSNOI, so its flicker noise matches ngspice 45 instead of the spice3 form, 670x high on a 10 um device (#156).
-- BSIM2 (LEVEL=5) with RSH = 0 gives the right `.ac`, `.tf` and `.sens` gain; a 1e12 S stand-in short had rounded gds to 1.2e-4 S (#157).
-- A MOS level 6 card with neither KC nor TOX keeps KC = 5e-5 and conducts, as in ngspice (#158).
-- Under a GPU backend, refactors of 50M multiply-adds or more (100k-transistor post-layout netlists) use the device LU by default (#141).
-- The device LU has no 400M multiply-add cap; an epoch whose tables do not fit in host or device memory stays on the host LU (#141).
-- The device LU's triangular solves run across the whole GPU: 4x faster on a 100k-transistor post-layout chain, where the device LU now beats the host LU (#141).
-- API: `Options.display` (a `*std.Io.Writer`) and C `display` + `display_user` (a callback) receive `.hdl` display-task lines instead of stdout (#127).
-- C API: `.hdl` models compile from a C handle; its Io had no allocator or environment, so the build failed as `CompilerGone` (#127).
-- The column ordering compacts its workspace, so patterns from n = 2000 no longer fail with `OutOfWorkspace`, and keeps the natural order where AMD would fill more (#46).
-- The tridiagonal engine hands a pivot under 1e-3 of its column to the pivoting LU, a zero pivot tolerance no longer accepts a zero pivot, and a capped re-pivot keeps no old pivot the refactor would refuse (#45).
-- Frequency solves (AC, noise, S-parameters) re-pivot when a replayed pivot falls below 1e-3 of its column, where pivots down to 1e-12 were accepted (scaled residuals up to 8e3) (#44).
-- `FreqSolver.factorEach` on sparse systems holds a frequency whose A(ω) is singular instead of failing with `SingularMatrix`, and holds only the frequencies no pivot tape replays (#43).
-- The per-frequency block factorization (`FreqSolver.factorEach`) holds a singular dense block as the identity instead of reading undefined pivots, and an empty system solves nothing (#42).
-- FFT spectra stay within a few eps of N per bin on long transforms; a 2^20-point transform had drifted to 9e3 eps (#41).
-- `ESPICE_SOLVER=jfnk` keeps the direct Newton contract: a residual past 1e154 still takes its step, the device load test gates acceptance, and gmin goes only where the gmin-stepping rung stamps it (#31).
-- GMRES (the PSS and QPSS Krylov solves) never reports convergence on an infinite right-hand side, and solves right-hand sides near 1e300 or 1e-200 instead of returning zero (#40).
-- Debug builds evaluate B-source `abs`, `min`, `max` and `?:`, and model conditionals on device values, as release builds do; Zig 0.17's self-hosted backend took the true arm at a zero condition (#25).
-- Device cards: a type word for another letter (`E1 o 0 CCCS ...`) and a model of another element's type (`D` on `NPN`) are refused as in ngspice; P-channel JFET, MESFET and HFET2 models run; a P-channel VDMOS is refused; every `UnsupportedDevice` names the card and maps to unsupported input (#75).
-- HSPICE dialect: `{expr}` is read as an expression, as in ngspice, with a note that braces are an ESPice extension; `R1 a 0 {rv}` failed with `UnresolvedParameter` (#153).
-- A B source's `ln`/`log`/`log10` of 0 is -1e99 as in ngspice, so an argument that starts Newton at 0 V converges instead of failing (#77).
-- V and I cards using `TRNOISE`, `TRRANDOM`, `LFSR`, `HB` or `PWL FILE=` are refused with an error naming the card; they ran silently as their DC value (#72).
-- HSPICE `.pat` names count toward the 32-level `[ ]` nesting limit; a long chain of names no longer overflows the stack (#67).
-- `.step` with `.alter` keeps the base run's step points, and `.step param p list` with no values is a parse error instead of running nothing (#66).
-- A `.param` chain of any depth resolves; past 62 links it was a `ParseError` (#110).
-- A `.step` of a parameter that a `.model` value reads reaches the model; every point ran with the nominal value (#65).
-- `K` coupling and its mutual inductance stay f64 from card to stamp; they were rounded through f32 (#89).
-- A malformed card's `ParseError` names the card it stopped at (#144).
-- A stray `.enddata` or `.end_variation` is refused as `ParseError` instead of read as nothing (#162).
-- An ngspice line holding only a `//` comment is a comment line, not a `ParseError` (and no longer a panic inside `.control` in safe builds) (#164).
-- An analysis card inside a `.subckt` is refused as `UnsupportedCard` instead of run as a top-level analysis (#165).
-- Subcircuits nest at most 32 levels as documented (a 33rd is refused, naming the instance); appended analysis cards keep their line as written and read a `SWEEP` tail; `.model OPT` parameters register in deck order (#64).
-- An analysis card reading a `.step`-swept parameter is refused naming its line wherever the `.step` sits, instead of running at the nominal value when the card comes first; a `PAT` Z state is `UnsupportedCard` (#63).
-- `.four v(a,b)` analyses the difference; `.pss`, `.hb`, `.phasenoise`, `.snosc` and `.pac`/`.snxf` refuse a `v(a,b)` output instead of reading v(a); `.pnoise`/`.snnoise` check their input source and `.snnoise` keeps `v(a,b)`; `.phasenoise f0` may omit K before its keywords (#57).
-- `.param` powers follow ngspice: `(-2)^0.5` and `(-8)**(1/3)` are |x|^y instead of NaN, and `pwr(-0,0)` is 1; the HSPICE dialect reads `sqrt`, `log`, `log10` and `pow` as Star-Hspice does (#39).
-- Subcircuits nest at most 32 levels as documented (a 33rd is refused, naming the instance); appended analysis cards keep their line as written and read a `SWEEP` tail; `.model OPT` parameters register in deck order (#64).
-- An analysis card reading a `.step`-swept parameter is refused naming its line wherever the `.step` sits, instead of running at the nominal value when the card comes first; a `PAT` Z state is `UnsupportedCard` (#63).
-- `.four v(a,b)` analyses the difference; `.pss`, `.hb`, `.phasenoise`, `.snosc` and `.pac`/`.snxf` refuse a `v(a,b)` output instead of reading v(a); `.pnoise`/`.snnoise` check their input source and `.snnoise` keeps `v(a,b)`; `.phasenoise f0` may omit K before its keywords (#57).
-- `.param` powers follow ngspice's numparam: `x^y`, `x**y` and `pwr(x,y)` are |x|^y (`(-1.75)^3` is +5.359, `(-8)**(1/3)` is 2, `pwr(-0,0)` is 1); the HSPICE dialect's `**` rounds a negative base's exponent, and it reads `sqrt`, `log`, `log10` and `pow` as Star-Hspice does (#39, #77).
-- A lone `\\` continuation line at the end of a deck is ignored instead of indexing an empty line (#38).
-- Number literals with an exponent past +-40 (`1e-300`, `1e300`) read exactly, as ngspice's `pow(10, e)` gives them (#36).
-- An analysis card that query validation would refuse (`.ac dec 10 1 1e308`, `.tran 1e-310 1u`) fails as `InvalidAnalysisArguments` on a line naming the card, not a bare `InvalidQueryOptions` (#108).
-- Unknown `.options` names draw a warning in every dialect, names longer than 16 characters included; HSPICE no longer warns on `scale` and `wnflag` (#58).
-- An instance parameter the device does not declare (`ww=10u` on an M card) fails the deck with `UnknownParameter`, as in ngspice (#35).
-- Sources follow ngspice: explicit 0 PULSE edges, width and period take the `.tran` defaults, PULSE's eighth argument is a pulse count, SIN's default frequency is 1/TSTOP, EXP's delays and time constants default from TSTEP, ngspice-dialect AM reads `(vo vmo vma fm fc td phasem phasec)`, `I ... m=` scales the source, and a PWL `r=` off its time points is refused (#73).
-- A negative or zero resistance keeps its sign with |R| floored at 1e-12, as ngspice does, instead of becoming 1 mOhm (#73).
-- A V source an F, H or W card senses keeps its AC drive, transient waveform and `.dc` sweep, and two sensors of one source each read its whole current (#74, #103, #106).
-- A `.step` whose every point needs its own circuit runs just those points, instead of writing past the query table (#132).
-- Running out of memory during a transient, PSS, HB, DC homotopy or sweep step reports `OutOfMemory` instead of a convergence failure such as `TimestepTooSmall` (#134).
-- A run whose implicit operating point fails reports that failure, not `DependencyFailed` (#135).
-- `.tran` with MATEX fails the step instead of hanging when the Krylov matrix overflows to inf (#125).
-- Device evaluation no longer copies a deduplicated model row onto itself, undefined behaviour in release builds (#122).
-- Third-party compact models are built from their upstream releases, unmodified, pinned by link and hash in `build.zig.zon`: PSP 103.8.2/104.1, JUNCAP2, BSIM-IMG, BSIM-CMG, BSIM-BULK, BSIM-SOI 101.0, L-UTSOI, HiSIM_HV/SOI/SOTB, HICUM/L2 3.2 and L0, Mextram 505.6, ASM-HEMT, ASM-ESD, MVSG, DIODE_CMC, R2/R3_CMC and MOSVAR; new LEVELs 72/76/77/78 (M), 6 (Q, D) and OSDI module names on `.model`.
-- `.noise` reads a `ddx()` inside a Verilog-A noise power (a channel noise's gm) instead of 0: MOS3, MOS9 and JFET2 channel noise now match ngspice (#119).
-- `.hdl` Verilog-A, VerA pin df3bd51d -> 7971b23e: a `$simparam` used as a parameter default answers per LRM 9.15 instead of reading 0 (VerA#51).
-- `.noise` reads a `ddx()` inside a Verilog-A noise power (a channel noise's gm) instead of 0: MOS3, MOS9 and JFET2 channel noise now match ngspice (#119).
-- `.hdl` Verilog-A, VerA pin 53e61b89 -> df3bd51d: `ddx()` inside a noise power reads its partial in
-  `noisePsd` (VerA#32), `$port_connected`/`$param_given` may control analog operators (VerA#33).
-- `.hdl` Verilog-A devices with more than 64 unknowns compile and run (dense Jacobian, one
-  derivative lane per unknown) (#117).
-- `bench-suites -Dsuite=cmcqa`: the HICUM and PSP noise tests, one `.noise` deck per bias point (#18).
-- `bench-suites -Dsuite=cmcqa`: the GF180 Rds, MOS CV, BJT, diode, MIM/MOS capacitor and resistor regressions, 2,234 more decks (#18).
-- `bench-suites -Dsuite=cmcqa`: PSP parameter cards keep their exponent signs (`NSUBO=3.0E+23` was read as `3.0E`) (#18).
-- `zig build test-gpu` runs one deck at a time; eight concurrent CUDA contexts ran latency-bound decks 9x slower and into the timeout (#15).
-- `.dcmatch`, `.acmatch` and `.dcsens` without a `.variation` block read a PDK's mismatch from the `agauss`-style calls in its models; sky130 fell back to unit variance, now a warning when nothing else applies (#100).
-- A `.variation` sigma may be an expression over `.param`s and the device's `w`, `l` and `m`, for Pelgrom scaling per device (#100).
-- A `MONTE=` sweep draws the `agauss`/`gauss`/`unif`/`aunif` calls inside `.model` cards per trial; sky130's
-  `*_mm` mismatch ran nominal in every trial (#100).
-- `OPTIMIZE=` under `--jobs` above 1 runs each trial point with its Jacobian points in one round, same
-  output: a 128-stage chain fit 1.81 s to 1.71 s, `rc_delay_fit` 13.9 to 10.1 ms at `--jobs=3` (#97).
-- `OPTIMIZE=` on a `.dc` card takes its Jacobian from direct sensitivities of the trial point's own sweep, not one sweep per parameter: a two-parameter common-source fit 2.5x fewer instructions, 7 iterations instead of 16 (#97).
-- `OPTIMIZE=` starts each point's operating point from the one of the iterate its step left: a 32-stage chain fit 3.6% fewer instructions (#97).
-- API: `Options.live_params` + `Problem.set_params`, and C `live_params` + `espice_set_params`, change
-  global `.param` values on a live Problem without a re-parse: a sky130 sizing point 6 ms, was 87 (#101).
-- A binned MOSFET whose L/W reads a swept or set `.param` takes the bin each point selects, on its
-  own circuit, where `.step` used to refuse it (#101).
-- `.vec`: VNAME names fill bits (`radix 144`, `<[4:1]>` groupings), V1, V2... without VNAME, `tunit 2 ns`,
-  IO `u`, TSKIP, Z on outputs; SLOPE defaults to 0.1 ns, VOH/VOL replace VTH, plain numbers only (#121).
-- `--tokenizer=spectre` reads Spectre netlists: a title line, instances, `parameters`, `model` groups,
-  `subckt`, functions, `if`/`else`, `include ... section=`, `simulator lang=spice` regions, tran/dc/ac/noise (#121).
-- HSPICE lines: a `$` line, `$` after a number or comma, and quoted `$` read as HSPICE does; ` \`
-  continues with a blank, `\\` without; a commented line no longer continues (#121).
-- ngspice lines: `#`/`;` comment lines, `//` and quote-aware `;`/`$` comments, `\\` joins, `@` and a stray
-  `+` as ngspice reads them; cards after `.end` are read (#121).
-- Numbers take the `a` (atto) suffix and the `d` exponent; expressions take `%`, `\`, `<>`, `.func`
-  and `.param f(x)=`, and 13 more numparam functions; `.macro`, `.parameters`, `.temperature` (#121).
-- Nested `.subckt` definitions flatten; a diode's thermal node is read; Touchstone and RLGC files
-  are checked as their specs say (option line, record counts, conductor count) (#121).
-- `.data` MER/LAM files resolve through `.option search=`, skip `*`/`$` lines and refuse a cell that
-  is not a number; `.load` defaults to the top deck's `.ic0`, and `FILE=x.ic` means `x.ic0` (#121).
-- `.hdl` models print their `$strobe`/`$display`/`$write`/`$warning`/`$info` lines to
-  stdout once per accepted point (OP, DC point, transient step), `%m` as the instance (#102, device ABI 26).
-- API: `Options.hdl_toolchain`, and C `espice_create_options.zig_path`/`share_path`, set the
-  Zig compiler and `share/espice` directory `.hdl` builds use; empty keeps `$ZIG` (#13).
-- `.hdl`: a source named more than once (several `.lib` sections) compiles once per deck.
-- API: `Problem.ready_queries` and `copy_result` fail with `error.BufferTooSmall` on a short
-  buffer (`ready_count` gives the size); GPU backend messages go through `std.log` (#13).
-- `.dc <param> start stop step` sweeps a `.param` (HSPICE `.DC`), with the parameter as
-  the plot axis (#94).
-- `.sens` names its columns as ngspice does: only R, C, L, V and I have a bare principal
-  column, so a diode IS is `v(d1:is)`; the multiplier column is `v(r1_m)` (#71).
-- A device whose `limit` keeps Newton history (a generated `$limit` with state) no longer
-  converges its OP to the limited image: the INITFIX pass does not stage state (#53).
-- `.hdl` Verilog-A, VerA pin 2692a15b -> 53e61b89 (GitHub main, package 0.9.0): 164
-  upstream commits (connect modules on primitives, wide regs, $fdebug/$debug per iteration,
-  absdelay revert, deep-nesting limits).
-- `.matex` no longer returns NaN on stiff circuits: a round-off Krylov breakdown is caught,
-  and a step that needs more than `m_max` vectors or comes out non-finite fails with
-  `MatexDidNotConverge` (#51).
-- VBIC decks are checked against VACASK running the VBIC 1.3 reference Verilog-A; the
-  ngspice VBIC 1.2/45 differences (avalm, excess phase, noise density total) are recorded
-  in the model's header comment (#16, #86).
-- MOS1 has noise (RD/RS, channel per NLEV with GDSNOI, flicker per NLEV, KF/AF); MOS3 takes
-  mos3noi.c's NLEV forms; BSIM4 matches ngspice 45's default NOIC (8.75e9), clamps the
-  flicker DelClm and the tnoiMod=1 npart_theta, and scales Rd/Rs noise as b4noi.c does;
-  `.noise` with a current-source input names its total `i(inoise_total)` (#84, #80).
-- BSIM4 at exactly zero bias keeps its junction capacitance and the dVdseff/dVd partial
-  (gds and the channel cap at vds = 0); HFET2's gds at vds = 0 is no longer 0 (#47).
-- `m=` multiplies every device: on models without an `m` of their own (BSIM4, BSIM-SOI,
-  HICUM, HiSIM) and where `m` is a shape (diode grading, HFET/MESA knee) it is the
-  instance's `$mfactor`, scaling every stamp, charge, AC term and noise source; BJT and
-  JFET2 junction gmin and BSIM2 channel noise scale with m as in ngspice (#48).
-- Source stepping in the operating-point ladder scales the independent V and I sources;
-  it ran at full sources before, so a deck that only source stepping solves failed (#104).
-- The JFET channel no longer runs `limvds`, which clamped a negative vds even at the fixed
-  point (inverse mode read 1.225 mA for 0.625); limited values within a few ulps of the
-  iterate are the iterate, so converged points skip the limiting correction (#49).
-- MOS levels 1-9 match ngspice 45 on card spellings and temperature: `U0`/`UO` on every
-  level, `DELVT0` on 3 and 9, instance `temp=`/`dtemp=` on 1, 2, 6 and 9, MOS6 `TNOM` in
-  degC, `LAMBDA0=0` kept, PHI from ni(TNOM) on 3 and 9, MOS2 VMAX with the TNOM mobility (#114).
-- A bare number after a Q, D, J or Z card's model name is the area, as ngspice reads it (#113).
-- Diodes take `area`, `pj`/`perim`, `jsw`/`ns`, `cjp`/`php`/`mjsw`/`fcs`, `ikr`, LEVEL=3
-  `w`/`l`/`xw` and plate caps, instance `temp`/`dtemp`, and the reverse cubic tail; JFET2
-  follows the circuit temperature and drops a drain-source gmin ngspice lacks (#79).
-- LTRA, TXL and CPL runs whose delay spans more accepted points than the history holds
-  (8192 LTRA, 2048 TXL/CPL) keep the entries the delay still reads; a full history drops
-  the point that loses least instead of the oldest live one (#105).
-- `.hdl` Verilog-A, VerA pin v1.0.0 -> 2692a15b: an instance port may connect a bit- or
-  part-select of a vector net (`.d0(r[0])`, `.d(bus[7:4])`, `r[i +: 4]`), which was E0906;
-  a `$table_model` capture is kept only from an accepted iteration (VerA VD-095), not from
-  the first Newton iterate; a VAMS 2.x `{...}` laplace/zi coefficient vector is refused
-  (E0572: write `'{...}`) (#116).
-- An operating point whose Newton ran away (node voltages near 1e24 V) is
-  refused instead of being published with exit 0; the ladder falls through to
-  gmin stepping (#3).
-- `zig build wasm`: espice.wasm (CPU, single-threaded, built-in models) and
-  cktimg.wasm for the docs playground; `docs/playground.md` runs every spice block.
-- Nix flake: `nix run github:OmarSiwy/ESPice`, `packages.espice` (CPU) and
-  `espice-cuda` (CUDA), `overlays.default`, smoke `checks`; CI pushes builds
-  to the `omarsiwy` Cachix cache.
-- User documentation at https://omarsiwy.github.io/ESPice/: a SPICE tutorial,
-  the CLI, dialect and card reference, analyses, devices, output, GPU, errors,
-  the C API and the benchmarks, with runnable examples in `docs/examples/`.
-- `zig build c-example` builds and runs the C API example; the package exports
-  `libespice` as a named lazy path for Zig consumers.
-- The developer design notes moved from `docs/` to `dev/`.
-- `.hdl` parameters named with `__`, a leading or trailing `_`, or a capital
-  `Z` bind from the instance card instead of failing as unknown (#2).
-- `bench-suites -Dsuite=cmcqa`: 3,218 single-device decks from the public CMC QA
-  sets (HICUM/L2 2.4.0, PSP 103) and the GF180MCU BSIM4 regression, each with
-  its reference results.
-- `bench-suites -Dsuite=circuitsim90`: the 43 MCNC CircuitSim90 decks (MOS2,
-  MOS3, BJT; up to chip2) from Xyce_Regression, converted to ngspice dialect.
-- `bench-suites -Dsuite=ngspice`: 353 decks from ngspice-45's `tests/` and
-  `examples/` and the Quality-page archives (paranoia, ISCAS85 on PTM 45 nm
-  BSIM4, KiCad).
-- `bench-suites -Dsuite=powergrid`: IBM power grids (ibmpg1-3, ibmpg1t) and
-  SRAM-PG ssram with their reference solutions; `POWERGRID_LARGE=1` adds
-  ibmpg4-8, ibmpg2t-6t and the multi-million-node SRAM-PG designs.
+- **Dialects:** Spectre netlists (`--tokenizer=spectre`); HSPICE quoting, braces, `$` comments and operators follow the HSPICE manual (#203); many ngspice parsing details match ngspice (#121).
+- **New:** VPI applications (`--vpi app.so`) for Verilog-A `$systf` calls and analog callbacks (#197, #198); `.dc` over a `.param`; `.vec` files; `.qpss` on multi-tone HB; `OPTIMIZE=` grid steps; `live_params` / `set_params` to change `.param` values without re-parsing (#101).
+- **Output:** `.hdl` display tasks print once per accepted point; Touchstone 2.0 with per-port z0; CSV, PSF and CITIfile fixes for downstream tools.
+- **GPU:** BSIM4, VBIC, MOS 1–9, sources, lines and filters evaluate on the GPU; the device LU takes large post-layout circuits and is 4x faster there (#139–#141).
+- **Accuracy:** dozens of fixes to match ngspice 45 on devices (MOS, BSIM2, BSIM4, JFET, diode, resistor TC), noise, `.tf`, `.sens`, `.four`, `.ac` sweep points and sources (#44–#168).
+- **Robustness:** bad decks fail with an error naming the card instead of running wrong; out-of-memory and Newton runaway are reported instead of publishing zeros.
+- **Models:** third-party compact models (PSP, BSIM-CMG/BULK/IMG/SOI, HiSIM, HICUM, Mextram, ASM-HEMT, MVSG and more) from their upstream releases, unmodified.
+- `ESPICE_THREADS` gives the same output at any thread count (#137).
+- Nix flake (`nix run github:OmarSiwy/ESPice`, CUDA package), the playground (`zig build wasm`) and the user documentation site.
 
 ## 1.0.0 (2026-10-05)
 
-- Zig 0.17.0. VerA (by its `v1.0.0` tag), Gompute and stdpp are pinned by git
-  URL and content hash; `zig build --fork=<path>` builds against a local checkout.
-- Licensed Apache-2.0. Models keep their own licences; see
-  `models/LICENSES.md` (`bsim4va` is CC-BY-NC).
-- stdpp pipelines carry the hot elementwise loops again, each with a scalar
-  oracle test.
-- Noise: table generators, `PsdTerm.coeff`, to-ground generators and
-  correlated sources work in every noise analysis (device ABI 24).
-- Verilog-A models see the stepped gmin and source scale during operating-point
-  homotopy (`$simparam`), a documented divergence from ngspice.
-- Verilog-A internal nets publish as `v(<instance>#<net>)` (device ABI 25).
-- `--backend cuda|hip` fails, naming the detected hardware, instead of falling
-  back to the CPU; `auto` still falls back.
-- GPU instance sync merges host and device changes, so a parameter written
-  after a GPU eval survives.
-- C API: argument errors return `ESPICE_INVALID_ARGUMENT`.
-- sky130 PDK decks run as written; PWL sources past 64 points chain instead of
-  truncating; an OSDI card is an error naming the `.hdl` card to use.
-- BSIM4 gets ngspice-style voltage limiting.
-- A transient that ends within 100 ulps of `tstop` finishes, as in ngspice.
-- About 90 hardening fixes across the parser, solvers, analyses, output and
-  device loader (overflows, NaN guards, leaks, crashes on malformed decks),
-  with over 300 new unit tests. Corpus: 797 of 799 decks pass.
-- `zig build bench` passes each deck's dialect and reads empty plots;
-  `test-gpu` skips decks with nothing GPU-eligible. README benchmark charts
-  against ngspice and VACASK.
-- `zig build bench-suites` fetches external SPICE suites at pinned revisions
-  (`tests/suites/`) and benches ESPice against ngspice and VACASK on them.
-- Release CI installs Zig 0.17.0 instead of 0.16.0, and the tarballs ship
-  `LICENSE` and `CHANGELOGS.md` (#1).
-- Removed `ref/` (SIMD notes and the standalone `verify.zig`) and `.agents/`;
-  SIMD differential tests live in each module's `zig build test` suite.
+- First release: Zig 0.17, Apache-2.0 (models keep their own licences).
+- sky130 PDK decks run as written; BSIM4 has ngspice-style limiting.
+- Verilog-A models see gmin and source stepping through `$simparam`, unlike ngspice.
+- `--backend cuda|hip` fails if no usable GPU is found; `auto` falls back to the CPU.
+- About 90 hardening fixes; 797 of 799 corpus decks pass.
+- `zig build bench` and `bench-suites` compare against ngspice and VACASK.
