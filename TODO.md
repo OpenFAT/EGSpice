@@ -9,18 +9,6 @@ integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](d
   that requires `test.yml` (`release-safe`) and `nix.yml` (`nix`) and blocks direct pushes;
   the merge queue (`merge_group` is already wired) once a second contributor appears.
   `gh api -X POST repos/OmarSiwy/ESPice/rulesets` after the coordinated push.
-- **Conformance suite: merged and pushed (2026-10-23).** `tests/fixtures/` is now the submodule
-  `tests/conformance` (VAMS Conformance Suite), decks under `tests/conformance/tests/netlist/`;
-  the A09 decks (ex `tests/pending/`), the bench-suites fetch scripts (ex `tests/suites/`) and
-  the post-layout generator (ex `tests/benchmark/postlayout/`) are under the suite's
-  `external/spice-bench/` and `tests/netlist/hdl/`. Suite `main` is at 650a3ed (pushed),
-  `flake.lock` pins it. New or fixed decks go into the suite, then a submodule bump and
-  `nix flake update conformance`. VerA still pins the suite's pre-rewrite 166282e
-  (same tree as upstream 3dad22b); bump it after v0.13.0.
-- **`.pz` at large n** (09 9.6): done. Above 1000 unknowns `.pz` uses shift-invert Arnoldi on the
-  sparse LU and returns the 20 poles and 20 zeros nearest s = 0 (plot name says "partial"); the
-  dense path and its output are unchanged below. Not done: complex shifts, a `.pz` parameter for
-  k or the shift.
 
 ## Release and pins
 
@@ -33,6 +21,9 @@ worktree, then one coordinated push of all three.
   the suite at 3dad22b). The user refines it and merges to VerA main; pin ESPice to that merged
   main tip (not a branch commit), then apply `$S/agents/vera/espice-sim-reads.patch`
   (`sim_reads` replacing the `bypass_models` allowlist, 11 more models bypass-eligible).
+- **Conformance suite pins**: ESPice pins suite `main` 4f4b219 (pushed); VerA pins 3dad22b. Bump
+  VerA's after v0.13.0. New or fixed decks go into the suite, then a submodule bump and
+  `nix flake update conformance`.
 - **Gompute 1.4.0**: done and pushed (tag 0.17.0-v1.4.0), pinned in build.zig.zon. Still owed:
   the flake's zigDeps `outputHash` for that pin, and the 6.11 colour-threshold patch (40 × SMs).
 - **Gompute experiments for a later release** (from the `vera` agent): `-maxrregcount=128` on heavy
@@ -42,54 +33,33 @@ worktree, then one coordinated push of all three.
 
 ## Final gates still owed
 
-- Full CPU oracle corpus and full-corpus A/B on the final tree.
+- Full-corpus A/B on the final tree (the CPU oracles run in `zig build test-conformance`).
 - Full GPU corpus (`zig build test -- --backend cuda --jobs 1`) for the tolerance-class GPU changes (01 1.6, 04 4.4) and
   the round-2 GPU work.
 - GPU Debug `zig build test` after 06 6.8 and the row-order lane gather.
 
 ## VerA ↔ ESPice integration (agent `bridge`, with session vera-26)
 
-Done (bridge's patch, applied 2026-10-23, final gate running): ESPice builds as a lazy dependency
+Done (bridge's patches v1 and v2, 2026-10-23): ESPice builds as a lazy dependency
 (`artifact("espice")`), runs as whatever `espice` the user has (VerA's `-Despice=PATH`, GPU options
 forwarded), `-I/--include=DIR` for `.hdl` includes (in the cache key), §4.6.4.3 card-knot noise
 tables, net initializers (`u_nodeset`) seeded as nodesets, `--version` with the VerA version and
-commit, CSV output confirmed; VerA's 13 decks: 9 pass, the rest need VerA-side fixture fixes.
+commit, CSV output, `setGiven` for `$param_given`, the loader's `zig version` check; VerA's 13 decks: 9 pass, the rest need VerA-side fixture fixes.
 Remaining:
 
-- **`$param_given` after the VerA `given__` bitset change** (with the VerA v0.13.0 pin):
-  replace `markGiven`'s by-name `<field>__given` write with `target.setGiven(field)` guarded by
-  `@hasDecl`; `castField` already handles the narrow integer fields.
 - **Call `setup` before `say`** in every host path that can reach a display task (with the pin).
-- **Build-cache gotcha**: after a VerA codegen change build once with `-Dva-cache=false`.
-- **Loader Zig check**: check the `zig` version before compiling a runtime `.hdl` (today the
-  system Zig 0.16 on PATH fails with "unrecognized optimization mode: 'debug'").
-- **Relay to the VerA session** (vera-26's session ended before it arrived): noiseport's answer
-  in `$S/agents/noiseport/to_vera26.txt` (resistor-noise constants, printed values, binary path),
-  and the caveat that VerA should emit potential-contribution noise on the flow unknown only for
-  pure potential branches, keeping the node form on switch branches (ESPice decides per instance
-  whether a switch branch's unknown collapses). ESPice handles both forms without double-applying.
-- **New fixture decks to move with the conformance-suite merge**: `noise/noise_va_vbranch.sp`,
-  `noise/noise_table_card_knots.sp` (+ their `.expected.json`, `vseries_res.va`, `ntab_card.va`,
-  `noiseless_res.va`); the compiled-in correctness runner sees them only after `zig build test` regenerates it.
 
 ## Performance round 2 (agents still running)
 
 | Agent | Remaining |
 |---|---|
-| gpu-resident | 02 2.7 graph capture → multi-GPU stages 0–3 (device table and fake-device test knob in Gompute, sweeps across GPUs, per-device placement and constants, measured per-device rates) → 01 1.3 device Newton → 01 1.2 device history mirror (~0.15%) |
+| gpu-resident | 02 2.7 graph capture → multi-GPU stages 0–3 (device table and fake-device test knob in Gompute, sweeps across GPUs, per-device placement and constants, measured per-device rates) (01 1.2 and 1.3 measured and dropped) |
 | gpu-tune | 02 2.7 admission bars, tail-cut refit, f32 refactor (likely dropped); 05 5.3(a) host stamping beside the device eval; `-Dgpu-jac-f32` removal gate |
 | gpu-lanes2 | 06 6.9 OP/DC lanes gate, 6.12 charge-kernel colouring, 6.8 staged cards and `par()`, 6.15 residue, 03 3.9 host-stepped batches on the device (needs VerA's half) |
-| host-solver | done this round: 02 2.4 pipelined tail, 04 4.10 CPU half (`.dc` first point reuses the OP: 4,000-stage chain sweep 2.2-3.4 → 1.2-1.3 s; failing MC/temperature/DATA lanes get the full ladder), supernodal DFS (300×300 grid factor 352 → 255 ms, exact); now: the chain_bsim4_100k cold OP (hours: ordering fill count, first-factor fill) |
-| frontend2 | copy-on-write rows for dcmatch/acmatch/MC lanes/tangents (gating), 08 8.1/8.2 C API streaming, 05 5.11 `.four`/`.fft` reuse, 07 7.5/7.8, 07 7.3 flattening |
+| host-solver | chain_bsim4_100k cold OP: gmin-stepping fixes (budget-relative thresholds, gentler back-off on LU refusals, ngspice's 1.00005 stop) and the gmin-assisted source start, unmeasured |
+| frontend2 | 07 7.3 body-token memo and 7.5 parser threads (parked: need builds) |
 | freq2 | 09 9.3 GCRO-DR and oscillator period column, 9.2 GPU complex frequency kernel and resident factors, 9.4(a) HB on the GPU, `factorEach` allocations |
-| vera | 03 3.2 frame fix measurement and spill reduction, field-major Model rows (P2), VerA half of 03 3.9, v0.13.0 release commit |
-
-## Bugs found
-
-- **chain_bsim4_100k with `.tran 2p 10p uic` stalls** (`--backend cuda`, ReleaseFast): Problem
-  creation finishes in 0.6 s, then no progress for 10–50 min at ~124 MiB of GPU memory, on the
-  binaries both before and after 02 2.3. The original deck (`.tran 2p 200p uic`) finishes in
-  ~77 s. Not yet diagnosed (CPU path untested); deck at `$S/me/gmem/c100k_short.sp`.
+| vera | field-major Model rows (P2) and spill reduction (frame fix, sim_reads, 3.9's VerA half and the release commit are in the v0.13.0 candidate) |
 
 ## Wanted later
 
@@ -102,8 +72,9 @@ Remaining:
 
 ## Machine and tooling
 
-- Build queue `$S/zb` (3 slots, -j6; GPU-shell builds one at a time at -j2, taking the GPU lock
-  before a slot). ptxas needs up to 10 GB per large model now that SASS is embedded by default.
+- Agents do not build; the coordinator runs the gates (`zig build test-conformance`, GPU builds at
+  -j10 under `systemd-run -p MemoryMax=26G`). ptxas needs up to 10 GB per large model.
+- After a VerA codegen change, build once with `-Dva-cache=false`.
 - Outside processes share the machine's 31 GB: the VAMS conformance harness (`-j 8`, iverilog,
   openvaf, `vera --run`) filled swap twice; one `ivlpp` reached 17 GB on
   `tests/verilog/19_compiler_directives`.
