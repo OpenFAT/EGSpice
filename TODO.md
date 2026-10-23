@@ -3,13 +3,6 @@
 Open issues and decisions from the 2026-10-22/23 performance round and the VerA
 integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](docs/performance/TODO/REMAINING.md).
 
-## Decisions waiting on the owner
-
-- **Gate `main` by machine** (TESTING.md, AGENTS.md "Branches and releases"): a ruleset on `main`
-  that requires `test.yml` (`release-safe`) and `nix.yml` (`nix`) and blocks direct pushes;
-  the merge queue (`merge_group` is already wired) once a second contributor appears.
-  `gh api -X POST repos/OmarSiwy/ESPice/rulesets` after the coordinated push.
-
 ## Release and pins
 
 Nothing is pushed or tagged until ESPice, VerA and Gompute sync perfectly (user decision); until
@@ -20,13 +13,8 @@ worktree, then one coordinated push of all three.
   the suite at 3dad22b). The user refines it and merges to VerA main; pin ESPice to that merged
   main tip (not a branch commit), then apply `$S/agents/vera/espice-sim-reads.patch`
   (`sim_reads` replacing the `bypass_models` allowlist, 11 more models bypass-eligible).
-- **VerA's suite pin**: bump 3dad22b to 4f4b219 (ESPice's) after v0.13.0.
 - **Gompute pin**: the flake's zigDeps `outputHash` for the 1.4.0 pin, and the 6.11
   colour-threshold patch (40 × SMs).
-- **Gompute experiments for a later release** (from the `vera` agent): `-maxrregcount=128` on heavy
-  roots (`gompute-maxrreg128.patch`: occupancy up to 2×, static frames +3–12%) and a bit-identical
-  log without `?f64` (`gompute-log-optional.patch`: bsimcmg frame 9,840 → 9,072 B); measure with
-  `$S/agents/vera/gpurun.sh` before adopting.
 
 ## Final gates still owed
 
@@ -45,11 +33,10 @@ worktree, then one coordinated push of all three.
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | gpu-resident | 02 2.7 graph capture → multi-GPU stages 0–3 (device table and fake-device test knob in Gompute, sweeps across GPUs, per-device placement and constants, measured per-device rates) |
 | gpu-tune     | 02 2.7 admission bars, tail-cut refit; 05 5.3(a) host stamping beside the device eval; `-Dgpu-jac-f32` removal gate                                                                |
-| gpu-lanes2   | 06 6.9 OP/DC lanes gate, 6.12 charge-kernel colouring, 6.8 staged cards and `par()`, 6.15 residue, 03 3.9 host-stepped batches on the device (needs VerA's half)                   |
+| gpu-lanes2   | 06 6.9 OP/DC lanes gate, 6.12 charge-kernel colouring, 6.8 staged cards and `par()`, 6.15 residue, 03 3.9 host-stepped batches on the device                   |
 | host-solver  | chain_bsim4_100k cold OP: gmin-stepping fixes (budget-relative thresholds, gentler back-off on LU refusals, ngspice's 1.00005 stop) and the gmin-assisted source start, unmeasured |
 | frontend2    | 07 7.3 body-token memo and 7.5 parser threads (parked: need builds)                                                                                                                |
 | freq2        | 09 9.3 GCRO-DR and oscillator period column, 9.2 GPU complex frequency kernel and resident factors, 9.4(a) HB on the GPU, `factorEach` allocations                                 |
-| vera         | field-major Model rows (P2) and spill reduction                                                                                                                                    |
 
 ## Machine and tooling
 
