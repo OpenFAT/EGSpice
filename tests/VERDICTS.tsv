@@ -531,6 +531,7 @@ PASS	conformance/tests/netlist/noise/ngspice_mos1_cs.sp
 PASS	conformance/tests/netlist/noise/ngspice_mos2_cs.sp
 PASS	conformance/tests/netlist/noise/ngspice_mos3_cs.sp
 PASS	conformance/tests/netlist/noise/ngspice_mos3_mos9_channel.sp
+PASS	conformance/tests/netlist/noise/noise_table_card_knots.sp
 PASS	conformance/tests/netlist/noise/noise_table_lin_clamp.sp
 PASS	conformance/tests/netlist/noise/noise_table_lin_interior.sp
 PASS	conformance/tests/netlist/noise/noise_table_log_clamp.sp
@@ -538,6 +539,7 @@ PASS	conformance/tests/netlist/noise/noise_table_log_interior.sp
 PASS	conformance/tests/netlist/noise/noise_va_coeff.sp
 PASS	conformance/tests/netlist/noise/noise_va_correlated.sp
 PASS	conformance/tests/netlist/noise/noise_va_ground.sp
+PASS	conformance/tests/netlist/noise/noise_va_vbranch.sp
 PASS	conformance/tests/netlist/noise/rc_1e-06.sp
 PASS	conformance/tests/netlist/noise/rc_1e-09.sp
 PASS	conformance/tests/netlist/noise/single_frequency.sp
