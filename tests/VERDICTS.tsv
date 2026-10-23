@@ -287,10 +287,10 @@ PASS	conformance/tests/netlist/hdl/a09_absdelay_accepted_only.sp
 PASS	conformance/tests/netlist/hdl/a09_abstime_per_attempt.sp
 PASS	conformance/tests/netlist/hdl/a09_analog_initial_once.sp
 PASS	conformance/tests/netlist/hdl/a09_cross_count_revert.sp
-XFAIL	conformance/tests/netlist/hdl/a09_idt_bystander_reject.sp
-XFAIL	conformance/tests/netlist/hdl/a09_idt_lte_reject.sp
+PASS	conformance/tests/netlist/hdl/a09_idt_bystander_reject.sp
+PASS	conformance/tests/netlist/hdl/a09_idt_lte_reject.sp
 PASS	conformance/tests/netlist/hdl/a09_idt_ramp_clean.sp
-XFAIL	conformance/tests/netlist/hdl/a09_idt_self_reject.sp
+PASS	conformance/tests/netlist/hdl/a09_idt_self_reject.sp
 PASS	conformance/tests/netlist/hdl/a09_limit_root_transient.sp
 PASS	conformance/tests/netlist/hdl/verilog_adder_op.sp
 PASS	conformance/tests/netlist/hdl/verilog_d2a_rc.sp

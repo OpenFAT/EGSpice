@@ -5,6 +5,10 @@ integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](d
 
 ## Decisions waiting on the owner
 
+- **Gate `main` by machine** (TESTING.md, AGENTS.md "Branches and releases"): a ruleset on `main`
+  that requires `test.yml` (`release-safe`) and `nix.yml` (`nix`) and blocks direct pushes;
+  the merge queue (`merge_group` is already wired) once a second contributor appears.
+  `gh api -X POST repos/OmarSiwy/ESPice/rulesets` after the coordinated push.
 - **Conformance suite: merged and pushed (2026-10-23).** `tests/fixtures/` is now the submodule
   `tests/conformance` (VAMS Conformance Suite), decks under `tests/conformance/tests/netlist/`;
   the A09 decks (ex `tests/pending/`), the bench-suites fetch scripts (ex `tests/suites/`) and
@@ -13,9 +17,6 @@ integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](d
   `flake.lock` pins it. New or fixed decks go into the suite, then a submodule bump and
   `nix flake update conformance`. VerA still pins the suite's pre-rewrite 166282e
   (same tree as upstream 3dad22b); bump it after v0.13.0.
-- **A09 host bug B1** (3 XFAIL decks, `hdl/a09_idt_{bystander,self,lte}_reject`): a rejected
-  transient step leaves an idt/event accumulator advanced; see the suite's
-  `docs/a09-accepted-rejected-lifecycle.md`. Drop each `KNOWN GAP` line when it passes.
 - **`.pz` at large n** (09 9.6): done. Above 1000 unknowns `.pz` uses shift-invert Arnoldi on the
   sparse LU and returns the 20 poles and 20 zeros nearest s = 0 (plot name says "partial"); the
   dense path and its output are unchanged below. Not done: complex shifts, a `.pz` parameter for
@@ -42,9 +43,9 @@ worktree, then one coordinated push of all three.
 ## Final gates still owed
 
 - Full CPU oracle corpus and full-corpus A/B on the final tree.
-- Full GPU corpus (`zig build test-gpu`) for the tolerance-class GPU changes (01 1.6, 04 4.4) and
+- Full GPU corpus (`zig build test -- --backend cuda --jobs 1`) for the tolerance-class GPU changes (01 1.6, 04 4.4) and
   the round-2 GPU work.
-- GPU Debug test-espice after 06 6.8 and the row-order lane gather.
+- GPU Debug `zig build test` after 06 6.8 and the row-order lane gather.
 
 ## VerA ↔ ESPice integration (agent `bridge`, with session vera-26)
 
