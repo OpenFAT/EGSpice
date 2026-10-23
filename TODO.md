@@ -13,15 +13,6 @@ worktree, then one coordinated push of all three.
   the suite at 3dad22b). The user refines it and merges to VerA main; pin ESPice to that merged
   main tip (not a branch commit), then apply `$S/agents/vera/espice-sim-reads.patch`
   (`sim_reads` replacing the `bypass_models` allowlist, 11 more models bypass-eligible).
-- **Gompute pin**: the flake's zigDeps `outputHash` for the 1.4.0 pin, and the 6.11
-  colour-threshold patch (40 × SMs).
-
-## Final gates still owed
-
-- Full-corpus A/B on the final tree (the CPU oracles run in `zig build test-conformance`).
-- Full GPU corpus (`zig build test -- --backend cuda --jobs 1`) for the tolerance-class GPU changes (01 1.6, 04 4.4) and
-  the round-2 GPU work.
-- GPU Debug `zig build test` after 06 6.8 and the row-order lane gather.
 
 ## VerA ↔ ESPice integration (agent `bridge`, with session vera-26)
 
@@ -33,17 +24,7 @@ worktree, then one coordinated push of all three.
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | gpu-resident | 02 2.7 graph capture → multi-GPU stages 0–3 (device table and fake-device test knob in Gompute, sweeps across GPUs, per-device placement and constants, measured per-device rates) |
 | gpu-tune     | 02 2.7 admission bars, tail-cut refit; 05 5.3(a) host stamping beside the device eval; `-Dgpu-jac-f32` removal gate                                                                |
-| gpu-lanes2   | 06 6.9 OP/DC lanes gate, 6.12 charge-kernel colouring, 6.8 staged cards and `par()`, 6.15 residue, 03 3.9 host-stepped batches on the device                   |
+| gpu-lanes2   | 06 6.9 OP/DC lanes gate, 6.12 charge-kernel colouring, 6.8 staged cards and `par()`, 6.15 residue, 03 3.9 host-stepped batches on the device                                       |
 | host-solver  | chain_bsim4_100k cold OP: gmin-stepping fixes (budget-relative thresholds, gentler back-off on LU refusals, ngspice's 1.00005 stop) and the gmin-assisted source start, unmeasured |
 | frontend2    | 07 7.3 body-token memo and 7.5 parser threads (parked: need builds)                                                                                                                |
 | freq2        | 09 9.3 GCRO-DR and oscillator period column, 9.2 GPU complex frequency kernel and resident factors, 9.4(a) HB on the GPU, `factorEach` allocations                                 |
-
-## Machine and tooling
-
-- Agents do not build; the coordinator runs the gates (`zig build test-conformance`, GPU builds at
-  -j10 under `systemd-run -p MemoryMax=26G`). ptxas needs up to 10 GB per large model.
-- After a VerA codegen change, build once with `-Dva-cache=false`.
-- Outside processes share the machine's 31 GB: the VAMS conformance harness (`-j 8`, iverilog,
-  openvaf, `vera --run`) filled swap twice; one `ivlpp` reached 17 GB on
-  `tests/verilog/19_compiler_directives`.
-- Subagents cannot write `.md` files (a hook); their reports are `REPORT.txt`.
