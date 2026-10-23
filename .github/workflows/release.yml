@@ -27,6 +27,8 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true # tests/conformance: the SPICE decks
       - id: plan
         env:
           VARIANT: ${{ inputs.variant || 'all' }}
@@ -97,7 +99,7 @@ jobs:
 
       - name: Smoke native executable and runtime Verilog-A
         if: steps.cpu.outputs.runnable == 'true'
-        run: nix develop .#ci -c bash tools/release_smoke.sh "$PWD/out/bin/espice" "$PWD/tests/fixtures"
+        run: nix develop .#ci -c bash tools/release_smoke.sh "$PWD/out/bin/espice" "$PWD/tests/conformance/tests/netlist"
 
       - name: Check CPU numerics at this instruction-set level
         if: matrix.gpu == false && steps.cpu.outputs.runnable == 'true'
@@ -135,7 +137,7 @@ jobs:
           docker build -t espice-bundle-smoke -f tools/release-container.Dockerfile tools
           docker run --rm --network none \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-            -v "$PWD/dist:/artifacts:ro" -v "$PWD/tests/fixtures:/fixtures:ro" \
+            -v "$PWD/dist:/artifacts:ro" -v "$PWD/tests/conformance/tests/netlist:/fixtures:ro" \
             -v "$PWD/tools/release_smoke.sh:/smoke.sh:ro" \
             espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /fixtures' \
             sh "/artifacts/espice-${VERSION}-${VARIANT}.run"

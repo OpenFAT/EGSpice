@@ -51,5 +51,5 @@ copies of `discipline.h` are not kept. `build.zig` lists the files in
   no notice of its own, so the file's terms are stated nowhere closer than
   that README. Keep this provenance with any copy.
 - The sky130 model slice under
-  `tests/fixtures/regression/ota_buffer_large_step.assets/` is Apache-2.0
+  `tests/conformance/tests/netlist/regression/ota_buffer_large_step.assets/` is Apache-2.0
   (SkyWater PDK); its README there says so.

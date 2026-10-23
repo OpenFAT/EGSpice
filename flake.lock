@@ -1,5 +1,28 @@
 {
   "nodes": {
+    "conformance": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792768811,
+        "narHash": "sha256-Y6enbJa2pkCH7WpkDZQF62aQkkcgN+IYSK3vV2GAWZE=",
+        "owner": "OmarSiwy",
+        "repo": "VAMS-Conformance-Suite",
+        "rev": "166282e72f655adfc540b1579171ea8cb3423895",
+        "type": "github"
+      },
+      "original": {
+        "owner": "OmarSiwy",
+        "repo": "VAMS-Conformance-Suite",
+        "type": "github"
+      }
+    },
     "flake-compat": {
       "flake": false,
       "locked": {
@@ -76,6 +99,7 @@
     },
     "root": {
       "inputs": {
+        "conformance": "conformance",
         "flake-utils": "flake-utils",
         "nix-bundle": "nix-bundle",
         "nixpkgs": "nixpkgs",

@@ -16,6 +16,11 @@
     nix-bundle.url = "github:nix-community/nix-bundle/eff01593f62794d458ec714090091419194ab64d";
     nix-bundle.inputs.nixpkgs.follows = "nixpkgs";
     nix-bundle.inputs.utils.follows = "flake-utils";
+    # The SPICE decks (tests/netlist/), also checked out at tests/conformance:
+    # a git flake leaves submodules out of its source.
+    conformance.url = "github:OmarSiwy/VAMS-Conformance-Suite";
+    conformance.inputs.nixpkgs.follows = "nixpkgs";
+    conformance.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs =
@@ -25,6 +30,7 @@
       flake-utils,
       zig-overlay,
       nix-bundle,
+      conformance,
       ...
     }:
     {
@@ -218,8 +224,8 @@
               NR == 2 { d = $c - want; ok = c && d * d <= 1e-12 * want * want }
               END { exit !ok }' "$1" || { echo "$1: $2 != $3"; cat "$1"; exit 1; }
           }
-          cp -r ${./tests/fixtures/hdl}/veriloga_res_divider.{sp,assets} .
-          ${lib.getExe espice} --format=csv --rawfile=op.csv ${./tests/fixtures/op/balanced_bridge.sp}
+          cp -r ${conformance}/tests/netlist/hdl/veriloga_res_divider.{sp,assets} .
+          ${lib.getExe espice} --format=csv --rawfile=op.csv ${conformance}/tests/netlist/op/balanced_bridge.sp
           check op.csv 'v(a)' 5
           ${lib.getExe espice} --format=csv --rawfile=hdl.csv veriloga_res_divider.sp
           check hdl.csv 'v(out)' 0.35

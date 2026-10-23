@@ -5,18 +5,12 @@ integration. Performance items in detail: [docs/performance/TODO/REMAINING.md](d
 
 ## Decisions waiting on the owner
 
-- **Conformance-suite merge.** Branch `origin/conformance-suite` (worktree `../ESPice-conformance`)
-  moves `tests/fixtures/` into the VAMS Conformance Suite as the submodule `tests/conformance`
-  (pinned 166282e) and rewrites every fixture path, plus a `conformance` flake input and
-  `submodules: true` in the workflows. Untested. Proposed order: finish the performance round
-  and its final gates on the current tree, commit, move this checkout's uncommitted fixture
-  edits (e.g. `ac/ltra_ac_lossless_limit.sp` and its `.expected.json`) into the suite repo and
-  bump the submodule, merge, run `zig build test` and fix what the path move breaks (VERDICTS
-  names, catalog paths, `fixtures/` prefix stripping), push, remove the worktree. Afterwards new
-  or fixed decks go into the suite (`tests/netlist/<analysis>/`), then the submodule bump and
-  `nix flake update conformance`.
-- **Commit the working tree.** 1.2.0 plus both performance rounds are uncommitted; vera-26 needs
-  an ESPice SHA to pin, and the merge above needs a committed base.
+- **Conformance suite: merged (2026-10-23).** `tests/fixtures/` is now the submodule
+  `tests/conformance` (VAMS Conformance Suite), decks under `tests/conformance/tests/netlist/`.
+  dev/performance's 68 fixture changes are suite commit a46e5ca (local branch
+  `espice-dev-performance`, not on GitHub). Before the push: push that suite commit, then
+  `nix flake update conformance` (flake.lock still pins 166282e), and run `zig build test`
+  for what the path move breaks. New or fixed decks go into the suite, then a submodule bump.
 - **`.pz` at large n** (09 9.6): done. Above 1000 unknowns `.pz` uses shift-invert Arnoldi on the
   sparse LU and returns the 20 poles and 20 zeros nearest s = 0 (plot name says "partial"); the
   dense path and its output are unchanged below. Not done: complex shifts, a `.pz` parameter for

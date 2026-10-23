@@ -33,7 +33,7 @@ tell:
 | Many points of a small circuit | asap7 24-stage bsimcmg chain at N = 1k-32k points; `stress/sweep_opamp_wl_5000` | `gen_lanes.py`, `gen_chain.py`, `lockstep.py` (HEAD `dev/research/gpu-lane-e1/`, `dev/research/lane-batched-simulation/`: restore them under `tests/benchmark/` when the `dev/` move lands) |
 | AC family | `ac/bench_medium_ladder_filter`, `stress/sweep_opamp_wl_5000`, the 222 AC-family corpus decks | fixtures |
 | Periodic | the 66 periodic corpus decks; no swept `.pss` deck exists | fixtures |
-| Whole corpus | 799 fixtures in `tests/fixtures/`, `cmcqa` (5,645 single-device decks) | `zig build test`, `bench-suites` |
+| Whole corpus | 940 decks in `tests/conformance/tests/netlist/` (the VAMS Conformance Suite submodule), `cmcqa` (5,645 single-device decks) | `zig build test`, `bench-suites` |
 
 ## Counters and tools that exist
 

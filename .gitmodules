@@ -1,0 +1,4 @@
+[submodule "tests/conformance"]
+	path = tests/conformance
+	url = https://github.com/OmarSiwy/VAMS-Conformance-Suite
+	shallow = true
