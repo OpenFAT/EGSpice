@@ -15,10 +15,24 @@ Docs: <https://omarsiwy.github.io/ESPice/> · Changes: [CHANGELOGS.md](CHANGELOG
 
 ## Install
 
-```sh
-nix run github:OmarSiwy/ESPice -- deck.sp
-nix profile install github:OmarSiwy/ESPice      # .#espice-cuda adds CUDA
-```
+| Route | Command |
+|---|---|
+| Install script (Linux, macOS) | `curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh \| sh` (`sh -s -- 0.3.0` pins a version): reads `sources.json`, checks the download's sha256, caches it, and keeps versions side by side under `~/.local/share/espice` |
+| Debian, Ubuntu, Mint | `sudo apt install ./espice-0.3.0-linux-amd64.deb` (`arm64` too) |
+| Fedora, openSUSE | `sudo dnf install ./espice-0.3.0-linux-amd64.rpm` (`zypper install` on openSUSE) |
+| Arch | `sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst`, or the release's `PKGBUILD` (`espice-bin`) with `makepkg`; on the AUR once published |
+| NVIDIA / AMD GPUs (Linux) | `espice-cuda-0.3.0-linux-{amd64,arm64}.{deb,rpm,pkg.tar.zst}` (any NVIDIA GPU from Turing on; needs the driver) or `espice-hip-0.3.0-linux-amd64.*` (every AMD target the release builds, picked at start; needs ROCm's HIP runtime). One of `espice`, `espice-cuda`, `espice-hip` at a time |
+| Homebrew (macOS, Linux) | `brew install OmarSiwy/espice/espice`, once the tap is published (the release's `espice.rb`) |
+| Nix (release binary) | `nix run github:OmarSiwy/ESPice#latest -- deck.sp`, or `'#"0.3.0"'` for a given release |
+| Nix (from source) | `nix run github:OmarSiwy/ESPice -- deck.sp`; `nix profile install github:OmarSiwy/ESPice` (`.#espice-cuda` adds CUDA) |
+| Release tarball | [GitHub releases](https://github.com/OmarSiwy/ESPice/releases): every platform and CPU level, with `SHA256SUMS`; GPU builds as self-extracting `.run` bundles |
+
+The packages, the install script, Homebrew and Nix install the CPU build at the baseline instruction
+set. Every route but the two from source needs a published release, and none exists yet; until
+one does, use Nix from source or build from source. Runtime `.hdl`
+models build with Zig 0.18.0-dev.349: the Linux packages and Nix carry it; with the install script,
+Homebrew or a tarball, put it on `PATH` or in `$ZIG`. More in the
+[install guide](https://omarsiwy.github.io/ESPice/using/install/).
 
 From source (Zig 0.18.0-dev.349, provided by the devshell; VerA and Gompute are pinned in
 `build.zig.zon`):
@@ -40,7 +54,7 @@ so running ESPice on the CPU needs nothing beyond the base system.
 | Run on the CPU | nothing |
 | Run on an NVIDIA GPU | the proprietary driver, which provides `libcuda.so.1`: `sudo ubuntu-drivers autoinstall` (or Mint's Driver Manager). The CUDA toolkit is not needed at run time. |
 | Run on an AMD GPU | the ROCm HIP runtime from AMD's repository (`amdgpu-install --usecase=hip`), which provides `libamdhip64.so`. |
-| Load `.hdl` models at run time | Zig `0.18.0-dev.349+d924f83bf` on `PATH`, or its path in `$ZIG` |
+| Load `.hdl` models at run time | nothing with the Linux packages or Nix; otherwise (install script, Homebrew, tarball) Zig `0.18.0-dev.349+d924f83bf` on `PATH`, or its path in `$ZIG` |
 | Build from source with Nix (recommended) | `sudo apt install curl git xz-utils`, then Nix: `sh <(curl -L https://nixos.org/nix/install) --daemon`; `nix develop` then provides Zig, Python and the GPU toolkits |
 | Build from source without Nix | `sudo apt install git curl xz-utils python3`, and Zig `0.18.0-dev.349+d924f83bf` from <https://ziglang.org/download/> |
 | Embed precompiled CUDA kernels (optional) | `ptxas` and `fatbinary` on `PATH`, from NVIDIA's CUDA 12 toolkit repository (`cuda-toolkit-12-x`; Ubuntu's own `nvidia-cuda-toolkit` is too old for recent GPUs). Without them the driver compiles the kernels on first use. |
@@ -54,7 +68,8 @@ so running ESPice on the CPU needs nothing beyond the base system.
   VBIC, HICUM, JFET/MESFET/HFET, passives, controlled and behavioural sources, switches,
   transmission lines.
 - **Your own models:** `.hdl "model.va"` plus an `N` card compiles a Verilog-A module at run time
-  (needs that Zig on `PATH` or in `$ZIG`; cached under `~/.cache/espice/hdl`). OSDI is not loaded.
+  (the Linux packages and Nix carry that Zig; with other routes it must be on `PATH` or in `$ZIG`; cached under
+  `~/.cache/espice/hdl`). OSDI is not loaded.
 - **Output:** binary/ASCII raw, CSV, Touchstone, PSF, FSDB, SST2, CITIfile, print.
 - **Parallel by default:** analyses form a DAG and run on every core (`--jobs`). `--plan` prints the
   DAG without solving.

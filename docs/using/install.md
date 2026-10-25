@@ -1,7 +1,80 @@
 # Install
 
 ESPice is one binary, `espice`, plus a static library and C header for
-embedding. There are three ways to get it.
+embedding. Every route below except building from source installs a
+published release, and no release exists yet: until one does, use Nix from
+source (`nix run github:OmarSiwy/ESPice`) or build from source.
+
+## Install script
+
+On Linux or macOS, without root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh -s -- 0.3.0
+```
+
+It reads `sources.json` (each release's tarballs and checksums), downloads
+the CPU build for your machine, checks its sha256, and unpacks it into
+`~/.local/share/espice/<version>`, linking `~/.local/bin/espice` to the
+version installed last. Tarballs stay in `~/.cache/espice/releases`, so
+reinstalling or switching back to a version downloads nothing.
+`ESPICE_INSTALL_HOME`, `ESPICE_INSTALL_BIN`, `ESPICE_INSTALL_CACHE` and
+`ESPICE_INSTALL_SOURCES` override the locations. Runtime `.hdl` needs the Zig
+it prints at the end, on `PATH` or in `ZIG`.
+
+## Homebrew
+
+```sh
+brew install OmarSiwy/espice/espice
+```
+
+Each release attaches `espice.rb`, which the release workflow installs and
+`brew test`s on macOS, then pushes to the `OmarSiwy/homebrew-espice` tap once
+that repository and its token are set up. Runtime `.hdl` needs the Zig named
+in `brew info espice`, on `PATH` or in `ZIG`.
+
+## Linux packages
+
+Each release attaches a `.deb`, an `.rpm` and an Arch package for x86-64
+and ARM64 (CPU builds at the baseline instruction set):
+
+```sh
+sudo apt install ./espice-0.3.0-linux-amd64.deb            # Debian, Ubuntu
+sudo dnf install ./espice-0.3.0-linux-amd64.rpm            # Fedora
+sudo zypper install ./espice-0.3.0-linux-amd64.rpm         # openSUSE
+sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst      # Arch
+```
+
+For GPUs, two more packages install in place of `espice` (each conflicts
+with the others, since all own `/usr/bin/espice`):
+
+- `espice-cuda` (x86-64 and ARM64): the `cuda-sm_75` build. It embeds PTX,
+  which the driver compiles for any newer card, so it runs on every NVIDIA
+  GPU from Turing on. It needs the NVIDIA driver (`libcuda.so.1`), not the
+  CUDA toolkit.
+- `espice-hip` (x86-64): AMD code objects run only on the GPU target they
+  were built for, so it carries one `espice` per target the release builds
+  (gfx900 to gfx1201, under `/usr/lib/espice/bin/`). `/usr/bin/espice` runs
+  the one for the GPU the kernel reports (`gfx_target_version` in
+  `/sys/class/kfd`); `ESPICE_HIP_ARCH=gfx1100` picks one by hand. It needs
+  ROCm's HIP runtime (`libamdhip64.so`). It leaves out `libespice.a`: C
+  embedders of a HIP build use that target's tarball.
+
+Both start without their driver, which `espice` loads only when a run uses
+the GPU; the release checks that each starts and solves the smoke decks on
+the CPU backend, and lists its GPU backend in `--version`. Hosted runners
+have no GPU, so GPU execution is not tested before a release.
+
+On Arch, the release's `PKGBUILD` builds `espice-bin`, the same files, with
+`makepkg`; the release workflow pushes it to the AUR once the maintainer's
+AUR key is configured. No release carries packages yet. Each package installs the release tree under
+`/usr/lib/espice/` with the Zig compiler that runtime `.hdl` builds need,
+and `/usr/bin/espice` points `ZIG` at that Zig unless you set `ZIG`
+yourself. Embedders use `/usr/lib/espice/include` and `/usr/lib/espice/lib`.
+Before a release ships, every package is installed in a clean Ubuntu 24.04,
+Debian 12, Fedora 42, openSUSE Leap 15.6 and Arch container and runs a
+built-in model and a runtime Verilog-A deck.
 
 ## Nix
 
@@ -32,6 +105,17 @@ Or use it as an input of your own flake:
   };
 }
 ```
+
+A released version installs from its release binary instead of building
+from source (CPU build, baseline instruction set):
+
+```sh
+nix run github:OmarSiwy/ESPice#latest -- my_circuit.sp
+nix run 'github:OmarSiwy/ESPice#"0.3.0"' -- my_circuit.sp
+```
+
+`sources.json` lists each release's tarballs and checksums; the release
+workflow adds a new release to it through a pull request.
 
 The flake package is a CPU-only build (`-Dgpu=false`). Its `espice` wrapper
 sets `ZIG` to the Zig it was built with, so decks that load Verilog-A

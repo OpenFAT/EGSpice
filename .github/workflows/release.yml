@@ -62,6 +62,8 @@ jobs:
       PACKAGE: ${{ matrix.package }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # tests/conformance: the smoke decks
       - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
@@ -118,6 +120,16 @@ jobs:
           mv out "$name"
           tar czf "dist/$name.tar.gz" "$name"
 
+      # The tree just archived, plus the Zig it was built with, for runtime .hdl.
+      - name: Distro packages (.deb, .rpm, Arch) for ${{ matrix.distro }}
+        if: matrix.distro != ''
+        run: bash tools/package.sh "${{ matrix.distro }}" "espice-${VERSION}-${VARIANT}" "$VERSION" "${{ matrix.deb_arch }}" dist
+
+      # GPU packages too, on the CPU backend: the runner has no GPU.
+      - name: Smoke distro packages in clean Ubuntu, Debian, Fedora, openSUSE and Arch
+        if: matrix.distro != '' && steps.cpu.outputs.runnable == 'true'
+        run: bash tools/distro_smoke.sh dist "$VERSION" "${{ matrix.deb_arch }}" tests/conformance/tests/netlist "${{ matrix.distro }}"
+
       - name: Bundle Linux runtime closure
         if: matrix.bundle
         run: |
@@ -140,6 +152,16 @@ jobs:
             espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /fixtures' \
             sh "/artifacts/espice-${VERSION}-${VARIANT}.run"
 
+      # The tarball alone for hip-package: 18 .run bundles with ROCm inside
+      # would not fit a hosted runner's disk.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.distro_bundle == 'espice-hip'
+        with:
+          name: hip-tarball-${{ matrix.name }}
+          path: dist/espice-${{ needs.plan.outputs.version }}-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.name }}
@@ -148,8 +170,46 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  publish:
+  # espice-hip: AMD code objects run only on the gfx target they were built
+  # for, so the package carries every linux-x86_64-v1-hip-gfx* build's espice
+  # and packaging/espice-hip.sh picks one at start (tools/hip_bundle.sh).
+  hip-package:
     needs: [plan, build]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # tests/conformance: the smoke decks
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+        with:
+          name: omarsiwy
+          skipPush: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: hip-tarball-*
+          path: hip
+          merge-multiple: true
+      - name: Bundle, package and smoke espice-hip
+        run: |
+          bash tools/hip_bundle.sh hip "$VERSION" espice-hip
+          bash tools/package.sh espice-hip espice-hip "$VERSION" amd64 dist
+          bash tools/distro_smoke.sh dist "$VERSION" amd64 tests/conformance/tests/netlist espice-hip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-espice-hip
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: [plan, build, hip-package]
     if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -172,5 +232,128 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.run
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+            dist/PKGBUILD
+            dist/espice.rb
             dist/SHA256SUMS
             dist/BUILD-MATRIX.json
+
+  # sources.json is what `nix run '.#"<version>"'` and `.#latest` install, so
+  # the release just uploaded is added to it on main through a pull request
+  # like any other change (bots never push to main). A GITHUB_TOKEN pull
+  # request starts no workflow, but a workflow_dispatch does, so the job
+  # dispatches the required checks on the branch and auto-merge lands it.
+  sources:
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event.release.tag_name || github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+      - name: Regenerate sources.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/update-sources.py
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - name: The new release binary installs and runs (checks.release)
+        run: |
+          git diff --quiet sources.json && exit 0
+          nix flake check --no-build
+          nix build -L .#checks.x86_64-linux.release
+      - name: Pull request, gated, auto-merged
+        run: |
+          git diff --quiet sources.json && exit 0
+          branch="sources/$TAG"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch"
+          git commit -m "nix: sources.json for $TAG" -- sources.json
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" --title "nix: sources.json for $TAG" \
+            --body "Generated by release.yml from the $TAG assets and SHA256SUMS; \`checks.release\` passed on it."
+          for w in test.yml cross.yml nix.yml; do
+            gh workflow run "$w" --ref "$branch"
+          done
+          gh pr merge "$branch" --auto --squash
+
+  # The formula the release attached, installed through a local tap on macOS
+  # and checked by `brew test` (a divider solved to its analytic value). With a
+  # HOMEBREW_TAP_TOKEN secret (a token that can push to OmarSiwy/homebrew-espice)
+  # it is pushed to the tap. After VerA's publish.yaml.
+  homebrew:
+    needs: [plan, publish]
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Install and test the formula
+        run: |
+          set -euo pipefail
+          gh release download "v$VERSION" -R "$GITHUB_REPOSITORY" -p espice.rb
+          brew tap-new --no-git espice/local
+          cp espice.rb "$(brew --repository espice/local)/Formula/espice.rb"
+          brew install espice/local/espice
+          brew test espice/local/espice
+          espice --version
+      - name: Push to OmarSiwy/homebrew-espice
+        if: env.TAP_TOKEN != ''
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/OmarSiwy/homebrew-espice.git" tap
+          mkdir -p tap/Formula && cp espice.rb tap/Formula/espice.rb
+          cd tap
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/espice.rb
+          git diff --cached --quiet || { git commit -m "espice v$VERSION"; git push; }
+
+  # The AUR package the release attached: makepkg in Arch downloads the
+  # uploaded .deb, checks it against the PKGBUILD's sha256, and the package it
+  # builds must install and run. With an AUR_SSH_PRIVATE_KEY secret (an AUR
+  # account's key) the PKGBUILD and its .SRCINFO are pushed to espice-bin.
+  aur:
+    needs: [plan, publish]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - name: Build, install and run espice-bin
+        run: |
+          set -euo pipefail
+          mkdir aur && cd aur
+          gh release download "v$VERSION" -R "$GITHUB_REPOSITORY" -p PKGBUILD
+          docker run --rm -v "$PWD:/aur" docker.io/library/archlinux:latest sh -c '
+            set -e
+            pacman -Sy --noconfirm --needed base-devel >/dev/null
+            useradd -m builder && chown -R builder /aur
+            su builder -c "cd /aur && makepkg --noconfirm && makepkg --printsrcinfo > .SRCINFO"
+            pacman -U --noconfirm /aur/espice-bin-*.pkg.tar.zst >/dev/null
+            espice --version'
+      - name: Push to the AUR
+        if: env.AUR_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && printf '%s\n' "$AUR_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          # ponytail: trust on first use from a fresh runner; pin AUR's host key here if that matters.
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur"
+          git clone ssh://aur@aur.archlinux.org/espice-bin.git espice-bin
+          cp aur/PKGBUILD aur/.SRCINFO espice-bin/
+          cd espice-bin
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet || { git commit -m "espice-bin $VERSION"; git push; }

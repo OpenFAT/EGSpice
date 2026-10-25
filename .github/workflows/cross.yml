@@ -40,3 +40,12 @@ jobs:
           nix develop .#ci -c zig build -Dtarget=${{ matrix.target }}
           -Doptimize=ReleaseSafe -Dgpu=false -Dcuda-arch=none -Dhip-arch=none
           -j2 --summary failures --prefix out
+      # The release's .deb, .rpm and Arch packages, built from this tree and
+      # installed in clean distro containers on every change (as release.yml does).
+      - name: Distro packages, smoked in Ubuntu, Debian, Fedora, openSUSE and Arch
+        if: matrix.target == 'x86_64-linux-gnu.2.28'
+        run: |
+          version=$(python3 -c "import sys; sys.path.insert(0, 'tools'); import release; print(release.version())")
+          cp README.md LICENSE CHANGELOGS.md out/ # as release.yml's archive step
+          bash tools/package.sh espice out "$version" amd64 dist
+          bash tools/distro_smoke.sh dist "$version" amd64 tests/conformance/tests/netlist

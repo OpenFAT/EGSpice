@@ -1,0 +1,58 @@
+# .deb, .rpm and Arch packages from one release tree, built by tools/package.sh,
+# which first expands NAME (espice, espice-cuda, espice-hip), DESCRIPTION,
+# WRAPPER (packaging/espice.sh, or espice-hip.sh), TREE (the release tree),
+# ZIG_DIR (the pinned Zig), VERSION and ARCH (amd64|arm64) here: nfpm leaves
+# contents paths as written.
+# The release tree keeps its layout under /usr/lib/espice (espice finds
+# share/espice beside its executable); the pinned Zig rides along for .hdl.
+name: ${NAME}
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: science
+priority: optional
+maintainer: omare <ok.elsawy@gmail.com>
+description: |
+  SPICE circuit simulator with a built-in Verilog-A compiler.
+  ${DESCRIPTION}; carries the Zig compiler that runtime .hdl models build with.
+# One of espice, espice-cuda and espice-hip: each owns /usr/bin/espice.
+provides:
+  - espice-simulator
+conflicts:
+  - espice-simulator
+vendor: ESPice
+homepage: https://github.com/OmarSiwy/ESPice
+license: Apache-2.0
+disable_globbing: true
+contents:
+  - src: ${TREE}/
+    dst: /usr/lib/espice/
+    type: tree
+  - src: ${ZIG_DIR}/bin/zig
+    dst: /usr/lib/espice/zig/zig
+    file_info:
+      mode: 0755
+  - src: ${ZIG_DIR}/lib/
+    dst: /usr/lib/espice/zig/lib/
+    type: tree
+  - src: ${WRAPPER}
+    dst: /usr/bin/espice
+    file_info:
+      mode: 0755
+  - src: ${TREE}/LICENSE
+    dst: /usr/share/licenses/${NAME}/LICENSE
+deb:
+  compression: xz
+rpm:
+  compression: xz
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.28)
+  rpm:
+    depends:
+      - glibc >= 2.28
+  archlinux:
+    depends:
+      - glibc
