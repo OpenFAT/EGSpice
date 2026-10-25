@@ -77,7 +77,8 @@
         "aarch64-linux",
         "x86_64-darwin",
         "aarch64-darwin"
-      ]
+      ],
+      "distro": "espice"
     },
     {
       "name": "cuda-sm_75",
@@ -86,7 +87,8 @@
       "systems": [
         "x86_64-linux",
         "aarch64-linux"
-      ]
+      ],
+      "distro": "espice-cuda"
     },
     {
       "name": "cuda-sm_80",
@@ -157,7 +159,8 @@
       "hip": "gfx900",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx906",
@@ -165,7 +168,8 @@
       "hip": "gfx906",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx908",
@@ -173,7 +177,8 @@
       "hip": "gfx908",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx90a",
@@ -181,7 +186,8 @@
       "hip": "gfx90a",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx942",
@@ -189,7 +195,8 @@
       "hip": "gfx942",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx950",
@@ -197,7 +204,8 @@
       "hip": "gfx950",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1030",
@@ -205,7 +213,8 @@
       "hip": "gfx1030",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1031",
@@ -213,7 +222,8 @@
       "hip": "gfx1031",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1032",
@@ -221,7 +231,8 @@
       "hip": "gfx1032",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1100",
@@ -229,7 +240,8 @@
       "hip": "gfx1100",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1101",
@@ -237,7 +249,8 @@
       "hip": "gfx1101",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1102",
@@ -245,7 +258,8 @@
       "hip": "gfx1102",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1103",
@@ -253,7 +267,8 @@
       "hip": "gfx1103",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1150",
@@ -261,7 +276,8 @@
       "hip": "gfx1150",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1151",
@@ -269,7 +285,8 @@
       "hip": "gfx1151",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1152",
@@ -277,7 +294,8 @@
       "hip": "gfx1152",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1200",
@@ -285,7 +303,8 @@
       "hip": "gfx1200",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     },
     {
       "name": "hip-gfx1201",
@@ -293,7 +312,8 @@
       "hip": "gfx1201",
       "systems": [
         "x86_64-linux"
-      ]
+      ],
+      "distro_bundle": "espice-hip"
     }
   ]
 }

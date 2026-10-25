@@ -23,8 +23,12 @@ def variants(catalogue):
                    "gpu": cuda != "none" or hip != "none",
                    "bundle": host["system"].endswith("-linux"),
                    "package": "espice-" + name,
-                   # .deb/.rpm/Arch packages: one CPU build per Linux architecture.
-                   "distro": host.get("distro", False) and not (cuda != "none" or hip != "none"),
+                   # .deb/.rpm/Arch packages, on the baseline host of each Linux
+                   # architecture: `espice` (CPU) and `espice-cuda` (sm_75 with
+                   # PTX, which newer cards JIT) from one variant each, and
+                   # `espice-hip` bundled from every HIP variant (bundle_hip).
+                   "distro": backend.get("distro", "") if host.get("distro") else "",
+                   "distro_bundle": backend.get("distro_bundle", "") if host.get("distro") else "",
                    "deb_arch": {"x86_64-linux": "amd64", "aarch64-linux": "arm64"}.get(host["system"], "")}
             if not re.fullmatch(r"[a-z0-9_-]+", name):
                 raise ValueError(f"invalid artifact name: {name}")

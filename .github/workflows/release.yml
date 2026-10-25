@@ -121,13 +121,14 @@ jobs:
           tar czf "dist/$name.tar.gz" "$name"
 
       # The tree just archived, plus the Zig it was built with, for runtime .hdl.
-      - name: Distro packages (.deb, .rpm, Arch)
-        if: matrix.distro
-        run: bash tools/package.sh "espice-${VERSION}-${VARIANT}" "$VERSION" "${{ matrix.deb_arch }}" dist
+      - name: Distro packages (.deb, .rpm, Arch) for ${{ matrix.distro }}
+        if: matrix.distro != ''
+        run: bash tools/package.sh "${{ matrix.distro }}" "espice-${VERSION}-${VARIANT}" "$VERSION" "${{ matrix.deb_arch }}" dist
 
+      # GPU packages too, on the CPU backend: the runner has no GPU.
       - name: Smoke distro packages in clean Ubuntu, Debian, Fedora, openSUSE and Arch
-        if: matrix.distro && steps.cpu.outputs.runnable == 'true'
-        run: bash tools/distro_smoke.sh dist "$VERSION" "${{ matrix.deb_arch }}" tests/conformance/tests/netlist
+        if: matrix.distro != '' && steps.cpu.outputs.runnable == 'true'
+        run: bash tools/distro_smoke.sh dist "$VERSION" "${{ matrix.deb_arch }}" tests/conformance/tests/netlist "${{ matrix.distro }}"
 
       - name: Bundle Linux runtime closure
         if: matrix.bundle
@@ -151,6 +152,16 @@ jobs:
             espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /fixtures' \
             sh "/artifacts/espice-${VERSION}-${VARIANT}.run"
 
+      # The tarball alone for hip-package: 18 .run bundles with ROCm inside
+      # would not fit a hosted runner's disk.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.distro_bundle == 'espice-hip'
+        with:
+          name: hip-tarball-${{ matrix.name }}
+          path: dist/espice-${{ needs.plan.outputs.version }}-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.name }}
@@ -159,8 +170,46 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  publish:
+  # espice-hip: AMD code objects run only on the gfx target they were built
+  # for, so the package carries every linux-x86_64-v1-hip-gfx* build's espice
+  # and packaging/espice-hip.sh picks one at start (tools/hip_bundle.sh).
+  hip-package:
     needs: [plan, build]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # tests/conformance: the smoke decks
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+        with:
+          name: omarsiwy
+          skipPush: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: hip-tarball-*
+          path: hip
+          merge-multiple: true
+      - name: Bundle, package and smoke espice-hip
+        run: |
+          bash tools/hip_bundle.sh hip "$VERSION" espice-hip
+          bash tools/package.sh espice-hip espice-hip "$VERSION" amd64 dist
+          bash tools/distro_smoke.sh dist "$VERSION" amd64 tests/conformance/tests/netlist espice-hip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-espice-hip
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: [plan, build, hip-package]
     if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:

@@ -47,5 +47,5 @@ jobs:
         run: |
           version=$(python3 -c "import sys; sys.path.insert(0, 'tools'); import release; print(release.version())")
           cp README.md LICENSE CHANGELOGS.md out/ # as release.yml's archive step
-          bash tools/package.sh out "$version" amd64 dist
+          bash tools/package.sh espice out "$version" amd64 dist
           bash tools/distro_smoke.sh dist "$version" amd64 tests/conformance/tests/netlist

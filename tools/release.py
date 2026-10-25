@@ -57,12 +57,20 @@ def metadata(name, release_version, runnable):
             'gpu_runtime_tested': False}
 
 
+def packages(name, release_version, deb_arch):
+    stem = f'{name}-{release_version}-linux-{deb_arch}'
+    return [stem + '.deb', stem + '.rpm', stem + '.pkg.tar.zst']
+
+
 def distro_assets(release_version, row):
     """The .deb, .rpm and Arch package release.yml builds for a `distro` row."""
-    if not row['distro']:
-        return []
-    stem = f'espice-{release_version}-linux-{row["deb_arch"]}'
-    return [stem + '.deb', stem + '.rpm', stem + '.pkg.tar.zst']
+    return packages(row['distro'], release_version, row['deb_arch']) if row['distro'] else []
+
+
+def bundle_assets(release_version, rows):
+    """The packages the hip-package job bundles from every `distro_bundle` row of one architecture."""
+    return sorted({name for row in rows if row['distro_bundle']
+                   for name in packages(row['distro_bundle'], release_version, row['deb_arch'])})
 
 
 def pkgbuild(directory, release_version):
@@ -110,6 +118,7 @@ def verify(directory, release_version):
         if build != want:
             raise ValueError(f'{archive.name}: build metadata differs from the release plan')
         builds.append(build)
+    expected += [directory / name for name in bundle_assets(release_version, catalogue())]
     actual = {path for pattern in ('*.run', '*.tar.gz', '*.deb', '*.rpm', '*.pkg.tar.zst')
               for path in directory.glob(pattern)}
     if actual != set(expected):

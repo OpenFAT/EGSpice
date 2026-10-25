@@ -116,7 +116,8 @@ class ReleaseTests(unittest.TestCase):
             (directory / deb).unlink()
             with self.assertRaises(ValueError):
                 release.verify(directory, version)
-        self.assertFalse(any(row['distro'] for row in release.catalogue() if row['gpu'] or row['system'].endswith('-darwin')))
+        self.assertFalse(any(row['distro'] or row['distro_bundle'] for row in release.catalogue() if row['system'].endswith('-darwin')))
+        self.assertEqual({row['distro'] for row in release.catalogue() if row['gpu'] and row['distro']}, {'espice-cuda'})
 
     def test_homebrew_formula_pins_every_platform_tarball(self):
         version = release.version()
@@ -135,6 +136,27 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn('Zig 0.18.0-dev.349+d924f83bf', text)
             sums = dict(reversed(line.split('  ')) for line in (directory / 'SHA256SUMS').read_text().splitlines())
             self.assertEqual(sums['espice.rb'], release.digest(directory / 'espice.rb'))
+
+    def test_gpu_packages_are_required(self):
+        version = release.version()
+        rows = release.catalogue()
+        cuda = [row for row in rows if row['distro'] == 'espice-cuda']
+        self.assertEqual(sorted(row['name'] for row in cuda), ['linux-aarch64-cuda-sm_75', 'linux-x86_64-v1-cuda-sm_75'])
+        hip = [row for row in rows if row['distro_bundle'] == 'espice-hip']
+        self.assertEqual(len(hip), 18)
+        self.assertEqual({row['name'].split('-hip-')[0] for row in hip}, {'linux-x86_64-v1'})
+        self.assertEqual(release.bundle_assets(version, rows), [f'espice-hip-{version}-linux-amd64.{ext}' for ext in ('deb', 'pkg.tar.zst', 'rpm')])
+        picked = [cuda[0], hip[0]]
+        with tempfile.TemporaryDirectory() as temp, patch.object(release, 'catalogue', return_value=picked):
+            directory = Path(temp)
+            for row in picked:
+                self.make_assets(directory, row)
+            for name in release.bundle_assets(version, picked):
+                (directory / name).write_bytes(b'example bundle package')
+            release.verify(directory, version)
+            (directory / f'espice-hip-{version}-linux-amd64.rpm').unlink()
+            with self.assertRaises(ValueError):
+                release.verify(directory, version)
 
 
 if __name__ == '__main__':

@@ -46,6 +46,26 @@ sudo zypper install ./espice-0.3.0-linux-amd64.rpm         # openSUSE
 sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst      # Arch
 ```
 
+For GPUs, two more packages install in place of `espice` (each conflicts
+with the others, since all own `/usr/bin/espice`):
+
+- `espice-cuda` (x86-64 and ARM64): the `cuda-sm_75` build. It embeds PTX,
+  which the driver compiles for any newer card, so it runs on every NVIDIA
+  GPU from Turing on. It needs the NVIDIA driver (`libcuda.so.1`), not the
+  CUDA toolkit.
+- `espice-hip` (x86-64): AMD code objects run only on the GPU target they
+  were built for, so it carries one `espice` per target the release builds
+  (gfx900 to gfx1201, under `/usr/lib/espice/bin/`). `/usr/bin/espice` runs
+  the one for the GPU the kernel reports (`gfx_target_version` in
+  `/sys/class/kfd`); `ESPICE_HIP_ARCH=gfx1100` picks one by hand. It needs
+  ROCm's HIP runtime (`libamdhip64.so`). It leaves out `libespice.a`: C
+  embedders of a HIP build use that target's tarball.
+
+Both start without their driver, which `espice` loads only when a run uses
+the GPU; the release checks that each starts and solves the smoke decks on
+the CPU backend, and lists its GPU backend in `--version`. Hosted runners
+have no GPU, so GPU execution is not tested before a release.
+
 On Arch, the release's `PKGBUILD` builds `espice-bin`, the same files, with
 `makepkg`; the release workflow pushes it to the AUR once the maintainer's
 AUR key is configured. No release carries packages yet. Each package installs the release tree under
