@@ -2,14 +2,19 @@
 //! result schemas. The numerical implementations stay private to the module.
 /// The query graph and its scheduler (`Session`).
 pub const session = @import("session.zig");
+/// Per-Problem execution settings every query shares.
 pub const ExecutionConfig = @import("executor.zig").Config;
 /// Developer switches `ExecutionConfig.knobs` carries; the facade fills them.
 pub const Knobs = @import("types.zig").Knobs;
+/// Refuses a backend without kernels in this build or a zero thread count.
 pub const validateBackend = @import("executor.zig").validateBackend;
+/// Most points one lane batch runs together under a config; advisory.
 pub const batchWidth = @import("executor.zig").batchWidth;
 /// Threads a Problem lends its large queries (`ExecutionConfig.thread_pool`).
 pub const ThreadPool = @import("executor.zig").ThreadPool;
+/// Reusable query threads a Problem lends through `ExecutionConfig.threads`.
 pub const Threads = @import("worker.zig").Threads;
+/// Solver workspaces a Problem's queries share (`ExecutionConfig.ws_pool`).
 pub const WsPool = @import("ws_pool.zig").WsPool;
 /// Whether the GPU driver came up; the facade owns one per Problem and
 /// lends it through `ExecutionConfig.gpu_driver`.

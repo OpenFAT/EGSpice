@@ -24,9 +24,9 @@ const std = @import("std");
 const assert = std.debug.assert;
 const direct = @import("direct.zig");
 const Gmres = @import("gmres.zig").Gmres;
-const BbdInfo = @import("core").numerics.BbdInfo;
-const Execution = @import("core").numerics.Execution;
 const num = @import("core").numerics;
+const BbdInfo = num.BbdInfo;
+const Execution = num.Execution;
 const lanes = @import("lane/lanes.zig");
 const Lanes = lanes.Lanes;
 const LaneSolver = @import("lane/solver.zig").LaneSolver;
@@ -76,7 +76,7 @@ fn executionOf(sys: anytype) Execution {
 }
 
 /// The user-facing accuracy profile (SPICE .options).
-pub const Tolerances = @import("core").numerics.Tolerances;
+pub const Tolerances = num.Tolerances;
 
 /// Newton options for `tol`, with `max_iter_override` replacing ITL1. The
 /// cap is never below 100: ngspice's NIiter raises any smaller maxIter to
@@ -409,11 +409,6 @@ fn plausible(x: []const f64, limit: f64) bool {
     return bad == 0;
 }
 
-/// Rows whose |F_i| exceeds `residualGate`, NaN included. A branchless
-/// count, not an early return: it runs only on an iterate that passed the
-/// delta gate, where it nearly always passes and reads every row anyway.
-/// 0.52 ns per row against the early-return loop's 1.22 (ReleaseFast, n =
-/// 64 to 16384).
 /// The lanes with every unknown finite and within their `limit` lane:
 /// `plausible` per lane.
 fn plausibleLanes(comptime V: type, x: []const V, limit: V) lanes.Of(V).Mask {
@@ -436,6 +431,11 @@ fn residualLanes(comptime V: type, opts: Options, residual: []const V, x: []cons
     return ~bad;
 }
 
+/// Rows whose |F_i| exceeds `residualGate`, NaN included. A branchless
+/// count, not an early return: it runs only on an iterate that passed the
+/// delta gate, where it nearly always passes and reads every row anyway.
+/// 0.52 ns per row against the early-return loop's 1.22 (ReleaseFast, n =
+/// 64 to 16384).
 fn residualMisses(opts: Options, residual: []const f64, x: []const f64, vals: []const f64, diag_slots: []const u32) usize {
     assert(residual.len >= x.len);
     assert(diag_slots.len >= x.len);
@@ -611,8 +611,8 @@ pub fn jfnk(
 
         assembleShifted(sys, x, t, opts, hook);
         @memcpy(f0, sys.rhs[0..n]);
-        if (iter == 0) limit = plausibleLimit(sys, x, f0, hook.vals(sys));
         const v = hook.vals(sys);
+        if (iter == 0) limit = plausibleLimit(sys, x, f0, v);
         loadGmin(f64, sys, v, null, x, opts);
         // Before the factor, which may overwrite `v`.
         const load_ok = if (comptime @hasDecl(S, "loadCheck")) sys.loadCheck(x, v, f0, opts.reltol, opts.abstol) else true;
@@ -833,12 +833,16 @@ pub const Prof = struct {
     /// limiting and the convergence gates.
     pub const Phase = enum(u3) { eval, load, factor, solve, update };
 
+    /// Opens one Newton iteration: stamps the clock and counts it. A no-op
+    /// while `io` is null.
     pub fn start(p: *Prof) void {
         const io = p.io orelse return;
         p.last = .now(io, .awake);
         p.counts[0] += 1;
     }
 
+    /// Charges the time since the last `start` or `lap` to `phase`; a
+    /// `.factor` lap also counts a factorization. A no-op while `io` is null.
     pub fn lap(p: *Prof, phase: Phase) void {
         comptime assert(@typeInfo(Phase).@"enum".field_names.len == @typeInfo(@FieldType(Prof, "ns")).array.len);
         const io = p.io orelse return;
@@ -954,6 +958,7 @@ pub fn LaneWorkspace(comptime W: usize) type {
         /// Fails only on allocation. Asserts that the lanes share n.
         pub fn init(gpa: std.mem.Allocator, ws: [W]*Workspace) !Self {
             const n = ws[0].slv.n;
+            for (ws) |w| assert(w.slv.n == n);
             var solvers: [W]*direct.Solver = undefined;
             for (&solvers, ws) |*s, w| s.* = &w.slv;
             var slv = try LaneSolver(W).init(gpa, solvers);

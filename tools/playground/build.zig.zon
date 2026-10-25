@@ -1,16 +1,16 @@
-// The docs playground's schematic half, a separate build root so ESPice's
-// own builds and its package never fetch cktImg. ESPice's `zig build wasm`
-// runs this build.
+// The docs playground, a separate build root so ESPice's own builds and its
+// package never fetch cktImg. pages.yml runs this build.
 .{
     .name = .espice_playground,
     .version = "1.0.0",
     .fingerprint = 0x4bc183452cdd47d8,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .espice = .{ .path = "../.." },
         .cktimg = .{
             .url = "git+https://github.com/OmarSiwy/cktImg#b6631d8ad1806084707da3ec15e16e72818e718d",
             .hash = "NetlistParser-0.0.0-g79GuK4rCwCqws4vfH93K09_yc8ivZuCwF4I0j7H3udR",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "cktimg.zig" },
+    .paths = .{ "build.zig", "build.zig.zon", "cktimg.zig", "espice.zig" },
 }

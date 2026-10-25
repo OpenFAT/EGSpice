@@ -11,6 +11,10 @@
 // g--si, channel current di--si with the normal/inverse swap on sign(vds).
 // No $limit is requested (fetlim/limvds/pnjlim are left to the host), and the
 // MODEINITJCT vgs = vgd = -1 V seed has no Verilog-A spelling.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module mes(d, g, s);
     inout d, g, s;
     electrical d, g, s;

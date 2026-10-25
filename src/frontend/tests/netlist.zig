@@ -19,10 +19,7 @@ fn device(nl: Netlist, name: []const u8) !Netlist.View {
 }
 
 fn numeric(value: Value) !f64 {
-    return switch (value) {
-        .num => |n| n,
-        else => error.UnresolvedConstant,
-    };
+    return value.number() orelse error.UnresolvedConstant;
 }
 
 fn parameter(kv: []const netlist.Kv, name: []const u8) !f64 {

@@ -9,8 +9,7 @@
 //! pays off on device work, not circuit size; `init` prices both sides
 //! before `auto` commits.
 //!
-//! Cites: dev/decisions.md S5 (the `noinline` entry points); #15, #93,
-//! #126, #139 for the decisions marked in the body.
+//! Cites #15, #93, #126 and #139 for the decisions marked in the body.
 
 const std = @import("std");
 const hdl = @import("hdl.zig");
@@ -25,16 +24,8 @@ const direct = @import("solver").direct;
 const Planes = device_ir.Planes;
 const SimState = device_ir.SimState;
 
-/// The backend this binary carries kernel images for. Comptime, because
-/// naming `gompute.RawByName(.cuda)` is a compile error in a build without
-/// CUDA artifacts.
 const artifacts = @import("gompute_kernels");
-const backend: ?gompute.Backend = if (artifacts.has_cuda)
-    .cuda
-else if (artifacts.has_hip)
-    .hip
-else
-    null;
+const backend = devices.backend;
 
 /// This binary carries kernel images, so a context can exist at all.
 pub const available = backend != null;
@@ -179,8 +170,8 @@ pub const Driver = struct {
     /// `prestart`'s thread; `deinit` joins it.
     warm: ?std.Thread = null,
 
-    /// Brings the driver and device 0's primary context up on a thread
-    /// (05 5.12), so the ~350 ms start overlaps the frontend instead of the
+    /// Brings the driver and device 0's primary context up on a thread,
+    /// so the ~350 ms start overlaps the frontend instead of the
     /// first query. The primary context stays retained for the process
     /// (gompute's `Compute.deinit` drops the handle only); a failure here
     /// leaves the first `GpuContext.init` to report it. Call once, before
@@ -215,8 +206,8 @@ pub const Driver = struct {
     }
 };
 
-/// Monotonic nanoseconds, for the cost probe and `Prof`.
-fn nowNs() u64 {
+/// Monotonic nanoseconds, for the cost probe, `Prof` and `lu.zig`'s timers.
+pub fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
@@ -245,7 +236,7 @@ const Prof = struct {
     /// Host waits on the stream, all causes, and by cause (`Wait`).
     syncs: u64 = 0,
     waits: [@typeInfo(Wait).@"enum".field_names.len]u64 = @splat(0),
-    /// The census (01 1.1): evals that carried charge (`evalQ`), accepted
+    /// The census: evals that carried charge (`evalQ`), accepted
     /// steps (`stateCtl(.commit)`, the operating point included), and the
     /// bytes each way over the bus, every copy counted.
     charge_evals: u64 = 0,
@@ -304,7 +295,7 @@ const Prof = struct {
 /// (parameter repacks, `syncHostState`).
 const Wait = enum { eval, charge, lim, state, query, tape, stepped, check, other };
 
-/// The device path's measured price under `auto` (01 1.9b): wall time
+/// The device path's measured price under `auto`: wall time
 /// inside the entry points that evaluate (eval, the limit pass with its
 /// prefetch, the charge passes) per device eval, from eval `from` to
 /// eval `at`, against the host price per eval `Cost.admit` measured.
@@ -325,7 +316,7 @@ const Audit = struct {
     const at: u64 = 40;
 };
 
-/// The prices `Audit` measured for one circuit on this card (01 1.9a),
+/// The prices `Audit` measured for one circuit on this card,
 /// kept beside the JIT markers in `<cache>/espice/gpu-cost/<key>` as the
 /// host and device microseconds per eval. `Cost.admit` prices from them
 /// instead of probing, and declines a circuit the device lost before
@@ -365,16 +356,9 @@ const CostCache = struct {
         return std.hash.Wyhash.hash(0, &info.uuid);
     }
 
-    fn path(buf: []u8, k: u64, knobs: Knobs) ?[:0]const u8 {
-        if (knobs.xdg_cache_home) |x|
-            return std.mem.printSentinel(buf, "{s}/espice/gpu-cost/{x:0>16}", .{ x, k }, 0) catch null;
-        const home = knobs.home orelse return null;
-        return std.mem.printSentinel(buf, "{s}/.cache/espice/gpu-cost/{x:0>16}", .{ home, k }, 0) catch null;
-    }
-
     fn read(k: u64, knobs: Knobs) ?Rec {
         var buf: [512]u8 = undefined;
-        const p = path(&buf, k, knobs) orelse return null;
+        const p = cachePath(&buf, "gpu-cost", k, knobs) orelse return null;
         const fd = std.c.open(p, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
         if (fd < 0) return null;
         defer _ = std.c.close(fd);
@@ -401,14 +385,8 @@ const CostCache = struct {
     /// run probes.
     fn write(k: u64, knobs: Knobs, rec: Rec) void {
         var buf: [512]u8 = undefined;
-        const p = path(&buf, k, knobs) orelse return;
-        const leaf = std.mem.lastIndexOfScalar(u8, p, '/') orelse return;
-        const app = std.mem.lastIndexOfScalar(u8, p[0..leaf], '/') orelse return;
-        for ([_]usize{ app, leaf }) |end| {
-            buf[end] = 0;
-            _ = std.c.mkdir(@ptrCast(&buf), 0o755);
-            buf[end] = '/';
-        }
+        const p = cachePath(&buf, "gpu-cost", k, knobs) orelse return;
+        if (!makeParents(&buf, p)) return;
         const fd = std.c.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
         if (fd < 0) return;
         defer _ = std.c.close(fd);
@@ -462,15 +440,40 @@ fn sassFits() bool {
 /// leaves stale markers and `auto` pays one cold JIT; key on the version too
 /// if that ever matters.
 fn markerPath(buf: []u8, image: []const u8, knobs: Knobs) ?[:0]const u8 {
-    const hash = std.hash.Wyhash.hash(0, image);
+    return cachePath(buf, "gpu-jit", std.hash.Wyhash.hash(0, image), knobs);
+}
+
+/// `<cache>/espice/<dir>/<key as 16 hex digits>` in `buf`, `<cache>` being
+/// `$XDG_CACHE_HOME`, else `$HOME/.cache`. Null without either, or past
+/// `buf` (no path, never a truncated one).
+fn cachePath(buf: []u8, comptime dir: []const u8, key: u64, knobs: Knobs) ?[:0]const u8 {
     if (knobs.xdg_cache_home) |x|
-        return std.mem.printSentinel(buf, "{s}/espice/gpu-jit/{x:0>16}", .{ x, hash }, 0) catch null;
+        return std.mem.printSentinel(buf, "{s}/espice/" ++ dir ++ "/{x:0>16}", .{ x, key }, 0) catch null;
     const home = knobs.home orelse return null;
-    return std.mem.printSentinel(buf, "{s}/.cache/espice/gpu-jit/{x:0>16}", .{ home, hash }, 0) catch null;
+    return std.mem.printSentinel(buf, "{s}/.cache/espice/" ++ dir ++ "/{x:0>16}", .{ home, key }, 0) catch null;
+}
+
+/// mkdir -p for `path`'s `espice/` and `<dir>/` (`cachePath`), whose bytes
+/// live at the start of `buf`; EEXIST is the common case. False when
+/// `path` has fewer than two slashes. Best effort: a failed mkdir surfaces
+/// as the caller's failed open.
+fn makeParents(buf: []u8, path: []const u8) bool {
+    const leaf = std.mem.lastIndexOfScalar(u8, path, '/') orelse return false;
+    const app = std.mem.lastIndexOfScalar(u8, path[0..leaf], '/') orelse return false;
+    for ([_]usize{ app, leaf }) |end| {
+        buf[end] = 0;
+        _ = std.c.mkdir(@ptrCast(buf.ptr), 0o755);
+        buf[end] = '/';
+    }
+    return true;
 }
 
 fn imageWarm(image: []const u8, knobs: Knobs) bool {
-    if (sassFits()) return true;
+    return sassFits() or markedWarm(image, knobs);
+}
+
+/// Whether `markWarm` recorded `image` under `knobs`' cache root.
+fn markedWarm(image: []const u8, knobs: Knobs) bool {
     var buf: [512]u8 = undefined;
     const path = markerPath(&buf, image, knobs) orelse return false;
     return std.c.access(path, 0) == 0;
@@ -481,14 +484,7 @@ fn imageWarm(image: []const u8, knobs: Knobs) bool {
 fn markWarm(image: []const u8, knobs: Knobs) void {
     var buf: [512]u8 = undefined;
     const path = markerPath(&buf, image, knobs) orelse return;
-    // mkdir -p for `espice/` and `gpu-jit/`; EEXIST is the common case.
-    const jit_dir = std.mem.lastIndexOfScalar(u8, path, '/') orelse return;
-    const app_dir = std.mem.lastIndexOfScalar(u8, path[0..jit_dir], '/') orelse return;
-    for ([_]usize{ app_dir, jit_dir }) |end| {
-        buf[end] = 0;
-        _ = std.c.mkdir(@ptrCast(&buf), 0o755);
-        buf[end] = '/';
-    }
+    if (!makeParents(&buf, path)) return;
     const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(c_uint, 0o644));
     if (fd >= 0) _ = std.c.close(fd);
 }
@@ -506,11 +502,11 @@ const BatchGpu = struct {
     /// `arp_qtp_<model>`: the LTE charge tape, when the host batch has one.
     qtp_kernel: ?Raw,
     /// `arp_qonly_<model>`: q rows and tape at x, values only, when the
-    /// image has it and the batch has charge (`evalQ`, 04 4.4).
+    /// image has it and the batch has charge (`evalQ`).
     q_kernel: ?Raw,
     /// `arp_evalc_<model>`, for a batch whose whole Jacobian is constant:
     /// the eval without g and c stamps, which sit in the device baseline
-    /// instead (01 1.6). Null keeps the batch's g/c in the staging.
+    /// instead. Null keeps the batch's g/c in the staging.
     const_kernel: ?Raw,
     /// Resident for the simulation. `repack` re-uploads only models and
     /// instances; the tapes never change.
@@ -569,20 +565,8 @@ const BatchGpu = struct {
     fn deinit(self: *BatchGpu, gpa: std.mem.Allocator) void {
         gpa.free(self.base);
         if (self.dev.len > 0) self.kernel.freePinned(self.dev);
-        self.d_models.free();
-        self.d_model_of.free();
-        self.d_instances.free();
-        self.d_gath.free();
-        self.d_rhs_idx.free();
-        self.d_slots.free();
-        self.d_lim.free();
-        self.d_states.free();
-        self.d_tape.free();
-        if (self.lim_kernel) |*k| k.deinit();
-        if (self.ctl_kernel) |*k| k.deinit();
-        if (self.qtp_kernel) |*k| k.deinit();
-        if (self.q_kernel) |*k| k.deinit();
-        if (self.const_kernel) |*k| k.deinit();
+        for ([_]*Buffer{ &self.d_models, &self.d_model_of, &self.d_instances, &self.d_gath, &self.d_rhs_idx, &self.d_slots, &self.d_lim, &self.d_states, &self.d_tape }) |b| b.free();
+        for ([_]*?Raw{ &self.lim_kernel, &self.ctl_kernel, &self.qtp_kernel, &self.q_kernel, &self.const_kernel }) |opt| if (opt.*) |*k| k.deinit();
         self.kernel.deinit();
     }
 
@@ -608,22 +592,24 @@ fn evalBlock(knobs: Knobs) u32 {
     return knobs.gpu_block;
 }
 
-/// `arp_qtp_<model>` for the eval kernel `arp_eval_<model>`, or null when
-/// the name has another shape or the result does not fit `buf` (the batch
-/// then keeps the row LTE).
-fn qtpName(buf: []u8, eval_kernel: []const u8) ?[]const u8 {
-    return renamed(buf, eval_kernel, "arp_qtp_");
+/// The kernel `lookup` loaded, or null when the image lacks it.
+fn optional(lookup: anytype) !?Raw {
+    return lookup catch |e| switch (e) {
+        error.KernelNotFound => null,
+        else => return e, // else: any other driver error is fatal for the batch
+    };
 }
 
-/// `eval_kernel` (`arp_eval_<model>`) with its prefix swapped for `prefix`,
-/// or null as `qtpName`.
+/// `eval_kernel` (`arp_eval_<model>`) with its prefix swapped for `prefix`
+/// (`arp_qtp_<model>`, ...), or null when the name has another shape or the
+/// result does not fit `buf`.
 fn renamed(buf: []u8, eval_kernel: []const u8, prefix: []const u8) ?[]const u8 {
     const eval_prefix = "arp_eval_";
     if (!std.mem.startsWith(u8, eval_kernel, eval_prefix)) return null;
     return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, eval_kernel[eval_prefix.len..] }) catch null;
 }
 
-/// One Newton eval's matrix request (02 2.3): A = G + alpha·C. Under
+/// One Newton eval's matrix request: A = G + alpha·C. Under
 /// `device` the device LU forms A from `d_planes` (`GpuLu.solveResident`)
 /// and the host keeps g and c on the diagonal only; otherwise the device
 /// forms A here and A comes down in place of g and c.
@@ -634,7 +620,7 @@ pub const GcReq = struct { alpha: f64, device: bool };
 /// `gcVals`'s pinned buffer, `device` A on the device for `gcSolve`.
 pub const GcServed = enum { failed, full, host_a, device };
 
-/// The resident Newton matrix's buffers (02 2.3): the gather slots (the
+/// The resident Newton matrix's buffers: the gather slots (the
 /// diagonal, the ground pin's first), their g then c per plane buffer, and
 /// A per plane buffer. Kernels from the LU image (`lu_device.zig`), launched
 /// at `gc_block` threads.
@@ -682,6 +668,12 @@ const Layout = struct {
     }
 };
 
+/// Host planes g, c, rhs, q back to back at the start of `buf`, for the
+/// host stamps into scratch (the cost probe, the baseline, the fault path).
+fn scratchPlanes(buf: []f64, ng: usize, nr: usize) Planes {
+    return .{ .g_vals = buf[0..ng], .c_vals = buf[ng..][0..ng], .rhs = buf[2 * ng ..][0..nr], .q_vec = buf[2 * ng + nr ..][0..nr] };
+}
+
 /// What `GpuContext.init` reads off the analysis circuit. The context keeps
 /// `batches` (borrowed: the circuit's own, which outlive it) and the plane
 /// allocations, and copies the rest.
@@ -701,9 +693,9 @@ pub const Host = struct {
 /// Every entry point that launches takes the circuit's analysis state
 /// (`sim`) as it stands at the call. The entry points are `noinline`: the
 /// circuit's methods inline into the Newton and transient loops, and an
-/// inlined GPU branch costs those loops registers on the host path
-/// (dev/decisions.md S5). Out of line, each is the opaque call the old
-/// function-pointer hook was, without the indirection.
+/// inlined GPU branch costs those loops registers on the host path. Out
+/// of line, each is the opaque call the old function-pointer hook was,
+/// without the indirection.
 pub const GpuContext = struct {
     gpa: std.mem.Allocator,
     /// The circuit's batches (`Host.batches`), for the fallback walks.
@@ -1033,7 +1025,7 @@ pub const GpuContext = struct {
 
         if (knobs.gpu_stats != .off) std.debug.print("gpu-stats: stage={d} pieces={d} cells={d}\n", .{ order.n_stage, order.n_pieces, layout.cells(n_planes) });
         // The eval kernels store every staging cell they own each pass; the
-        // cells no pass writes keep this zero (01 1.10).
+        // cells no pass writes keep this zero.
         try d_stage.fillAsync(0, @max(order.n_stage, 1) * @sizeOf(f64), &stream);
         // Charge-free planes read zero until a host batch stamps them.
         @memset(pin_planes, 0);
@@ -1104,14 +1096,15 @@ pub const GpuContext = struct {
             return false;
         };
         const heavy = image.len >= heavy_image_bytes;
-        if (heavy and !explicit and !imageWarm(image, knobs)) {
+        const cold = heavy and !imageWarm(image, knobs);
+        if (cold and !explicit) {
             std.debug.print(
                 "note: GPU kernel for '{s}' is not compiled yet ({d} MB of PTX), so this run stays on the CPU; `--backend cuda` compiles it once per build\n",
                 .{ b.type_name, image.len >> 20 },
             );
             return Error.ImageNotCompiled;
         }
-        if (heavy and report and !imageWarm(image, knobs)) std.debug.print(
+        if (cold and report) std.debug.print(
             "note: compiling the GPU kernel for '{s}' ({d} MB of PTX); the driver caches it for later runs\n",
             .{ b.type_name, image.len >> 20 },
         );
@@ -1125,31 +1118,23 @@ pub const GpuContext = struct {
         errdefer if (lim_kernel) |*k| k.deinit();
         var ctl_kernel: ?Raw = if (p.ctl_kernel.len > 0) try hdl.kernel(backend.?, @ptrCast(get), p.ctl_kernel) else null;
         errdefer if (ctl_kernel) |*k| k.deinit();
-        // `arp_qtp_<model>` is named after the eval kernel, not carried in
-        // the frozen payload; an older image without it keeps the row LTE.
-        var qtp_name: [128]u8 = undefined;
+        // The kernels below are named after the eval kernel, not carried in
+        // the frozen payload; an older image without one keeps the host's
+        // path for it (the row LTE, the full eval, the staged g/c).
+        var name: [128]u8 = undefined;
         var qtp_kernel: ?Raw = null;
-        if (b.hooks.q_tape != null) if (qtpName(&qtp_name, p.kernel)) |name| {
-            qtp_kernel = hdl.kernel(backend.?, @ptrCast(get), name) catch |e| switch (e) {
-                error.KernelNotFound => null,
-                else => return e, // else: any other driver error is fatal for the batch
-            };
+        if (b.hooks.q_tape != null) if (renamed(&name, p.kernel, "arp_qtp_")) |n| {
+            qtp_kernel = try optional(hdl.kernel(backend.?, @ptrCast(get), n));
         };
         errdefer if (qtp_kernel) |*k| k.deinit();
         var q_kernel: ?Raw = null;
-        if (b.has_charge) if (renamed(&qtp_name, p.kernel, "arp_qonly_")) |name| {
-            q_kernel = gompute.rawKernelByName(backend.?, name, devices.ordinal) catch |e| switch (e) {
-                error.KernelNotFound => null,
-                else => return e, // else: any other driver error is fatal for the batch
-            };
+        if (b.has_charge) if (renamed(&name, p.kernel, "arp_qonly_")) |n| {
+            q_kernel = try optional(hdl.kernel(backend.?, @ptrCast(get), n));
         };
         errdefer if (q_kernel) |*k| k.deinit();
         var const_kernel: ?Raw = null;
-        if (b.has_const_jacobian and !knobs.gpu_nofuse) if (renamed(&qtp_name, p.kernel, "arp_evalc_")) |name| {
-            const_kernel = gompute.rawKernelByName(backend.?, name, devices.ordinal) catch |e| switch (e) {
-                error.KernelNotFound => null,
-                else => return e, // else: any other driver error is fatal for the batch
-            };
+        if (b.has_const_jacobian and !knobs.gpu_nofuse) if (renamed(&name, p.kernel, "arp_evalc_")) |n| {
+            const_kernel = try optional(hdl.kernel(backend.?, @ptrCast(get), n));
         };
         errdefer if (const_kernel) |*k| k.deinit();
         const tape: []f64 = if (qtp_kernel != null) @constCast(b.hooks.q_tape.?(b.ctx)) else &.{};
@@ -1266,12 +1251,7 @@ pub const GpuContext = struct {
             const g = try gpa.alloc(f64, 2 * ng + 2 * nr);
             defer gpa.free(g);
             @memset(g, 0);
-            const pl: Planes = .{
-                .g_vals = g[0..ng],
-                .c_vals = g[ng..][0..ng],
-                .rhs = g[2 * ng ..][0..nr],
-                .q_vec = g[2 * ng + nr ..][0..nr],
-            };
+            const pl = scratchPlanes(g, ng, nr);
             // Spread, not zero: at x = 0 every MOSFET sits in cutoff, which
             // evaluates in half the time of the operating mix (mos1: 197 us
             // against ~400 us per eval on parallel_inverters_2000).
@@ -1547,19 +1527,14 @@ pub const GpuContext = struct {
     /// tapes are marked stale.
     // ponytail: the baseline values are the host stamp's sum of the
     // constant batches, then reduced ahead of the rest of the cell: the sum
-    // order differs from the full restamp (tolerance class, 01 1.6).
+    // order differs from the full restamp (tolerance class).
     fn uploadBase(self: *Self) !void {
         if (self.base_cells.len == 0) return;
         const l = self.layout;
         const scratch = try self.gpa.alloc(f64, 2 * l.ng + 2 * l.nr + self.n + 1);
         defer self.gpa.free(scratch);
         @memset(scratch, 0);
-        const pl: Planes = .{
-            .g_vals = scratch[0..l.ng],
-            .c_vals = scratch[l.ng..][0..l.ng],
-            .rhs = scratch[2 * l.ng ..][0..l.nr],
-            .q_vec = scratch[2 * l.ng + l.nr ..][0..l.nr],
-        };
+        const pl = scratchPlanes(scratch, l.ng, l.nr);
         const x0 = scratch[2 * l.ng + 2 * l.nr ..];
         for (self.batches) |*bg| {
             if (bg.const_kernel == null) continue;
@@ -1574,8 +1549,8 @@ pub const GpuContext = struct {
         if (n_planes == 2) for (self.base_cells, vals[n_base..]) |cell, *v| {
             v.* = pl.c_vals[cell];
         };
-        try self.d_stage.uploadAtAsync(vals.ptr, self.n_stage * @sizeOf(f64), vals.len * @sizeOf(f64), &self.stream);
-        self.prof.up += vals.len * @sizeOf(f64);
+        var base = view(self.d_stage, self.n_stage * @sizeOf(f64));
+        try self.upload(&base, std.mem.sliceAsBytes(vals));
         // `vals` is pageable and freed on return: the driver staged it, but
         // wait anyway so the bytes are on the device before any launch.
         try self.sync(.other);
@@ -1770,7 +1745,7 @@ pub const GpuContext = struct {
     }
 
     /// `evalOnGpu` for a Newton iterate whose matrix is `G + req.alpha·C`
-    /// (02 2.3, `Circuit.evalNewtonGC`). Returns what the planes hold:
+    /// (`Circuit.evalNewtonGC`). Returns what the planes hold:
     /// `full` when the query cannot take a resident matrix, `failed` as
     /// `eval`'s false. `diag` (n slots) and `nnz` are the circuit's, the
     /// same every call.
@@ -1853,14 +1828,12 @@ pub const GpuContext = struct {
         const gc = &self.gc.?;
         const pb = self.pinnedBuf(buf);
         if (self.lu_check) {
-            try self.d_planes.downloadAtAsync(pb.ptr, 0, self.n_cells * @sizeOf(f64), &self.stream);
-            self.prof.down += self.n_cells * @sizeOf(f64);
+            try self.download(&self.d_planes, std.mem.sliceAsBytes(pb[0..self.n_cells]));
         } else {
             var rhs = view(self.d_planes, l.off(.rhs) * @sizeOf(f64));
-            try rhs.downloadAtAsync(pb[l.off(.rhs)..].ptr, 0, l.nr * @sizeOf(f64), &self.stream);
+            try self.download(&rhs, std.mem.sliceAsBytes(pb[l.off(.rhs)..][0..l.nr]));
             var q = view(self.d_planes, l.off(.q) * @sizeOf(f64));
-            try q.downloadAtAsync(pb[l.off(.q)..].ptr, 0, l.nr * @sizeOf(f64), &self.stream);
-            self.prof.down += 2 * l.nr * @sizeOf(f64);
+            try self.download(&q, std.mem.sliceAsBytes(pb[l.off(.q)..][0..l.nr]));
         }
         const count = self.gcCount(r);
         if (count > 0) {
@@ -1869,8 +1842,7 @@ pub const GpuContext = struct {
             try gc.gather.launchOn(&self.stream, gompute.Dim3.linear(count, gc_block), .{ .x = gc_block }, 0, &.{
                 gompute.interface.arg(&n_k), gc.d_k.argPtr(), self.d_planes.argPtr(), c_plane.argPtr(), gc.d_kv.argPtr(),
             });
-            try gc.d_kv.downloadAtAsync(gc.pin_kv[buf].ptr, 0, 2 * count * @sizeOf(f64), &self.stream);
-            self.prof.down += 2 * count * @sizeOf(f64);
+            try self.download(&gc.d_kv, std.mem.sliceAsBytes(gc.pin_kv[buf][0 .. 2 * count]));
         }
         if (!r.device) try self.enqueueCombine(buf, r.alpha);
     }
@@ -1886,8 +1858,7 @@ pub const GpuContext = struct {
         try gc.combine.launchOn(&self.stream, gompute.Dim3.linear(gc.nnz, gc_block), .{ .x = gc_block }, 0, &.{
             gompute.interface.arg(&n), gompute.interface.arg(&a), self.d_planes.argPtr(), c_plane.argPtr(), gc.d_a.argPtr(),
         });
-        try gc.d_a.downloadAtAsync(gc.pin_a[buf].ptr, 0, @as(usize, gc.nnz) * @sizeOf(f64), &self.stream);
-        self.prof.down += @as(usize, gc.nnz) * @sizeOf(f64);
+        try self.download(&gc.d_a, std.mem.sliceAsBytes(gc.pin_a[buf]));
     }
 
     /// Writes the gathered g and c into plane buffer `buf`'s planes.
@@ -1946,7 +1917,7 @@ pub const GpuContext = struct {
         const scratch = self.gpa.alloc(f64, 2 * l.ng + 2 * l.nr) catch @panic("OOM in the device-LU fault fallback");
         defer self.gpa.free(scratch);
         @memset(scratch, 0);
-        const pl: Planes = .{ .g_vals = scratch[0..l.ng], .c_vals = scratch[l.ng..][0..l.ng], .rhs = scratch[2 * l.ng ..][0..l.nr], .q_vec = scratch[2 * l.ng + l.nr ..][0..l.nr] };
+        const pl = scratchPlanes(scratch, l.ng, l.nr);
         const x = self.pin_x[self.cur][0..self.x_len];
         for (self.all_batches) |b| walk.stampRange(b, &pl, 0, b.count, x, self.last_t, .full);
         const gc = &self.gc.?;
@@ -1990,10 +1961,9 @@ pub const GpuContext = struct {
         if (comptime backend == null) return Error.NoGpuArtifacts;
         _ = try self.pushStepped();
         @memcpy(self.pin_x[buf][0..x.len], x);
-        try self.d_x[buf].uploadAtAsync(self.pin_x[buf].ptr, 0, x.len * @sizeOf(f64), &self.stream);
-        self.prof.up += x.len * @sizeOf(f64);
+        try self.upload(&self.d_x[buf], std.mem.sliceAsBytes(self.pin_x[buf][0..x.len]));
         // No staging clear: the kernels store each cell they own every pass,
-        // and the cells none writes hold `init`'s zero (01 1.10).
+        // and the cells none writes hold `init`'s zero.
         try self.phaseLap(0);
 
         for (self.batches) |*bg| {
@@ -2029,8 +1999,7 @@ pub const GpuContext = struct {
         try self.phaseLap(3);
         self.gc_buf[buf] = gc;
         if (gc) |r| try self.enqueueGcDown(buf, r) else {
-            try self.d_planes.downloadAtAsync(self.pinnedBuf(buf).ptr, 0, self.n_cells * @sizeOf(f64), &self.stream);
-            self.prof.down += self.n_cells * @sizeOf(f64);
+            try self.download(&self.d_planes, std.mem.sliceAsBytes(self.pinnedBuf(buf)[0..self.n_cells]));
         }
         try self.phaseLap(4);
         // `pin_tape` is about to hold buffer `buf`'s tape, or stale bytes.
@@ -2042,7 +2011,7 @@ pub const GpuContext = struct {
     /// work this process does not own. Counted for `ESPICE_GPU_STATS`.
     fn sync(self: *Self, comptime why: Wait) !void {
         self.prof.syncs += 1;
-        self.prof.waits[@intFromEnum(why)] += 1;
+        self.prof.waits[@backingInt(why)] += 1;
         try self.stream.synchronize();
     }
 
@@ -2224,8 +2193,7 @@ pub const GpuContext = struct {
         // `d_x[cur]` holds the x behind the planes' charge, which a lazy
         // tape pass reads.
         @memcpy(self.pin_x[buf][0..x.len], x);
-        try self.d_x[buf].uploadAtAsync(self.pin_x[buf].ptr, 0, x.len * @sizeOf(f64), &self.stream);
-        self.prof.up += x.len * @sizeOf(f64);
+        try self.upload(&self.d_x[buf], std.mem.sliceAsBytes(self.pin_x[buf][0..x.len]));
         const sim_at = self.simAt(t);
         var off: usize = 0;
         for (self.batches) |*bg| {
@@ -2248,8 +2216,7 @@ pub const GpuContext = struct {
                 gompute.interface.arg(&with_tape),
             });
             if (bg.tape.len > 0) {
-                try bg.d_tape.downloadAtAsync(self.pin_tape[off..].ptr, 0, bg.tape.len * @sizeOf(f64), &self.stream);
-                self.prof.down += bg.tape.len * @sizeOf(f64);
+                try self.download(&bg.d_tape, std.mem.sliceAsBytes(self.pin_tape[off..][0..bg.tape.len]));
             }
             off += bg.tape.len;
         }
@@ -2265,8 +2232,7 @@ pub const GpuContext = struct {
         var seg2 = view(self.d_seg2, 2 * l.off(.q) * @sizeOf(u32));
         var q_plane = view(self.d_planes, l.off(.q) * @sizeOf(f64));
         try self.launchReduce(&seg2, &self.d_mid, &q_plane, l.nr);
-        try q_plane.downloadAtAsync(self.pinnedBuf(buf)[l.off(.q)..].ptr, 0, l.nr * @sizeOf(f64), &self.stream);
-        self.prof.down += l.nr * @sizeOf(f64);
+        try self.download(&q_plane, std.mem.sliceAsBytes(self.pinnedBuf(buf)[l.off(.q)..][0..l.nr]));
         self.tape_buf = buf;
     }
 
@@ -2280,7 +2246,7 @@ pub const GpuContext = struct {
 
     /// The transient's accepted-point pass (`Circuit.acceptStates`): the
     /// charges at `x`, then every resident state half, then the accepted-
-    /// state query, queued as one chain behind one wait (01 1.1), in the
+    /// state query, queued as one chain behind one wait, in the
     /// order the separate calls run them: the charges read the state before
     /// `updateState` latches it, and the query reads it after. The query's
     /// device half is kept for the `stateCtl(.query)` that follows. Returns
@@ -2316,8 +2282,7 @@ pub const GpuContext = struct {
         var word1 = view(self.d_flags, 4);
         const query = try self.enqueueCtl(.query, &word1);
         if (states or query) {
-            try self.d_flags.downloadAtAsync(self.pin_flags.ptr, 0, 8, &self.stream);
-            self.prof.down += 8;
+            try self.download(&self.d_flags, self.pin_flags[0..8]);
         }
         self.prof.lap("enqueue");
         try self.sync(.charge);
@@ -2373,8 +2338,7 @@ pub const GpuContext = struct {
                 bg.d_instances.argPtr(),
                 bg.d_tape.argPtr(),
             });
-            try bg.d_tape.downloadAtAsync(self.pin_tape[off..].ptr, 0, bg.tape.len * @sizeOf(f64), &self.stream);
-            self.prof.down += bg.tape.len * @sizeOf(f64);
+            try self.download(&bg.d_tape, std.mem.sliceAsBytes(self.pin_tape[off..][0..bg.tape.len]));
             off += bg.tape.len;
         }
         self.tape_buf = buf;
@@ -2460,10 +2424,9 @@ pub const GpuContext = struct {
                 // `x_old` explicitly: under JFNK the last eval was a
                 // finite-difference probe.
                 @memcpy(self.pin_x2[0..n], x[0..n]);
-                try self.d_x2.uploadAtAsync(self.pin_x2.ptr, 0, n * @sizeOf(f64), &self.stream);
+                try self.upload(&self.d_x2, std.mem.sliceAsBytes(self.pin_x2[0..n]));
                 @memcpy(self.pin_xold[0..n], x_old[0..n]);
-                try self.d_xold.uploadAtAsync(self.pin_xold.ptr, 0, n * @sizeOf(f64), &self.stream);
-                self.prof.up += 2 * n * @sizeOf(f64);
+                try self.upload(&self.d_xold, std.mem.sliceAsBytes(self.pin_xold[0..n]));
                 try self.d_flags.fillAsync(0, 4, &self.stream);
             }
             try self.syncSeededLim(bg);
@@ -2490,8 +2453,7 @@ pub const GpuContext = struct {
             launched = true;
         }
         if (launched) {
-            try self.d_flags.downloadAtAsync(self.pin_flags.ptr, 0, 4, &self.stream);
-            self.prof.down += 4;
+            try self.download(&self.d_flags, self.pin_flags[0..4]);
         }
 
         var any = walk.limitBatches(self.cpu_batches, x, x_old);
@@ -2557,8 +2519,7 @@ pub const GpuContext = struct {
         // the held values the first one wrote, so the fallback's walk over
         // every batch must be the only one.
         if (try self.enqueueStates(x)) {
-            try self.d_flags.downloadAtAsync(self.pin_flags.ptr, 0, 4, &self.stream);
-            self.prof.down += 4;
+            try self.download(&self.d_flags, self.pin_flags[0..4]);
             try self.sync(.state);
             if (std.mem.readInt(u32, self.pin_flags[0..4], .little) & 2 != 0) {
                 self.poisoned = true;
@@ -2581,8 +2542,7 @@ pub const GpuContext = struct {
                 self.pre = null;
                 if (self.params_dirty) try self.repack();
                 @memcpy(self.pin_x2[0..n], x[0..n]);
-                try self.d_x2.uploadAtAsync(self.pin_x2.ptr, 0, n * @sizeOf(f64), &self.stream);
-                self.prof.up += n * @sizeOf(f64);
+                try self.upload(&self.d_x2, std.mem.sliceAsBytes(self.pin_x2[0..n]));
                 try self.d_flags.fillAsync(0, 4, &self.stream);
             }
             var count: u64 = bg.count;
@@ -2675,8 +2635,7 @@ pub const GpuContext = struct {
         // enqueue happens before the walk: the fallback re-walks every batch,
         // and the path commit `pq += wq` is not idempotent.
         if (wait) {
-            try self.d_flags.downloadAtAsync(self.pin_flags.ptr, 0, 4, &self.stream);
-            self.prof.down += 4;
+            try self.download(&self.d_flags, self.pin_flags[0..4]);
             if (follow) |f| try self.prefetch(f);
         }
 
@@ -2979,14 +2938,14 @@ test detectedHardware {
     try std.testing.expect(std.mem.eql(u8, name, "none") or std.mem.eql(u8, name, "cuda") or std.mem.eql(u8, name, "hip"));
 }
 
-test qtpName {
+test renamed {
     var buf: [32]u8 = undefined;
-    try std.testing.expectEqualStrings("arp_qtp_mos1", qtpName(&buf, "arp_eval_mos1").?);
-    try std.testing.expectEqualStrings("arp_qtp_", qtpName(&buf, "arp_eval_").?);
-    try std.testing.expect(qtpName(&buf, "arp_lim_mos1") == null);
-    try std.testing.expect(qtpName(&buf, "") == null);
+    try std.testing.expectEqualStrings("arp_qtp_mos1", renamed(&buf, "arp_eval_mos1", "arp_qtp_").?);
+    try std.testing.expectEqualStrings("arp_qtp_", renamed(&buf, "arp_eval_", "arp_qtp_").?);
+    try std.testing.expect(renamed(&buf, "arp_lim_mos1", "arp_qtp_") == null);
+    try std.testing.expect(renamed(&buf, "", "arp_qtp_") == null);
     // Too long for the buffer: no tape kernel, not a panic.
-    try std.testing.expect(qtpName(&buf, "arp_eval_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx") == null);
+    try std.testing.expect(renamed(&buf, "arp_eval_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "arp_qtp_") == null);
 }
 
 test "Layout puts g, rhs, c, q back to back" {
@@ -3366,18 +3325,20 @@ test markerPath {
     try std.testing.expect(!std.mem.eql(u8, markerPath(&buf, "image", .{ .home = "/h" }).?, markerPath(&other, "imagf", .{ .home = "/h" }).?));
 }
 
-test "markWarm makes imageWarm true for that image only" {
+test "markWarm marks that image only" {
+    // markedWarm, not imageWarm: a build whose SASS fits this card is warm
+    // without a marker.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root: [64]u8 = undefined;
     const knobs: Knobs = .{ .xdg_cache_home = try std.fmt.bufPrint(&root, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) };
-    try std.testing.expect(!imageWarm("a", knobs));
+    try std.testing.expect(!markedWarm("a", knobs));
     markWarm("a", knobs);
-    try std.testing.expect(imageWarm("a", knobs));
-    try std.testing.expect(!imageWarm("b", knobs));
+    try std.testing.expect(markedWarm("a", knobs));
+    try std.testing.expect(!markedWarm("b", knobs));
     // A second mark, with both directories present, is harmless.
     markWarm("a", knobs);
-    try std.testing.expect(imageWarm("a", knobs));
+    try std.testing.expect(markedWarm("a", knobs));
 }
 
 test "without kernel images init declines as the machine and auto falls back" {

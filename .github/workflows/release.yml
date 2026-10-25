@@ -26,7 +26,7 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       version: ${{ steps.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: true # tests/conformance: the SPICE decks
       - id: plan
@@ -61,12 +61,12 @@ jobs:
       CPU_CHECK: ${{ matrix.check }}
       PACKAGE: ${{ matrix.package }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
         with:
           name: omarsiwy
           skipPush: true
@@ -104,11 +104,9 @@ jobs:
       - name: Check CPU numerics at this instruction-set level
         if: matrix.gpu == false && steps.cpu.outputs.runnable == 'true'
         run: |
-          for suite in test-core test-solver; do
-            nix develop .#ci -c zig build "$suite" \
-              -Doptimize=ReleaseSafe -Dtarget="$TARGET" -Dcpu="$CPU" \
-              -Dgpu=false -Dcuda-arch=none -Dhip-arch=none -j2 --summary failures
-          done
+          nix develop .#ci -c zig build test \
+            -Doptimize=ReleaseSafe -Dtarget="$TARGET" -Dcpu="$CPU" \
+            -Dgpu=false -Dcuda-arch=none -Dhip-arch=none -j2 --summary failures
 
       - name: Package native archive
         shell: bash
@@ -142,7 +140,7 @@ jobs:
             espice-bundle-smoke sh -ec 'test ! -e /nix/store; bash /smoke.sh "$1" /fixtures' \
             sh "/artifacts/espice-${VERSION}-${VARIANT}.run"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.name }}
           path: dist/*
@@ -159,15 +157,15 @@ jobs:
     env:
       VERSION: ${{ needs.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
       - name: Verify complete release and write checksums
         run: python3 tools/release.py verify dist "$VERSION"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           fail_on_unmatched_files: true
           prerelease: ${{ contains(needs.plan.outputs.version, '-') }}

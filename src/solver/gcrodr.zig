@@ -142,6 +142,8 @@ pub const Gcrodr = struct {
         return self;
     }
 
+    /// Frees the workspace, the recycled space included; `gpa` must be the
+    /// allocator `init` got.
     pub fn deinit(self: *Self, gpa: Allocator) void {
         gpa.free(self.slab);
         gpa.free(self.piv);
@@ -187,8 +189,8 @@ pub const Gcrodr = struct {
 
         op.matvec(x[0..n], self.r[0..n]);
         num.sub(self.r[0..n], b[0..n], self.r[0..n]);
-        if (num.norm2(self.r[0..n]) <= abs_tol)
-            return .{ .iterations = 0, .residual = num.norm2(self.r[0..n]) / b_norm, .converged = true };
+        const r0 = num.norm2(self.r[0..n]);
+        if (r0 <= abs_tol) return .{ .iterations = 0, .residual = r0 / b_norm, .converged = true };
         @memset(self.d[0..n], 0);
 
         // C = Â U for this operator, then U·R^-1 keeps C = Â U.
@@ -308,11 +310,10 @@ pub const Gcrodr = struct {
             num.axpy(self.d[0..n], -s, vec(self.u, n, ii));
         }
         // r -= V_{s+1} H̄ y2 (C's part cancels against U's).
+        // H̄ is Hessenberg: row `row` starts at column row - 1.
         for (0..steps + 1) |row| {
             var s: f64 = 0;
-            for (0..steps) |j| {
-                if (row <= j + 1) s += self.h[row * m + j] * y2[j];
-            }
+            for (row -| 1..steps) |j| s += self.h[row * m + j] * y2[j];
             num.axpy(r, -s, vec(self.v, n, row));
         }
         return @intCast(steps);
@@ -340,8 +341,8 @@ pub const Gcrodr = struct {
             gb[ii * mc + ii] = dscale[ii];
             for (0..steps) |j| gb[ii * mc + kk + j] = self.b[ii * m + j];
         }
-        for (0..steps + 1) |row| for (0..steps) |j| {
-            if (row <= j + 1) gb[(kk + row) * mc + kk + j] = self.h[row * m + j];
+        for (0..steps + 1) |row| for (row -| 1..steps) |j| {
+            gb[(kk + row) * mc + kk + j] = self.h[row * m + j];
         };
         const em = self.em[0 .. mc * mc];
         if (kk == 0) {

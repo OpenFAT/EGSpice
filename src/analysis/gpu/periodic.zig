@@ -10,6 +10,10 @@ const FS = solver.freq_solve.FreqSolver;
 const SolveResult = solver.gmres.Gmres.SolveResult;
 const block = @import("device").abi.gpu_lane_block_size;
 
+/// The sampled HB problem shared by every point: `n` unknowns, `nf`
+/// (odd) frequency values per unknown, `nt` time samples, the pattern's
+/// CSC and the `nt * nf` inverse and forward transforms. Borrowed by
+/// `Engine.init`, which copies it to the device.
 pub const Setup = struct {
     points: usize,
     n: u32,
@@ -34,6 +38,9 @@ pub const Operator = struct {
     solve_fn: *const fn (*anyopaque, []const f64, []f64, u32, f64, u32) ?SolveResult,
     deinit_fn: *const fn (*anyopaque) void,
 
+    /// One point's engine on the first backend this build carries. Asserts
+    /// `setup.points == 1`. Fails with `error.GpuBackendUnavailable`
+    /// without images, or the driver's error. Free with `deinit`.
     pub fn init(gpa: std.mem.Allocator, setup: Setup, stats: bool) !Operator {
         std.debug.assert(setup.points == 1);
         if (comptime artifacts.has_cuda) return Adapter(.cuda).create(gpa, setup, stats);
@@ -41,22 +48,33 @@ pub const Operator = struct {
         return error.GpuBackendUnavailable;
     }
 
+    /// `Engine.refresh` with this Newton step's sampled planes and `fs`'s
+    /// held factors. Fails with `error.GpuBackendUnavailable` once a
+    /// driver fault poisoned the operator.
     pub fn refresh(self: *Operator, g: []const f64, c: []const f64, fs: *const FS) !void {
         try self.refresh_fn(self.context, g, c, fs);
     }
 
+    /// The Jacobian product on the device. False on a driver fault (and
+    /// every call after it): the caller computes `out` on the host.
     pub fn matvec(self: *Operator, input: []const f64, out: []f64) bool {
         return self.matvec_fn(self.context, input, out);
     }
 
+    /// The harmonic preconditioner on the device; false as `matvec`.
+    /// `input` and `out` may alias.
     pub fn precond(self: *Operator, input: []const f64, out: []f64) bool {
         return self.precond_fn(self.context, input, out);
     }
 
+    /// The whole preconditioned GMRES solve on the device, from guess `x`.
+    /// Null on a driver fault: `x` is unchanged and the caller solves on
+    /// the host.
     pub fn solve(self: *Operator, b: []const f64, x: []f64, m: u32, tolerance: f64, max_restarts: u32) ?SolveResult {
         return self.solve_fn(self.context, b, x, m, tolerance, max_restarts);
     }
 
+    /// Frees the engine and the context.
     pub fn deinit(self: *Operator) void {
         self.deinit_fn(self.context);
         self.* = undefined;
@@ -131,14 +149,16 @@ pub fn Engine(comptime backend: gompute.Backend) type {
         pub const Stream = Raw.Stream;
         const Factor = @import("freq.zig").DeviceHeld(backend);
         const Krylov = @import("krylov.zig").Engine(backend);
+        /// `arp_periodic_<tag>`, loaded in tag order into `kernels`.
         const Kernel = enum { inverse, product, forward, pack, unpack, copy };
+        const kernel_names = @typeInfo(Kernel).@"enum".field_names;
         const Id = enum { row_ptr, columns, slots, inv, fwd, omega, g, c, time, gv, cv, input, output, mask, rhs, solution };
         const Storage = struct { value: ?Buffer = null, capacity: usize = 0 };
 
         gpa: std.mem.Allocator,
         shape: pk.Shape,
         nnz: usize,
-        kernels: [6]Raw,
+        kernels: [kernel_names.len]Raw,
         stream: Stream,
         buffers: [@typeInfo(Id).@"enum".field_names.len]Storage = @splat(.{}),
         factors: []?Factor,
@@ -152,15 +172,18 @@ pub fn Engine(comptime backend: gompute.Backend) type {
         factor_rounds: usize = 0,
         factor_lanes: usize = 0,
 
+        /// Loads the kernels on device 0 and uploads `setup`'s pattern,
+        /// transforms and omegas. Asserts the shape is consistent (odd
+        /// `nf`, transform and omega lengths). Free with `deinit`.
         pub fn init(a: std.mem.Allocator, setup: Setup, stats: bool) !Self {
             std.debug.assert(setup.points > 0 and setup.n > 0 and setup.nf > 0 and setup.nf % 2 == 1 and setup.nt > 0);
             std.debug.assert(setup.inv.len == @as(usize, setup.nt) * setup.nf and setup.fwd.len == setup.inv.len);
             std.debug.assert(setup.omegas.len == ((setup.nf + 1) / 2) * setup.points);
-            var kernels: [6]Raw = undefined;
+            var kernels: [kernel_names.len]Raw = undefined;
             var loaded: usize = 0;
             errdefer for (kernels[0..loaded]) |*k| k.deinit();
-            for ([_][]const u8{ "arp_periodic_inverse", "arp_periodic_product", "arp_periodic_forward", "arp_periodic_pack", "arp_periodic_unpack", "arp_periodic_copy" }) |name| {
-                kernels[loaded] = try gompute.rawKernelByName(backend, name, 0);
+            inline for (kernel_names) |name| {
+                kernels[loaded] = try gompute.rawKernelByName(backend, "arp_periodic_" ++ name, 0);
                 loaded += 1;
             }
             var stream = try kernels[0].createStream();
@@ -205,6 +228,8 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             return self;
         }
 
+        /// Drains the stream, prints the `ESPICE_GPU_STATS` lines, then
+        /// frees everything.
         pub fn deinit(self: *Self) void {
             self.stream.synchronize() catch {};
             if (self.stats and self.matvecs != 0)
@@ -274,6 +299,9 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             self.factor_rounds += 1;
         }
 
+        /// Queues the sampled Jacobian product on `stream` for the points
+        /// `mask` selects (one byte each); other points' outputs are left
+        /// as they were. Unwaited.
         pub fn matvec(self: *Self, input: *Buffer, output: *Buffer, mask: *Buffer, stream: *Stream) !void {
             const scalar = gompute.interface.arg;
             const samples = @as(usize, self.shape.n) * self.shape.nt * @as(usize, @intCast(self.shape.points));
@@ -292,6 +320,9 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             self.matvecs += 1;
         }
 
+        /// Queues the harmonic preconditioner on `stream` for the points
+        /// `mask` selects: each point's device factors, or a copy for a
+        /// point without them. Unwaited.
         pub fn precond(self: *Self, input: *Buffer, output: *Buffer, mask: *Buffer, stream: *Stream) !void {
             const scalar = gompute.interface.arg;
             const values = @as(usize, self.shape.n) * self.shape.nf;

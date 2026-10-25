@@ -1,18 +1,27 @@
 //! Problem facade contract: ownership, transactional appends, stepped vs
-//! batch execution, output ordering and failure isolation.
+//! batch execution, output ordering and failure isolation. Oracles: the
+//! same deck through another path that must agree (run_all against stepped
+//! advances, one thread or job against N, lanes against each point run
+//! alone, live `set_params` against a fresh parse, a `.data` sweep against
+//! the points API, the CPU against the GPU lanes), `checkAllAllocationFailures`
+//! for leaks, closed forms (4kTR noise, dividers, the B-source deck's own
+//! algebra), and the named error each misuse must get.
 const std = @import("std");
 const api = @import("espice");
 const t = std.testing;
 const deck = "query fixture\nV1 in 0 dc 1 ac 1\nR1 in out 1k\nC1 out 0 1n\n.ac dec 80 1 100k\n.tran 1n 10n uic\n.end\n";
 
+/// A problem over `source` with two parallel workers; the caller deinits it.
 fn create(source: []const u8) !*api.Problem {
     return createLimited(source, 2);
 }
 
+/// A problem over `source` with `max_parallel` workers; the caller deinits it.
 fn createLimited(source: []const u8, max_parallel: u16) !*api.Problem {
     return api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "memory.cir" } }, .max_parallel = max_parallel });
 }
 
+/// The first query of `kind`.
 fn find(p: *api.Problem, kind: api.requests.Kind) !api.QueryId {
     for (0..p.query_count()) |i| {
         const id: api.QueryId = @fromBackingInt(@intCast(i));
@@ -21,6 +30,7 @@ fn find(p: *api.Problem, kind: api.requests.Kind) !api.QueryId {
     return error.MissingQuery;
 }
 
+/// Constructs and destroys a problem over `deck` with an output path.
 fn construct(allocator: std.mem.Allocator) !void {
     const p = try api.Problem.init(allocator, t.io, .{
         .source = .{ .bytes = .{ .data = deck, .origin = "construction.cir" } },
@@ -733,9 +743,7 @@ fn opValue(source: []const u8, name: []const u8) !f64 {
     const p = try create(source);
     defer p.deinit();
     try p.run_all();
-    const r = try p.result(@fromBackingInt(@intCast(0)));
-    for (r.varnames, 0..) |v, i| if (std.mem.eql(u8, v, name)) return r.data[i];
-    return error.MissingColumn;
+    return column(try p.result(@fromBackingInt(@intCast(0))), name);
 }
 
 test "ngspice .option seed draws the distributions once, reproducibly per seed" {
@@ -997,6 +1005,7 @@ test "same deck, same bytes: run twice, any solver_threads, any device_threads" 
 /// main session's four points' `tf`.
 const JobsRun = struct { raw: []u8, measures: []u8, tf: [4]f64 };
 
+/// Runs `jobs_deck` at `jobs` into a raw file under `tmp`.
 fn runJobs(tmp: *const std.testing.TmpDir, jobs: u16, warm_start: bool) !JobsRun {
     var name_buf: [32]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "jobs{d}{s}.raw", .{ jobs, if (warm_start) "w" else "" });
@@ -1218,6 +1227,7 @@ const MeasureRun = struct {
     }
 };
 
+/// Runs `source` under `point`; the caller deinits the result.
 fn measureRun(source: api.Source, dialect: api.Dialect, point: api.requests.PointOptions) !MeasureRun {
     const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = dialect, .point = point });
     defer p.deinit();
@@ -1683,11 +1693,9 @@ const LaneRun = struct {
         r.measures.deinit(t.allocator);
     }
 
-    fn add(r: *LaneRun, source: []const u8) !void {
-        return r.addWith(source, false);
-    }
-
-    fn addWith(r: *LaneRun, source: []const u8, lanes: bool) !void {
+    /// Runs `source` (HSPICE, bypass off) with `.lanes` on or off and
+    /// appends its points.
+    fn add(r: *LaneRun, source: []const u8, lanes: bool) !void {
         const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "lane.sp" } }, .dialect = .hspice, .backend = .{ .lanes = lanes, .knobs = .{ .bypass = false } } });
         defer p.deinit();
         try p.run_all();
@@ -1718,13 +1726,13 @@ test "per-lane stimulus (#212): each .data point equals its row run alone, to th
     defer t.allocator.free(source);
     var swept: LaneRun = .{};
     defer swept.deinit();
-    try swept.add(source);
+    try swept.add(source, false);
     var alone: LaneRun = .{};
     defer alone.deinit();
     for ([_][2]f64{ .{ 0, 1 }, .{ 0, 0 }, .{ 1, 1 }, .{ 1, 0 } }) |row| {
         const solo = try laneSolo(source, row[0], row[1]);
         defer t.allocator.free(solo);
-        try alone.add(solo);
+        try alone.add(solo, false);
     }
     try t.expectEqual(@as(usize, 4), swept.grids.items.len);
     try t.expectEqual(@as(usize, 12), std.mem.count(u8, swept.measures.items, "\n"));
@@ -1917,13 +1925,13 @@ test "per-lane stimulus (#212) under lanes: each .data point equals its row run 
     defer t.allocator.free(source);
     var swept: LaneRun = .{};
     defer swept.deinit();
-    try swept.addWith(source, true);
+    try swept.add(source, true);
     var alone: LaneRun = .{};
     defer alone.deinit();
     for ([_][2]f64{ .{ 0, 1 }, .{ 0, 0 }, .{ 1, 1 }, .{ 1, 0 } }) |row| {
         const solo = try laneSolo(source, row[0], row[1]);
         defer t.allocator.free(solo);
-        try alone.add(solo);
+        try alone.add(solo, false);
     }
     try t.expectEqualStrings(alone.measures.items, swept.measures.items);
     try t.expectEqualSlices(u64, @ptrCast(alone.data.items), @ptrCast(swept.data.items));
@@ -2091,18 +2099,22 @@ fn gpuChainSource(order: []const usize) ![]u8 {
     return std.mem.replaceOwned(u8, t.allocator, chain_deck, "ROWS\n", rows.written());
 }
 
+/// One point's samples (`cols` columns; empty when it failed) and its failure.
 const GpuPoint = struct {
     data: []f64,
     cols: usize,
     failure: ?anyerror,
 };
 
-fn gpuChainPoints(source: []const u8, gpu: bool) ![]GpuPoint {
+/// The transients of `source` under `point`, on `cuda` lanes or the plain
+/// CPU path, in request order; a failed point keeps its own error. Free
+/// with `freeGpuPoints`.
+fn gpuChainPoints(source: []const u8, gpu: bool, point: @FieldType(api.Options, "point")) ![]GpuPoint {
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{ .data = source, .origin = "gpu-chain.sp" } },
         .dialect = .hspice,
         .backend = .{ .backend = if (gpu) .cuda else .cpu, .lanes = gpu },
-        .point = .{ .early_stop = true },
+        .point = point,
     });
     defer p.deinit();
     p.run_all() catch {};
@@ -2122,11 +2134,15 @@ fn gpuChainPoints(source: []const u8, gpu: bool) ![]GpuPoint {
     return points.toOwnedSlice(t.allocator);
 }
 
+/// Frees what `gpuChainPoints` or `staticPoints` returned.
 fn freeGpuPoints(points: []GpuPoint) void {
     for (points) |p| t.allocator.free(p.data);
     t.allocator.free(points);
 }
 
+/// Expects `gpu` to fail as `cpu` did, or to end within two steps of it and
+/// track the CPU waveform, linearly interpolated, to 1e-3 of each column's
+/// peak over their common time span.
 fn expectGpuPoint(cpu: GpuPoint, gpu: GpuPoint) !void {
     // Do not compare runtime ?anyerror values: #215 is a compiler bug in
     // that comparison. Test null and unwrap explicitly.
@@ -2248,43 +2264,17 @@ test "GPU lane colours (06 6.11): a thread per (instance colour, lane) gives the
     for (&order, 0..) |*k, i| k.* = i;
     const src = try gpuChainSource(&order);
     defer t.allocator.free(src);
-    const plain = try gpuChainPoints(src, true);
+    const plain = try gpuChainPoints(src, true, .{ .early_stop = true });
     defer freeGpuPoints(plain);
     gpu_lanes.test_access.force_color = true;
     defer gpu_lanes.test_access.force_color = false;
-    const colored = try gpuChainPoints(src, true);
+    const colored = try gpuChainPoints(src, true, .{ .early_stop = true });
     defer freeGpuPoints(colored);
     try t.expectEqual(plain.len, colored.len);
     for (plain, colored) |a, b| {
         try t.expectEqual(a.failure, b.failure);
         try t.expectEqualSlices(u64, @ptrCast(a.data), @ptrCast(b.data));
     }
-}
-
-/// The transients of `source` under `cuda` lanes with `point`.
-fn gpuBoundPoints(source: []const u8, point: @FieldType(api.Options, "point")) ![]GpuPoint {
-    const p = try api.Problem.init(t.allocator, t.io, .{
-        .source = .{ .bytes = .{ .data = source, .origin = "gpu-chain.sp" } },
-        .dialect = .hspice,
-        .backend = .{ .backend = .cuda, .lanes = true },
-        .point = point,
-    });
-    defer p.deinit();
-    p.run_all() catch {};
-    var points: std.ArrayList(GpuPoint) = .empty;
-    errdefer {
-        for (points.items) |v| t.allocator.free(v.data);
-        points.deinit(t.allocator);
-    }
-    for (0..p.query_count()) |i| {
-        const id: api.QueryId = @fromBackingInt(@intCast(i));
-        const info = try p.query_info(id);
-        if (!info.requested or info.kind != .tran) continue;
-        if (p.result(id)) |res| {
-            try points.append(t.allocator, .{ .data = try t.allocator.dupe(f64, res.data), .cols = res.varnames.len, .failure = null });
-        } else |err| try points.append(t.allocator, .{ .data = &.{}, .cols = 0, .failure = @as(?anyerror, info.failure) orelse err });
-    }
-    return points.toOwnedSlice(t.allocator);
 }
 
 test "GPU lane measure bound (06 6.8): device passes under abort_after fail and finish the points the host measurer does, bit for bit" {
@@ -2299,11 +2289,11 @@ test "GPU lane measure bound (06 6.8): device passes under abort_after fail and 
     var spared = false;
     for ([_]f64{ 150e-12, 250e-12, 350e-12 }) |bound| for ([_]bool{ false, true }) |early| {
         const point: @FieldType(api.Options, "point") = .{ .early_stop = early, .abort_after = bound };
-        const dev = try gpuBoundPoints(src, point);
+        const dev = try gpuChainPoints(src, true, point);
         defer freeGpuPoints(dev);
         gpu_lanes.test_access.host_meas = true;
         defer gpu_lanes.test_access.host_meas = false;
-        const host = try gpuBoundPoints(src, point);
+        const host = try gpuChainPoints(src, true, point);
         defer freeGpuPoints(host);
         try t.expectEqual(host.len, dev.len);
         var bounded: usize = 0;
@@ -2325,12 +2315,16 @@ test "GPU lane measure bound (06 6.8): device passes under abort_after fail and 
 
 /// The transients of `source` under `cuda` lanes with early stop on or
 /// off, and every card's printed value and error line.
+/// `source` on CUDA lanes: measures-only (the device computes the cards'
+/// values) or, with `early`, early stop (the device decides when to stop).
+/// A plain run measures on the host from its full recording, never on the
+/// device (tran.zig `Run.init`'s `watched`).
 fn gpuMeasRun(source: []const u8, early: bool) !struct { points: []GpuPoint, text: []u8 } {
     const p = try api.Problem.init(t.allocator, t.io, .{
         .source = .{ .bytes = .{ .data = source, .origin = "gpu-chain.sp" } },
         .dialect = .hspice,
         .backend = .{ .backend = .cuda, .lanes = true },
-        .point = .{ .early_stop = early },
+        .point = .{ .measures_only = !early, .early_stop = early },
     });
     defer p.deinit();
     p.run_all() catch {};
@@ -2397,7 +2391,7 @@ test "GPU lane lockstep (#208): mixed sizing, moved edge, extreme wire, failed p
     for (0..count) |k| {
         const src = try gpuChainSource(&.{k});
         defer t.allocator.free(src);
-        const result = try gpuChainPoints(src, false);
+        const result = try gpuChainPoints(src, false, .{ .early_stop = true });
         defer t.allocator.free(result);
         try t.expectEqual(@as(usize, 1), result.len);
         alone[k] = result[0];
@@ -2416,7 +2410,7 @@ test "GPU lane lockstep (#208): mixed sizing, moved edge, extreme wire, failed p
         const src = try gpuChainSource(&order);
         defer t.allocator.free(src);
         const before = gpu_lanes.test_access.admitted.load(.monotonic);
-        const got = try gpuChainPoints(src, true);
+        const got = try gpuChainPoints(src, true, .{ .early_stop = true });
         defer freeGpuPoints(got);
         try t.expectEqual(order.len, got.len);
         try t.expectEqual(order.len, gpu_lanes.test_access.admitted.load(.monotonic) - before);

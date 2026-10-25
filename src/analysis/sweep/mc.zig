@@ -3,8 +3,7 @@
 //! lane (`lanes.solveLanes`) sharing one Newton workspace. Each draw is
 //! keyed by (Options.seed, trial, variable), so a run is reproducible and
 //! any trial can be computed alone. With `Options.variants` the lanes are
-//! deck variants instead, each warm from the nominal OP.
-//! Cites dev/analysis/ensemble-sweeps.md and dev/analysis/variants.md.
+//! deck variants instead, each warm from the nominal OP. No outside source.
 const std = @import("std");
 const root = @import("../types.zig");
 const lanes = @import("lanes.zig");

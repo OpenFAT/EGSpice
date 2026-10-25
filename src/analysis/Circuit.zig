@@ -15,7 +15,6 @@ const device_ir = @import("device").abi;
 const Prepared = @import("device").Circuit;
 const progress_api = @import("worker.zig");
 const par_eval = @import("par_eval.zig");
-const walk = par_eval;
 const gpu_mod = @import("gpu/context.zig");
 const GpuContext = gpu_mod.GpuContext;
 const GpuLu = @import("gpu/lu.zig").GpuLu;
@@ -538,18 +537,18 @@ pub const Circuit = struct {
         return ok;
     }
 
-    // The executor's setup. None touches the planes or a device parameter,
-    // so none clears `lin`.
-
-    /// Installs the query's solver threading and the facade's developer
-    /// switches. Asserts that `workspace` has not run yet, since it reads
-    /// `knobs`.
     /// `ws_pool` when this circuit's workspaces come from the same allocator.
     fn pooled(self: *const Circuit) ?*WsPool {
         const p = self.ws_pool orelse return null;
         return if (p.gpa.ptr == self.gpa.ptr and p.gpa.vtable == self.gpa.vtable) p else null;
     }
 
+    // The executor's setup. None touches the planes or a device parameter,
+    // so none clears `lin`.
+
+    /// Installs the query's solver threading and the facade's developer
+    /// switches. Asserts that `workspace` has not run yet, since it reads
+    /// `knobs`.
     pub fn configure(self: *Circuit, execution: numerics.Execution, knobs: Knobs) void {
         std.debug.assert(self.ws == null);
         self.solver_execution = execution;
@@ -1174,7 +1173,7 @@ pub const Circuit = struct {
     pub fn applyLimits(self: *const Circuit, x: []f64, x_old: []const f64) bool {
         if (self.gpuContext()) |g| return g.applyLimits(x, x_old, self.sim);
         if (self.par_eval) |p| return p.limit(self.batches, x, x_old);
-        return walk.limitBatches(self.batches, x, x_old);
+        return par_eval.limitBatches(self.batches, x, x_old);
     }
 
     /// Sets every `idt` state unknown with an ic to that ic (`Hooks.seed_ic`):
@@ -1195,14 +1194,14 @@ pub const Circuit = struct {
     /// limiters clamp against the seed. Cold starts only.
     pub fn seedJunctions(self: *const Circuit, x: []f64) void {
         if (self.gpuContext()) |g| return g.seedJunctions(x);
-        walk.seedBatches(self.batches, x);
+        par_eval.seedBatches(self.batches, x);
     }
 
     /// Resets device-private limiting state after a Newton solve, so later
     /// evals (waveform, AC, noise) see the node vector itself.
     pub fn clearLimits(self: *const Circuit) void {
         if (self.gpuContext()) |g| return g.clearLimits();
-        walk.clearLimitBatches(self.batches);
+        par_eval.clearLimitBatches(self.batches);
     }
 
     /// Starts a nonlinear solve: `$simparam("iteration")` reads 1.
@@ -1262,7 +1261,7 @@ pub const Circuit = struct {
     /// `updateBatches` on the host, over ParEval's lanes when it exists.
     fn hostUpdate(self: *const Circuit, x: []const f64) ?f64 {
         if (self.par_eval) |p| return p.update(self.batches, x);
-        return walk.updateBatches(self.batches, x);
+        return par_eval.updateBatches(self.batches, x);
     }
 
     /// Stages every `Hooks.say` line at x, before `updateState` moves the
@@ -1318,7 +1317,7 @@ pub const Circuit = struct {
     /// static solve may push (`Hooks.commit_state`). The transient calls it
     /// once per accepted point, before `stateCtl(.commit)`.
     pub fn commitStates(self: *const Circuit, x: []const f64) ?f64 {
-        return walk.minReject(self.batches, "commit_state", x);
+        return par_eval.minReject(self.batches, "commit_state", x);
     }
 
     /// Commits, reverts or queries the accepted device state. `.commit` at
@@ -1333,7 +1332,7 @@ pub const Circuit = struct {
             d.staged.clearRetainingCapacity();
         };
         if (self.gpuContext()) |g| return g.stateCtl(sop, self.sim);
-        return walk.stateCtlBatches(self.batches, sop);
+        return par_eval.stateCtlBatches(self.batches, sop);
     }
 
     /// Returns the smallest model delay (`D.delays`) in the circuit, or null.
@@ -1388,7 +1387,13 @@ pub const Circuit = struct {
             f(b.ctx, gmin, source_scale);
             any = true;
         };
-        if (!any) return;
+        if (any) self.paramsMoved();
+    }
+
+    /// Device parameters moved: drops the `linearize` memo and the
+    /// constant-Jacobian baseline, and marks the resident GPU parameters and
+    /// every bypass recording stale.
+    fn paramsMoved(self: *Circuit) void {
         self.lin.valid = false;
         self.has_baseline = false;
         self.markGpuDirty();
@@ -1430,9 +1435,7 @@ pub const Circuit = struct {
     /// wiring moved and the circuit must be rebuilt; restore the parameters
     /// and recompute before reusing it.
     pub fn recompute(self: *Circuit) error{TopologyChanged}!void {
-        self.lin.valid = false;
-        self.has_baseline = false;
-        self.markGpuDirty();
+        self.paramsMoved();
         for (self.batches) |b| if (b.hooks.recompute) |f| {
             if (!f(b.ctx)) return error.TopologyChanged;
         };
@@ -1447,15 +1450,10 @@ pub const Circuit = struct {
     /// RB(T) reaches zero). The caller owns that distinction; `.dc` takes the
     /// full walk on the first point of every inner sweep and narrows after.
     pub fn recomputeType(self: *Circuit, t: device_ir.DeviceType) error{TopologyChanged}!void {
-        self.lin.valid = false;
-        self.has_baseline = false;
-        self.markGpuDirty();
-        for (self.batches, self.batch_types) |b, bt| {
-            if (bt != t) continue;
-            if (b.hooks.recompute) |f| {
-                if (!f(b.ctx)) return error.TopologyChanged;
-            }
-        }
+        self.paramsMoved();
+        for (self.batches, self.batch_types) |b, bt| if (bt == t) if (b.hooks.recompute) |f| {
+            if (!f(b.ctx)) return error.TopologyChanged;
+        };
     }
 
     /// Returns every device parameter, typed by batch. Built once and freed by
@@ -1505,9 +1503,7 @@ pub const Circuit = struct {
             for (refs, values) |r, v| if (r >= lo and r < hi) list.items[r - lo].set(v);
         }
         if (!rederive) return;
-        self.lin.valid = false;
-        self.has_baseline = false;
-        self.markGpuDirty();
+        self.paramsMoved();
         for (self.batches, touched) |b, t| if (t) if (b.hooks.recompute) |f| {
             if (!f(b.ctx)) return error.TopologyChanged;
         };
@@ -1587,7 +1583,7 @@ pub const Circuit = struct {
 
     /// Appends every batch's parameters to `list`, each stamped with its
     /// batch's Library type. Invalidates pointers into `list` when it grows.
-    pub fn collectTyped(batches: []const Batch, types: []const device_ir.DeviceType, gpa: std.mem.Allocator, list: *std.ArrayList(ParamRef)) !void {
+    fn collectTyped(batches: []const Batch, types: []const device_ir.DeviceType, gpa: std.mem.Allocator, list: *std.ArrayList(ParamRef)) !void {
         for (batches, types) |b, t| {
             const first = list.items.len;
             try b.hooks.collect_params(b.ctx, gpa, list).unwrap();

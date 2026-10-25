@@ -19,6 +19,10 @@
 // folded into the channel conductance as `rt` (hfeta()). ngspice's RI/RF gate
 // access nodes (s''/d'') are not modelled; with their default RI=RF=0 they
 // collapse onto sp/dp, which is where the Meyer caps land here.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module hfet1(d, g, s);
     inout d, g, s;
     electrical d, g, s;

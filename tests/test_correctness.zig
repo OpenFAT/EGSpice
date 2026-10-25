@@ -1,7 +1,7 @@
 //! End-to-end fixture runner: simulates every tests/conformance/tests/netlist deck in a child
 //! espice and checks the raw output against its embedded .expected.json
 //! oracle. An unsupported feature is a failure, never a skip. The one skip:
-//! under a GPU backend (`test-gpu`), a deck with nothing GPU-eligible, which
+//! under a GPU backend (`zig build test -- --backend cuda --jobs 1`), a deck with nothing GPU-eligible, which
 //! an explicit `--backend cuda|hip` refuses by design. A deck whose
 //! header carries `* KNOWN GAP:` reports XFAIL when it fails, which does not
 //! fail the run, and XPASS when it passes, which does: drop the marker. From
@@ -9,13 +9,16 @@
 //!   zig build test -- --jobs 8 --filter op/
 //!   zig build test -- --list
 //! A full CPU run (no `--filter`) also checks every deck's verdict by name
-//! against tests/VERDICTS.tsv (AGENTS.md §2.7), and fails on any difference:
+//! against tests/VERDICTS.tsv (AGENTS.md, Testing), and fails on any difference:
 //! a deck added, removed, or moved between PASS and XFAIL. After a measured
 //! run whose differences are intended, rewrite the file from that run:
 //!   zig build test -- --update-verdicts
 //! With `--metamorphic` it instead runs every deck tests/metamorphic.zig can
 //! rewrite exactly, once as written and once per rewrite, and fails when a
-//! rewrite moves a result past float noise (`zig build test-metamorphic`).
+//! rewrite moves a result past float noise (part of `zig build test`).
+//! With `--perturb` every expected value moves by 0.1% (`perturb`) and a deck
+//! that still passes is reported LOOSE: its tolerance cannot see an error
+//! that size. It reports and never fails (the nightly tier).
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -93,6 +96,9 @@ const Runner = struct {
 /// The `--backend` every run gets; `--backend cuda` checks the GPU path
 /// against the same expectations. Set once in `main`, before any worker.
 var backend_name: []const u8 = "cpu";
+/// `--perturb`: the factor on every expected column, measure and statistic.
+// ponytail: report-only; ratchet the LOOSE names like VERDICTS.tsv once the list is triaged.
+var perturb: f64 = 1;
 /// The C VPI application build.zig compiles for the decks marked
 /// `* VPI FIXTURE` (`--vpi-fixture`, #197); no path in a deck can name it.
 var vpi_fixture: ?[]const u8 = null;
@@ -112,12 +118,13 @@ pub fn main(init: std.process.Init) !u8 {
     var list = equal(app, "--list");
     var update_verdicts = false;
     var metamorphic_mode = false;
-    const Flag = enum(u8) { list, filter, jobs, timeout, backend, update_verdicts, metamorphic, vpi_fixture };
+    const Flag = enum(u8) { list, filter, jobs, timeout, backend, update_verdicts, metamorphic, vpi_fixture, perturb };
     const flags = std.StaticStringMap(Flag).initComptime(.{
         .{ "--list", .list },               .{ "--filter", .filter },
         .{ "--jobs", .jobs },               .{ "--timeout", .timeout },
         .{ "--backend", .backend },         .{ "--update-verdicts", .update_verdicts },
         .{ "--metamorphic", .metamorphic }, .{ "--vpi-fixture", .vpi_fixture },
+        .{ "--perturb", .perturb },
     });
     while (args.next()) |arg| {
         switch (flags.get(arg) orelse return error.UnknownArgument) {
@@ -129,6 +136,7 @@ pub fn main(init: std.process.Init) !u8 {
             .update_verdicts => update_verdicts = true,
             .metamorphic => metamorphic_mode = true,
             .vpi_fixture => vpi_fixture = args.next() orelse return error.MissingArgument,
+            .perturb => perturb = 1 + 1e-3,
         }
     }
     if (jobs == 0) return error.InvalidWorkerCount;
@@ -155,6 +163,10 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("Correctness: {d} passed, {d} failed, {d} xfail, {d} xpass, {d} skipped, {d} selected\n", .{
         count.get(.pass), count.get(.fail), count.get(.xfail), count.get(.xpass), count.get(.skip), selected,
     });
+    if (perturb != 1 and !metamorphic_mode) {
+        std.debug.print("Correctness: {d} of {d} checked decks LOOSE (still pass with every expected value moved 0.1%)\n", .{ count.get(.pass), count.get(.pass) + count.get(.fail) });
+        return 0;
+    }
     const clean = count.get(.fail) == 0 and count.get(.xpass) == 0;
     // The name list holds only for the whole corpus on the CPU path.
     if (metamorphic_mode or filter.len != 0 or !equal(backend_name, "cpu")) return if (clean) 0 else 1;
@@ -233,6 +245,7 @@ fn containsLine(text: []const u8, want: []const u8) bool {
     return false;
 }
 
+// Oracle: hand-written name lists whose differences are known.
 test "verdict diff names both directions and refuses an empty list" {
     var sink: std.Io.Writer.Discarding = .init(&.{});
     try std.testing.expect(reportVerdictDiff(&sink.writer, "PASS\ta.sp\nXFAIL\tb.sp\n", "PASS\ta.sp\nXFAIL\tb.sp\n"));
@@ -264,6 +277,17 @@ fn worker(runner: *Runner) void {
             if (ran) std.debug.print("PASS {s}\n", .{path});
             continue;
         }
+        if (perturb != 1) {
+            // A known gap fails as written, and a rejection has no value to
+            // move: perturbing either says nothing.
+            if (gap) continue;
+            const oracle = parseOracle(arena.allocator(), expected_outputs[i]) catch continue;
+            if (oracle.expect.status == .@"error") continue;
+            const loose = if (runCase(arena.allocator(), runner.io, runner.app, path, expected_outputs[i], runner.timeout_seconds)) true else |_| false;
+            runner.outcomes[i] = if (loose) .pass else .fail;
+            if (loose) std.debug.print("LOOSE {s}\n", .{path});
+            continue;
+        }
         runCase(arena.allocator(), runner.io, runner.app, path, expected_outputs[i], runner.timeout_seconds) catch |err| {
             if (err == error.NotEligible) {
                 runner.outcomes[i] = .skip;
@@ -282,32 +306,63 @@ fn worker(runner: *Runner) void {
 /// Whether the deck at `path` (under tests/) is marked `* KNOWN GAP:`.
 fn knownGap(a: Allocator, io: Io, path: []const u8) bool {
     const full = std.fmt.allocPrint(a, "tests/{s}", .{path}) catch return false;
-    const source = Io.Dir.cwd().readFileAlloc(io, full, a, .unlimited) catch return false;
+    return marked(a, io, full, "KNOWN GAP:");
+}
+
+/// Whether a `*` comment line of the deck at `netlist` starts with
+/// `marker`. An unreadable deck reads as unmarked: the simulator run that
+/// follows fails and names it.
+fn marked(a: Allocator, io: Io, netlist: []const u8, marker: []const u8) bool {
+    const source = Io.Dir.cwd().readFileAlloc(io, netlist, a, .unlimited) catch return false;
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |text| {
         if (text.len == 0 or text[0] != '*') continue;
-        if (std.mem.startsWith(u8, std.mem.trimStart(u8, text[1..], " \t"), "KNOWN GAP:")) return true;
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, text[1..], " \t"), marker)) return true;
     }
     return false;
+}
+
+/// An `.expected.json` as the schema reads it, in `a`; unknown fields
+/// (provenance) are skipped.
+fn parseOracle(a: Allocator, json: []const u8) !Oracle {
+    return std.json.parseFromSliceLeaky(Oracle, a, json, .{ .ignore_unknown_fields = true });
+}
+
+/// The lowercase hex SHA-256 of `bytes`, the form `netlist_sha256` records.
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// A fresh `.zig-cache/<kind>/<random hex>` directory, created; the caller
+/// deletes it.
+fn scratchDir(a: Allocator, io: Io, kind: []const u8) ![]const u8 {
+    var random: [16]u8 = undefined;
+    io.random(&random);
+    const path = try std.fmt.allocPrint(a, ".zig-cache/{s}/{s}", .{ kind, std.fmt.bytesToHex(random, .lower) });
+    try Io.Dir.cwd().createDirPath(io, path);
+    return path;
+}
+
+/// `simulate`, required to exit 0, then its raw output parsed.
+fn simulatePlots(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: []const u8, timeout_seconds: u32, tokenizer: ?[]const u8) ![]const Plot {
+    try requireSuccess(try simulate(a, io, app, netlist, output, timeout_seconds, tokenizer));
+    return parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, output, a, .unlimited));
 }
 
 /// Checks the oracle, the deck's hash against it, then simulates and compares.
 /// A `repeatability` check reruns the deck and requires bitwise-equal output.
 fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []const u8, timeout_seconds: u32) !void {
-    const oracle = try std.json.parseFromSliceLeaky(Oracle, a, expected, .{ .ignore_unknown_fields = true });
+    const oracle = try parseOracle(a, expected);
     try validateOracle(oracle);
     const netlist = try std.fmt.allocPrint(a, "tests/{s}", .{path});
     const source = try Io.Dir.cwd().readFileAlloc(io, netlist, a, .unlimited);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
-    if (!equal(&std.fmt.bytesToHex(digest, .lower), oracle.netlist_sha256)) return error.StaleOracle;
+    if (!equal(&sha256Hex(source), oracle.netlist_sha256)) return error.StaleOracle;
 
     // Isolated output per case/run. Child processes see the fixture directory,
     // so relative .include/.hdl paths keep their SPICE meaning.
-    var random: [16]u8 = undefined;
-    io.random(&random);
-    const scratch = try std.fmt.allocPrint(a, ".zig-cache/correctness/{s}", .{std.fmt.bytesToHex(random, .lower)});
-    try Io.Dir.cwd().createDirPath(io, scratch);
+    const scratch = try scratchDir(a, io, "correctness");
     defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
     const raw = try Io.Dir.cwd().realPathFileAlloc(io, scratch, a);
     const output = try std.fmt.allocPrint(a, "{s}/result.raw", .{raw});
@@ -315,7 +370,7 @@ fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []
     const result = try simulate(a, io, executable, netlist, output, timeout_seconds, oracle.tokenizer);
     if (oracle.expect.status == .@"error") return checkRejection(oracle.expect.category.?, result);
     // An explicit GPU backend refuses a circuit with no GPU-eligible device
-    // (no CPU fallback); under test-gpu that deck has nothing to compare.
+    // (no CPU fallback); under a GPU backend that deck has nothing to compare.
     if (!equal(backend_name, "cpu") and std.mem.indexOf(u8, result.stderr, "(CircuitNotEligible)") != null) return error.NotEligible;
     try requireSuccess(result);
     // A `-Dcertify` build reports its KCL record on stderr (src/analysis/certify.zig).
@@ -329,9 +384,7 @@ fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []
         if (!equal(try string(try field(check, "kind")), "repeatability")) continue;
         // Remove the first output so a missing second result cannot reuse it.
         try Io.Dir.cwd().deleteFile(io, output);
-        try requireSuccess(try simulate(a, io, executable, netlist, output, timeout_seconds, oracle.tokenizer));
-        const repeated = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, output, a, .unlimited));
-        try repeatable(plots, repeated);
+        try repeatable(plots, try simulatePlots(a, io, executable, netlist, output, timeout_seconds, oracle.tokenizer));
     }
 }
 
@@ -339,14 +392,11 @@ fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []
 /// compared column by column; false when no rewrite applies (an error
 /// oracle, a dialect other than ngspice, or syntax the rewrites skip).
 fn runMetamorphic(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []const u8, timeout_seconds: u32) !bool {
-    const oracle = try std.json.parseFromSliceLeaky(Oracle, a, expected, .{ .ignore_unknown_fields = true });
+    const oracle = try parseOracle(a, expected);
     if (oracle.expect.status == .@"error" or oracle.tokenizer != null) return false;
     const netlist = try std.fmt.allocPrint(a, "tests/{s}", .{path});
     const source = try Io.Dir.cwd().readFileAlloc(io, netlist, a, .unlimited);
-    var random: [16]u8 = undefined;
-    io.random(&random);
-    const scratch = try std.fmt.allocPrint(a, ".zig-cache/metamorphic/{s}", .{std.fmt.bytesToHex(random, .lower)});
-    try Io.Dir.cwd().createDirPath(io, scratch);
+    const scratch = try scratchDir(a, io, "metamorphic");
     defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
     const dir = try Io.Dir.cwd().realPathFileAlloc(io, scratch, a);
     const executable = try Io.Dir.cwd().realPathFileAlloc(io, app, a);
@@ -355,15 +405,11 @@ fn runMetamorphic(a: Allocator, io: Io, app: []const u8, path: []const u8, expec
     for (std.meta.tags(metamorphic.Kind)) |kind| {
         const v = try metamorphic.rewrite(a, source, kind) orelse continue;
         if (base == null) {
-            const output = try std.fmt.allocPrint(a, "{s}/base.raw", .{dir});
-            try requireSuccess(try simulate(a, io, executable, netlist, output, timeout_seconds, null));
-            base = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, output, a, .unlimited));
+            base = try simulatePlots(a, io, executable, netlist, try std.fmt.allocPrint(a, "{s}/base.raw", .{dir}), timeout_seconds, null);
         }
         const deck = try std.fmt.allocPrint(a, "{s}/{t}.sp", .{ dir, kind });
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = deck, .data = v.text });
-        const output = try std.fmt.allocPrint(a, "{s}/{t}.raw", .{ dir, kind });
-        try requireSuccess(try simulate(a, io, executable, deck, output, timeout_seconds, null));
-        const plots = try parseRaw(a, try Io.Dir.cwd().readFileAlloc(io, output, a, .unlimited));
+        const plots = try simulatePlots(a, io, executable, deck, try std.fmt.allocPrint(a, "{s}/{t}.raw", .{ dir, kind }), timeout_seconds, null);
         sameResults(a, base.?, plots, v) catch |err| {
             diagnostic("  {t}: {s}\n{s}", .{ kind, @errorName(err), v.text });
             bad = true;
@@ -430,7 +476,7 @@ fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: 
     defer select.cancelDiscard();
     const base = [_][]const u8{ app, "--backend", backend_name, "--format=binary", "-b", "-r", output, "--tokenizer", tokenizer orelse "ngspice", std.fs.path.basename(netlist) };
     var with_vpi: [base.len + 2][]const u8 = undefined;
-    const argv: []const []const u8 = if (try marksVpiFixture(a, io, netlist)) blk: {
+    const argv: []const []const u8 = if (marked(a, io, netlist, "VPI FIXTURE")) blk: {
         @memcpy(with_vpi[0..base.len], &base);
         with_vpi[base.len] = "--vpi";
         // Absolute, as `app` is: the deck runs from its own directory.
@@ -449,18 +495,6 @@ fn simulate(a: Allocator, io: Io, app: []const u8, netlist: []const u8, output: 
         .process => |result| result,
         .timeout => error.Timeout,
     };
-}
-
-/// Whether the deck's header holds `* VPI FIXTURE`.
-fn marksVpiFixture(a: Allocator, io: Io, netlist: []const u8) !bool {
-    // An unreadable deck fails in the simulator, which names it.
-    const source = Io.Dir.cwd().readFileAlloc(io, netlist, a, .unlimited) catch return false;
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    while (lines.next()) |text| {
-        if (text.len == 0 or text[0] != '*') continue;
-        if (std.mem.startsWith(u8, std.mem.trimStart(u8, text[1..], " \t"), "VPI FIXTURE")) return true;
-    }
-    return false;
 }
 
 fn requireSuccess(result: std.process.RunResult) !void {
@@ -750,7 +784,7 @@ fn comparePlot(a: Allocator, expected: ExpectedPlot, actual: Plot) !void {
                 const axis = expected.axis.?;
                 break :blk try sample(actual, try actual.column(axis.name), c, axis.values[j], axis.rtol, axis.atol);
             } else actual.value(row, c);
-            const want = try scalar(v);
+            const want = (try scalar(v)).mul(.init(perturb, 0));
             if (col.magnitude) {
                 try checkValue(name, row, .init(got.magnitude(), 0), .init(want.magnitude(), 0), col.rtol, col.atol);
             } else try checkValue(name, row, got, want, col.rtol, col.atol);
@@ -844,7 +878,7 @@ fn measureLine(stdout: []const u8, check: Json) !void {
         if (!equal(std.mem.trim(u8, text[0..eq], " \t"), name)) continue;
         var fields = std.mem.tokenizeAny(u8, text[eq + 1 ..], " \t");
         const got = std.fmt.parseFloat(f64, fields.next() orelse return error.MissingMeasure) catch return error.MissingMeasure;
-        if (close(.init(got, 0), .init(expected, 0), rtol, atol)) return;
+        if (close(.init(got, 0), .init(expected * perturb, 0), rtol, atol)) return;
         diagnostic("  measure {s}: expected {e}, got {e}\n", .{ name, expected, got });
         return error.MeasureMismatch;
     }
@@ -864,7 +898,7 @@ fn between(value: f64, minimum: f64, maximum: f64) !void {
 /// |got - expected| <= rtol * |expected| for a quantity measured off a waveform.
 fn measured(name: []const u8, got: f64, expected: f64, rtol: f64) !void {
     try tolerance(rtol, 0);
-    if (std.math.isFinite(got) and close(.init(got, 0), .init(expected, 0), rtol, 0)) return;
+    if (std.math.isFinite(got) and close(.init(got, 0), .init(expected * perturb, 0), rtol, 0)) return;
     diagnostic("  {s}: expected {e}, got {e}; rtol={e}\n", .{ name, expected, got, rtol });
     return error.StatisticMismatch;
 }
@@ -1066,24 +1100,24 @@ test {
     _ = metamorphic;
 }
 
+// Oracle: SHA-256 of each deck against the hash its .expected.json records.
 test "every discovered fixture has a valid oracle and matching source hash" {
     try std.testing.expect(spice_files.len > 0);
     for (spice_files, expected_outputs) |path, json| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const oracle = try std.json.parseFromSliceLeaky(Oracle, a, json, .{ .ignore_unknown_fields = true });
+        const oracle = try parseOracle(a, json);
         validateOracle(oracle) catch |err| {
             std.debug.print("invalid oracle: {s}\n", .{path});
             return err;
         };
         const source = try Io.Dir.cwd().readFileAlloc(std.testing.io, try std.fmt.allocPrint(a, "tests/{s}", .{path}), a, .unlimited);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
-        try std.testing.expectEqualStrings(oracle.netlist_sha256, &std.fmt.bytesToHex(digest, .lower));
+        try std.testing.expectEqualStrings(oracle.netlist_sha256, &sha256Hex(source));
     }
 }
 
+// Oracle: a hand-encoded binary raw blob whose values and length are known.
 test "raw parser rejects truncated and nonfinite data and reads concatenated plots" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1099,6 +1133,8 @@ test "raw parser rejects truncated and nonfinite data and reads concatenated plo
     try std.testing.expectError(error.NonfiniteOutput, parseRaw(a, try std.mem.concat(a, u8, &.{ header, std.mem.sliceAsBytes(&bad) })));
 }
 
+// Oracle: hand-computed linear interpolation (v(out) = 1.5 at t = 0.5) and
+// root sets whose valid pairing is known.
 test "numeric matching covers row indices, interpolation, phase and multiplicity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1136,6 +1172,7 @@ test "numeric matching covers row indices, interpolation, phase and multiplicity
     try std.testing.expectError(error.NotRepeatable, repeatable(&.{p}, &.{wrong}));
 }
 
+// Oracle: closed form: {0, 1, 2} has mean 1 and sample stddev 1.
 test "statistical checks measure samples and reject biased output" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1151,6 +1188,7 @@ test "statistical checks measure samples and reject biased output" {
     try std.testing.expectError(error.UnknownCheck, checkKind(try std.json.parseFromSliceLeaky(Json, a, "{\"kind\":\"typo\"}", .{})));
 }
 
+// Oracle: hand-written stderr and exit codes with a known category.
 test "invalid decks require the intended diagnostic instead of arbitrary failure" {
     try checkRejection("invalid_analysis_arguments", .{ .term = .{ .exited = 1 }, .stdout = @constCast(""), .stderr = @constCast("Error: example.sp: InvalidQueryOptions\n") });
     try std.testing.expectError(error.WrongDiagnostic, checkRejection("invalid_analysis_arguments", .{ .term = .{ .exited = 1 }, .stdout = @constCast(""), .stderr = @constCast("Error: ModelNotFound\n") }));
@@ -1158,6 +1196,7 @@ test "invalid decks require the intended diagnostic instead of arbitrary failure
     try std.testing.expectError(error.ExpectedDiagnosticExit, checkRejection("invalid_analysis_arguments", .{ .term = .{ .exited = 2 }, .stdout = @constCast(""), .stderr = @constCast("Usage: espice FILE\n") }));
 }
 
+// Oracle: a script that sleeps 5 s against a 1 s deadline must time out.
 test "deadline kills a simulator that closes output streams before hanging" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
@@ -1171,6 +1210,7 @@ test "deadline kills a simulator that closes output streams before hanging" {
     try std.testing.expectError(error.Timeout, simulate(a, io, app, "tests/conformance/tests/netlist/op/divider_default.sp", "/dev/null", 1, null));
 }
 
+// Oracle: a triangle wave whose period and swing are known by construction.
 test "oscillation check measures period and swing and rejects a slow or stalled waveform" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1192,6 +1232,8 @@ test "oscillation check measures period and swing and rejects a slow or stalled 
     try std.testing.expectError(error.StatisticMismatch, compareCheck(a, check, &.{stalled}));
 }
 
+// Oracle: analytic integrals of piecewise-linear waveforms, a spectrum with
+// a known THD, and hand-placed roots.
 test "time statistics, phase wrap, THD, axis bounds and root sets are enforced" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

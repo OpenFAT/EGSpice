@@ -24,7 +24,7 @@
 //! a sparse frequency solve are the upgrade for large n.
 //!
 //! Cites ngspice distoan.c, cktdisto.c, dkerproc.c, dloadfns.c and
-//! diodset.c; dev/analysis/distortion.md.
+//! diodset.c.
 const std = @import("std");
 const root = @import("../types.zig");
 const dense_lu = @import("solver").dense_lu;

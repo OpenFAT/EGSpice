@@ -1,5 +1,8 @@
 //! Tests for the evaluator: AD scalars, the bit-trick helpers, the runtime
-//! vtable and binder, and batch instantiation and hooks.
+//! vtable and binder, and batch instantiation and hooks. Oracles, per test:
+//! `std.math` and the float compare a bit trick replaces, a central
+//! difference, the same batch forced wide or run serially, hand-derived
+//! stamps of a toy device, and ngspice's breakpoint arithmetic.
 const impl = @import("device_eval");
 const contract = @import("contract");
 const SimState = contract.SimState;
@@ -31,6 +34,14 @@ fn markGiven(model: anytype, comptime field: []const u8) void {
         @field(model.*, field ++ "__given") = true;
     }
 }
+
+/// A dense 3x3 pattern over nodes 0..2; slot 9 and row 3 take ground writes.
+const dense3: impl.test_access.PatternView = .{
+    .col_ptr = &.{ 0, 3, 6, 9 },
+    .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
+    .n = 3,
+    .trash_slot = 9,
+};
 
 test "narrow admission rejects a limiter write without a derivative lane" {
     const D = struct {
@@ -375,12 +386,7 @@ test "equal cards share one Model row until a parameter is collected" {
     var proto: ProtoStore(D) = .{};
     for ([_]f64{ 1000, 50, 1000 }, [_][2]u32{ .{ 1, 2 }, .{ 2, 0 }, .{ 1, 0 } }) |r, nodes|
         try proto.append(&.{ .r = r }, &.{}, nodes);
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     const copy = try batch.hooks.instantiate(batch.ctx, a).unwrap();
     defer copy.hooks.deinit(copy.ctx, a);
@@ -436,12 +442,7 @@ test "write_params copies a shared Model row only for an instance written apart"
     var proto: ProtoStore(D) = .{};
     for ([_]f64{ 1000, 50, 1000 }, [_][2]u32{ .{ 1, 2 }, .{ 2, 0 }, .{ 1, 0 } }) |r, nodes|
         try proto.append(&.{ .r = r }, &.{}, nodes);
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     // Ordinals: mfactor of instances 0..2, then r of instances 0..2.
     const layout = try batch.hooks.param_layout.?(batch.ctx).unwrap();
@@ -537,12 +538,7 @@ test "collect_noise emits a correlated source's rows contiguously, with coeff, g
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
     try proto.append(&.{}, &.{}, .{ 2, 1 });
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     try std.testing.expectEqualDeep(&[_][]const u8{ "a", "c", "b", "t" }, batch.hooks.noise_names);
     var noise: std.ArrayList(NoiseSource) = .empty;
@@ -636,12 +632,7 @@ test "seed_nodeset writes each net initializer into its unknown, ground excepted
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
     try proto.append(&.{}, &.{}, .{ 0, 1 }); // p on ground: nothing written
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     var x = [_]f64{ -1, -1, -1 };
     batch.hooks.seed_nodeset.?(batch.ctx, &x);
@@ -677,13 +668,7 @@ test "prepared device instances share tapes and isolate parameters and accepted 
     const a = std.testing.allocator;
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
-    // A dense 3x3 pattern; row 3 and slot 9 take the ground writes.
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     var noise: std.ArrayList(NoiseSource) = .empty;
     defer noise.deinit(a);
@@ -766,12 +751,7 @@ test "a live timer schedule reaches next_breakpoint" {
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
     try proto.append(&.{}, &.{}, .{ 2, 1 });
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     const next = batch.hooks.next_breakpoint.?;
     try std.testing.expectEqual(@as(?f64, null), next(batch.ctx, 0));
@@ -834,12 +814,7 @@ test "iteration hooks gather each instance and preserve accepted-time state" {
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
     try proto.append(&.{}, &.{}, .{ 2, 1 });
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     const typed: *DeviceBatch(D) = @ptrCast(@alignCast(batch.ctx));
     try std.testing.expect(batch.hooks.gpu_payload == null);
@@ -879,12 +854,7 @@ test "set_homotopy writes gmin__ and source_scale__ on every row and reruns setu
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{ .r = 1 }, &.{}, .{ 1, 2 });
     try proto.append(&.{ .r = 3 }, &.{}, .{ 2, 1 });
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     const typed: *DeviceBatch(D) = @ptrCast(@alignCast(batch.ctx));
     batch.hooks.set_homotopy.?(batch.ctx, 1e-3, 0.25);
@@ -934,12 +904,7 @@ test "a status-latch-only device stays GPU-eligible and reports its latched stat
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
     try proto.append(&.{}, &.{}, .{ 2, 1 });
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     // The latch is its only eval write, so the device may be resident.
     try std.testing.expect(batch.hooks.gpu_payload != null);
@@ -984,12 +949,7 @@ test "mutable evaluation captures per-instance data without GPU residency" {
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
     try proto.append(&.{}, &.{}, .{ 2, 1 });
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     const typed: *DeviceBatch(D) = @ptrCast(@alignCast(batch.ctx));
     try std.testing.expect(batch.hooks.gpu_payload == null);
@@ -1135,12 +1095,7 @@ test "analog initial reruns after a revert rolls its held results back" {
     const a = std.testing.allocator;
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
-    const template = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const template = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer template.hooks.deinit(template.ctx, a);
     const batch = try template.hooks.instantiate(template.ctx, a).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
@@ -1211,12 +1166,7 @@ test "a held-variable device that limits is resident, its state half deferred to
     const a = std.testing.allocator;
     var proto: ProtoStore(D) = .{};
     try proto.append(&.{}, &.{}, .{ 1, 2 });
-    const batch = try ProtoStore(D).finalize(&proto, a, .{
-        .col_ptr = &.{ 0, 3, 6, 9 },
-        .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-        .n = 3,
-        .trash_slot = 9,
-    }).unwrap();
+    const batch = try ProtoStore(D).finalize(&proto, a, dense3).unwrap();
     defer batch.hooks.deinit(batch.ctx, a);
     const p = batch.hooks.gpu_payload.?(batch.ctx);
     try std.testing.expect(p.lim_kernel.len > 0);
@@ -1388,14 +1338,6 @@ const Conductance = struct {
     }
 };
 
-/// A dense 3x3 pattern over nodes 0..2; slot 9 and row 3 take ground writes.
-const dense3: impl.test_access.PatternView = .{
-    .col_ptr = &.{ 0, 3, 6, 9 },
-    .row_idx = &.{ 0, 1, 2, 0, 1, 2, 0, 1, 2 },
-    .n = 3,
-    .trash_slot = 9,
-};
-
 test "ac_dyn: every frequency once, ragged tails included" {
     const D = struct {
         pub const U = Conductance.U;
@@ -1525,6 +1467,17 @@ test "Dual: sel takes b at a ±0 indicator and a at any other, NaN included" {
     for ([_]f64{ 0.0, -0.0 }) |c| try std.testing.expectEqual(@as(f64, 0.5), S.sel(S.con(c), x.neg(), x).v);
     for ([_]f64{ 1.0, -1.0, std.math.floatTrueMin(f64), std.math.inf(f64), std.math.nan(f64) }) |c| {
         try std.testing.expectEqual(@as(f64, -0.5), S.sel(S.con(c), x.neg(), x).v);
+    }
+}
+
+test "Real: sel picks what Dual's .v picks, ±0 and NaN included" {
+    // Oracle: `DualFor.sel`'s `.v`, which `RealFor` must repeat verbatim; it
+    // used `c.v != 0.0`, the compare #25 miscompiles.
+    const R = impl.test_access.Real;
+    const S = impl.test_access.Sparse;
+    for ([_]f64{ 0.0, -0.0, 1.0, -1.0, std.math.floatTrueMin(f64), std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |c| {
+        const want = S.sel(S.con(c), S.con(-0.5), S.con(0.5)).v;
+        try std.testing.expectEqual(want, R.sel(R.con(c), R.con(-0.5), R.con(0.5)).v);
     }
 }
 

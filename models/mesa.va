@@ -28,6 +28,10 @@
 //     from ngspice if any device runs at vds < 0.
 //   * ngspice's `off` flag / icvds / icvgs cold-start seeds are netlist-level
 //     initial conditions, not model equations; the solver owns them.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module mesa(dr, g, s);
     inout dr, g, s;
     electrical dr, g, s;

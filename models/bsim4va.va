@@ -1,3 +1,7 @@
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 /*
 Verilog-A definition of BSIM4 based on version 4.8
 Enhancements List:

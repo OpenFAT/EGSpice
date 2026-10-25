@@ -36,9 +36,16 @@ pub const LaneTab = extern struct {
     n_void_slots: u32,
 };
 
+/// `LaneTab.flags` bit: the step has a fabricated unit pivot
+/// (`SparseLu.void_col`).
 pub const void_bit: u32 = 1;
+/// `LaneTab.flags` bit: the pivot passed only the row-scaled test
+/// (`SparseLu.scaled_pivot`), so the growth monitor skips it.
 pub const scaled_bit: u32 = 2;
 
+/// The per-lane bodies over the pointer type `P` (`HostP` on the host,
+/// `gompute.GlobalPtr` on the device). Every body touches lane l only, so
+/// lanes may run in any order or at once.
 pub fn Bodies(comptime P: fn (type) type) type {
     return struct {
         /// `LaneLu.refactor` for lane l, plus `LaneSolver.wideMultipliers`:
@@ -121,9 +128,16 @@ pub fn Bodies(comptime P: fn (type) type) type {
         /// `LaneSolver.factorSolveNeg`'s vector lane. `y` is n rows of
         /// scratch.
         pub fn solveNeg(t: LaneTab, x: P(u32), lx: P(f64), ux: P(f64), udiag: P(f64), rhs: P(f64), y: P(f64), dx: P(f64), n_lanes: u32, l: u32) void {
-            const N: usize = n_lanes;
-            const L: usize = l;
-            for (0..t.n) |r| y[@as(usize, x[t.pinv + r]) * N + L] = -rhs[r * N + L];
+            luSolve(true, t, x, lx, ux, udiag, rhs, y, dx, n_lanes, l);
+        }
+
+        /// `LaneLu.solve` for lane l: out = A_l^-1 rhs_l, or -A_l^-1 rhs_l
+        /// when `neg` (the negation is exact, at the gather). `y` is n rows
+        /// of scratch.
+        pub fn luSolve(comptime neg: bool, t: LaneTab, x: P(u32), lx: P(f64), ux: P(f64), udiag: P(f64), rhs: P(f64), y: P(f64), out: P(f64), n_lanes: usize, l: usize) void {
+            const N = n_lanes;
+            const L = l;
+            for (0..t.n) |r| y[@as(usize, x[t.pinv + r]) * N + L] = if (neg) -rhs[r * N + L] else rhs[r * N + L];
             for (0..t.n) |k| {
                 const yk = y[k * N + L];
                 if (yk != 0) for (x[t.lp + k]..x[t.lp + k + 1]) |p| {
@@ -139,7 +153,7 @@ pub fn Bodies(comptime P: fn (type) type) type {
                     y[@as(usize, x[t.ui + p]) * N + L] -= ux[p * N + L] * zk;
                 };
             }
-            for (0..t.n) |j| dx[@as(usize, x[t.q + j]) * N + L] = y[j * N + L];
+            for (0..t.n) |j| out[@as(usize, x[t.q + j]) * N + L] = y[j * N + L];
         }
 
         /// `converger.updateAndNorm` at W = 1 for lane l: x_old = x,
@@ -448,7 +462,7 @@ pub const step_stopped: u8 = 4;
 pub const step_idle: u8 = 0;
 pub const step_attempt: u8 = 1;
 pub const step_accept: u8 = 2;
-pub const step_reject: u8 = 3;
+const step_reject: u8 = 3;
 
 /// `tran.methodAt` over method codes, for a `top` of order <= 2.
 fn methodAt(top: u8, k: u8) u8 {
@@ -546,7 +560,7 @@ fn retry(s: anytype, dt: f64, next: f64) void {
 /// leaves `t_new` and `dt_next` for `stepEndB`. A gate asking for
 /// `reject_at` or `$bound_step` parks the lane. `pq`/`pqt` are the lane's
 /// `nh` ring slots.
-pub fn stepEndA(s: anytype, gate: lk_Gate, query: u32, lte: [2]f64, ops: anytype, accept: anytype, sc: anytype, pq: anytype, pqt: anytype, nh: usize) void {
+pub fn stepEndA(s: anytype, gate: Gate, query: u32, lte: [2]f64, ops: anytype, accept: anytype, sc: anytype, pq: anytype, pqt: anytype, nh: usize) void {
     if (s.event != step_attempt) return;
     // The host stopped the lane while its Newton ran.
     if (s.status != step_run) {
@@ -685,8 +699,6 @@ pub fn stepEndB(s: anytype, nb: f64) void {
     if (t_new + s.dt > s.t_stop) s.dt = s.t_stop - t_new;
 }
 
-const lk_Gate = Gate;
-
 /// Newton per-lane gate state, one record per lane.
 pub const Gate = extern struct {
     /// `plausibleLimit`, set at iteration 0.
@@ -703,6 +715,7 @@ pub const Gate = extern struct {
     _pad: u32 = 0,
 };
 
+/// `converger.Options` as the device gates read it; extern, passed by value.
 pub const NewtonOpts = extern struct {
     reltol: f64,
     abstol: f64,

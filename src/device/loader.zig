@@ -57,7 +57,21 @@ pub const Prepared = struct {
     pub fn name(self: *const Prepared) []const u8 {
         return self.name_buf[0..self.name_len];
     }
+
+    /// A device named `module_name` (lowercased), its vtable still unset;
+    /// null when the name is longer than `name_buf`.
+    fn named(module_name: []const u8, is_digital: bool) ?Prepared {
+        var out: Prepared = .{ .vtable = undefined, .name_buf = undefined, .name_len = undefined, .digital = is_digital };
+        if (module_name.len > out.name_buf.len) return null;
+        out.name_len = @intCast(std.ascii.lowerString(&out.name_buf, module_name).len);
+        std.debug.assert(out.name_len == module_name.len);
+        return out;
+    }
 };
+
+/// The library's generation suffix (`lib<name>.<generation>.so`), shared by
+/// a fresh build and the cached-load path that reopens it.
+const generation = 1;
 
 /// The source languages the loader compiles, by file extension, ignoring
 /// case: every Verilog-A and Verilog extension the frontend routes here
@@ -113,10 +127,7 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
         },
     };
 
-    var out: Prepared = .{ .vtable = undefined, .name_buf = undefined, .name_len = undefined, .digital = hdl == .v };
-    if (module_name.len > out.name_buf.len) return error.NameTooLong;
-    out.name_len = @intCast(std.ascii.lowerString(&out.name_buf, module_name).len);
-    std.debug.assert(out.name_len == module_name.len);
+    var out = Prepared.named(module_name, hdl == .v) orelse return error.NameTooLong;
     // Only the compiled MIR knows a `.va` module's name, so `compileSource`
     // must run before this check; codegen and the build are skipped.
     if (isLoaded(loaded, out.name())) return null;
@@ -151,20 +162,6 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
         .{ .name = "frontend", .root = try std.fs.path.join(arena, &.{ vera_root, "lib/frontend/root.zig" }), .deps = &.{ "base", "diag", "kernels" } },
         .{ .name = "kernels", .root = try std.fs.path.join(arena, &.{ vera_root, "lib/kernels/root.zig" }), .deps = &.{"contract"} },
     };
-    // The vtable crosses the dlopen boundary with Zig calling convention and
-    // auto layout, so the library must match the host's backend and mode
-    // (`layoutHash` checks both).
-    var options: fastvaf.orchestrator.Options = .{
-        .work_dir = paths.work_dir,
-        .name = module_name,
-        .optimize = builtin.mode,
-        .backend = if (builtin.zig_backend == .stage2_llvm) .llvm else .self_hosted,
-        .modules = &modules,
-        .zig_exe = paths.zig,
-        // The host's libc, not what the compiler detects: a Nix sandbox
-        // detects musl, whose libc.so a glibc espice cannot load.
-        .target = "native-native-" ++ @tagName(builtin.target.abi),
-    };
     // One build tree per (source, host ABI, module set): VerA's writer prunes
     // its tree, so unrelated sources must not share one, and a stable path
     // keeps Zig's compiler cache warm.
@@ -183,7 +180,20 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
     const digest = hash.finalResult();
     const work_dir = try std.fs.path.join(gpa, &.{ paths.work_dir, &std.fmt.bytesToHex(digest, .lower) });
     defer gpa.free(work_dir);
-    options.work_dir = work_dir;
+    // The vtable crosses the dlopen boundary with Zig calling convention and
+    // auto layout, so the library must match the host's backend and mode
+    // (`layoutHash` checks both).
+    const options: fastvaf.orchestrator.Options = .{
+        .work_dir = work_dir,
+        .name = module_name,
+        .optimize = builtin.mode,
+        .backend = if (builtin.zig_backend == .stage2_llvm) .llvm else .self_hosted,
+        .modules = &modules,
+        .zig_exe = paths.zig,
+        // The host's libc, not what the compiler detects: a Nix sandbox
+        // detects musl, whose libc.so a glibc espice cannot load.
+        .target = "native-native-" ++ @tagName(builtin.target.abi),
+    };
     try std.Io.Dir.cwd().createDirPath(io, work_dir);
     const dir = try std.Io.Dir.cwd().openDir(io, work_dir, .{});
     defer dir.close(io);
@@ -196,7 +206,6 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
     // inode: truncating a library another loader has mapped would corrupt its
     // live vtable. Platforms that refuse the unlink fail here rather than
     // overwrite a mapped file.
-    const generation = 1;
     const target = builtin.target;
     const library = try gpa.print("{s}{s}.{d}{s}", .{
         target.libPrefix(), module_name, generation, target.dynamicLibSuffix(),
@@ -447,10 +456,7 @@ fn cachedLoad(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
     const digest = lines.next() orelse return null;
     if (module_name.len == 0 or digest.len != 64) return null;
 
-    var out: Prepared = .{ .vtable = undefined, .name_buf = undefined, .name_len = undefined, .digital = digital_dev };
-    if (module_name.len > out.name_buf.len) return null;
-    out.name_len = @intCast(std.ascii.lowerString(&out.name_buf, module_name).len);
-    std.debug.assert(out.name_len == module_name.len);
+    var out = Prepared.named(module_name, digital_dev) orelse return null;
     if (isLoaded(loaded, out.name())) return @as(?Prepared, null);
 
     const work_dir = std.fs.path.join(gpa, &.{ work_root, digest }) catch return null;
@@ -460,7 +466,7 @@ fn cachedLoad(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
     const lock = dir.createFile(io, "build.lock", .{ .truncate = false, .lock = .exclusive }) catch return null;
     defer lock.close(io);
     const target = builtin.target;
-    const so = gpa.print("{s}/{s}{s}.1{s}", .{ work_dir, target.libPrefix(), module_name, target.dynamicLibSuffix() }) catch return null;
+    const so = gpa.print("{s}/{s}{s}.{d}{s}", .{ work_dir, target.libPrefix(), module_name, generation, target.dynamicLibSuffix() }) catch return null;
     defer gpa.free(so);
     out.vtable = loadDevice(so) catch return null;
     @import("hdl_gpu.zig").register(io, so, work_dir, paths);

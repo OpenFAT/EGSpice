@@ -8,9 +8,14 @@
 //! Without it the one column is `espice=--backend=cpu`. `--ngspice none` or
 //! `--vacask none` drops that reference; `--xyce BIN`, `--hspice BIN` and `--spectre BIN`
 //! add one. `auto` for any of them takes the tool from PATH when it is
-//! installed and drops it when not (`zig build test-conformance`); an
+//! installed and drops it when not (`zig build bench` passes `auto`); an
 //! HSPICE or Spectre found that way moves the report to `vendor-NAME.md`.
-//!   zig build bench-postlayout -- --espice cpu8=ESPICE_THREADS=8,--backend=cpu
+//! `--fixtures DIR` replaces the corpus, e.g. synthetic post-layout decks or an
+//! external suite (each script says where it writes):
+//!   python3 tests/conformance/external/spice-bench/postlayout/gen.py zig-out/postlayout
+//!   zig build bench -- --fixtures zig-out/postlayout --out zig-out/postlayout-results.md
+//!   bash tests/conformance/external/spice-bench/fetch.sh zig-out/suites cmcqa
+//!   zig build bench -- --fixtures zig-out/suites/cmcqa --out zig-out/suites-results.md
 const std = @import("std");
 const Io = std.Io;
 const ngspice = @import("ngspice.zig");
@@ -189,7 +194,7 @@ pub fn main(init: std.process.Init) !void {
                 break :blk .{ .argv = argv, .cwd = .{ .path = std.fs.path.dirname(source).? }, .raw = raw };
             } else switch (refs.items[i - nv]) {
                 .ngspice => try ngspice.prepare(io, fa, cfg.refs.get(.ngspice), source, try std.fmt.allocPrint(fa, "{s}/ngspice.raw", .{absolute}), cfg.klu, hspice_dialect),
-                .vacask => try vacask.prepareWithOptions(io, fa, cfg.refs.get(.vacask), source, try std.fmt.allocPrint(fa, "{s}/vacask", .{absolute}), hspice_dialect, .{ .tran_fs = cfg.vacask_tran_fs, .tran_step = cfg.vacask_tran_step }),
+                .vacask => try vacask.prepare(io, fa, cfg.refs.get(.vacask), source, try std.fmt.allocPrint(fa, "{s}/vacask", .{absolute}), hspice_dialect, .{ .tran_fs = cfg.vacask_tran_fs, .tran_step = cfg.vacask_tran_step }),
                 .xyce => try xyce.prepare(io, fa, cfg.refs.get(.xyce), source, try std.fmt.allocPrint(fa, "{s}/xyce.raw", .{absolute}), dialect),
                 .hspice => try hspice.prepare(io, fa, cfg.refs.get(.hspice), cfg.hspice_args, source, try std.fmt.allocPrint(fa, "{s}/hspice", .{absolute}), hspice_dialect, cfg.match_tol),
                 .spectre => try spectre.prepare(io, fa, cfg.refs.get(.spectre), cfg.spectre_args, source, try std.fmt.allocPrint(fa, "{s}/spectre", .{absolute}), hspice_dialect, cfg.match_tol),
@@ -257,8 +262,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Report: {s}\nRaw outputs: {s}\n", .{ cfg.report, scratch });
 }
 
-/// Hash binaries once outside timing; argv and exact staged decks are saved per
-/// fixture. Repository patch/build provenance is prepared by prepare_comparison.
+/// The SHA-256 of the file at `path` as lowercase hex, allocated in `a`.
+/// Streamed, so a simulator binary or a large patch is never read whole.
 fn fileHash(a: Allocator, io: Io, path: []const u8) ![]const u8 {
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
@@ -275,6 +280,7 @@ fn fileHash(a: Allocator, io: Io, path: []const u8) ![]const u8 {
     return a.dupe(u8, &std.fmt.bytesToHex(hash.finalResult(), .lower));
 }
 
+/// `bin` itself when it is a path, else where `which` finds it.
 fn binaryPath(a: Allocator, io: Io, bin: []const u8) ![]const u8 {
     if (std.mem.indexOfScalar(u8, bin, '/') != null) return bin;
     const located = try std.process.run(a, io, .{ .argv = &.{ "which", bin } });
@@ -282,6 +288,9 @@ fn binaryPath(a: Allocator, io: Io, bin: []const u8) ![]const u8 {
     return std.mem.trim(u8, located.stdout, " \t\r\n");
 }
 
+/// Writes `provenance.json` into `scratch` once, outside timing: the git
+/// revision, the working-tree patch, a copy of every untracked file, and the
+/// hash of every simulator binary.
 fn snapshotRun(a: Allocator, io: Io, scratch: []const u8, cfg: Config) !void {
     const Binary = struct { label: []const u8, path: []const u8, sha256: []const u8 };
     var binaries: std.ArrayList(Binary) = .empty;
@@ -324,6 +333,8 @@ fn snapshotRun(a: Allocator, io: Io, scratch: []const u8, cfg: Config) !void {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ scratch, "provenance.json" }), .data = state });
 }
 
+/// Writes `directory`/provenance.json for one fixture: each staged input file,
+/// archived under `inputs/` by hash, and each engine's argv and cwd.
 fn snapshotJobs(a: Allocator, io: Io, directory: []const u8, source: []const u8, jobs: []const ?common.Job, labels: []const []const u8, contract: completion.Contract) !void {
     const Input = struct { path: []const u8, sha256: []const u8, snapshot: []const u8 };
     const Invocation = struct { engine: []const u8, argv: []const []const u8, cwd: []const u8 };
@@ -381,7 +392,7 @@ fn findDecks(a: Allocator, io: Io, root: []const u8, filter: []const u8) ![]cons
     var paths: std.ArrayList([]const u8) = .empty;
     while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".sp")) continue;
-        if (std.mem.indexOf(u8, entry.path, ".assets/") != null or !matches(entry.path, filter)) continue;
+        if (std.mem.indexOf(u8, entry.path, ".assets/") != null or std.mem.indexOf(u8, entry.path, filter) == null) continue;
         try paths.append(a, try a.dupe(u8, entry.path));
     }
     std.mem.sort([]const u8, paths.items, {}, lessStr);
@@ -394,7 +405,7 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
     const engine = args.next() orelse return error.MissingEngine;
     var cfg: Config = .{ .espice = try Io.Dir.cwd().realPathFileAlloc(io, engine, a), .fixtures = args.next() orelse return error.MissingFixtures };
     var variants: std.ArrayList(Variant) = .empty;
-    const Flag = enum(u8) { list, klu, native_tol, filter, iters, timeout, rtol, out, ngspice, vacask, xyce, hspice, spectre, hspice_args, spectre_args, espice, vacask_tran_fs, vacask_tran_step };
+    const Flag = enum(u8) { list, klu, native_tol, filter, iters, timeout, rtol, out, ngspice, vacask, xyce, hspice, spectre, hspice_args, spectre_args, espice, vacask_tran_fs, vacask_tran_step, fixtures };
     const flags = std.StaticStringMap(Flag).initComptime(.{
         .{ "--list", .list },                    .{ "--ngspice-klu", .klu },               .{ "--filter", .filter },
         .{ "--iters", .iters },                  .{ "--timeout", .timeout },               .{ "--rtol", .rtol },
@@ -402,6 +413,7 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
         .{ "--xyce", .xyce },                    .{ "--espice", .espice },                 .{ "--hspice", .hspice },
         .{ "--spectre", .spectre },              .{ "--hspice-args", .hspice_args },       .{ "--spectre-args", .spectre_args },
         .{ "--vendor-tolerances", .native_tol }, .{ "--vacask-tran-fs", .vacask_tran_fs }, .{ "--vacask-tran-step", .vacask_tran_step },
+        .{ "--fixtures", .fixtures },
     });
     while (args.next()) |arg| {
         const flag = flags.get(arg) orelse return error.UnknownArgument;
@@ -419,6 +431,7 @@ fn arguments(a: Allocator, io: Io, init: std.process.Init) !Config {
             .timeout => cfg.timeout = try std.fmt.parseInt(u32, value, 10),
             .rtol => cfg.rtol = try std.fmt.parseFloat(f64, value),
             .out => cfg.report = value,
+            .fixtures => cfg.fixtures = value,
             .ngspice => cfg.refs.set(.ngspice, value),
             .vacask => cfg.refs.set(.vacask, value),
             .vacask_tran_fs => cfg.vacask_tran_fs = try std.fmt.parseFloat(f64, value),
@@ -513,10 +526,6 @@ fn loadAverage(io: Io, a: Allocator) []const u8 {
     const n = file.readStreaming(io, &.{buf}) catch return "—";
     var words = std.mem.tokenizeAny(u8, buf[0..n], " \n");
     return words.next() orelse "—";
-}
-
-fn matches(path: []const u8, filter: []const u8) bool {
-    return std.mem.indexOf(u8, path, filter) != null;
 }
 
 /// All engines get one warm-up, then one run per round. Rotating the order

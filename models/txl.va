@@ -24,6 +24,10 @@
 //
 // Nodes: ngspice's inp2y binds the two signal nodes and ignores the card's
 // reference nodes, so n1/n2 are declared for the card shape and unused.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module txl(p1, n1, p2, n2);
     inout p1, n1, p2, n2;
     electrical p1, n1, p2, n2;

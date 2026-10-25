@@ -80,6 +80,8 @@ pub const Threads = struct {
     idle: std.ArrayList(*Slot) = .empty,
     all: std.ArrayList(*Slot) = .empty,
 
+    /// One pooled thread and the task it runs; `spawn` hands it out and
+    /// `join` takes it back. Heap-pinned: the thread holds its address.
     pub const Slot = struct {
         pool: *Threads,
         thread: std.Thread = undefined,
@@ -106,13 +108,16 @@ pub const Threads = struct {
         }
     };
 
+    /// `run(ctx)`, called once on a pooled thread; `ctx` must outlive `join`.
     pub const Task = struct { run: *const fn (*anyopaque) void, ctx: *anyopaque };
 
+    /// An empty pool; threads start on demand in `spawn`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Threads {
         return .{ .gpa = gpa, .io = io };
     }
 
-    /// Runs `task` on an idle thread, or a new one.
+    /// Runs `task` on an idle thread, or a new one. Fails on allocation or
+    /// thread spawn, leaving the pool as it was.
     pub fn spawn(self: *Threads, task: Task) !*Slot {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -145,6 +150,8 @@ pub const Threads = struct {
         self.idle.appendAssumeCapacity(slot);
     }
 
+    /// Stops and joins every thread, then frees the pool. Asserts that
+    /// every spawned task was joined.
     pub fn deinit(self: *Threads) void {
         std.debug.assert(self.idle.items.len == self.all.items.len);
         for (self.all.items) |s| {

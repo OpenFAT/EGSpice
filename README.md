@@ -86,9 +86,13 @@ Median of 3 runs after a warm-up, process startup included, CPU backend, 32 x In
 VACASK). The decks live in the
 [VAMS Conformance Suite](https://github.com/OmarSiwy/VAMS-Conformance-Suite), a submodule
 (`git submodule update --init tests/conformance`; the flake reads the same commit as its `conformance`
-input). Add or fix a deck there, then move the submodule and `nix flake update conformance` together. Per-area steps: `test-core`, `test-solver`, `test-device`, `test-frontend`,
-`test-analysis`, `test-output`, `test-espice`, `test-c-api`. Benchmarks:
-`nix develop .#benchmarking -c zig build bench`.
+input). Add or fix a deck there, then move the submodule and `nix flake update conformance` together. Narrow a run with `-Dtest-filter=NAME` (unit tests) and
+`-- --filter op/` (decks). Benchmarks:
+`nix develop .#benchmarking -c zig build bench`. What each check proves, and which run when: [TESTING.md](TESTING.md).
+
+## Contributing
+
+Maintained by one person. Branches, pins and how to send a change: [CONTRIBUTING.md](CONTRIBUTING.md). Vulnerabilities: [SECURITY.md](SECURITY.md).
 
 ## License
 

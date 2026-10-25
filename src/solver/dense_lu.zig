@@ -346,11 +346,7 @@ inline fn elimRow(row_i: []f64, row_k: []const f64, factor: f64, start: usize, n
 fn swapRows(a: []f64, n: usize, r1: usize, r2: usize) void {
     assert(r1 < n);
     assert(r2 < n);
-    for (a[r1 * n ..][0..n], a[r2 * n ..][0..n]) |*p, *q| {
-        const t = p.*;
-        p.* = q.*;
-        q.* = t;
-    }
+    for (a[r1 * n ..][0..n], a[r2 * n ..][0..n]) |*p, *q| std.mem.swap(f64, p, q);
 }
 
 /// Private kernels for src/solver/tests.zig; empty outside test builds.

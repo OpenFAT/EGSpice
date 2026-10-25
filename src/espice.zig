@@ -110,10 +110,13 @@ pub const Options = struct {
 /// `Options.measures`: the `.meas` values and the cards' error lines.
 pub const MeasureWriters = struct { out: *std.Io.Writer, err: *std.Io.Writer };
 
-/// The VPI host interface (`Options.vpi`) and its errors.
+/// The VPI host interface (`Options.vpi`), which vpi_host.zig implements.
 pub const Vpi = frontend.Library.Vpi;
+/// Why `Vpi.load_app` or `Vpi.attach` failed; Library.zig names each cause.
 pub const VpiError = frontend.Library.VpiError;
+/// The solution an analysis is attempting, as `Vpi.point` hands it over.
 pub const VpiAnalogPoint = frontend.Library.AnalogPoint;
+/// What the VPI callbacks decided about the point (`Vpi.verdict`).
 pub const VpiVerdict = frontend.Library.Verdict;
 
 /// Why publication stopped (`Problem.output_error`): an encoder or file
@@ -264,10 +267,10 @@ pub const Problem = struct {
         self.ws_pool = try .init(self.workerAllocator(), io, options.max_parallel);
         errdefer self.ws_pool.deinit();
         errdefer self.arena.deinit();
-        if (analysis.gpu_available and options.backend.backend != .cpu and likelyGpu(options)) {
+        if (analysis.gpu_available and options.backend.backend != .cpu) {
             // The driver reads the JIT cache cap at its start.
             raiseJitCache();
-            self.gpu_driver.prestart();
+            if (likelyGpu(options)) self.gpu_driver.prestart();
         }
         errdefer self.gpu_driver.deinit();
         const a = self.arena.allocator();
@@ -291,14 +294,11 @@ pub const Problem = struct {
         self.prepared = try frontend.build(&self.library, a, scratch, ast);
         timingLap(io, &lap, "Problem creation (expansion, binding, topology)");
         errdefer self.prepared.deinit();
-        self.live = &.{};
         if (self.prepared.tuning) |t| {
             const live = try a.alloc(u32, options.live_params.len);
             for (options.live_params, live) |name, *k| k.* = try t.index(name);
             self.live = live;
-            const names = try a.alloc([]const u8, options.live_params.len);
-            for (names, options.live_params) |*name, given| name.* = try a.dupe(u8, given);
-            self.live_names = names;
+            self.live_names = try dupeAll(a, options.live_params);
         }
         self.out_dir = try a.dupe(u8, if (options.output.path) |out| std.fs.path.dirname(out) orelse "." else ".");
         if (self.prepared.deck.save_op) |save| {
@@ -336,7 +336,6 @@ pub const Problem = struct {
             execution.gpu_share = analysis.gpu_lanes.share(cpus);
             execution.gpu_static = analysis.gpu_lanes.staticPolicy(execution, cpus);
         }
-        if (analysis.gpu_available and execution.backend != .cpu) raiseJitCache();
         execution.display = options.display;
         self.measures_to = options.measures;
         self.session = analysis.session.Session.init(self.workerAllocator(), io, &self.prepared.circuit, &self.prepared.deck, execution);
@@ -687,9 +686,7 @@ pub const Problem = struct {
 
     /// `error.UnknownMeasure` for a `point.abort_measure` no card names.
     fn checkPoint(self: *const Problem, point: requests.PointOptions) !void {
-        if (point.abort_measure.len == 0) return;
-        for (self.prepared.deck.measures) |m| if (std.ascii.eqlIgnoreCase(m.name, point.abort_measure)) return;
-        return error.UnknownMeasure;
+        if (point.abort_measure.len != 0 and measureIndex(self.prepared.deck.measures, point.abort_measure) == null) return error.UnknownMeasure;
     }
 
     /// One variant row per live parameter of the point at `values`, that
@@ -813,9 +810,7 @@ pub const Problem = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const cards = try a.alloc(u32, names.len);
-        for (names, cards) |name, *card| card.* = for (measures, 0..) |m, k| {
-            if (std.ascii.eqlIgnoreCase(m.name, name)) break @intCast(k);
-        } else return error.UnknownMeasure;
+        for (names, cards) |name, *card| card.* = measureIndex(measures, name) orelse return error.UnknownMeasure;
         const outputs = session.outputs.items;
         const ends = try self.pointEnds(a, first, reasons.len);
         const nan = std.math.nan(f64);
@@ -926,6 +921,9 @@ pub const Problem = struct {
         const reasons = try a.alloc(Reason, count);
         defer a.free(reasons);
         try self.point_measures(first, names, base, reasons);
+        const cards = try a.alloc(u32, names.len);
+        defer a.free(cards);
+        for (names, cards) |name, *card| card.* = measureIndex(measures, name).?; // `point_measures` checked every name
         const values = try a.alloc(f64, measures.len);
         defer a.free(values);
         const v0 = try a.alloc(f64, measures.len);
@@ -947,12 +945,7 @@ pub const Problem = struct {
             output.measureValues(measures, .tran, try block(&self.session, q, 0), v0);
             for (steps, 0..) |h, k| {
                 output.measureValues(measures, .tran, try block(&self.session, q, k + 1), values);
-                for (names, 0..) |name, c| {
-                    const card = for (measures, 0..) |m, n| {
-                        if (std.ascii.eqlIgnoreCase(m.name, name)) break n;
-                    } else unreachable; // `point_measures` checked every name
-                    out[(i * names.len + c) * p + k] = (values[card] - v0[card]) / h;
-                }
+                for (cards, 0..) |card, c| out[(i * names.len + c) * p + k] = (values[card] - v0[card]) / h;
             }
         }
     }
@@ -1162,8 +1155,7 @@ pub const Problem = struct {
     /// come from `analysis.schemaOf`; `endStream` checks the row count.
     fn openStream(self: *Problem) !void {
         const deck = &self.prepared.deck;
-        if (!self.session.config.final_plan or self.next_output != 0 or self.streaming != null) return;
-        if (self.save_path != null or deck.stims.len != 0 or self.prepared.tuner != null or deck.probe_labels.len != deck.probes.len) return;
+        if (!self.sidesAllowed() or self.next_output != 0 or self.streaming != null) return;
         if (self.session.outputs.items.len == 0) return;
         const id = self.session.outputs.items[0];
         if ((try self.session.info(id)).status != .pending) return;
@@ -1774,6 +1766,13 @@ pub const Problem = struct {
     }
 };
 
+/// The index of the `.meas` card named `name` (case-insensitive), the first
+/// when several share it.
+fn measureIndex(measures: []const core.Measure, name: []const u8) ?u32 {
+    for (measures, 0..) |m, k| if (std.ascii.eqlIgnoreCase(m.name, name)) return @as(u32, @intCast(k));
+    return null;
+}
+
 /// The variant row `job` runs at, or null for the nominal circuit.
 fn variantOf(job: Query) ?u32 {
     return switch (job) {
@@ -1823,7 +1822,7 @@ fn block(session: *const analysis.session.Session, id: QueryId, k: usize) !Resul
 /// card can read; a transient's own run, not its tangent blocks. A sweep
 /// point's block names its row and label, and prints NaN for each card
 /// without a value, a failed point's for all.
-fn printQueryMeasures(session: *const analysis.session.Session, id: QueryId, out: *std.Io.Writer, err: *std.Io.Writer, measures: []const @import("core").Measure) !void {
+fn printQueryMeasures(session: *const analysis.session.Session, id: QueryId, out: *std.Io.Writer, err: *std.Io.Writer, measures: []const core.Measure) !void {
     const info = try session.info(id);
     switch (info.kind) {
         .op, .tran, .ac, .dc, .fft, .tran_noise, .dcmatch, .acmatch, .lstb, .phasenoise, .pnoise, .sp => {},
@@ -1935,17 +1934,18 @@ fn getenv(name: [*:0]const u8) ?[*:0]const u8 {
     return std.c.getenv(name);
 }
 
-/// `given` with each null path the environment sets filled in, copied into
-/// `a`: `zig` from `$ZIG`, and `cache_dir` from `$ESPICE_CACHE/hdl`, else
-/// `$XDG_CACHE_HOME/espice/hdl`, else `$HOME/.cache/espice/hdl`, else
-/// `$TMPDIR/espice-cache/hdl` (default `/tmp`). An empty variable counts as
-/// unset for the cache, as `$ZIG` never is.
+/// Copies `items`, the list and each string, into `a`.
 fn dupeAll(a: std.mem.Allocator, items: []const []const u8) ![]const []const u8 {
     const out = try a.alloc([]const u8, items.len);
     for (out, items) |*o, s| o.* = try a.dupe(u8, s);
     return out;
 }
 
+/// `given` with each null path the environment sets filled in, copied into
+/// `a`: `zig` from `$ZIG`, and `cache_dir` from `$ESPICE_CACHE/hdl`, else
+/// `$XDG_CACHE_HOME/espice/hdl`, else `$HOME/.cache/espice/hdl`, else
+/// `$TMPDIR/espice-cache/hdl` (default `/tmp`). An empty variable counts as
+/// unset for the cache, as `$ZIG` never is.
 fn toolchainFromEnv(a: std.mem.Allocator, given: HdlToolchain) !HdlToolchain {
     const env = struct {
         fn get(name: [*:0]const u8) ?[]const u8 {
@@ -1970,13 +1970,6 @@ fn toolchainFromEnv(a: std.mem.Allocator, given: HdlToolchain) !HdlToolchain {
     };
 }
 
-/// Keeps the driver's JIT cache (`~/.nv/ComputeCache`) from evicting the
-/// compact-model kernels, whose cold compiles take 15 s (bsim4va) to 1001 s
-/// (hisimhv_va). The default cap is 256 MiB on older drivers and this
-/// machine's cache already held 321 MB before they were added. 4 GiB is the
-/// driver's maximum. A user's own setting wins. It must run before the
-/// driver initializes, which the first GPU query of the process does, so
-/// `Problem.init` calls it whenever the backend may use the GPU.
 /// Whether a run will probably take the GPU, judged before parsing: an
 /// explicit `cuda`/`hip`, or a deck file of at least `likely_gpu_bytes`,
 /// the size where `auto`'s cost model starts admitting post-layout decks.
@@ -2002,6 +1995,13 @@ fn likelyGpu(options: Options) bool {
 /// teardown (stress/scaling_parallel_inverters_2000, 199 KiB: 0.6 → 1.0 s).
 const likely_gpu_bytes = 1 << 20;
 
+/// Keeps the driver's JIT cache (`~/.nv/ComputeCache`) from evicting the
+/// compact-model kernels, whose cold compiles take 15 s (bsim4va) to 1001 s
+/// (hisimhv_va). The default cap is 256 MiB on older drivers and this
+/// machine's cache already held 321 MB before they were added. 4 GiB is the
+/// driver's maximum. A user's own setting wins. It must run before the
+/// driver initializes, which the first GPU query of the process does, so
+/// `Problem.init` calls it whenever the backend may use the GPU.
 fn raiseJitCache() void {
     const setenv = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

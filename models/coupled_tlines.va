@@ -26,6 +26,10 @@
 //     sits slightly below the exact DC point. ponytail: an explicit
 //     g*length/2 shunt at each end needs internal nodes; add it if a
 //     G-dominated card shows up.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module coupled_tlines(p1, p2, pr, n1, n2, nr);
     inout p1, p2, pr, n1, n2, nr;
     electrical p1, p2, pr, n1, n2, nr;

@@ -15,7 +15,7 @@ header; this page explains how the calls fit together.
 
 This program simulates an RC low-pass from netlist text and prints the AC
 magnitude at `v(out)`. It is `docs/embed/host.c` in the repository, and
-`zig build c-example` compiles and runs it on every docs build, so it
+`zig build test` compiles and runs it on every merge, so it
 stays in step with the header.
 
 ```c

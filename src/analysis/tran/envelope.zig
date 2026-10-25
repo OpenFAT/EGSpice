@@ -4,7 +4,7 @@
 //! envelope moves more than envelope_reltol and doubles below a quarter of it.
 //! In: a circuit at its operating point and the carrier period. Out: one
 //! row of time, peak and rms per probe per envelope point.
-//! Cites Verilog-AMS LRM §9.10 and dev/analysis/mpde-envelope.md.
+//! Cites Verilog-AMS LRM §9.10.
 const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
@@ -124,16 +124,13 @@ fn simulate(
         for (probes, 0..) |node, p| {
             row[1 + 2 * p] = @abs(x[node]); // peak
             row[2 + 2 * p] = @abs(x[node]); // rms
+            prev_peak[p] = @abs(x[node]);
         }
     }
 
     var t: f64 = 0;
     var outer_steps: u32 = 0;
     var periods_per_step: u32 = options.periods_per_outer_step;
-
-    for (probes, 0..) |node, p| {
-        prev_peak[p] = @abs(x[node]);
-    }
 
     var attempts: u64 = 0;
     while (t < options.t_stop and outer_steps < options.max_outer_steps) {

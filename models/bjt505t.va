@@ -11,6 +11,9 @@
 
 // Front definitions
 
+`include "constants.vams"
+`include "disciplines.vams"
+
 `include "discipline.h"
 
 // Numerical, physical and model constants

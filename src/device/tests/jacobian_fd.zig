@@ -1,5 +1,5 @@
 //! Jacobian-vs-finite-difference property over every built-in model
-//! (TESTING-METHODOLOGY 2.1 item 3): at random voltages each stamped G entry
+//! (TESTING.md, wrong device derivative): at random voltages each stamped G entry
 //! must match a central difference of the stamped residual, and each C entry
 //! one of the stamped charge. Reaches each model through its object's
 //! vtable, as the builder does, so no device body compiles into this test.
@@ -46,6 +46,10 @@ fn expectColumn(name: []const u8, col_ptr: []const u32, row_idx: []const u32, ja
     }
 }
 
+/// Checks model `name` at `points` random voltages. Fails with
+/// `JacobianMismatch` at the first entry off its difference, and with
+/// `NoFinitePoint` when no point stamps finite planes. Leaves its blobs
+/// and planes in `gpa`: the caller passes an arena.
 fn checkModel(gpa: std.mem.Allocator, name: []const u8, vt: *const abi.DeviceVtable, rand: std.Random) !void {
     const mblob = try gpa.alignedAlloc(u8, .@"16", vt.model_size);
     const iblob = try gpa.alignedAlloc(u8, .@"16", vt.instance_size);

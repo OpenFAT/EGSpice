@@ -3,6 +3,9 @@
 const std = @import("std");
 const lk = @import("lane.zig");
 
+/// The batch's dimensions: `points` independent points, `n` nodes, `nf`
+/// real spectral coefficients and `nt` time samples; `charge` nonzero
+/// adds the C (omega) terms.
 pub const Shape = extern struct {
     points: u64,
     n: u32,
@@ -11,6 +14,8 @@ pub const Shape = extern struct {
     charge: u32,
 };
 
+/// The per-point bodies over the pointer type `P`; each returns without
+/// touching an inactive point (`active[p] == 0`), except `pack`.
 pub fn Bodies(comptime P: fn (type) type) type {
     return struct {
         /// core.numerics.dot's fixed sixteen-accumulator reduction, with
@@ -111,6 +116,7 @@ pub fn Bodies(comptime P: fn (type) type) type {
             out[i * N + p] = value * (if (imag) @as(f64, -1) else 1);
         }
 
+        /// out = input at (row i, point p), for an active point.
         pub fn copy(t: Shape, i: usize, p: usize, active: P(u8), input: P(f64), out: P(f64)) void {
             if (active[p] == 0) return;
             const at = i * @as(usize, @intCast(t.points)) + p;
@@ -148,6 +154,7 @@ pub const Rows = struct {
     columns: []u32,
     slots: []u32,
 
+    /// Transposes the CSC pattern's slots into rows, O(n + nnz).
     pub fn init(a: std.mem.Allocator, col_ptr: []const u32, row_idx: []const u32) !Rows {
         const n = col_ptr.len - 1;
         const nz = col_ptr[n];
@@ -173,6 +180,7 @@ pub const Rows = struct {
         return .{ .ptr = ptr, .columns = columns, .slots = slots };
     }
 
+    /// Frees the three arrays with the allocator `init` got.
     pub fn deinit(self: Rows, a: std.mem.Allocator) void {
         a.free(self.ptr);
         a.free(self.columns);

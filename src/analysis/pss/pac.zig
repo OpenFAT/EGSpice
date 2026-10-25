@@ -4,9 +4,8 @@
 //! f_in + m*f_LO, m in -M..M. pxf.zig runs the same sweep on the transposed
 //! system, pnoise.zig on the transposed system with noise sources.
 //!
-//! Cites: dev/analysis/pac.md, dev/analysis/multitone-hb.md (the
-//! dense/Krylov crossover in `useKrylov`), Verilog-A LRM §4.6.1 (a
-//! small-signal phase is not static, so sources follow their waveform).
+//! Cites: Verilog-A LRM §4.6.1 (a small-signal phase is not static, so
+//! sources follow their waveform).
 const std = @import("std");
 const root = @import("../types.zig");
 const pss = @import("pss.zig");
@@ -125,20 +124,35 @@ fn sweepDense(
             dynSpectra(ckt, lin, omegas, dyn_f[n_sb..], dyn_hat);
             addDynConversion(adjoint, a_work, lin, ckt.ac_dyn_slots, dyn_hat, n, n_sb, nn, nn2);
         }
-        if (drive.len != 0) {
-            @memcpy(rhs_work[n_harm * n ..][0..n], drive[0..n]);
-            @memcpy(rhs_work[nn + n_harm * n ..][0..n], drive[n..]);
-        }
+        putDrive(rhs_work, drive, n_harm);
 
         try dense_lu.factorizeSolve(nn2, a_work, rhs_work, x_work);
 
         freqs[fi] = f_in;
-        if (adjoint) {
-            for (out[fi * nn ..][0..nn], x_work[0..nn], x_work[nn..nn2]) |*t, re, im| t.* = .{ .re = re, .im = -im };
-        } else for (0..n_sb) |p| {
-            const idx = p * n + probe_node;
-            out[fi * n_sb + p] = .{ .re = x_work[idx], .im = x_work[nn + idx] };
-        }
+        storePoint(adjoint, out, fi, x_work, n, probe_node);
+    }
+}
+
+/// Places `drive` ([re(0..n), im(0..n)], or empty) on sideband m = 0 of the
+/// zeroed stacked-real right-hand side `rhs`.
+fn putDrive(rhs: []f64, drive: []const f64, n_harm: usize) void {
+    if (drive.len == 0) return;
+    const n = drive.len / 2;
+    const nn = rhs.len / 2;
+    @memcpy(rhs[n_harm * n ..][0..n], drive[0..n]);
+    @memcpy(rhs[nn + n_harm * n ..][0..n], drive[n..]);
+}
+
+/// Writes input frequency `fi`'s row of `out` from the stacked-real
+/// solution `x`, in `sweep`'s PAC or PXF shape.
+fn storePoint(comptime adjoint: bool, out: []Complex, fi: usize, x: []const f64, n: usize, probe_node: u32) void {
+    const nn = x.len / 2;
+    const n_sb = nn / n;
+    if (adjoint) {
+        for (out[fi * nn ..][0..nn], x[0..nn], x[nn..]) |*t, re, im| t.* = .{ .re = re, .im = -im };
+    } else for (0..n_sb) |p| {
+        const idx = p * n + probe_node;
+        out[fi * n_sb + p] = .{ .re = x[idx], .im = x[nn + idx] };
     }
 }
 
@@ -146,8 +160,7 @@ fn sweepDense(
 /// `sweepKrylov`. The dense LU is O((2·n_sb·n)^3) a point and the Krylov
 /// solve O(iterations·(n_sb^2·nnz + n_sb·LU)). Whole-run medians on
 /// diode-RC ladder `.hbac` decks: dense 0.94x at n·n_sb = 35, even at 49,
-/// Krylov 1.25x at 70, 1.44x at 85, 10x at 408 and 43x at 748
-/// (dev/analysis/multitone-hb.md).
+/// Krylov 1.25x at 70, 1.44x at 85, 10x at 408 and 43x at 748.
 fn useKrylov(n: usize, n_sb: usize) bool {
     return n * n_sb >= 64;
 }
@@ -209,21 +222,13 @@ fn sweepKrylov(
         @import("../gpu/freq.zig").prepareHeld(&gpu_held, &gpu_held_disabled, ckt, &fs, omegas.len, allocator);
         op.gpu_held = if (gpu_held) |*held| held else null;
         @memset(rhs, 0);
-        if (drive.len != 0) {
-            @memcpy(rhs[n_harm * n ..][0..n], drive[0..n]);
-            @memcpy(rhs[nn + n_harm * n ..][0..n], drive[n..]);
-        }
+        putDrive(rhs, drive, n_harm);
         @memset(x, 0);
         // Where the dense LU would report a singular matrix.
         if (!gmres.solve(&op, rhs, x, krylov_tol, krylov_max_restarts).converged) return error.PacDidNotConverge;
 
         freqs[fi] = f_in;
-        if (adjoint) {
-            for (out[fi * nn ..][0..nn], x[0..nn], x[nn..]) |*t, re, im| t.* = .{ .re = re, .im = -im };
-        } else for (0..n_sb) |p| {
-            const idx = p * n + probe_node;
-            out[fi * n_sb + p] = .{ .re = x[idx], .im = x[nn + idx] };
-        }
+        storePoint(adjoint, out, fi, x, n, probe_node);
     }
 }
 
@@ -607,13 +612,8 @@ pub fn result(a: std.mem.Allocator, freqs: []const f64, transfer: []const Comple
 
 /// FFT bin of signed harmonic m: m mod n_samples, or null when |m| >= n_samples.
 pub fn mapHarmonicToFftBin(m: i32, n_samples: usize) ?usize {
-    const ns: i32 = @intCast(n_samples);
-    if (m >= 0 and m < ns) {
-        return @intCast(m);
-    } else if (m < 0 and m > -ns) {
-        return @intCast(ns + m);
-    }
-    return null;
+    if (@abs(m) >= n_samples) return null;
+    return @intCast(if (m < 0) @as(i32, @intCast(n_samples)) + m else m);
 }
 
 test spectra {

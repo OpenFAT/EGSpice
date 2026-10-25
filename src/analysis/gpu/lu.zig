@@ -18,19 +18,14 @@ const direct = solver.direct;
 /// `-Dlu-instrument`: compiles the `ESPICE_GPU_LU_BENCH` harness (`Bench`).
 const instrument = direct.instrument;
 
-const artifacts = @import("gompute_kernels");
-const backend: ?gompute.Backend = if (artifacts.has_cuda) .cuda else if (artifacts.has_hip) .hip else null;
+const backend = devices.backend;
 const Raw = if (backend) |be| gompute.RawByName(be) else void;
 const Buffer = if (backend != null) Raw.Buffer else void;
 const Stream = if (backend != null) Raw.Stream else void;
 const GraphExec = if (backend != null) Raw.GraphExec else void;
 const Event = if (backend != null) Raw.Event else void;
 
-fn nowNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
+const nowNs = @import("context.zig").nowNs;
 
 /// A Newton matrix formed on the device (02 2.3, `GpuLu.solveResident`):
 /// A = g + alpha·c over the GPU context's planes, then the host's values at
@@ -220,12 +215,7 @@ pub const GpuLu = struct {
         k.freePinned(self.pin_fail);
         for ([_]*Buffer{ &self.d_a, &self.d_rhs, &self.d_y, &self.d_dx }) |b| b.free();
         self.stream.deinit();
-        self.k_uh.deinit();
-        self.k_lp.deinit();
-        self.k_up.deinit();
-        self.k_lh.deinit();
-        self.k_ref16.deinit();
-        self.k_ref.deinit();
+        for ([_]*Raw{ &self.k_uh, &self.k_lp, &self.k_up, &self.k_lh, &self.k_ref16, &self.k_ref }) |kern| kern.deinit();
         self.gpa.destroy(self);
     }
 
@@ -266,11 +256,7 @@ pub const GpuLu = struct {
         if (!slv.factored or !lu.factored) return null;
         // Tape-sized factors refactor in microseconds on the host.
         if (lu.tv.items.len != 0) return null;
-        if (self.epoch != lu.pattern_epoch) {
-            const t = nowNs();
-            defer self.st.load_ns += nowNs() - t;
-            try self.load(slv);
-        }
+        try self.ensureEpoch(slv);
         if (self.declined) return null;
         // A stale `vcopy` (`stale`) says nothing about `vals`.
         const refactor = self.vcopyStale(slv) or !slv.unchanged(vals);
@@ -420,11 +406,7 @@ pub const GpuLu = struct {
         if (comptime backend == null) return error.NoGpuArtifacts;
         const lu = slv.sparse() orelse return self.fill(vals, r);
         if (!slv.factored or !lu.factored or lu.tv.items.len != 0) return self.fill(vals, r);
-        if (self.epoch != lu.pattern_epoch) {
-            const t = nowNs();
-            defer self.st.load_ns += nowNs() - t;
-            try self.load(slv);
-        }
+        try self.ensureEpoch(slv);
         if (self.declined or lu.void_slots.items.len != 0) return self.fill(vals, r);
 
         self.st.calls += 1;
@@ -522,6 +504,15 @@ pub const GpuLu = struct {
         self.stale = null;
         if (st.gen != st.slv.gen) return;
         try self.downloadA(st.slv.vcopy);
+    }
+
+    /// `load`s `slv`'s pivot epoch unless the tables already hold it,
+    /// timed into `st.load_ns`.
+    fn ensureEpoch(self: *Self, slv: *direct.Solver) !void {
+        if (self.epoch == slv.sparse().?.pattern_epoch) return;
+        const t = nowNs();
+        defer self.st.load_ns += nowNs() - t;
+        try self.load(slv);
     }
 
     /// Builds and uploads the tables of `slv`'s current pivot epoch, or
@@ -794,4 +785,3 @@ test "GpuLu.admits: the flop bars and the empty matrix" {
     try std.testing.expect(admits(1 << 40, n, false));
     try std.testing.expect(!admits(0, 0, true));
 }
-

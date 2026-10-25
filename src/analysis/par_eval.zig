@@ -333,15 +333,7 @@ pub const ParEval = struct {
         self.next_block.v.store(0, .monotonic);
         self.stamped.v.store(0, .monotonic);
         self.done.v.store(0, .monotonic);
-        // Comptime-false single-threaded, so `startWorkers` never compiles there.
-        if (!builtin.single_threaded and self.n_lanes > 1) {
-            if (!self.started) self.startWorkers();
-            // seq_cst pairs with the worker's `sleepers` increment and epoch
-            // re-check: either it sees the new epoch or this sees it parking.
-            _ = self.wake.epoch.fetchAdd(1, .seq_cst);
-            if (self.wake.sleepers.load(.seq_cst) != 0)
-                self.io.futexWake(u32, &self.wake.epoch.raw, std.math.maxInt(u32));
-        }
+        self.ring();
         self.pass();
         waitCount(&self.done.v, self.n_lanes - 1);
         // The trash cells take no stamps here; give them their initial value.
@@ -386,14 +378,23 @@ pub const ParEval = struct {
         self.job_kind = kind;
         self.next_task.v.store(0, .monotonic);
         self.done.v.store(0, .monotonic);
+        self.ring();
+        self.walkPass();
+        waitCount(&self.done.v, self.n_lanes - 1);
+    }
+
+    /// Starts the workers on first use, then bumps `epoch` so they run the
+    /// pass just published, paying for the wake only when one is parked.
+    fn ring(self: *ParEval) void {
+        // Comptime-false single-threaded, so `startWorkers` never compiles there.
         if (!builtin.single_threaded and self.n_lanes > 1) {
             if (!self.started) self.startWorkers();
+            // seq_cst pairs with the worker's `sleepers` increment and epoch
+            // re-check: either it sees the new epoch or this sees it parking.
             _ = self.wake.epoch.fetchAdd(1, .seq_cst);
             if (self.wake.sleepers.load(.seq_cst) != 0)
                 self.io.futexWake(u32, &self.wake.epoch.raw, std.math.maxInt(u32));
         }
-        self.walkPass();
-        waitCount(&self.done.v, self.n_lanes - 1);
     }
 
     /// One lane's share of a limit or update pass.

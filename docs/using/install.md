@@ -46,7 +46,7 @@ file, for each tagged release on the
 [GitHub releases page](https://github.com/OmarSiwy/ESPice/releases).
 
 !!! note
-    The 1.0.0 release has no tarballs: its release build failed. Until a
+    The 0.1.0 release has no tarballs: its release build failed. Until a
     release carries them, install with Nix or build from source.
 
 The release catalogue is [tools/release-targets.json](https://github.com/OmarSiwy/ESPice/blob/main/tools/release-targets.json).
@@ -82,8 +82,8 @@ machine supports: `grep -o 'avx512f\|avx2' /proc/cpuinfo | sort -u` helps
 identify v3 and v4. A higher unsupported level can terminate with `SIGILL`.
 
 ```sh
-tar xzf espice-1.2.0-linux-x86_64-v3-cuda-sm_89.tar.gz
-./espice-1.2.0-linux-x86_64-v3-cuda-sm_89/bin/espice --version
+tar xzf espice-0.3.0-linux-x86_64-v3-cuda-sm_89.tar.gz
+./espice-0.3.0-linux-x86_64-v3-cuda-sm_89/bin/espice --version
 ```
 
 Archives contain `bin/espice`, `lib/libespice.a`, `include/espice.h`, and
@@ -103,8 +103,8 @@ The launcher's host prerequisites are a shell, `tar` and `bzip2`; they are
 needed before the bundled runtime can be extracted.
 
 ```sh
-chmod +x espice-1.2.0-linux-x86_64-v1-cpu.run
-./espice-1.2.0-linux-x86_64-v1-cpu.run circuit.sp
+chmod +x espice-0.3.0-linux-x86_64-v1-cpu.run
+./espice-0.3.0-linux-x86_64-v1-cpu.run circuit.sp
 ```
 
 To build the same bundle locally, use the repository's locked bundler:
@@ -159,7 +159,7 @@ faster:
 zig build -Dgpu=false
 ```
 
-`zig build run -- FILE.sp` builds and runs in one step.
+`zig build && zig-out/bin/espice FILE.sp` builds and runs.
 
 Build options (`zig build --help` lists them all):
 

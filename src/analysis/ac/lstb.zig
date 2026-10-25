@@ -102,12 +102,16 @@ fn responses(opts: Options, n: usize, x: []const f64) Responses {
     return r;
 }
 
-/// The two-injection sweep. Margin refinement continues the same
-/// frequency solver after the sweep, so it retains its live pivot history.
+/// The two-injection sweep; null with `margins`, whose refinement continues
+/// the same frequency solver after the sweep and so keeps its sweep live.
+/// Fails with error.InvalidProbe as `run` does, before allocating.
 pub fn plan(ctx: *const root.RunCtx, opts: Options) !?freq.Plan {
     if (opts.margins) return null;
-    const scratch = ctx.scratch_allocator;
-    const n: usize = ctx.circuit.n;
+    return try sweepPlan(ctx.scratch_allocator, opts, ctx.circuit.n);
+}
+
+/// The two-injection sweep of `run`, `plan` and `MarginState`.
+fn sweepPlan(scratch: std.mem.Allocator, opts: Options, n: usize) !freq.Plan {
     try validateProbes(opts, n);
     const rhs = try scratch.alloc(f64, 4 * n);
     errdefer scratch.free(rhs);
@@ -133,19 +137,15 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const scratch = ctx.scratch_allocator;
     const ckt = ctx.circuit;
     const n: usize = ckt.n;
-    try validateProbes(opts, n);
+    const p = try sweepPlan(scratch, opts, n);
+    defer p.deinit(scratch);
+    const freqs = p.freqs;
+    const rhs = p.rhs;
 
     var fs = try FreqSolver.fromCircuit(scratch, ckt, ctx.x_op);
     defer fs.deinit();
 
     const n_points: usize = opts.sweep.count();
-    const freqs, const omegas = try freq.axis(scratch, opts.sweep);
-    defer freq.freeAxis(scratch, freqs);
-
-    const rhs = try scratch.alloc(f64, 4 * n);
-    defer scratch.free(rhs);
-    @memset(rhs, 0);
-    fill(opts, n, rhs);
 
     const loop = try scratch.alloc(Complex, n_points);
     defer scratch.free(loop);
@@ -153,7 +153,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const data = try a.alloc(f64, if (opts.margins) 5 else n_points * cols * 2);
     errdefer a.free(data);
 
-    var stream = try freq.Stream.init(scratch, &fs, ckt, ctx.x_op, omegas, rhs, false);
+    var stream = try freq.Stream.init(scratch, &fs, ckt, ctx.x_op, p.omegas, rhs, false);
     defer stream.deinit(scratch);
     stream.pre = ctx.freq_pre;
     while (try stream.next(ckt)) |pt| {
@@ -176,18 +176,20 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     var probe: Probe = try .init(scratch, &fs, ckt, ctx.x_op, rhs, opts);
     defer probe.deinit(scratch);
     const m = try Margins.find(&probe, freqs, loop);
-    data[0..5].* = .{ m.gain_margin, m.phase_crossover_freq, m.phase_margin, m.unity_gain_freq, m.loop_gain_minifreq };
+    data[0..5].* = m.values();
     return .{
         .plotname = "Loop Stability Margins",
-        .varnames = try a.dupe([]const u8, &.{ "gain_margin", "phase_crossover_freq", "phase_margin", "unity_gain_freq", "loop_gain_minifreq" }),
+        .varnames = try a.dupe([]const u8, &Margins.names),
         .is_complex = false,
         .npoints = 1,
         .data = data,
     };
 }
 
+/// One point's `run` outcome from `runGpuLanes`.
 pub const LaneOutcome = root.ErrorOf(run)!root.Result;
-pub const LaneStats = struct {
+/// What a `runLanes` batch put on the device, for the `gpu_stats` line.
+const LaneStats = struct {
     rounds: usize = 0,
     device_lanes: usize = 0,
     device_groups: usize = 0,
@@ -292,9 +294,7 @@ const MarginState = struct {
     ctx: *const root.RunCtx,
     opts: Options,
     fs: FreqSolver,
-    freqs: []f64,
-    omegas: []f64,
-    rhs: []f64,
+    sweep: freq.Plan,
     solutions: []f64,
     dynamic: []f64,
     loop: []Complex,
@@ -309,28 +309,22 @@ const MarginState = struct {
     fn init(ctx: *const root.RunCtx, opts: Options) !MarginState {
         const scratch = ctx.scratch_allocator;
         const ckt = ctx.circuit;
-        try validateProbes(opts, ckt.n);
+        const p = try sweepPlan(scratch, opts, ckt.n);
+        errdefer p.deinit(scratch);
         var fs = try FreqSolver.fromCircuit(scratch, ckt, ctx.x_op);
         errdefer fs.deinit();
-        const freqs, const omegas = try freq.axis(scratch, opts.sweep);
-        errdefer freq.freeAxis(scratch, freqs);
-        const rhs = try scratch.alloc(f64, 4 * @as(usize, ckt.n));
-        errdefer scratch.free(rhs);
-        @memset(rhs, 0);
-        fill(opts, ckt.n, rhs);
-        const solutions = try scratch.alloc(f64, FreqSolver.W * rhs.len);
+        const solutions = try scratch.alloc(f64, FreqSolver.W * p.rhs.len);
         errdefer scratch.free(solutions);
         const dynamic = try scratch.alloc(f64, 2 * FreqSolver.W * ckt.ac_dyn_slots.len);
         errdefer scratch.free(dynamic);
-        const loop = try scratch.alloc(Complex, freqs.len);
-        return .{ .ctx = ctx, .opts = opts, .fs = fs, .freqs = freqs, .omegas = omegas, .rhs = rhs, .solutions = solutions, .dynamic = dynamic, .loop = loop };
+        const loop = try scratch.alloc(Complex, p.freqs.len);
+        return .{ .ctx = ctx, .opts = opts, .fs = fs, .sweep = p, .solutions = solutions, .dynamic = dynamic, .loop = loop };
     }
 
     fn deinit(self: *MarginState) void {
         const scratch = self.ctx.scratch_allocator;
         self.fs.deinit();
-        freq.freeAxis(scratch, self.freqs);
-        scratch.free(self.rhs);
+        self.sweep.deinit(scratch);
         scratch.free(self.solutions);
         scratch.free(self.dynamic);
         scratch.free(self.loop);
@@ -344,7 +338,7 @@ const MarginState = struct {
         const im = self.dynamic[self.dynamic.len / 2 ..][0..terms];
         if (terms != 0) ckt.acDyn(self.ctx.x_op, omegas, re, im);
         self.pending = true;
-        return .{ .fs = &self.fs, .omegas = omegas, .dyn = .{ .slots = ckt.ac_dyn_slots, .re = re, .im = im }, .rhs = self.rhs, .out = self.solutions[0 .. omegas.len * self.rhs.len], .adjoint = false };
+        return .{ .fs = &self.fs, .omegas = omegas, .dyn = .{ .slots = ckt.ac_dyn_slots, .re = re, .im = im }, .rhs = self.sweep.rhs, .out = self.solutions[0 .. omegas.len * self.sweep.rhs.len], .adjoint = false };
     }
 
     fn next(self: *MarginState) !?rounds.RoundPoint {
@@ -353,26 +347,25 @@ const MarginState = struct {
             if (self.phase == .sweep) {
                 // Stream checkpoints after solving a chunk and before
                 // returning any of its rows; preserve that exact boundary.
-                if (self.sweep_end % freq.quantum == 0 or self.sweep_end == self.omegas.len)
-                    try self.ctx.circuit.checkpoint(.{ .phase = .frequency, .completed = self.sweep_end, .total = self.omegas.len });
+                if (self.sweep_end % freq.quantum == 0 or self.sweep_end == self.sweep.omegas.len)
+                    try self.ctx.circuit.checkpoint(.{ .phase = .frequency, .completed = self.sweep_end, .total = self.sweep.omegas.len });
                 for (self.sweep_base..self.sweep_end, 0..) |k, local|
-                    self.loop[k] = Gains.of(responses(self.opts, self.ctx.circuit.n, self.solutions[local * self.rhs.len ..][0..self.rhs.len])).w;
+                    self.loop[k] = Gains.of(responses(self.opts, self.ctx.circuit.n, self.solutions[local * self.sweep.rhs.len ..][0..self.sweep.rhs.len])).w;
                 self.sweep_base = self.sweep_end;
             } else {
-                const gain = Gains.of(responses(self.opts, self.ctx.circuit.n, self.solutions[0..self.rhs.len])).w;
+                const gain = Gains.of(responses(self.opts, self.ctx.circuit.n, self.solutions[0..self.sweep.rhs.len])).w;
                 self.refiner.accept(gain);
             }
         }
         while (true) {
             switch (self.phase) {
                 .sweep => {
-                    if (self.sweep_base != self.omegas.len) {
-                        self.sweep_end = self.sweep_base + @min(FreqSolver.W, self.omegas.len - self.sweep_base);
-                        return self.request(self.omegas[self.sweep_base..self.sweep_end]);
+                    if (self.sweep_base != self.sweep.omegas.len) {
+                        self.sweep_end = self.sweep_base + @min(FreqSolver.W, self.sweep.omegas.len - self.sweep_base);
+                        return self.request(self.sweep.omegas[self.sweep_base..self.sweep_end]);
                     }
-                    const nan = std.math.nan(f64);
-                    self.margins = .{ .gain_margin = nan, .phase_crossover_freq = nan, .phase_margin = nan, .unity_gain_freq = nan, .loop_gain_minifreq = 20 * std.math.log10(self.loop[0].mag()) };
-                    self.refiner = Refiner.init(self.freqs, self.loop, .unity);
+                    self.margins = .unbracketed(self.loop[0]);
+                    self.refiner = Refiner.init(self.sweep.freqs, self.loop, .unity);
                     self.phase = .unity;
                 },
                 .unity, .negative_real => {
@@ -381,17 +374,11 @@ const MarginState = struct {
                         return self.request(&self.omega);
                     }
                     if (self.phase == .unity) {
-                        if (self.refiner.best) |cross| {
-                            self.margins.unity_gain_freq = cross.f;
-                            self.margins.phase_margin = std.math.radiansToDegrees(reversed(cross.w));
-                        } else std.debug.print("warning: .lstb: |loop gain| never crosses 1 in the sweep; no phase margin\n", .{});
-                        self.refiner = Refiner.init(self.freqs, self.loop, .negative_real);
+                        self.margins.setUnity(self.refiner.best);
+                        self.refiner = Refiner.init(self.sweep.freqs, self.loop, .negative_real);
                         self.phase = .negative_real;
                     } else {
-                        if (self.refiner.best) |cross| {
-                            self.margins.phase_crossover_freq = cross.f;
-                            self.margins.gain_margin = -20 * std.math.log10(cross.w.mag());
-                        } else std.debug.print("warning: .lstb: loop gain never crosses -180 degrees in the sweep; no gain margin\n", .{});
+                        self.margins.setNegativeReal(self.refiner.best);
                         self.phase = .done;
                     }
                 },
@@ -403,12 +390,11 @@ const MarginState = struct {
     fn result(self: *const MarginState) !root.Result {
         std.debug.assert(self.phase == .done);
         const a = self.ctx.allocator;
-        const m = self.margins;
-        const data = try a.dupe(f64, &.{ m.gain_margin, m.phase_crossover_freq, m.phase_margin, m.unity_gain_freq, m.loop_gain_minifreq });
+        const data = try a.dupe(f64, &self.margins.values());
         errdefer a.free(data);
         return .{
             .plotname = "Loop Stability Margins",
-            .varnames = try a.dupe([]const u8, &.{ "gain_margin", "phase_crossover_freq", "phase_margin", "unity_gain_freq", "loop_gain_minifreq" }),
+            .varnames = try a.dupe([]const u8, &Margins.names),
             .is_complex = false,
             .npoints = 1,
             .data = data,
@@ -464,20 +450,44 @@ pub const Margins = struct {
     /// dB: 20·log10|W| at the sweep's first frequency.
     loop_gain_minifreq: f64,
 
+    /// The published column names, in `values` order.
+    const names = [_][]const u8{ "gain_margin", "phase_crossover_freq", "phase_margin", "unity_gain_freq", "loop_gain_minifreq" };
+
+    /// The published row, in `names` order.
+    fn values(m: Margins) [names.len]f64 {
+        return .{ m.gain_margin, m.phase_crossover_freq, m.phase_margin, m.unity_gain_freq, m.loop_gain_minifreq };
+    }
+
+    /// Every margin NaN until a crossing sets it; `first` is the loop gain
+    /// at the sweep's first frequency.
+    fn unbracketed(first: Complex) Margins {
+        const nan = std.math.nan(f64);
+        return .{ .gain_margin = nan, .phase_crossover_freq = nan, .phase_margin = nan, .unity_gain_freq = nan, .loop_gain_minifreq = 20 * std.math.log10(first.mag()) };
+    }
+
+    /// The phase margin at the unity-magnitude crossing, or a warning when
+    /// the sweep never brackets one.
+    fn setUnity(m: *Margins, cross: ?Crossing) void {
+        const c = cross orelse return std.debug.print("warning: .lstb: |loop gain| never crosses 1 in the sweep; no phase margin\n", .{});
+        m.unity_gain_freq = c.f;
+        m.phase_margin = std.math.radiansToDegrees(reversed(c.w));
+    }
+
+    /// The gain margin at the negative-real crossing, or a warning when the
+    /// sweep never brackets one.
+    fn setNegativeReal(m: *Margins, cross: ?Crossing) void {
+        const c = cross orelse return std.debug.print("warning: .lstb: loop gain never crosses -180 degrees in the sweep; no gain margin\n", .{});
+        m.phase_crossover_freq = c.f;
+        m.gain_margin = -20 * std.math.log10(c.w.mag());
+    }
+
     /// Brackets the first unity-magnitude and first negative-real crossing
     /// of `loop` over `freqs`, then refines each on the circuit itself
     /// (`crossing`), so the margins do not depend on the grid.
     fn find(probe: *Probe, freqs: []const f64, loop: []const Complex) !Margins {
-        const nan = std.math.nan(f64);
-        var m: Margins = .{ .gain_margin = nan, .phase_crossover_freq = nan, .phase_margin = nan, .unity_gain_freq = nan, .loop_gain_minifreq = 20 * std.math.log10(loop[0].mag()) };
-        if (try crossing(probe, freqs, loop, logMag)) |c| {
-            m.unity_gain_freq = c.f;
-            m.phase_margin = std.math.radiansToDegrees(reversed(c.w));
-        } else std.debug.print("warning: .lstb: |loop gain| never crosses 1 in the sweep; no phase margin\n", .{});
-        if (try crossing(probe, freqs, loop, reversedPhase)) |c| {
-            m.phase_crossover_freq = c.f;
-            m.gain_margin = -20 * std.math.log10(c.w.mag());
-        } else std.debug.print("warning: .lstb: loop gain never crosses -180 degrees in the sweep; no gain margin\n", .{});
+        var m: Margins = .unbracketed(loop[0]);
+        m.setUnity(try crossing(probe, freqs, loop, .unity));
+        m.setNegativeReal(try crossing(probe, freqs, loop, .negative_real));
         return m;
     }
 };
@@ -485,16 +495,6 @@ pub const Margins = struct {
 /// ∠(−W) in radians, (−π, π]: the phase margin angle.
 fn reversed(w: Complex) f64 {
     return std.math.atan2(-w.im, -w.re);
-}
-
-fn logMag(w: Complex) ?f64 {
-    return @log(w.mag());
-}
-
-/// ∠(−W), defined only near the negative real axis (Re W < 0), where it is
-/// continuous and zero at the crossing.
-fn reversedPhase(w: Complex) ?f64 {
-    return if (w.re < 0) reversed(w) else null;
 }
 
 /// A refined crossing: its frequency and the loop gain there.
@@ -515,10 +515,13 @@ const Refiner = struct {
     steps: u8 = 0,
     done: bool = true,
 
+    /// The function whose sign change `mode` brackets: ln|W|, or ∠(−W),
+    /// defined only near the negative real axis (Re W < 0), where it is
+    /// continuous and zero at the crossing.
     fn value(mode: Mode, w: Complex) ?f64 {
         return switch (mode) {
-            .unity => logMag(w),
-            .negative_real => reversedPhase(w),
+            .unity => @log(w.mag()),
+            .negative_real => if (w.re < 0) reversed(w) else null,
         };
     }
 
@@ -571,45 +574,14 @@ const Refiner = struct {
     }
 };
 
-/// The first sign change of `g` between neighbouring sweep points,
-/// refined by Illinois regula falsi on `probe` to a relative frequency
-/// width of 1e-13 (at most 100 solves). Null when no neighbours bracket a
-/// root.
-fn crossing(probe: *Probe, freqs: []const f64, loop: []const Complex, comptime g: fn (Complex) ?f64) !?Crossing {
-    for (1..loop.len) |k| {
-        var g_lo = g(loop[k - 1]) orelse continue;
-        var g_hi = g(loop[k]) orelse continue;
-        if (g_lo == 0) return .{ .f = freqs[k - 1], .w = loop[k - 1] };
-        if ((g_lo < 0) == (g_hi < 0) or g_hi == 0) {
-            if (g_hi == 0) return .{ .f = freqs[k], .w = loop[k] };
-            continue;
-        }
-        var lo = freqs[k - 1];
-        var hi = freqs[k];
-        var best: Crossing = .{ .f = hi, .w = loop[k] };
-        var side: i2 = 0;
-        for (0..100) |_| {
-            var f = hi - g_hi * (hi - lo) / (g_hi - g_lo);
-            if (!(f > lo and f < hi)) f = 0.5 * (lo + hi);
-            const w = try probe.gain(f);
-            const gv = g(w) orelse break;
-            best = .{ .f = f, .w = w };
-            if (gv == 0 or hi - lo <= 1e-13 * hi) break;
-            if ((gv < 0) == (g_hi < 0)) {
-                hi = f;
-                g_hi = gv;
-                if (side == 1) g_lo *= 0.5;
-                side = 1;
-            } else {
-                lo = f;
-                g_lo = gv;
-                if (side == -1) g_hi *= 0.5;
-                side = -1;
-            }
-        }
-        return best;
-    }
-    return null;
+/// The first sign change of `mode`'s function between neighbouring sweep
+/// points, refined by Illinois regula falsi on `probe` to a relative
+/// frequency width of 1e-13 (at most 100 solves). Null when no neighbours
+/// bracket a root. The same `Refiner` steps the GPU rounds take.
+fn crossing(probe: *Probe, freqs: []const f64, loop: []const Complex, mode: Refiner.Mode) !?Crossing {
+    var r = Refiner.init(freqs, loop, mode);
+    while (r.next()) |f| r.accept(try probe.gain(f));
+    return r.best;
 }
 
 test fill {
@@ -667,13 +639,13 @@ test crossing {
     const freqs = [_]f64{ 1, 10, 100 };
     const above = [_]Complex{ .{ .re = 4, .im = 0 }, .{ .re = 2, .im = 0 }, .{ .re = 1.5, .im = 0 } };
     var probe: Probe = undefined;
-    try std.testing.expectEqual(null, try crossing(&probe, &freqs, &above, logMag));
+    try std.testing.expectEqual(null, try crossing(&probe, &freqs, &above, .unity));
     const on_grid = [_]Complex{ .{ .re = 4, .im = 0 }, .{ .re = 1, .im = 0 }, .{ .re = 0.5, .im = 0 } };
-    const c = (try crossing(&probe, &freqs, &on_grid, logMag)).?;
+    const c = (try crossing(&probe, &freqs, &on_grid, .unity)).?;
     try std.testing.expectEqual(@as(f64, 10), c.f);
-    // reversedPhase is undefined off the negative real axis, so a loop that
+    // ∠(−W) is undefined off the negative real axis, so a loop that
     // stays in the right half plane never brackets a phase crossover.
-    try std.testing.expectEqual(null, try crossing(&probe, &freqs, &above, reversedPhase));
+    try std.testing.expectEqual(null, try crossing(&probe, &freqs, &above, .negative_real));
 }
 
 test "live LSTB margin rounds preserve scalar refinements, failures and cancellation in every order" {

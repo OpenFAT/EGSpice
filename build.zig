@@ -10,11 +10,9 @@ pub fn build(b: *Build) void {
     const optimize = b.option(std.lang.Optimize, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
     const debug_info = b.option(bool, "debug-info", "Emit DWARF in Release builds (slow: ~3x LLVM time)") orelse false;
     const gpu_kernels = b.option(bool, "gpu", "Compile the GPU device kernels (default true)") orelse true;
-    const single_threaded = b.option(bool, "single-threaded", "Build without threads, as espice.wasm does");
     const cuda_arch = b.option([]const u8, "cuda-arch", "CUDA arch (sm_75, ...), `auto` to probe the build machine, `none` to omit") orelse "auto";
     const hip_arch = b.option([]const u8, "hip-arch", "HIP arch (gfx1100, ...), `none` to omit") orelse "gfx1100";
     const gpu_lanes = b.option(bool, "gpu-lanes", "Also compile the GPU lane kernels (phase 4; default true, ~2x ptxas time)") orelse true;
-    const suite = b.option([]const u8, "suite", "bench-suites: one suite under tests/conformance/external/spice-bench (default: all)");
     const use_llvm = optimize != .debug;
 
     const gompute = b.dependency("gompute", .{});
@@ -41,7 +39,6 @@ pub fn build(b: *Build) void {
         .target = target,
         .optimize = optimize,
         .strip = optimize != .debug and !debug_info,
-        .single_threaded = single_threaded,
         .use_llvm = use_llvm,
         .gpu_kernels = gpu_kernels,
     };
@@ -58,7 +55,8 @@ pub fn build(b: *Build) void {
             run.addFileArg(vera.path("lib/contract.zig"));
         }
         if (m.include) |inc| {
-            run.addArgs(&.{ "-I", pathFromRoot(b, b, "models") });
+            run.addArg("-I");
+            run.addDirectoryArg(b.path("models"));
             run.addFileInput(b.path(b.fmt("models/{s}", .{inc})));
         }
         for (m.inc_dirs) |dir| {
@@ -77,23 +75,6 @@ pub fn build(b: *Build) void {
     }
 
     const g = graph(M, vera, gompute.module("gompute"), models, gen, bo);
-    // Warm the same objects consumed by every host test, CLI and library.
-    // No separate archive/configuration: Zig owns their content-addressed cache.
-    const build_models = b.step("build-models", "Compile and cache the shared host model objects without linking a simulator");
-    for (g.objs) |obj| {
-        _ = obj.getEmittedBin();
-        build_models.dependOn(&obj.step);
-    }
-
-    const frontend_bench = b.addExecutable(.{
-        .name = "frontend-bench",
-        .use_llvm = use_llvm,
-        .root_module = M.make(b.path("tests/benchmark/frontend.zig"), &.{.{ .name = "netlist", .module = g.netlist }}),
-    });
-    const run_frontend_bench = b.addRunArtifact(frontend_bench);
-    run_frontend_bench.addPassthruArgs();
-    b.step("bench-frontend", "Measure netlist parsing and expansion").dependOn(&run_frontend_bench.step);
-
     const exe = b.addExecutable(.{
         .name = "espice",
         .use_llvm = use_llvm,
@@ -110,8 +91,6 @@ pub fn build(b: *Build) void {
     exe.rdynamic = true; // dlopen'd VPI apps resolve vpi_* against the exe
     for (g.objs) |o| exe.root_module.addObject(o);
     b.installArtifact(exe);
-    b.step("build-cli", "Build and install the simulator CLI without the static library").dependOn(&b.addInstallArtifact(exe, .{}).step);
-    b.step("compile-cli", "Compile the simulator CLI without installing a duplicate").dependOn(&exe.step);
     for ([_]struct { Build.LazyPath, []const u8 }{
         .{ b.path("src/core"), "core" },
         .{ b.path("src/device"), "device" },
@@ -159,7 +138,7 @@ pub fn build(b: *Build) void {
 
     // Compile the coupled-line state kernels on CPU-only CI runners too.
     // LLVM's AMDGPU frame lowering has failed here even when host tests pass.
-    const hip_codegen = b.step("test-hip-codegen", "Compile coupled-line HIP kernels, including lane state kernels");
+    const test_step = b.step("test", "Run every suite, the codegen probes and the SPICE corpus; `-- --backend cuda --jobs 1` runs the corpus on the GPU");
     const hip_probe_target = b.resolveTargetQuery(std.Target.Query.parse(.{
         .arch_os_abi = "amdgcn-amdhsa",
         .cpu_features = "gfx1100+trap_handler",
@@ -194,17 +173,20 @@ pub fn build(b: *Build) void {
         } });
         if (previous_hip_probe) |previous| probe.step.dependOn(&previous.step);
         previous_hip_probe = probe;
-        hip_codegen.dependOn(&symbols.step);
+        test_step.dependOn(&symbols.step);
     }
 
-    const espice_h = b.addTranslateC(.{ .root_source_file = b.path("include/espice.h"), .target = target, .optimize = optimize }).createModule();
+    const wasm = target.result.cpu.arch.isWasm();
+    const espice_h = b.addTranslateC(.{ .root_source_file = b.path("include/espice.h"), .target = target, .optimize = optimize, .link_libc = !wasm }).createModule();
     const c_api_mod = M.make(b.path("src/c_api.zig"), &.{
         .{ .name = "espice", .module = g.espice },
         .{ .name = "espice_h", .module = espice_h },
         .{ .name = "core", .module = g.core },
     });
-    c_api_mod.link_libc = true;
+    c_api_mod.link_libc = !wasm;
     for (g.objs) |o| c_api_mod.addObject(o);
+    // The C API with its device objects, for tools/playground's espice.wasm.
+    b.modules.put(b.allocator, "c_api", c_api_mod) catch @panic("OOM");
     const c_api_lib = b.addLibrary(.{ .name = "espice", .linkage = .static, .root_module = c_api_mod, .use_llvm = exe.use_llvm, .use_lld = exe.use_lld });
     // Installed as files, not with `installArtifact`, so that a dependent's
     // `artifact("espice")` names the CLI alone.
@@ -218,18 +200,7 @@ pub fn build(b: *Build) void {
     c_example_mod.addIncludePath(b.path("include"));
     c_example_mod.linkLibrary(c_api_lib);
     const c_example = b.addExecutable(.{ .name = "c-example", .root_module = c_example_mod });
-    b.step("c-example", "Build and run the C API example from the docs").dependOn(&b.addRunArtifact(c_example).step);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    run_cmd.addPassthruArgs();
-    b.step("run", "Run ESPice").dependOn(&run_cmd.step);
-
-    const run_vera = b.addRunArtifact(vera_exe);
-    run_vera.addPassthruArgs();
-    b.step("vera", "Run the vera CLI (any .va/.v/.sv/.vhd)").dependOn(&run_vera.step);
-
-    const test_step = b.step("test", "Run every suite and the numeric SPICE fixtures");
+    test_step.dependOn(&b.addRunArtifact(c_example).step); // the docs' C API example keeps working
     const t: HostTest = .{
         .b = b,
         .exe = exe,
@@ -263,56 +234,39 @@ pub fn build(b: *Build) void {
     error_tests_mod.addObject(b.addObject(.{ .name = "device_errors", .root_module = error_object_mod, .use_llvm = use_llvm }));
 
     const wfit_mod = M.make(b.path("src/frontend/wfit.zig"), &.{ .{ .name = "core", .module = g.core }, .{ .name = "netlist", .module = g.netlist } });
-    const run_grammar = t.run(M.make(b.path("tests/frontend/root.zig"), &.{
-        .{ .name = "netlist", .module = g.netlist },
-        .{ .name = "wfit", .module = wfit_mod },
-    }), &.{}, false);
-    run_grammar.setCwd(b.path("."));
 
-    for ([_]struct { []const u8, []const u8, []const *Build.Step.Run }{
-        .{ "test-espice", "Run Problem facade, analysis contract, C ABI and CLI tests", &.{ run_espice_tests, run_c_api_tests, run_c_api_unit_tests, t.run(exe.root_module, &.{}, false) } },
-        .{ "test-c-api", "Run C ABI boundary tests", &.{ run_c_api_tests, run_c_api_unit_tests } },
-        .{
-            "test-frontend", "Run netlist, builder and prepared-circuit tests",
-            &.{
-                t.run(g.netlist, &.{}, false),
-                t.run(wfit_mod, &.{}, false),
-                t.run(g.frontend, &.{.{ .name = "build_options", .module = bo }}, true),
-                // spice.zig and builder.zig's own tests live only in the builder module.
-                t.run(g.builder, &.{}, true),
-            },
-        },
-        .{ "test-analysis", "Run all analysis tests", &.{t.run(g.analysis, &.{
+    for ([_]*Build.Step.Run{
+        run_espice_tests,
+        run_c_api_tests,
+        run_c_api_unit_tests,
+        t.run(exe.root_module, &.{}, false),
+        t.run(g.netlist, &.{}, false),
+        t.run(wfit_mod, &.{}, false),
+        t.run(g.frontend, &.{.{ .name = "build_options", .module = bo }}, true),
+        // spice.zig and builder.zig's own tests live only in the builder module.
+        t.run(g.builder, &.{}, true),
+        t.run(g.analysis, &.{
             .{ .name = "builder", .module = g.builder },
             .{ .name = "limiter_device", .module = M.make(limiter_source, &.{contract}) },
             contract,
             .{ .name = "models", .module = g.models },
             .{ .name = "device_eval", .module = g.eval },
-        }, true)} },
-        .{ "test-core", "Run shared data and numerics tests", &.{t.run(g.core, &.{}, false)} },
-        .{ "test-solver", "Run solver tests", &.{t.run(g.solver, &.{}, false)} },
-        .{ "test-output", "Run waveform writer tests", &.{ t.run(g.output, &.{}, false), t.run(g.measure, &.{}, false) } },
-        .{ "test-device", "Run device catalog, evaluator and ABI tests", &.{
-            t.run(g.device, &.{}, true),
-            t.run(g.abi, &.{}, false),
-            t.run(M.make(b.path("src/device/tests/eval.zig"), &.{
-                .{ .name = "device_eval", .module = g.eval },
-                contract,
-                .{ .name = "models", .module = g.models },
-            }), &.{}, true),
-            t.run(error_tests_mod, &.{}, false),
-            t.run(M.make(b.path("models/ltra_ac.zig"), &.{}), &.{}, false),
-        } },
-        .{ "test-grammar", "Check every input grammar against the frontend", &.{run_grammar} },
-    }) |s| {
-        const step = b.step(s[0], s[1]);
-        for (s[2]) |r| step.dependOn(&r.step);
-        test_step.dependOn(step);
-    }
+        }, true),
+        t.run(g.core, &.{}, false),
+        t.run(g.solver, &.{}, false),
+        t.run(g.output, &.{}, false),
+        t.run(g.measure, &.{}, false),
+        t.run(g.device, &.{}, true),
+        t.run(g.abi, &.{}, false),
+        t.run(M.make(b.path("src/device/tests/eval.zig"), &.{
+            .{ .name = "device_eval", .module = g.eval },
+            contract,
+            .{ .name = "models", .module = g.models },
+        }), &.{}, true),
+        t.run(error_tests_mod, &.{}, false),
+        t.run(M.make(b.path("models/ltra_ac.zig"), &.{}), &.{}, false),
+    }) |r| test_step.dependOn(&r.step);
 
-    // The runners use threads for deadlines, whatever -Dsingle-threaded says.
-    var MH = M;
-    MH.single_threaded = null;
     const vpi_fixture = b.addLibrary(.{
         .name = "vpi_gain",
         .linkage = .dynamic,
@@ -323,7 +277,7 @@ pub fn build(b: *Build) void {
     vpi_fixture.linker_allow_shlib_undefined = true;
     const correctness = b.addExecutable(.{
         .name = "test-correctness",
-        .root_module = MH.make(b.path("tests/test_correctness.zig"), &.{.{ .name = "fixture_catalog", .module = @import("tests/fixture_catalog.zig").create(b) }}),
+        .root_module = M.make(b.path("tests/test_correctness.zig"), &.{.{ .name = "fixture_catalog", .module = @import("tests/fixture_catalog.zig").create(b) }}),
     });
     const run_harness_tests = t.run(correctness.root_module, &.{}, false);
     run_harness_tests.setCwd(b.path("."));
@@ -334,19 +288,13 @@ pub fn build(b: *Build) void {
 
     const run_metamorphic = corpus(b, correctness, exe, vpi_fixture, &.{"--metamorphic"});
     run_metamorphic.step.dependOn(&run_harness_tests.step);
-    b.step("test-metamorphic", "Check that metamorphic rewrites of the fixture decks keep their results").dependOn(&run_metamorphic.step);
     test_step.dependOn(&run_metamorphic.step);
-
-    // One deck at a time: concurrent CUDA contexts time-slice one GPU.
-    const run_gpu_corpus = corpus(b, correctness, exe, vpi_fixture, &.{ "--backend", "cuda", "--jobs", "1" });
-    b.step("test-gpu", "Run the numeric SPICE fixtures with --backend cuda").dependOn(&run_gpu_corpus.step);
 
     {
         var P = M;
         P.target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 } });
         P.optimize = .fast;
         P.strip = false;
-        P.single_threaded = null;
         const pg = graph(P, b.dependency("vera", .{ .target = P.target, .optimize = P.optimize }), gompute.module("gompute"), models, gen, bo);
         const core: Import = .{ .name = "core", .module = pg.core };
         const probe = b.addObject(.{ .name = "codegen-probe", .root_module = P.make(b.path("tests/codegen.zig"), &.{
@@ -359,82 +307,13 @@ pub fn build(b: *Build) void {
         residue.addFileArg(b.path("tools/asm_probe.py"));
         residue.addFileArg(probe.getEmittedAsm());
         residue.addArgs(&.{ "gen_dual_mul=hand_dual_mul", "gen_engine_solve=hand_engine_solve", "gen_hook_trap_assemble=hand_hook_trap_assemble", "gen_hook_step_assemble=hand_hook_step_assemble", "gen_hook_diag_at=hand_hook_diag_at", "gen_num_dot=hand_num_dot", "gen_num_sum=hand_num_sum", "gen_num_norminf=hand_num_norminf", "gen_lanes_splat=hand_lanes_splat", "gen_lanes_any=hand_lanes_any", "gen_lanes_all=hand_lanes_all", "gen_lanes_select=hand_lanes_select", "gen_lanes_cmp=hand_lanes_cmp", "gen_lanes_either=hand_lanes_either", "gen_lanes_lane=hand_lanes_lane", "gen_lanes_each=hand_lanes_each", "gen_newton=hand_newton", "gen_update_and_norm=hand_update_and_norm" });
-        b.step("test-codegen", "Judge the residue probes in tests/codegen.zig").dependOn(&residue.step);
         test_step.dependOn(&residue.step);
     }
 
-    const bench_runner = b.addExecutable(.{ .name = "bench-runner", .root_module = MH.make(b.path("tests/benchmark/runner.zig"), &.{}) });
-    b.step("build-benchmark", "Build the standalone simulator comparison runner").dependOn(&b.addInstallArtifact(bench_runner, .{}).step);
-    b.step("bench", "Compare ESPice with ngspice, VACASK and optional --xyce BIN (nix develop .#benchmarking)").dependOn(&corpus(b, bench_runner, exe, null, &.{"tests/conformance/tests/netlist"}).step);
-
-    const gen_postlayout = b.addSystemCommand(&.{ "python3", "tests/conformance/external/spice-bench/postlayout/gen.py", "zig-out/postlayout" });
-    gen_postlayout.setCwd(b.path("."));
-    const run_postlayout = corpus(b, bench_runner, exe, null, &.{ "zig-out/postlayout", "--out", "zig-out/postlayout-results.md" });
-    run_postlayout.step.dependOn(&gen_postlayout.step);
-    b.step("bench-postlayout", "Time ESPice on synthetic post-layout decks against ngspice and VACASK").dependOn(&run_postlayout.step);
-
-    const fetch_suites = b.addSystemCommand(&.{ "bash", "tests/conformance/external/spice-bench/fetch.sh", "zig-out/suites" });
-    if (suite) |name| fetch_suites.addArg(name);
-    fetch_suites.setCwd(b.path("."));
-    fetch_suites.has_side_effects = true;
-    const suites_dir = if (suite) |name| b.fmt("zig-out/suites/{s}", .{name}) else "zig-out/suites";
-    const run_suites = corpus(b, bench_runner, exe, null, &.{ suites_dir, "--out", "zig-out/suites-results.md" });
-    run_suites.step.dependOn(&fetch_suites.step);
-    b.step("bench-suites", "Fetch the external SPICE suites and time ESPice on them against ngspice and VACASK").dependOn(&run_suites.step);
-
-    // The conformance suite in one step: the oracles first, then every deck
-    // timed and compared against each simulator installed (a missing one
-    // drops out), espice on the CPU and, in a GPU build, on CUDA. Serial
-    // after the oracles, so the timings run on a quiet machine.
-    const conformance_args: []const []const u8 = if (gpu_kernels)
-        &.{ "tests/conformance/tests/netlist", "--out", "zig-out/conformance-results.md", "--espice", "espice-cpu=--backend=cpu", "--espice", "espice-gpu=--backend=cuda", "--ngspice", "auto", "--vacask", "auto", "--xyce", "auto", "--hspice", "auto", "--spectre", "auto" }
-    else
-        &.{ "tests/conformance/tests/netlist", "--out", "zig-out/conformance-results.md", "--espice", "espice-cpu=--backend=cpu", "--ngspice", "auto", "--vacask", "auto", "--xyce", "auto", "--hspice", "auto", "--spectre", "auto" };
-    const run_conformance_bench = corpus(b, bench_runner, exe, null, conformance_args);
-    run_conformance_bench.step.dependOn(&run_correctness.step);
-    b.step("test-conformance", "The conformance suite: oracles, then a benchmark against every simulator on PATH (Xyce, VACASK, Spectre, ngspice, HSPICE) and espice CPU/GPU").dependOn(&run_conformance_bench.step);
-
-    const run_bench_tests = t.run(bench_runner.root_module, &.{}, false);
-    b.step("test-benchmark", "Test reference adapters and benchmark comparison").dependOn(&run_bench_tests.step);
-    test_step.dependOn(&run_bench_tests.step);
-
-    {
-        const wasm_step = b.step("wasm", "Build the docs playground (zig-out/wasm/espice.wasm, cktimg.wasm)");
-        var W = M;
-        W.target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi, .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}) });
-        W.optimize = .small;
-        W.strip = true;
-        W.single_threaded = null;
-        W.use_llvm = null;
-        const wgompute = b.dependency("gompute", .{ .target = W.target, .optimize = W.optimize }).module("gompute");
-        const wg = graph(W, b.dependency("vera", .{ .target = W.target, .optimize = W.optimize }), wgompute, models, gen, bo);
-        wg.analysis.addImport("gompute_kernels", wgompute.import_table.get("gompute_kernels").?);
-        const wh: Import = .{ .name = "espice_h", .module = b.addTranslateC(.{ .root_source_file = b.path("include/espice.h"), .target = W.target, .optimize = W.optimize, .link_libc = false }).createModule() };
-        const wroot = W.make(b.path("tools/playground/espice.zig"), &.{ wh, .{ .name = "c_api", .module = W.make(b.path("src/c_api.zig"), &.{ .{ .name = "espice", .module = wg.espice }, wh }) } });
-        for (wg.objs) |o| wroot.addObject(o);
-        wroot.single_threaded = true;
-        const wexe = b.addExecutable(.{ .name = "espice", .root_module = wroot });
-        wexe.entry = .disabled;
-        wexe.rdynamic = true;
-        wexe.wasi_exec_model = .reactor;
-        wexe.stack_size = 16 << 20; // the corpus peaks at 541 KiB (dc/device_b3soipd_output.sp)
-        wasm_step.dependOn(&b.addInstallArtifact(wexe, .{ .dest_dir = .{ .override = .{ .custom = "wasm" } } }).step);
-
-        // Build with `-Dcpu=x86_64 -Dhip-arch=none -Dcuda-arch=none` to match simd128's lane count.
-        const cmp = b.addSystemCommand(&.{"node"});
-        cmp.addFileArg(b.path("tools/playground/compare.js"));
-        cmp.addDirectoryArg(wexe.getEmittedBin().dirname());
-        cmp.addArtifactArg(exe);
-        cmp.addDirectoryArg(b.path("tests/conformance/tests/netlist"));
-        cmp.addFileInput(b.path("docs/javascripts/playground.js"));
-        b.step("wasm-compare", "Check espice.wasm against the native espice over the corpus (node)").dependOn(&cmp.step);
-
-        const ck = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "--prefix" });
-        const ck_out = ck.addOutputDirectoryArg("playground");
-        ck.setCwd(b.path("tools/playground"));
-        for ([_][]const u8{ "build.zig", "build.zig.zon", "cktimg.zig" }) |f| ck.addFileInput(b.path(b.fmt("tools/playground/{s}", .{f})));
-        wasm_step.dependOn(&b.addInstallFileWithDir(ck_out.path(b, "wasm/cktimg.wasm"), .{ .custom = "wasm" }, "cktimg.wasm").step);
-    }
+    const bench_runner = b.addExecutable(.{ .name = "bench-runner", .root_module = M.make(b.path("tests/benchmark/runner.zig"), &.{}) });
+    test_step.dependOn(&t.run(bench_runner.root_module, &.{}, false).step);
+    // Every open-source simulator on PATH (a missing one drops out); --fixtures DIR for another deck set.
+    b.step("bench", "Time and compare ESPice against ngspice, VACASK and Xyce (nix develop .#benchmarking)").dependOn(&corpus(b, bench_runner, exe, null, &.{ "tests/conformance/tests/netlist", "--ngspice", "auto", "--vacask", "auto", "--xyce", "auto" }).step);
 
     checkModuleGraph(b, exe.root_module);
     checkModuleGraph(b, c_api_mod);
@@ -445,7 +324,6 @@ const Cfg = struct {
     target: Build.ResolvedTarget,
     optimize: std.lang.Optimize,
     strip: bool,
-    single_threaded: ?bool,
     use_llvm: ?bool,
     /// `-Dgpu`: device kernels are compiled in, so host device objects build
     /// their Model rows in the kernels' layout (no Debug `su_ok`).
@@ -457,7 +335,6 @@ const Cfg = struct {
             .target = self.target,
             .optimize = self.optimize,
             .strip = self.strip,
-            .single_threaded = self.single_threaded,
             .imports = imports,
         });
         return mod;

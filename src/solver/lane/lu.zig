@@ -7,8 +7,7 @@
 //! a unit divisor so the surviving lanes stay exact; the caller re-solves
 //! them on the scalar path (freq_solve.zig `solveBatch`) or holds them
 //! (`factorEach`). In: a factored SparseLu and W lanes of values. Out: W
-//! lanes of L and U, and W-lane solves. Cites no outside source; the lane
-//! axis is AGENTS.md §2.10.
+//! lanes of L and U, and W-lane solves. Cites no outside source.
 
 const std = @import("std");
 const assert = std.debug.assert;

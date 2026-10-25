@@ -6,7 +6,13 @@ const spice = @import("vacask.zig");
 const number = spice.parseSpice;
 const Allocator = std.mem.Allocator;
 
+/// The analyses a contract can request. `noise_integrated` is the one-point
+/// total plot that every `.noise` request implies.
 pub const Kind = enum { op, dc, ac, tran, noise, noise_integrated };
+/// One analysis the deck asked for, and what its plot must cover. `stop` is
+/// the last grid point the simulator generates, which for a log sweep can
+/// fall short of `requested_stop`, the deck's literal FSTOP. `points` 0
+/// leaves the point count unchecked; empty `signals` checks no names.
 pub const Request = struct {
     kind: Kind,
     start: f64 = 0,
@@ -15,6 +21,9 @@ pub const Request = struct {
     points: usize = 0,
     signals: []const []const u8 = &.{},
 };
+/// Everything one run must write to count as complete. Serialized beside
+/// the deck as `*.completion.json` and into the samples JSONL, so its field
+/// names are a file format. A non-empty `unsupported` fails every run.
 pub const Contract = struct {
     schema_version: u32 = 1,
     requests: []const Request = &.{},
@@ -55,6 +64,11 @@ fn frequencyGrid(request: *Request, mode: []const u8, points: f64) bool {
     return std.math.isFinite(request.stop);
 }
 
+/// The contract implied by deck `text`: one request per analysis card, with
+/// the `.save`d signals, or else the `v(...)`/`i(...)` columns `oracle`
+/// (the deck's `.expected.json`) lists for that analysis. A card this file
+/// cannot parse lands in `unsupported` rather than failing the call. All
+/// slices are allocated in `a`; pass an arena.
 pub fn fromDeck(a: Allocator, text: []const u8, oracle: ?[]const u8) !Contract {
     var requests: std.ArrayList(Request) = .empty;
     var unsupported: std.ArrayList([]const u8) = .empty;

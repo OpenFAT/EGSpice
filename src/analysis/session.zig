@@ -204,6 +204,9 @@ pub const Session = struct {
         self.last_template_reader = true;
     }
 
+    /// The `stream_opener` callback: `open(ctx, id, job)` returns the writer
+    /// query `id`'s rows go to, or null to keep them. `ctx` must outlive
+    /// the session.
     pub const StreamOpener = struct {
         ctx: *anyopaque,
         open: *const fn (ctx: *anyopaque, id: QueryId, job: requests.Query) ?*std.Io.Writer,
@@ -562,18 +565,23 @@ pub const Session = struct {
         }
     }
 
+    /// The circuit row `i` instantiates (`Row.template`).
+    fn templateOf(self: *const Session, i: usize) *const Circuit {
+        const t = self.rows.items(.template)[i];
+        return if (t == 0) self.topology else self.templates.items[t - 1];
+    }
+
     fn makeExecutor(self: *Session, i: usize) !void {
         if (self.rows.items(.executor)[i] != null) return;
         const dep = self.rows.items(.dependency)[i];
         const initial = if (dep == none) null else self.rows.items(.executor)[@backingInt(dep)];
-        const template = self.rows.items(.template)[i];
         // Query `i` may take its source's state only as its last reader,
         // once every other reader has stopped a quantum: their copies are done.
         const last = if (dep == none) self.last_template_reader and self.root_readers == 1 else self.rows.items(.readers)[@backingInt(dep)] == 1;
         self.rows.items(.executor)[i] = try execution.Executor.create(
             self.allocator,
             self.io,
-            if (template == 0) self.topology else self.templates.items[template - 1],
+            self.templateOf(i),
             self.deck,
             self.jobAt(i),
             initial,
@@ -603,7 +611,7 @@ pub const Session = struct {
     fn gather(self: *Session, i: usize) void {
         const lane_width = execution.lane_width;
         const config = self.config;
-        if (config.gpu_lanes and (self.kindAt(i) == .tran or self.kindAt(i) == .pss or self.kindAt(i) == .hb or execution.gpuFreqLaneKind(self.kindAt(i)) or self.staticWide(i)) and self.rows.items(.executor)[i] == null) return self.gatherWide(i);
+        if (config.gpu_lanes and self.gpuLaned(i)) return self.gatherWide(i);
         if (!execution.lanesOn(config) or config.backend != .cpu or config.device_threads != 1 or config.timing_in_depth) return;
         const ji = self.jobAt(i);
         if (!batchable(ji) or self.rows.items(.executor)[i] != null) return;
@@ -616,25 +624,51 @@ pub const Session = struct {
         for (0..from_urgent + @min(queued.len, lane_window)) |at| {
             if (n == peers.len) break;
             const j = if (at < from_urgent) urgent[urgent.len - 1 - at] else queued[at - from_urgent];
-            if (j == i or !self.ready(j) or self.rows.items(.running)[j] or self.rows.items(.executor)[j] != null) continue;
-            if (self.rows.items(.template)[j] != self.rows.items(.template)[i]) continue;
-            if ((self.rows.items(.dependency)[j] == none) != (self.rows.items(.dependency)[i] == none)) continue;
-            if (!sameLaneJob(ji, self.jobAt(j))) continue;
+            if (!self.peerOf(i, ji, j)) continue;
             peers[n] = j;
             n += 1;
         }
-        if (n == 0) return;
-        self.makeExecutor(i) catch return;
+        _ = self.lead(i, peers[0..n]);
+    }
+
+    /// Row `j` may join leader `i` (whose query is `ji`) in a lane batch: a
+    /// ready, never-started row other than `i` on its template, with a
+    /// prerequisite exactly when `i` has one, and `sameLaneJob` options.
+    fn peerOf(self: *const Session, i: usize, ji: requests.Query, j: usize) bool {
+        const rows = self.rows.slice();
+        return j != i and self.ready(j) and !rows.items(.running)[j] and rows.items(.executor)[j] == null and
+            rows.items(.template)[j] == rows.items(.template)[i] and
+            (rows.items(.dependency)[j] == none) == (rows.items(.dependency)[i] == none) and
+            sameLaneJob(ji, self.jobAt(j));
+    }
+
+    /// Makes row `i` the leader of `peers` (rows): builds every executor
+    /// and marks each peer running. A peer whose executor cannot be built
+    /// is left out to run alone. Null, with no peer taken, when `peers` is
+    /// empty or the leader or its list cannot be built.
+    fn lead(self: *Session, i: usize, peers: []const usize) ?*execution.Executor {
+        if (peers.len == 0) return null;
+        self.makeExecutor(i) catch return null;
         const leader = self.rows.items(.executor)[i].?;
-        const list = leader.work.allocator().alloc(*execution.Executor, n) catch return;
+        const list = leader.work.allocator().alloc(*execution.Executor, peers.len) catch return null;
         var taken: usize = 0;
-        for (peers[0..n]) |j| {
+        for (peers) |j| {
             self.makeExecutor(j) catch continue;
             list[taken] = self.rows.items(.executor)[j].?;
             taken += 1;
             self.rows.items(.running)[j] = true;
         }
         leader.peers = list[0..taken];
+        return leader;
+    }
+
+    /// Row i is a never-built transient, shooting, HB, AC-family or
+    /// `staticWide` row: under `Config.gpu_lanes` it gathers as GPU lanes.
+    /// A row `shareWithHost` gave the CPU already has its executor.
+    fn gpuLaned(self: *const Session, i: usize) bool {
+        const kind = self.kindAt(i);
+        return (kind == .tran or kind == .pss or kind == .hb or execution.gpuFreqLaneKind(kind) or self.staticWide(i)) and
+            self.rows.items(.executor)[i] == null;
     }
 
     /// Row i is an operating point or `.dc` sweep that batches as GPU
@@ -672,29 +706,14 @@ pub const Session = struct {
         for ([_][]const u32{ self.urgent.items, queued }) |list| for (list) |j32| {
             if (peers.items.len == cap) break;
             const j: usize = j32;
-            if (j == i or !self.ready(j) or self.rows.items(.running)[j] or self.rows.items(.executor)[j] != null) continue;
-            if (std.mem.indexOfScalar(usize, peers.items, j) != null) continue;
-            if (self.rows.items(.template)[j] != self.rows.items(.template)[i]) continue;
-            if ((self.rows.items(.dependency)[j] == none) != (self.rows.items(.dependency)[i] == none)) continue;
-            if (!sameLaneJob(ji, self.jobAt(j))) continue;
+            if (!self.peerOf(i, ji, j) or std.mem.indexOfScalar(usize, peers.items, j) != null) continue;
             peers.append(self.allocator, j) catch break;
         };
         // Lanes in row order, whatever order the OPs finished in, so lane 0
         // (the LU plan's source) and the host share are the same each run.
         std.mem.sortUnstable(usize, peers.items, {}, std.sort.asc(usize));
         self.shareWithHost(&peers);
-        if (peers.items.len == 0) return;
-        self.makeExecutor(i) catch return;
-        const leader = self.rows.items(.executor)[i].?;
-        const list = leader.work.allocator().alloc(*execution.Executor, peers.items.len) catch return;
-        var taken: usize = 0;
-        for (peers.items) |j| {
-            self.makeExecutor(j) catch continue;
-            list[taken] = self.rows.items(.executor)[j].?;
-            taken += 1;
-            self.rows.items(.running)[j] = true;
-        }
-        leader.peers = list[0..taken];
+        const leader = self.lead(i, peers.items) orelse return;
         // Under a final plan a member nothing reads drops its circuit with
         // its wave (`Executor.executeGpuBatch`), as `releaseIfRead` would
         // once the batch ends.
@@ -826,8 +845,7 @@ pub const Session = struct {
             npoints += self.rows.items(.executor)[l].?.result().?.npoints;
         }
         const job = self.jobAt(g);
-        const template = self.rows.items(.template)[g];
-        const e = try execution.Executor.create(self.allocator, self.io, if (template == 0) self.topology else self.templates.items[template - 1], self.deck, job, null, false, self.config);
+        const e = try execution.Executor.create(self.allocator, self.io, self.templateOf(g), self.deck, job, null, false, self.config);
         self.rows.items(.executor)[g] = e;
         var res = self.rows.items(.executor)[first].?.result().?;
         const ncols = res.varnames.len;
@@ -950,9 +968,7 @@ pub const Session = struct {
             // ponytail: one scan of `running` per call; count it if a sweep
             // of 100k points makes the scan show.
             const top = self.urgent.getLastOrNull() orelse return null;
-            // A row `shareWithHost` gave the CPU already has its executor and runs now.
-            const laned = (self.kindAt(top) == .tran or self.kindAt(top) == .pss or self.kindAt(top) == .hb or execution.gpuFreqLaneKind(self.kindAt(top)) or self.staticWide(top)) and
-                self.rows.items(.executor)[top] == null;
+            const laned = self.gpuLaned(top);
             if (laned and std.mem.indexOfScalar(bool, self.rows.items(.running), true) != null) return null;
             // The batch leader is the lowest ready row, not the last OP to finish.
             if (laned) std.mem.sortUnstable(u32, self.urgent.items, {}, std.sort.desc(u32));
@@ -1000,22 +1016,17 @@ pub const Session = struct {
     /// terminal target returns its status without running anything. Fails
     /// as `advanceReady` does.
     pub fn advance(self: *Session, target: QueryId) !Advance {
-        const target_info = try self.info(target);
-        if (target_info.status.terminal()) return .{
-            .requested = target,
-            .advanced = target,
-            .status = target_info.status,
-            .target_status = target_info.status,
-            .progress = target_info.progress,
-            .failure = target_info.failure,
-        };
+        var events: [1]Advance = undefined;
+        if ((try self.info(target)).status.terminal()) {
+            try self.event(target, &events[0]);
+            return events[0];
+        }
         // The first ready query in scheduler order: the prerequisite, the
         // target, or one of a split target's lanes.
         const next: QueryId = for (0..self.rows.len) |offset| {
             const i = (offset + self.cursor) % self.rows.len;
             if (self.contains(.{ .query = target }, i) and self.ready(i)) break @fromBackingInt(@intCast(i));
         } else return error.SchedulingFailure;
-        var events: [1]Advance = undefined;
         _ = try self.advanceReady(&.{next}, .{}, &events);
         events[0].requested = target;
         events[0].target_status = (try self.info(target)).status;
@@ -1140,10 +1151,7 @@ pub const Session = struct {
         var n_next: usize = 0;
         switch (options.preview) {
             .run_all => n_next = @min(try self.readyQueries(options.scope, next), limits.max_parallel),
-            .advance => |id| {
-                const n = try self.readyQueries(.{ .query = id }, next);
-                n_next = @min(n, 1);
-            },
+            .advance => |id| n_next = @min(try self.readyQueries(.{ .query = id }, next), 1),
             .advance_ready => |ids| {
                 try self.validateReady(ids, limits);
                 @memcpy(next[0..ids.len], ids);
@@ -1509,6 +1517,26 @@ fn hbSidebands(allocator: std.mem.Allocator, o: requests.HbLptv) !usize {
     return 2 * try @import("pss/mhb.zig").lineCount(allocator, o.hb()) - 1;
 }
 
+/// How many of `topology`'s device parameters `keep(type_name, param_name)`
+/// admits, all of them for null. A batch with a `param_layout` is counted
+/// from it, which leaves the template's Model rows shared.
+fn countParams(allocator: std.mem.Allocator, topology: *const Circuit, comptime keep: ?fn ([]const u8, []const u8) bool) !usize {
+    var refs: std.ArrayList(ParamRef) = .empty;
+    defer refs.deinit(allocator);
+    var n: usize = 0;
+    for (topology.batches) |b| {
+        if (b.hooks.param_layout) |layout| {
+            const l = try layout(b.ctx).unwrap();
+            for (l.fields) |f| n += l.count * @intFromBool(if (keep) |k| k(b.type_name, f.name) else true);
+            continue;
+        }
+        refs.clearRetainingCapacity();
+        try b.hooks.collect_params(b.ctx, allocator, &refs).unwrap();
+        for (refs.items) |r| n += @intFromBool(if (keep) |k| k(b.type_name, r.param_name) else true);
+    }
+    return n;
+}
+
 /// Returns the shape `query` publishes over this circuit and deck, without
 /// running it.
 pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *const Deck, query: requests.Query) !core.QuerySchema {
@@ -1534,23 +1562,7 @@ pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *c
         .hblin => |o| 1 + o.ports.len * o.ports.len + @intFromBool(o.noise and o.ports.len >= 2),
         .sp => |o| @import("ac/sp.zig").columns(@import("ac/sp.zig").modeCount(o.ports), o.lin),
         // The parameters `.sens` lists, which isSensParam narrows (#154).
-        .sens => blk: {
-            var refs: std.ArrayList(ParamRef) = .empty;
-            defer refs.deinit(allocator);
-            var n: usize = 0;
-            for (topology.batches) |b| {
-                // The layout leaves the template's Model rows shared.
-                if (b.hooks.param_layout) |layout| {
-                    const l = try layout(b.ctx).unwrap();
-                    for (l.fields) |f| n += l.count * @intFromBool(@import("sweep/sens.zig").isSensParam(b.type_name, f.name));
-                    continue;
-                }
-                refs.clearRetainingCapacity();
-                try b.hooks.collect_params(b.ctx, allocator, &refs).unwrap();
-                for (refs.items) |r| n += @intFromBool(@import("sweep/sens.zig").isSensParam(b.type_name, r.param_name));
-            }
-            break :blk n;
-        },
+        .sens => try countParams(allocator, topology, @import("sweep/sens.zig").isSensParam),
         .dcmatch, .dcsens, .acmatch => blk: {
             const groups = switch (query) {
                 inline .dcmatch, .dcsens, .acmatch => |o| o.variations.starts.len -| 1,
@@ -1562,20 +1574,7 @@ pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *c
                 else => 0,
             };
             if (groups != 0) break :blk groups + extra;
-            var refs: std.ArrayList(ParamRef) = .empty;
-            defer refs.deinit(allocator);
-            var n: usize = 0;
-            for (topology.batches) |b| {
-                if (b.hooks.param_layout) |layout| {
-                    const l = try layout(b.ctx).unwrap();
-                    n += l.count * l.fields.len;
-                    continue;
-                }
-                refs.clearRetainingCapacity();
-                try b.hooks.collect_params(b.ctx, allocator, &refs).unwrap();
-                n += refs.items.len;
-            }
-            break :blk n + extra;
+            break :blk try countParams(allocator, topology, null) + extra;
         },
         else => deck.probes.len + 1,
     };

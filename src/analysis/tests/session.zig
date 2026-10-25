@@ -7,11 +7,11 @@ const Deck = @import("core").Deck;
 const builtin = @import("device").Library.builtin;
 const requests = @import("core").query;
 const std = @import("std");
+const t = std.testing;
 const validate = @import("core").validate.validate;
 const validateDeck = @import("core").validate.validateDeck;
 
 test "query boundary rejects nonfinite values and nonterminating sweeps" {
-    const t = std.testing;
     try t.expectError(error.InvalidQueryOptions, validate(.{ .ac = .{ .sweep = .{ .f_start = 0, .f_stop = 1 } } }, 4));
     try t.expectError(error.InvalidQueryOptions, validate(.{ .dc = .{ .start = 0, .stop = 1, .step = -1 } }, 4));
     try t.expectError(error.InvalidQueryOptions, validate(.{ .tran = .{ .t_stop = std.math.inf(f64) } }, 4));
@@ -20,7 +20,6 @@ test "query boundary rejects nonfinite values and nonterminating sweeps" {
 }
 
 test "query boundary refuses a v(a,b) reference on .hbxf and .hbac (#201)" {
-    const t = std.testing;
     const lptv: requests.HbLptv = .{ .f0 = 1e3, .out_node = 1, .out_neg = 2, .sweep = .{ .f_start = 10, .f_stop = 100 } };
     try t.expectError(error.InvalidQueryOptions, validate(.{ .hbxf = lptv }, 4));
     try t.expectError(error.InvalidQueryOptions, validate(.{ .hbac = lptv }, 4));
@@ -32,7 +31,6 @@ test "query boundary refuses a v(a,b) reference on .hbxf and .hbac (#201)" {
 }
 
 test "query boundary checks derived frequencies, dimensions and nested controls" {
-    const t = std.testing;
     const invalid = [_]requests.Query{
         .{ .ac = .{ .sweep = .{ .f_start = 1, .f_stop = 1e308 } } },
         .{ .hb = .{ .f0 = 1e3, .n_harmonics = 0 } },
@@ -56,7 +54,6 @@ test "query boundary checks derived frequencies, dimensions and nested controls"
 }
 
 test "validate: every node and branch row a driver indexes with is in range" {
-    const t = std.testing;
     const sweep: requests.FreqSweep = .{ .f_start = 1, .f_stop = 1e3 };
     const far = 4;
     const ports = [_]requests.Port{.{ .node = 1, .neg = far, .branch = 2 }};
@@ -83,7 +80,6 @@ test "validate: every node and branch row a driver indexes with is in range" {
 }
 
 test "validate: refuses what the frontend refuses" {
-    const t = std.testing;
     const refused = [_]requests.Query{
         .{ .op = .{ .tol = .{ .temp_c = -273.15 } } },
         .{ .temp = .{ .t_start = -300, .t_stop = 0, .t_step = 1 } },
@@ -107,14 +103,13 @@ test "a dc sweep target resolves against the prepared card table, type included"
     // Same ordinal, different device type: the two no longer alias.
     try validateDeck(.{ .dc = .{ .target = .{ .device = .{ .type = builtin("isource"), .index = 0 } } } }, 4, &deck);
     try validateDeck(.{ .dc = .{ .target = .{ .device = .{ .type = builtin("resistor"), .index = 1, .param_name = "r" } } } }, 4, &deck);
-    try std.testing.expectError(error.DcSweepSourceNotFound, validateDeck(.{ .dc = .{ .target = .{ .device = .{ .index = 1 } } } }, 4, &deck));
-    try std.testing.expectError(error.DcSweepSourceNotFound, validateDeck(.{ .dc = .{ .target = .{ .device = .{ .type = builtin("vsource") } }, .target2 = .{ .device = .{ .type = builtin("resistor"), .index = 0 } } } }, 4, &deck));
+    try t.expectError(error.DcSweepSourceNotFound, validateDeck(.{ .dc = .{ .target = .{ .device = .{ .index = 1 } } } }, 4, &deck));
+    try t.expectError(error.DcSweepSourceNotFound, validateDeck(.{ .dc = .{ .target = .{ .device = .{ .type = builtin("vsource") } }, .target2 = .{ .device = .{ .type = builtin("resistor"), .index = 0 } } } }, 4, &deck));
     // The temperature is not a card and is never looked up.
     try validateDeck(.{ .dc = .{ .target = .{ .device = .{ .type = builtin("vsource") } }, .target2 = .temp } }, 4, &deck);
 }
 
 test "fft sample count is bounded before the power-of-two test" {
-    const t = std.testing;
     const base: requests.Fft = .{ .tran = .{ .t_stop = 1e-6 }, .out_pos = 1, .start = 0, .stop = 1e-6, .label = "v(1)" };
     // 0 used to reach `isPowerOfTwo`, which asserts a positive argument.
     for ([_]u32{ 0, 1, 2, 3, 6, 1000, (1 << 27) + 1, 1 << 28, std.math.maxInt(u32) }) |np| {
@@ -132,8 +127,8 @@ test "fft sample count is bounded before the power-of-two test" {
 test "backend validation rejects zero thread counts" {
     const validateBackend = @import("../executor.zig").validateBackend;
     try validateBackend(.{});
-    try std.testing.expectError(error.InvalidThreadCount, validateBackend(.{ .solver_threads = 0 }));
-    try std.testing.expectError(error.InvalidThreadCount, validateBackend(.{ .device_threads = 0 }));
+    try t.expectError(error.InvalidThreadCount, validateBackend(.{ .solver_threads = 0 }));
+    try t.expectError(error.InvalidThreadCount, validateBackend(.{ .device_threads = 0 }));
 }
 
 test "backend validation refuses an explicit GPU this build has no kernels for" {
@@ -144,7 +139,7 @@ test "backend validation refuses an explicit GPU this build has no kernels for" 
         if (requestSupported(be))
             try validateBackend(.{ .backend = be })
         else
-            try std.testing.expectError(error.GpuBackendUnavailable, validateBackend(.{ .backend = be }));
+            try t.expectError(error.GpuBackendUnavailable, validateBackend(.{ .backend = be }));
     }
 }
 
@@ -177,8 +172,36 @@ fn bareDeck(probes: []const u32, labels: []const []const u8) Deck {
     };
 }
 
+/// The ordinal in `params` of parameter `name` on instance `index` of `ty`.
+fn paramRef(params: []const @import("../types.zig").ParamRef, ty: @import("device").abi.DeviceType, index: u32, name: []const u8) !u32 {
+    for (params, 0..) |p, k| if (p.type == ty and p.index == index and std.mem.eql(u8, p.param_name, name)) return @intCast(k);
+    return error.TestUnexpectedResult;
+}
+
+/// An executor config with lane batching `lanes` and bypass off: lanes
+/// never bypass, so the oracle is the plain scalar run.
+fn laneConfig(lanes: bool) @import("../executor.zig").Config {
+    var config: @import("../executor.zig").Config = .{};
+    config.knobs.lanes = lanes;
+    config.knobs.bypass = false;
+    return config;
+}
+
+/// One query's outcome: its status, failure and (when complete) a copy of
+/// its data the caller frees.
+const LaneRow = struct { status: Status, failure: ?@import("../session.zig").Failure, data: []f64 };
+
+/// Reads query `id`'s outcome out of `s`.
+fn laneRow(s: *Session, id: requests.QueryId) !LaneRow {
+    const q = try s.info(id);
+    return .{
+        .status = q.status,
+        .failure = q.failure,
+        .data = if (q.status == .complete) try t.allocator.dupe(f64, (try s.result(id)).data) else &.{},
+    };
+}
+
 test "session shares one OP prerequisite and gates its dependents on it" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -254,7 +277,6 @@ test "session shares one OP prerequisite and gates its dependents on it" {
 }
 
 test "a failed implicit OP's own error is the session failure, not DependencyFailed" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -283,7 +305,6 @@ test "a failed implicit OP's own error is the session failure, not DependencyFai
 }
 
 test "schemaOf names the plot and scale column a transient and an AC sweep publish" {
-    const t = std.testing;
     const schemaOf = @import("../session.zig").schemaOf;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
@@ -322,7 +343,6 @@ test "schemaOf names the plot and scale column a transient and an AC sweep publi
 }
 
 test "schemaOf predicts the columns envelope and noise publish (#83)" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -359,7 +379,6 @@ test "schemaOf predicts the columns envelope and noise publish (#83)" {
 /// shuffled by it; without one, one at a time in row order. Returns each
 /// requested result's data, concatenated, owned by the caller.
 fn runAll(prepared: *const @import("device").Circuit, deck: *const Deck, jobs: []const requests.Query, device_threads: u32, seed: ?u64) ![]f64 {
-    const t = std.testing;
     var s = Session.init(t.allocator, t.io, prepared, deck, .{ .device_threads = device_threads });
     defer s.deinit();
     var ids: [8]requests.QueryId = undefined;
@@ -384,9 +403,8 @@ fn runAll(prepared: *const @import("device").Circuit, deck: *const Deck, jobs: [
 }
 
 test "--jobs determinism: results are byte-identical across lane counts and scheduler orders" {
-    // TESTING-METHODOLOGY 2.1 item 6: `--jobs=1` against N, plus a seeded
+    // TESTING.md, parallel nondeterminism: `--jobs=1` against N, plus a seeded
     // permutation of each round's ready set. The oracle is the serial run.
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -427,7 +445,6 @@ test "--jobs determinism: results are byte-identical across lane counts and sche
 }
 
 test "variant rows re-derive only the batches they write, bitwise as a full recompute (#214)" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -446,17 +463,9 @@ test "variant rows re-derive only the batches they write, bitwise as a full reco
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const Find = struct {
-        fn ref(ps: anytype, ty: @import("core").DeviceType, index: u32, name: []const u8) !u32 {
-            for (ps, 0..) |p, k| {
-                if (p.type == ty and p.index == index and std.mem.eql(u8, p.param_name, name)) return @intCast(k);
-            }
-            return error.TestUnexpectedResult;
-        }
-    };
-    const r1 = try Find.ref(params, builtin("resistor"), 1, "r");
-    const is2 = try Find.ref(params, builtin("diode"), 2, "is");
-    const c0 = try Find.ref(params, builtin("capacitor"), 0, "c");
+    const r1 = try paramRef(params, builtin("resistor"), 1, "r");
+    const is2 = try paramRef(params, builtin("diode"), 2, "is");
+    const c0 = try paramRef(params, builtin("capacitor"), 0, "c");
     // One batch, two batches, every batch under a temperature, and none.
     const labels = [_][]const u8{ "a", "b", "c", "d" };
     const temps = [_]?f64{ null, null, 85, null };
@@ -479,7 +488,6 @@ test "variant rows re-derive only the batches they write, bitwise as a full reco
 }
 
 test "lane batches: OP and .dc rows at several temperatures group into batches and each equals its run alone, bitwise" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -514,10 +522,7 @@ test "lane batches: OP and .dc rows at several temperatures group into batches a
     var dc_batched: usize = 0;
     var tran_batched: usize = 0;
     for ([_]bool{ false, true }, &out) |lanes, *o| {
-        var config: @import("../executor.zig").Config = .{};
-        config.knobs.lanes = lanes;
-        config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-        var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(lanes));
         defer s.deinit();
         var ids: [jobs.len]requests.QueryId = undefined;
         _ = try s.append(&jobs, &ids);
@@ -539,7 +544,6 @@ test "lane batches: OP and .dc rows at several temperatures group into batches a
 }
 
 test "lane batches: a NaN value, failing, peeling and re-pivoting lanes leave the others bitwise and fail as they do alone" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -557,9 +561,7 @@ test "lane batches: a NaN value, failing, peeling and re-pivoting lanes leave th
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const r_ref: u32 = for (params, 0..) |p, k| {
-        if (p.type == builtin("resistor") and p.index == 0 and std.mem.eql(u8, p.param_name, "r")) break @intCast(k);
-    } else return error.TestUnexpectedResult;
+    const r_ref = try paramRef(params, builtin("resistor"), 0, "r");
     const values = [_]f64{ 1e3, 2e3, std.math.nan(f64), 1e-30, 5e3, -1e3, 0, 1e12, 7e3, 10, 1e-9 };
     var labels: [values.len][]const u8 = undefined;
     var starts: [values.len + 1]u32 = undefined;
@@ -581,14 +583,10 @@ test "lane batches: a NaN value, failing, peeling and re-pivoting lanes leave th
         o.* = .{ .op = .{ .tol = .{ .variant = @intCast(k) } } };
         d.* = .{ .dc = .{ .target = target, .start = -1, .stop = 3, .step = 0.5, .tol = .{ .variant = @intCast(k) } } };
     }
-    const Row = struct { status: Status, failure: ?@import("../session.zig").Failure, data: []f64 };
-    var rows: [2][jobs.len]Row = undefined;
+    var rows: [2][jobs.len]LaneRow = undefined;
     var batched: usize = 0;
     for ([_]bool{ false, true }, &rows) |lanes, *out| {
-        var config: @import("../executor.zig").Config = .{};
-        config.knobs.lanes = lanes;
-        config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-        var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(lanes));
         defer s.deinit();
         var ids: [jobs.len]requests.QueryId = undefined;
         _ = try s.append(&jobs, &ids);
@@ -596,11 +594,7 @@ test "lane batches: a NaN value, failing, peeling and re-pivoting lanes leave th
         for (s.rows.items(.executor)) |e| if (e) |x| {
             batched += x.peers.len;
         };
-        for (ids, out) |id, *r| {
-            const q = try s.info(id);
-            r.* = .{ .status = q.status, .failure = q.failure, .data = &.{} };
-            if (q.status == .complete) r.data = try t.allocator.dupe(f64, (try s.result(id)).data);
-        }
+        for (ids, out) |id, *r| r.* = try laneRow(&s, id);
     }
     defer for (rows) |rs| for (rs) |r| t.allocator.free(r.data);
     try t.expect(batched > 0);
@@ -616,7 +610,6 @@ test "lane batches: a NaN value, failing, peeling and re-pivoting lanes leave th
 }
 
 test "split lanes (#213): .mc trials, .dc DATA= variants and a .temp range run as lane rows, batched or not, at any --jobs, and assemble bitwise the lanes run alone" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -635,9 +628,7 @@ test "split lanes (#213): .mc trials, .dc DATA= variants and a .temp range run a
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const r_ref: u32 = for (params, 0..) |p, k| {
-        if (p.type == builtin("resistor") and p.index == 0 and std.mem.eql(u8, p.param_name, "r")) break @intCast(k);
-    } else return error.TestUnexpectedResult;
+    const r_ref = try paramRef(params, builtin("resistor"), 0, "r");
     const values = [_]f64{ 1e3, 2e3, std.math.nan(f64), 3e3, 5e3, -1e3, 7e3, 1e4, 2e4, 10, 1e5 };
     var labels: [values.len][]const u8 = undefined;
     var starts: [values.len + 1]u32 = undefined;
@@ -664,10 +655,7 @@ test "split lanes (#213): .mc trials, .dc DATA= variants and a .temp range run a
     var out: [runs.len][jobs.len][]f64 = undefined;
     var batched: usize = 0;
     for (runs, &out) |r, *o| {
-        var config: @import("../executor.zig").Config = .{};
-        config.knobs.lanes = r.lanes;
-        config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-        var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(r.lanes));
         defer s.deinit();
         var ids: [jobs.len]requests.QueryId = undefined;
         _ = try s.append(&jobs, &ids);
@@ -687,10 +675,7 @@ test "split lanes (#213): .mc trials, .dc DATA= variants and a .temp range run a
     try t.expectEqual(@as(usize, 11 * 4), out[0][2].len);
 
     // The same lanes appended one query each, never split or batched.
-    var config: @import("../executor.zig").Config = .{};
-    config.knobs.lanes = false;
-    config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-    var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+    var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(false));
     defer s.deinit();
     var alone: [33]requests.Query = undefined;
     for (0..11) |k| {
@@ -721,7 +706,6 @@ test "split lanes (#213): .mc trials, .dc DATA= variants and a .temp range run a
 }
 
 test "lane batches: .tran rows (a moved source edge, a NaN and an extreme lane) group into batches and each equals its run alone, bitwise" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -741,14 +725,8 @@ test "lane batches: .tran rows (a moved source edge, a NaN and an extreme lane) 
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const find = struct {
-        fn f(ps: []const @import("../types.zig").ParamRef, ty: @import("device").abi.DeviceType, name: []const u8) !u32 {
-            for (ps, 0..) |p, k| if (p.type == ty and p.index == 0 and std.mem.eql(u8, p.param_name, name)) return @intCast(k);
-            return error.TestUnexpectedResult;
-        }
-    }.f;
-    const r_ref = try find(params, builtin("resistor"), "r");
-    const td_ref = try find(params, builtin("vsource"), "pulse_td");
+    const r_ref = try paramRef(params, builtin("resistor"), 0, "r");
+    const td_ref = try paramRef(params, builtin("vsource"), 0, "pulse_td");
     // Rows 0..7 write the first resistor; rows 8..11 the source delay (one
     // edge moved per row). Repeated values replicate a lane.
     const refs = [_]u32{ r_ref, r_ref, r_ref, r_ref, r_ref, r_ref, r_ref, r_ref, td_ref, td_ref, td_ref, td_ref };
@@ -767,14 +745,10 @@ test "lane batches: .tran rows (a moved source edge, a NaN and an extreme lane) 
     deck.cards = &.{.{ .type = builtin("vsource"), .index = 0, .name = "v1" }};
     var jobs: [values.len]requests.Query = undefined;
     for (&jobs, 0..) |*j, k| j.* = .{ .tran = .{ .t_stop = 8e-9, .dt_init = 2e-11, .tol = .{ .variant = @intCast(k) } } };
-    const Row = struct { status: Status, failure: ?@import("../session.zig").Failure, data: []f64 };
-    var rows: [2][jobs.len]Row = undefined;
+    var rows: [2][jobs.len]LaneRow = undefined;
     var tran_batched: usize = 0;
     for ([_]bool{ false, true }, &rows) |lanes, *out| {
-        var config: @import("../executor.zig").Config = .{};
-        config.knobs.lanes = lanes;
-        config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-        var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(lanes));
         defer s.deinit();
         var ids: [jobs.len]requests.QueryId = undefined;
         _ = try s.append(&jobs, &ids);
@@ -782,11 +756,7 @@ test "lane batches: .tran rows (a moved source edge, a NaN and an extreme lane) 
         for (s.rows.items(.executor), s.rows.items(.job)) |e, j| if (e) |x| {
             if (s.jobs.items[j] == .tran) tran_batched += x.peers.len;
         };
-        for (ids, out) |id, *r| {
-            const q = try s.info(id);
-            r.* = .{ .status = q.status, .failure = q.failure, .data = &.{} };
-            if (q.status == .complete) r.data = try t.allocator.dupe(f64, (try s.result(id)).data);
-        }
+        for (ids, out) |id, *r| r.* = try laneRow(&s, id);
     }
     defer for (rows) |rs| for (rs) |r| t.allocator.free(r.data);
     try t.expect(tran_batched > 0);
@@ -802,7 +772,6 @@ test "lane batches: .tran rows (a moved source edge, a NaN and an extreme lane) 
 }
 
 test "lane batches preserve checkpoint scheduling and only gather completion quanta" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -816,9 +785,7 @@ test "lane batches preserve checkpoint scheduling and only gather completion qua
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const resistor: u32 = for (params, 0..) |p, k| {
-        if (p.type == builtin("resistor") and p.index == 0 and std.mem.eql(u8, p.param_name, "r")) break @intCast(k);
-    } else return error.TestUnexpectedResult;
+    const resistor = try paramRef(params, builtin("resistor"), 0, "r");
     const values = [_]f64{ 1e3, 3e3, std.math.nan(f64), 5e3 };
     const refs: [values.len]u32 = @splat(resistor);
     const labels: [values.len][]const u8 = @splat("row");
@@ -850,9 +817,7 @@ test "lane batches preserve checkpoint scheduling and only gather completion qua
     var expected_data: [values.len][]f64 = @splat(&.{});
     defer for (expected_data) |data| t.allocator.free(data);
     for (modes, 0..) |mode, run| {
-        var config: @import("../executor.zig").Config = .{};
-        config.knobs.lanes = mode.cpu;
-        config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
+        var config = laneConfig(mode.cpu);
         config.gpu_lanes = mode.gpu;
         if (mode.share > 0) config.gpu_share = mode.share;
         var session = Session.init(t.allocator, t.io, &prepared, &deck, config);
@@ -896,7 +861,6 @@ test "lane batches preserve checkpoint scheduling and only gather completion qua
 }
 
 test "lane batches: streamed measures, early stop and aborts stay per lane in every order (#207)" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -910,9 +874,7 @@ test "lane batches: streamed measures, early stop and aborts stay per lane in ev
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const r_ref: u32 = for (params, 0..) |p, k| {
-        if (p.type == builtin("resistor") and p.index == 0 and std.mem.eql(u8, p.param_name, "r")) break @intCast(k);
-    } else return error.TestUnexpectedResult;
+    const r_ref = try paramRef(params, builtin("resistor"), 0, "r");
 
     // Slow rows miss the bound, the NaN fails, and the others resolve at
     // distinct times. UIC puts the failing row in the transient batch too.
@@ -940,10 +902,7 @@ test "lane batches: streamed measures, early stop and aborts stay per lane in ev
     };
     const Run = struct {
         fn collect(circuit: *const @import("device").Circuit, d: *const Deck, order: []const usize, lanes: bool, bounded: bool) ![]Row {
-            var config: @import("../executor.zig").Config = .{};
-            config.knobs.lanes = lanes;
-            config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-            var s = Session.init(t.allocator, t.io, circuit, d, config);
+            var s = Session.init(t.allocator, t.io, circuit, d, laneConfig(lanes));
             defer s.deinit();
             var jobs: [values.len]requests.Query = undefined;
             for (order, jobs[0..order.len]) |k, *j| j.* = .{ .tran = .{
@@ -1034,7 +993,6 @@ test "lane batches: streamed measures, early stop and aborts stay per lane in ev
 }
 
 test "lane batches: .pss rows on variant rows equal their runs alone bitwise, replicated, failing and NaN lanes included (#210)" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -1054,9 +1012,7 @@ test "lane batches: .pss rows on variant rows equal their runs alone bitwise, re
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const r_ref: u32 = for (params, 0..) |p, k| {
-        if (p.type == builtin("resistor") and p.index == 1 and std.mem.eql(u8, p.param_name, "r")) break @intCast(k);
-    } else return error.TestUnexpectedResult;
+    const r_ref = try paramRef(params, builtin("resistor"), 1, "r");
     // Three copies of 1k (replication), a NaN, a near-short, and spread loads.
     const values = [_]f64{ 1e3, 2e3, 1e3, std.math.nan(f64), 500, 1e-30, 1e3, 5e3, 1e5 };
     var labels: [values.len][]const u8 = undefined;
@@ -1074,14 +1030,10 @@ test "lane batches: .pss rows on variant rows equal their runs alone bitwise, re
     deck.variants = .{ .labels = &labels, .temp_c = &temps, .starts = &starts, .refs = &refs, .values = &values };
     var jobs: [values.len]requests.Query = undefined;
     for (&jobs, 0..) |*j, k| j.* = .{ .pss = .{ .period = 1e-3, .n_samples = 64, .tol = .{ .variant = @intCast(k) } } };
-    const Row = struct { status: Status, failure: ?@import("../session.zig").Failure, data: []f64 };
-    var rows: [2][jobs.len]Row = undefined;
+    var rows: [2][jobs.len]LaneRow = undefined;
     var batched: usize = 0;
     for ([_]bool{ false, true }, &rows) |lanes, *got| {
-        var config: @import("../executor.zig").Config = .{};
-        config.knobs.lanes = lanes;
-        config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-        var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(lanes));
         defer s.deinit();
         var ids: [jobs.len]requests.QueryId = undefined;
         _ = try s.append(&jobs, &ids);
@@ -1089,11 +1041,7 @@ test "lane batches: .pss rows on variant rows equal their runs alone bitwise, re
         for (s.rows.items(.executor), s.rows.items(.job)) |e, j| if (e) |x| {
             if (s.jobs.items[j] == .pss) batched += x.peers.len;
         };
-        for (ids, got) |id, *r| {
-            const q = try s.info(id);
-            r.* = .{ .status = q.status, .failure = q.failure, .data = &.{} };
-            if (q.status == .complete) r.data = try t.allocator.dupe(f64, (try s.result(id)).data);
-        }
+        for (ids, got) |id, *r| r.* = try laneRow(&s, id);
     }
     defer for (rows) |rs| for (rs) |r| t.allocator.free(r.data);
     try t.expect(batched > 0);
@@ -1111,7 +1059,6 @@ test "lane batches: .pss rows on variant rows equal their runs alone bitwise, re
 }
 
 test "CPU lane batches: HB rows remain independent query workers (#210)" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -1128,10 +1075,7 @@ test "CPU lane batches: HB rows remain independent query workers (#210)" {
         .{ .hb = .{ .f0 = 1e3, .n_harmonics = 3 } },
         .{ .hb = .{ .f0 = 1e3, .n_harmonics = 3 } },
     };
-    var config: @import("../executor.zig").Config = .{};
-    config.knobs.lanes = true;
-    config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-    var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+    var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(true));
     defer s.deinit();
     var ids: [jobs.len]requests.QueryId = undefined;
     _ = try s.append(&jobs, &ids);
@@ -1141,7 +1085,6 @@ test "CPU lane batches: HB rows remain independent query workers (#210)" {
 }
 
 test "lane batches: AC-family rows on variant rows equal their runs alone, bitwise, with failing and replicated lanes" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -1161,9 +1104,7 @@ test "lane batches: AC-family rows on variant rows equal their runs alone, bitwi
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const r_ref: u32 = for (params, 0..) |p, k| {
-        if (p.type == builtin("resistor") and p.index == 0 and std.mem.eql(u8, p.param_name, "r")) break @intCast(k);
-    } else return error.TestUnexpectedResult;
+    const r_ref = try paramRef(params, builtin("resistor"), 0, "r");
     // Rows 0, 2, 5 and 8 replicate one point; 4 cannot solve its OP.
     const values = [_]f64{ 1e3, 2e3, 1e3, 5e2, std.math.nan(f64), 1e3, 7e3, 3e2, 1e3, 1e4 };
     var labels: [values.len][]const u8 = undefined;
@@ -1191,14 +1132,10 @@ test "lane batches: AC-family rows on variant rows equal their runs alone, bitwi
         ac.* = .{ .ac = .{ .sweep = sweep, .tol = .{ .variant = @intCast(k) } } };
         nz.* = .{ .noise = .{ .out_node = prev, .sweep = sweep, .tol = .{ .variant = @intCast(k) } } };
     }
-    const Row = struct { status: Status, failure: ?@import("../session.zig").Failure, data: []f64 };
-    var rows: [2][jobs.len]Row = undefined;
+    var rows: [2][jobs.len]LaneRow = undefined;
     var ac_batched: usize = 0;
     for ([_]bool{ false, true }, &rows) |lanes, *out| {
-        var config: @import("../executor.zig").Config = .{};
-        config.knobs.lanes = lanes;
-        config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-        var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(lanes));
         defer s.deinit();
         var ids: [jobs.len]requests.QueryId = undefined;
         _ = try s.append(&jobs, &ids);
@@ -1206,11 +1143,7 @@ test "lane batches: AC-family rows on variant rows equal their runs alone, bitwi
         for (s.rows.items(.executor), s.rows.items(.job)) |e, j| if (e) |x| {
             if (s.jobs.items[j] == .ac or s.jobs.items[j] == .noise) ac_batched += x.peers.len;
         };
-        for (ids, out) |id, *r| {
-            const q = try s.info(id);
-            r.* = .{ .status = q.status, .failure = q.failure, .data = &.{} };
-            if (q.status == .complete) r.data = try t.allocator.dupe(f64, (try s.result(id)).data);
-        }
+        for (ids, out) |id, *r| r.* = try laneRow(&s, id);
     }
     defer for (rows) |rs| for (rs) |r| t.allocator.free(r.data);
     try t.expect(ac_batched > 0);
@@ -1228,7 +1161,6 @@ test "lane batches: AC-family rows on variant rows equal their runs alone, bitwi
 }
 
 test "floor retry: forced capacitor scalar and CPU lanes complete with identical accepted rows" {
-    const t = std.testing;
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);
@@ -1240,9 +1172,7 @@ test "floor retry: forced capacitor scalar and CPU lanes complete with identical
     var probe = try @import("../types.zig").Circuit.instantiate(&prepared, t.allocator);
     defer probe.deinit();
     const params = try probe.collectParams();
-    const dc_ref: u32 = for (params, 0..) |param, k| {
-        if (param.type == builtin("vsource") and param.index == 0 and std.mem.eql(u8, param.param_name, "dc")) break @intCast(k);
-    } else return error.TestUnexpectedResult;
+    const dc_ref = try paramRef(params, builtin("vsource"), 0, "dc");
     var deck = bareDeck(&.{out_node}, &.{"v(out)"});
     deck.variants = .{
         .labels = &.{ "a", "b", "c", "d" },
@@ -1265,10 +1195,7 @@ test "floor retry: forced capacitor scalar and CPU lanes complete with identical
     defer for (rows) |rs| for (rs) |r| t.allocator.free(r);
     var batched: usize = 0;
     for ([_]bool{ false, true }, &rows) |lanes, *result_rows| {
-        var config: @import("../executor.zig").Config = .{};
-        config.knobs.lanes = lanes;
-        config.knobs.bypass = false; // lanes never bypass: the oracle is the plain scalar run
-        var s = Session.init(t.allocator, t.io, &prepared, &deck, config);
+        var s = Session.init(t.allocator, t.io, &prepared, &deck, laneConfig(lanes));
         defer s.deinit();
         var ids: [jobs.len]requests.QueryId = undefined;
         _ = try s.append(&jobs, &ids);

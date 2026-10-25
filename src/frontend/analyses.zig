@@ -7,8 +7,8 @@
 const std = @import("std");
 const core = @import("core");
 const Library = @import("device").Library;
-const requests = @import("core").query;
-const numerics = @import("core").numerics;
+const requests = core.query;
+const numerics = core.numerics;
 const netlist = @import("netlist");
 const Value = netlist.Value;
 const nameAt = Value.nameAt;
@@ -320,6 +320,8 @@ fn cardError(line: []const u8, err: anytype) @TypeOf(err) {
 
 /// Parsed `.options` overrides, in deck order: a later card wins.
 pub const DeckOptions = struct {
+    /// The `.options` tolerances and iteration limits, copied into every
+    /// query by `applyDeckOptions`.
     tol: numerics.Tolerances = .{},
     /// `.options method`; null keeps each query's default.
     method: ?requests.Method = null,
@@ -330,6 +332,8 @@ pub const DeckOptions = struct {
     /// `.options delmax`: the transient step cap when the `.tran` card sets
     /// none.
     delmax: ?f64 = null,
+    /// `.options tran_ceiling=duration|compatibility`; null keeps the
+    /// `.tran` query's own policy.
     tran_ceiling: ?@FieldType(requests.Tran, "ceiling_policy") = null,
     /// `.options xmu`: the trapezoidal damping weight; null keeps 0.5.
     xmu: ?f64 = null,
@@ -1686,20 +1690,18 @@ pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const
             try singleEnded(node_neg);
             // HSPICE `.snac <sweep>` and `.snxf v(out) <sweep>` [CR .SNAC,
             // .SNXF] run at the `.sn` fundamental.
+            var opts: requests.Pac = undefined;
             if (a.sn) {
                 const lo = ctx.sn_f0 orelse return error.MissingAnalysisCard;
-                const first: usize = @intFromBool(id == .pxf);
-                const grid = try acGrid(ctx.arena, args, first);
+                const grid = try acGrid(ctx.arena, args, @intFromBool(id == .pxf));
                 if (grid.end != args.len) return error.InvalidAnalysisArguments;
-                const opts: requests.Pac = .{ .f_lo = lo, .sweep = grid.sweep, .out_node = try outputNode(node_id) };
-                return if (id == .pac) .{ .pac = opts } else .{ .pxf = opts };
+                opts = .{ .f_lo = lo, .sweep = grid.sweep, .out_node = try outputNode(node_id) };
+            } else {
+                try arity(args, 5, 5);
+                const sweep = try frequencySweep(args, 1);
+                opts = .{ .f_lo = try positive(args, 0), .sweep = sweep, .out_node = try outputNode(node_id) };
             }
-            try arity(args, 5, 5);
-            const sweep = try frequencySweep(args, 1);
-            const lo = try positive(args, 0);
-            const out = try outputNode(node_id);
-            if (id == .pac) return .{ .pac = .{ .f_lo = lo, .sweep = sweep, .out_node = out } };
-            return .{ .pxf = .{ .f_lo = lo, .sweep = sweep, .out_node = out } };
+            return if (id == .pac) .{ .pac = opts } else .{ .pxf = opts };
         },
         .sp => {
             if (cardIs(a.line, "net")) return .{ .sp = try net(a, sources, ctx) };

@@ -35,8 +35,12 @@ pub const InitError = error{ NotApplicable, OutOfMemory };
 /// Activation thresholds. The defaults are the production gates; tests relax
 /// them to exercise small systems.
 pub const Limits = struct {
+    /// Fewer blocks than this is `NotApplicable`.
     min_blocks: usize = 8,
+    /// A larger block is `NotApplicable`: each factors dense, O(s^3).
     max_block: u32 = 64,
+    /// A larger border (coupling nodes plus ground) is `NotApplicable`, as
+    /// is one past n / 2: S factors dense.
     max_border: u32 = 512,
 };
 
@@ -368,21 +372,11 @@ pub const Bbd = struct {
         return result;
     }
 
-    /// x = A^-1 x after a successful factor. Asserts that `x` holds all n
-    /// unknowns.
-    pub fn solveInPlace(self: *Self, x: []f64) void {
-        self.solve(false, x);
-    }
-
-    /// x = A^-T x after a successful factor. The transposed Schur
-    /// complement is S^T, and W^T = E^T A^-T takes F's role, so the
-    /// border reduction reads the raw b_i before any block solve. Asserts
-    /// as `solveInPlace` does.
-    pub fn solveTInPlace(self: *Self, x: []f64) void {
-        self.solve(true, x);
-    }
-
-    inline fn solve(self: *Self, comptime transpose: bool, x: []f64) void {
+    /// x = A^-1 x, or A^-T x with `transpose`, in place after a successful
+    /// factor. The transposed Schur complement is S^T, and W^T = E^T A^-T
+    /// takes F's role, so that border reduction reads the raw b_i before
+    /// any block solve. Asserts that `x` holds all n unknowns.
+    pub fn solve(self: *Self, comptime transpose: bool, x: []f64) void {
         // The last border node is the last unknown (init requires it).
         assert(x.len > self.border_node[self.b - 1]);
         const bsz: usize = self.b;

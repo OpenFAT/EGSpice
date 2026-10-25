@@ -24,6 +24,9 @@
 // Further information can be found in the file releasenotesPSP103.txt
 //
 
+`include "constants.vams"
+`include "disciplines.vams"
+
 `include "discipline.h"
 
 // ---- begin `include "Common103_macrodefs.include" ----

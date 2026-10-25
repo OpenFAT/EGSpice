@@ -1,5 +1,8 @@
 //! Solver unit tests: kernels against dense references, and every SIMD or
-//! tape kernel against its scalar oracle, bitwise.
+//! tape kernel against its scalar oracle, bitwise. Other oracles: LAPACK's
+//! scaled residual (`lawnRatio`, LAWN 41), hand-derived solutions of small
+//! systems, a naive DFT and Parseval for the FFT, and a recomputed
+//! ||b - A x|| for GMRES.
 
 const std = @import("std");
 const testing = std.testing;
@@ -62,6 +65,16 @@ fn denseSolve(comptime n: usize, a_in: [n][n]f64, b_in: [n]f64) [n]f64 {
     return x;
 }
 
+/// A distilled BSIMSOI floating-body block: row 0 is the body KCL row at
+/// atto-siemens, rows 1 and 2 drain and source with Gmbs = 1 uS in the body
+/// column. Its body diagonal is only acceptable as a row-scaled pivot.
+const bsimsoi_body = [4][4]f64{
+    .{ 2.0e-20, -1.0e-20, -1.0e-20, 0.0 },
+    .{ -1.0e-6, 1.0e3, -9.0e-4, 1.0e-3 },
+    .{ 1.0e-6, -9.0e-4, 2.0e-3, -1.0e-3 },
+    .{ 0.0, 0.0, -1.0e-3, 1.0 },
+};
+
 fn identity(comptime n: usize) [n]u32 {
     var q: [n]u32 = undefined;
     for (0..n) |i| q[i] = @intCast(i);
@@ -90,7 +103,7 @@ fn lawnRatio(n: usize, a: []const f64, x: []const f64, b: []const f64) f64 {
 
 /// Solves A x = b and A^T x = b with `lu`: x must match the dense
 /// reference and both must pass LAPACK's scaled-residual certificate at its
-/// THRESH of 30 (TESTING-METHODOLOGY 2.1), which needs no stored answer.
+/// THRESH of 30 (TESTING.md, wrong LU solve), which needs no stored answer.
 fn checkSolve(comptime n: usize, a: [n][n]f64, b: [n]f64, lu: *@import("sparse_lu.zig").SparseLu) !void {
     var x: [n]f64 = undefined;
     lu.solve(&b, &x);
@@ -245,12 +258,12 @@ const BbdTests = struct {
 
         flat.solve(b_rhs, x_ref);
         @memcpy(x, b_rhs);
-        eng.solveInPlace(x);
+        eng.solve(false, x);
         for (x, x_ref) |xi, ri| try testing.expectApproxEqAbs(ri, xi, 1e-11);
 
         flat.solveT(b_rhs, x_ref);
         @memcpy(x, b_rhs);
-        eng.solveTInPlace(x);
+        eng.solve(true, x);
         for (x, x_ref) |xi, ri| try testing.expectApproxEqAbs(ri, xi, 1e-11);
     }
 
@@ -317,9 +330,9 @@ const BbdTests = struct {
             inline for (.{ false, true }) |transpose| {
                 @memcpy(expected, rhs);
                 @memcpy(actual, rhs);
-                if (transpose) eng.solveTInPlace(actual) else eng.solveInPlace(actual);
+                eng.solve(transpose, actual);
                 try eng.factorWithExecution(sy.vals, .{});
-                if (transpose) eng.solveTInPlace(expected) else eng.solveInPlace(expected);
+                eng.solve(transpose, expected);
                 try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
                 try eng.factorWithExecution(sy.vals, execution);
             }
@@ -440,7 +453,7 @@ const BbdTests = struct {
             for (rhs) |*v| v.* = 2 * prng.random().float(f64) - 1;
             inline for (.{ false, true }) |transpose| {
                 @memcpy(x, rhs);
-                if (transpose) eng.solveTInPlace(x) else eng.solveInPlace(x);
+                eng.solve(transpose, x);
                 try testing.expect(lawnRatio(n, if (transpose) at else sy.dense, x, rhs) <= 30);
             }
         };
@@ -1047,7 +1060,6 @@ const DirectTests = struct {
     const impl = @import("direct.zig");
     const Allocator = std.mem.Allocator;
     const Solver = impl.Solver;
-    const sparse_lu = @import("sparse_lu.zig");
 
     test "solver construction releases storage on every allocation failure" {
         try std.testing.checkAllAllocationFailures(@import("core").testing.fixed_growth, struct {
@@ -1209,7 +1221,6 @@ const PivotTests = struct {
             for (lu.w) |v| try testing.expectEqual(@as(f64, 0), v);
         };
     }
-
 };
 
 const FftTests = struct {
@@ -2389,7 +2400,7 @@ const LaneLuTests = struct {
             .{ .{ 1e-3, 0, 1, 0 }, .{ 0, 2e-3, -1, 0 }, .{ 1, -1, 0, 1 }, .{ 0, 0, 1, 3 } },
             // Atto-siemens row (BSIMSOI floating body): the base tape carries a
             // scale-accepted pivot, so this exercises the growth-monitor skip.
-            .{ .{ 2.0e-20, -1.0e-20, -1.0e-20, 0.0 }, .{ -1.0e-6, 1.0e3, -9.0e-4, 1.0e-3 }, .{ 1.0e-6, -9.0e-4, 2.0e-3, -1.0e-3 }, .{ 0.0, 0.0, -1.0e-3, 1.0 } },
+            bsimsoi_body,
         };
 
         var prng = std.Random.DefaultPrng.init(0xABCDEF);
@@ -2899,12 +2910,7 @@ const SparseTests = struct {
         var ws = order.Ws.init(&buf);
         try order.order(4, &csc.col_ptr, csc.row_idx[0..csc.nnz()], &q, &ws);
 
-        // q must be a valid permutation of 0..4.
-        var seen = @as([4]bool, @splat(false));
-        for (q) |c| {
-            try testing.expect(!seen[c]);
-            seen[c] = true;
-        }
+        try OrderTests.expectPermutation(&q, 4);
         // The hub (node 0) is deferred: not factored first.
         try testing.expect(q[0] != 0);
 
@@ -2938,12 +2944,7 @@ const SparseTests = struct {
         // and source, with Gmbs = 1 uS in the body column. The raw threshold
         // test rejects the body diagonal and pivots on the drain row, which
         // rebuilds the body equation from numbers 1e14 times its own size.
-        const a = [4][4]f64{
-            .{ 2.0e-20, -1.0e-20, -1.0e-20, 0.0 },
-            .{ -1.0e-6, 1.0e3, -9.0e-4, 1.0e-3 },
-            .{ 1.0e-6, -9.0e-4, 2.0e-3, -1.0e-3 },
-            .{ 0.0, 0.0, -1.0e-3, 1.0 },
-        };
+        const a = bsimsoi_body;
         const x_true = [4]f64{ 0.03526, 0.9, 0.1, 1.1 };
         var b: [4]f64 = .{ 0, 0, 0, 0 };
         for (0..4) |i| for (0..4) |j| {
@@ -3524,6 +3525,21 @@ const LuKernelTests = struct {
         };
     }
 
+    /// Multiplies by 1e20 every A entry below its pivot (in `lu`'s order) in
+    /// the first step from 40 on that has one, so that step's refactor fails
+    /// the growth limit.
+    fn growBelowPivot(c: Case, lu: *const SparseLu, vals: []f64) void {
+        var k: u32 = 40;
+        while (true) : (k += 1) {
+            var hit = false;
+            for (c.col_ptr[c.q[k]]..c.col_ptr[c.q[k] + 1]) |p| if (lu.prow[p] > k) {
+                vals[p] *= 1e20;
+                hit = true;
+            };
+            if (hit) break;
+        }
+    }
+
     /// Refactors `vals` with the oracle and with the kernels (1 and 4
     /// threads, scratch and in-place columns); both must fail at the same
     /// step or agree bitwise. Returns whether the oracle succeeded.
@@ -3603,18 +3619,8 @@ const LuKernelTests = struct {
                     else => r.float(f64) - 0.5, // else: three in five entries are random
                 };
                 // Round 3 puts the first step from 40 on with an A entry
-                // below its pivot under the growth limit: those grow 1e20.
-                if (round == 3) {
-                    var k: u32 = 40;
-                    while (true) : (k += 1) {
-                        var hit = false;
-                        for (c.col_ptr[c.q[k]]..c.col_ptr[c.q[k] + 1]) |p| if (lu.prow[p] > k) {
-                            vals[p] *= 1e20;
-                            hit = true;
-                        };
-                        if (hit) break;
-                    }
-                }
+                // below its pivot under the growth limit.
+                if (round == 3) growBelowPivot(c, &lu, vals);
                 if (!try expectMatch(gpa, &lu, c, tb, vals, rhs, &stamp)) failed += 1;
             }
         }
@@ -3644,18 +3650,7 @@ const LuKernelTests = struct {
             defer threaded.deinit();
             for (0..4) |round| {
                 values(c, r, vals);
-                if (round == 2) {
-                    // A column with an entry below its pivot grows 1e20.
-                    var k: u32 = 40;
-                    while (true) : (k += 1) {
-                        var hit = false;
-                        for (c.col_ptr[c.q[k]]..c.col_ptr[c.q[k] + 1]) |p| if (a.prow[p] > k) {
-                            vals[p] *= 1e20;
-                            hit = true;
-                        };
-                        if (hit) break;
-                    }
-                }
+                if (round == 2) growBelowPivot(c, &a, vals);
                 const ref = b.refactor(c.col_ptr, vals, 1e-12);
                 const got = hr.run(&a, vals, threaded.io(), 4);
                 if (ref) |_| {
@@ -3673,14 +3668,7 @@ const LuKernelTests = struct {
 
     test "lu kernels: a scale-accepted pivot skips the growth monitor on the device too" {
         const gpa = testing.allocator;
-        // The BSIMSOI body block of "atto-siemens row keeps its own diagonal".
-        const a = [4][4]f64{
-            .{ 2.0e-20, -1.0e-20, -1.0e-20, 0.0 },
-            .{ -1.0e-6, 1.0e3, -9.0e-4, 1.0e-3 },
-            .{ 1.0e-6, -9.0e-4, 2.0e-3, -1.0e-3 },
-            .{ 0.0, 0.0, -1.0e-3, 1.0 },
-        };
-        var csc = DenseCsc(4).from(a);
+        var csc = DenseCsc(4).from(bsimsoi_body);
         var q = identity(4);
         const c: Case = .{ .n = 4, .col_ptr = &csc.col_ptr, .row_idx = csc.row_idx[0..csc.nnz()], .q = &q };
         var lu = try SparseLu.init(gpa, 4, c.col_ptr, &q);

@@ -13,6 +13,9 @@
 //   modeling using the S element]; VAMS-2023 §4.5.11.4.
 //
 // sparam_2..4 are this file with SP_N defined (build.zig model_variants).
+
+`include "constants.vams"
+
 `include "disciplines.vams"
 
 `ifndef SP_N

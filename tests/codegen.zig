@@ -1,4 +1,4 @@
-//! Residue probes (AGENTS.md §1.2 R8, `zig/zero-cost.md`): each hot-path
+//! Residue probes (TESTING.md, abstraction costs run time): each hot-path
 //! abstraction as an exported `gen_<name>` beside the hand-written
 //! `hand_<name>` it claims to equal. Nothing links or runs this object; the
 //! build emits its x86_64_v3 ReleaseFast assembly and `tools/asm_probe.py`
@@ -47,7 +47,7 @@ export fn gen_engine_solve(e: *Engine, x: [*]f64, n: u32) void {
     switch (e.*) {
         .lu => |*lu| lu.solve(x[0..n], x[0..n]),
         .tri => |*tri| tri.solve(x[0..n]),
-        .bbd => |*bbd| bbd.solveInPlace(x[0..n]),
+        .bbd => |*bbd| bbd.solve(false, x[0..n]),
     }
 }
 
@@ -59,7 +59,7 @@ const HandEngines = struct {
 
 export fn hand_engine_solve(e: *HandEngines, x: [*]f64, n: u32) void {
     if (e.tri) |*tri| return tri.solve(x[0..n]);
-    if (e.bbd) |*bbd| return bbd.solveInPlace(x[0..n]);
+    if (e.bbd) |*bbd| return bbd.solve(false, x[0..n]);
     e.lu.?.solve(x[0..n], x[0..n]);
 }
 

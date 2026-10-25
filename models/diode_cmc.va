@@ -52,6 +52,9 @@
 //
 //
 
+`include "constants.vams"
+`include "disciplines.vams"
+
 `include "discipline.h"
 
 // ---- begin `include "DIODE_CMC_SIMKIT_macrodefs.include" ----

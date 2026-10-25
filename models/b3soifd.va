@@ -28,6 +28,10 @@
 //     l/w/p terms to 1.0 (not 0), so those three bin even on a plain card.
 //     ponytail: the other ~300 l*/w*/p* params; add when a deck bins.
 //   * Newton limiting (B3SOIFDlimit): shapes the path, not the solution.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module b3soifd(d, g, s, e);
     inout d, g, s, e;
     electrical d, g, s, e;

@@ -227,7 +227,7 @@ pub const Lm = struct {
         }
         // A start or trial point counts alone; its batched Jacobian points
         // count when the Jacobian phase consumes them.
-        const anchored = s.phase == .start or s.phase == .trial;
+        const anchored = s.stepping();
         const residuals = if (anchored) residuals_all[0..m] else residuals_all;
         s.evaluations += if (anchored) 1 else s.pending;
         switch (s.phase) {
@@ -251,7 +251,7 @@ pub const Lm = struct {
                 for (0..n) |j| {
                     s.g[j] = 2 * dot(s.jac[j * m ..][0..m], s.r);
                     // A parameter on a limit its descent direction points past stays put.
-                    s.free[j] = !((s.x[j] <= s.lo[j] and s.g[j] > 0) or (s.x[j] >= s.hi[j] and s.g[j] < 0));
+                    s.free[j] = s.pinned(j) == 0;
                 }
                 if (s.gradientNorm() < s.opts.grad) return s.stop(.grad);
                 s.trialPoint();

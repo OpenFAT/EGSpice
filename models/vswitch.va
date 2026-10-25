@@ -14,6 +14,10 @@
 //   `@(initial_step)` and the `@(cross(...))` edges.
 // Codes follow §1.2: 2 = HYST_OFF, 3 = HYST_ON, ON = code > 2.5. swload.c's
 // REALLY_* states are not stored; outside the band `u` recomputes them.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module vswitch(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;

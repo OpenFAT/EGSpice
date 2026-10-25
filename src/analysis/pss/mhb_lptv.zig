@@ -16,7 +16,7 @@
 //! `pac.sweepKrylov`'s: GMRES on the block convolution, right
 //! preconditioned by G_0 + j(ω + ω_p)·C_0 lanes.
 //!
-//! Cites: dev/analysis/multitone-hb.md, dev/analysis/periodic-noise.md.
+//! No outside source beyond mhb.zig's and pnoise.zig's.
 const std = @import("std");
 const root = @import("../types.zig");
 const mhb = @import("mhb.zig");
@@ -306,15 +306,7 @@ pub fn noise(ctx: *const root.RunCtx, opts: Options) !root.Result {
         const x_s = td[2 * ns * nt + nf ..][0..n];
         for (0..nt) |s| {
             for (x_s, 0..) |*v, node| v.* = lin.orb.x_td[node * nt + s];
-            const at = try ckt.collectNoiseSources(x_s, scratch);
-            defer scratch.free(at);
-            if (at.len != ns) return error.NoiseTopologyChanged;
-            for (at, srcs, 0..) |src, original, i| {
-                if (src.node_p != original.node_p or src.node_n != original.node_n) return error.NoiseTopologyChanged;
-                td[i * nt + s] = pnoise.whiteAmp(src);
-                td[(ns + i) * nt + s] = src.coeff * pnoise.signedSqrt(src.flicker);
-                if (s == 0) exponent[i] = src.ef;
-            }
+            try pnoise.sampleAmplitudes(ckt, x_s, srcs, s, nt, td, exponent, scratch);
         }
         // Forward transform, then each line's phasor.
         for (0..2 * ns) |i| {

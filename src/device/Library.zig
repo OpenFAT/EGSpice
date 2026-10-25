@@ -37,7 +37,7 @@ vpi_loaded: bool = false,
 /// one design (VerA#84).
 systf_hosts: std.ArrayList(SystfBinding) = .empty,
 
-pub const SystfBinding = struct { t: DeviceType, host: *const abi.SystfHost };
+const SystfBinding = struct { t: DeviceType, host: *const abi.SystfHost };
 
 /// The VPI application host. The executable implements it over VerA's
 /// `vpi` module, so the `vpi_*` symbols an application calls are exported

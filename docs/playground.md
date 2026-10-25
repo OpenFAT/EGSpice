@@ -4,6 +4,19 @@ Every netlist on this site runs in your browser. Edit it and the schematic
 redraws. Press **Run** and ESPice, compiled to WebAssembly, simulates it on
 your machine. Nothing is sent to a server.
 
+## Your own circuit
+
+Replace this deck with any self-contained netlist and press **Run**.
+
+```spice
+My circuit
+V1 in 0 1
+R1 in out 1k
+R2 out 0 1k
+.op
+.end
+```
+
 ## RC low-pass: transient
 
 A 1 kΩ, 1 nF low-pass (τ = 1 µs) driven by a 5 µs pulse. `v(out)` charges

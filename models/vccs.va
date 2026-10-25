@@ -12,6 +12,10 @@
 //
 // ponytail: no POLY ladder; the builder routes G POLY(1) to bsource.va
 // (imode=1) and fills only `gain` here.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module vccs(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;

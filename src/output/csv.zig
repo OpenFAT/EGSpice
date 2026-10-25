@@ -32,9 +32,8 @@ pub fn writeHeader(w: *Io.Writer, plot: Plot) !void {
 /// writes after the header.
 pub fn writeRows(w: *Io.Writer, stride: usize, rows: []const f64) !void {
     assert(rows.len % stride == 0);
-    var at: usize = 0;
-    while (at < rows.len) : (at += stride) {
-        for (rows[at..][0..stride], 0..) |x, i| {
+    for (0..rows.len / stride) |k| {
+        for (rows[k * stride ..][0..stride], 0..) |x, i| {
             if (i > 0) try w.writeByte(',');
             try w.print("{e}", .{x});
         }

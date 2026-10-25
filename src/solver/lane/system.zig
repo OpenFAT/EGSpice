@@ -24,7 +24,9 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
     return struct {
         const Self = @This();
         const L = Lanes(W);
+        /// Lane l's value in element l (`Lanes(W).V`).
         pub const V = L.V;
+        /// Bit l for lane l (`Lanes(W).Mask`).
         pub const Mask = L.Mask;
 
         /// Lane l's own system, borrowed; all on one pattern.
@@ -78,6 +80,7 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
             };
         }
 
+        /// Frees the lane planes; the lanes' systems stay the caller's.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             gpa.free(self.rhs);
             gpa.free(self.vals);
@@ -128,6 +131,7 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
         else
             struct { phase: enum { nonlinear }, completed: u16, total: u16 };
 
+        /// Each active lane's `advanceIteration` on its own x_old.
         pub fn advanceIteration(self: *Self, x_old: []const V) void {
             if (comptime !@hasDecl(Sys, "advanceIteration")) return;
             var it = L.each(self.active);
@@ -196,6 +200,7 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
             return flipped;
         }
 
+        /// Every lane's `clearLimits`, active or not.
         pub fn clearLimits(self: *Self) void {
             if (comptime @hasDecl(Sys, "clearLimits")) for (self.lanes) |s| s.clearLimits();
         }

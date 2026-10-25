@@ -12,9 +12,10 @@ Newest first.
 - Faster and leaner on large decks: quicker sparse LU, faster parsing of large hierarchies (a 100k-transistor chain parses in half the memory), CSV and `.print` sweeps stream to disk (a 200-point sweep: ~1 GB → ~50 MB), and Monte Carlo shares unchanged model rows (1.04 → 0.19 GB on a 1k chain).
 - The compact models ship in the source tree; building no longer downloads them.
 - Cached `.hdl` builds rebuild once (new device ABI).
+- VerA v0.20.0 and Gompute 1.5.0.
 - Removed: the `ESPICE_LINEAR_CACHE` variable, the `-Dbsim4-narrow` build option and the `test-gpu-*` build steps (`test-gpu` runs the corpus on CUDA).
 
-## 1.2.0 (2026-10-20)
+## 0.3.0 (2026-10-20)
 
 - Sweeps (`.step`, `.mc`, `.dc DATA=`/`MONTE=`, `.temp` ranges) run their points in parallel across `--jobs`, about 2x faster with flat memory; output is the same at every `--jobs`. Monte Carlo draws differ from 1.1 (#213).
 - New CLI defaults: `--jobs` is one per CPU, and `--measures-only`, `--early-stop` and `--warm-start` turn on by themselves when nothing reads the transient waveforms; `--full-waveforms` turns them off. `--tokenizer` detects the dialect.
@@ -26,7 +27,7 @@ Newest first.
 - VerA v0.11.4: a user `.hdl` model writing `- -x` needs `-(-x)`. `.hdl` reads Verilog-AMS 2023, and 2.3-era models compile inside `begin_keywords "VAMS-2.3"`.
 - A title-only deck succeeds, as in ngspice; espice.wasm works again (#8).
 
-## 1.1.0 (2026-10-19)
+## 0.2.0 (2026-10-19)
 
 - **Dialects:** Spectre netlists (`--tokenizer=spectre`); HSPICE quoting, braces, `$` comments and operators follow the HSPICE manual (#203); many ngspice parsing details match ngspice (#121).
 - **New:** VPI applications (`--vpi app.so`) for Verilog-A `$systf` calls and analog callbacks (#197, #198); `.dc` over a `.param`; `.vec` files; `.qpss` on multi-tone HB; `OPTIMIZE=` grid steps; `live_params` / `set_params` to change `.param` values without re-parsing (#101).
@@ -38,7 +39,7 @@ Newest first.
 - `ESPICE_THREADS` gives the same output at any thread count (#137).
 - Nix flake (`nix run github:OmarSiwy/ESPice`, CUDA package), the playground (`zig build wasm`) and the user documentation site.
 
-## 1.0.0 (2026-10-05)
+## 0.1.0 (2026-10-05)
 
 - First release: Zig 0.17, Apache-2.0 (models keep their own licences).
 - sky130 PDK decks run as written; BSIM4 has ngspice-style limiting.

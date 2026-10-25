@@ -7,6 +7,8 @@
 const std = @import("std");
 const lk = @import("lane.zig");
 
+/// The per-lane bodies over the pointer type `P` (`lk.HostP` on the host);
+/// buffers are lane-major, element i of lane l at `i * n_lanes + l`.
 pub fn Bodies(comptime P: fn (type) type) type {
     return struct {
         /// One source CSC slot of one lane. `positions[4*slot..][0..4]`
@@ -46,23 +48,7 @@ pub fn Bodies(comptime P: fn (type) type) type {
                 for (0..t.n) |r| out[r * N + l] = y[@as(usize, indices[t.pinv + r]) * N + l];
                 return;
             }
-            for (0..t.n) |r| y[@as(usize, indices[t.pinv + r]) * N + l] = rhs[r * N + l];
-            for (0..t.n) |k| {
-                const v = y[k * N + l];
-                if (v != 0) for (indices[t.lp + k]..indices[t.lp + k + 1]) |p| {
-                    y[@as(usize, indices[t.li + p]) * N + l] -= lx[p * N + l] * v;
-                };
-            }
-            var k: usize = t.n;
-            while (k > 0) {
-                k -= 1;
-                const v = y[k * N + l] / diag[k * N + l];
-                y[k * N + l] = v;
-                if (v != 0) for (indices[t.up + k]..indices[t.up + k + 1]) |p| {
-                    y[@as(usize, indices[t.ui + p]) * N + l] -= ux[p * N + l] * v;
-                };
-            }
-            for (0..t.n) |j| out[@as(usize, indices[t.q + j]) * N + l] = y[j * N + l];
+            lk.Bodies(P).luSolve(false, t, indices, lx, ux, diag, rhs, y, out, n_lanes, l);
         }
 
         /// The complex lanes' A(ω) = G + jωC on the n x n source pattern,
@@ -268,7 +254,7 @@ pub fn positions(src_col_ptr: []const u32, out: []u32) void {
         const start = src_col_ptr[j];
         const len = src_col_ptr[j + 1] - start;
         for (start..src_col_ptr[j + 1]) |p| {
-            const top: u32 = @intCast(2 * start + p - start);
+            const top: u32 = @intCast(start + p);
             const right = 2 * nnz + top;
             out[4 * p ..][0..4].* = .{ top, top + len, right, right + len };
         }

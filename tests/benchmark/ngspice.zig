@@ -3,6 +3,7 @@
 //! `nix develop .#benchmarking`, whose flake lock pins its version.
 const std = @import("std");
 const common = @import("job.zig");
+/// The flag whose output the report header quotes as ngspice's version.
 pub const version_flag = "--version";
 
 /// A batch job writing `raw_path`. With `klu`, a deck that lacks the option

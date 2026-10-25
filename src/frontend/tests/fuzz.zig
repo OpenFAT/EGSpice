@@ -15,6 +15,9 @@ const Smith = std.testing.Smith;
 const Dialect = netlist.Dialect;
 const Netlist = netlist.Netlist;
 const Value = netlist.Value;
+/// Drives the structured generator from a seeded PRNG, so the merge gate
+/// runs generated decks without `--fuzz` (it replays only the corpus).
+const Seeded = @import("seeded.zig").Seeded;
 
 /// Generated decks stop growing past this many bytes.
 const deck_max = 1 << 14;
@@ -293,20 +296,6 @@ test "fuzz netlist.parse: decks built from cards" {
     std.testing.log_level = .err;
     try std.testing.fuzz({}, structured, .{});
 }
-
-/// The structured generator driven by a seeded PRNG, so the merge gate runs
-/// generated decks without `--fuzz` (it replays only the corpus).
-const Seeded = struct {
-    r: std.Random,
-
-    pub fn index(self: *Seeded, len: usize) usize {
-        return self.r.uintLessThan(usize, len);
-    }
-
-    pub fn eosWeightedSimple(self: *Seeded, false_weight: u64, true_weight: u64) bool {
-        return self.r.uintLessThan(u64, false_weight + true_weight) < true_weight;
-    }
-};
 
 test "netlist.parse holds every oracle on 1000 seeded generated decks" {
     std.testing.log_level = .err;

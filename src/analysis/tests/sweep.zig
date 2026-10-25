@@ -4,11 +4,13 @@
 //! each row. The helpers check against hand-computed values or a
 //! second path (materialize-then-dot for `adjointFd`, bit for bit).
 
+const std = @import("std");
+const t = std.testing;
+const root = @import("../types.zig");
+
 const DcmatchTests = struct {
     const impl = @import("../dc/dcmatch.zig");
     const pelgromSigma = impl.test_access.pelgromSigma;
-    const root = @import("../types.zig");
-    const std = @import("std");
 
     test "pelgromSigma: A_P / sqrt(W·L), unit without Pelgrom data, 0 for mfactor" {
         // 4 mV·um over 1 um^2: 4e-3 / sqrt(1e-12) = 4000.
@@ -21,54 +23,50 @@ const DcmatchTests = struct {
         };
         for (cases) |c| {
             const ref: root.ParamRef = .{ .ptr = undefined, .param_name = c.name, .index = 0, .is_instance = false, .primary = false, .pelgrom_ap = c.ap, .area_wl = c.wl };
-            try std.testing.expectApproxEqRel(c.want, pelgromSigma(ref), 1e-12);
+            try t.expectApproxEqRel(c.want, pelgromSigma(ref), 1e-12);
         }
     }
 };
 
 const SensTests = struct {
     const impl = @import("../sweep/sens.zig");
-    const std = @import("std");
-    const testing = std.testing;
 
     test "fdStep: relative to the parameter, absolute only at 0 (#85)" {
         // IS = 1e-14 steps by 1e-20, not by a 1e-12 floor that is 100 IS.
-        try testing.expectEqual(@as(f64, 1e-6 * 1e-14), impl.fdStep(1e-14));
-        try testing.expectEqual(@as(f64, 1e-6 * 1e3), impl.fdStep(-1e3));
-        try testing.expectEqual(@as(f64, 1e-12), impl.fdStep(0));
+        try t.expectEqual(@as(f64, 1e-6 * 1e-14), impl.fdStep(1e-14));
+        try t.expectEqual(@as(f64, 1e-6 * 1e3), impl.fdStep(-1e3));
+        try t.expectEqual(@as(f64, 1e-12), impl.fdStep(0));
     }
 
     test "isSensParam: a source's dc, no waveform or table entry (#154)" {
-        try testing.expect(impl.isSensParam("vsource", "dc"));
-        try testing.expect(impl.isSensParam("isource", "dc"));
-        try testing.expect(!impl.isSensParam("vsource", "acmag"));
-        try testing.expect(!impl.isSensParam("vsource", "pulse_v1"));
-        try testing.expect(!impl.isSensParam("vsource", "mfactor"));
-        try testing.expect(!impl.isSensParam("vsource", "pwl_timesZ5b0Z5d"));
-        try testing.expect(!impl.isSensParam("bsource", "coefZ5b3Z5d"));
-        try testing.expect(impl.isSensParam("gummel_poon", "VAR"));
-        try testing.expect(impl.isSensParam("resistor", "mfactor"));
+        try t.expect(impl.isSensParam("vsource", "dc"));
+        try t.expect(impl.isSensParam("isource", "dc"));
+        try t.expect(!impl.isSensParam("vsource", "acmag"));
+        try t.expect(!impl.isSensParam("vsource", "pulse_v1"));
+        try t.expect(!impl.isSensParam("vsource", "mfactor"));
+        try t.expect(!impl.isSensParam("vsource", "pwl_timesZ5b0Z5d"));
+        try t.expect(!impl.isSensParam("bsource", "coefZ5b3Z5d"));
+        try t.expect(impl.isSensParam("gummel_poon", "VAR"));
+        try t.expect(impl.isSensParam("resistor", "mfactor"));
     }
 };
 
 const TempSweepTests = struct {
     const impl = @import("../sweep/temp_sweep.zig");
     const numPoints = impl.numPoints;
-    const std = @import("std");
-    const testing = std.testing;
 
     test "temp_sweep: numPoints calculation" {
-        try testing.expectEqual(@as(u32, 166), numPoints(.{
+        try t.expectEqual(@as(u32, 166), numPoints(.{
             .t_start = -40.0,
             .t_stop = 125.0,
             .t_step = 1.0,
         }));
-        try testing.expectEqual(@as(u32, 34), numPoints(.{
+        try t.expectEqual(@as(u32, 34), numPoints(.{
             .t_start = -40.0,
             .t_stop = 125.0,
             .t_step = 5.0,
         }));
-        try testing.expectEqual(@as(u32, 1), numPoints(.{
+        try t.expectEqual(@as(u32, 1), numPoints(.{
             .t_start = 27.0,
             .t_stop = 27.0,
             .t_step = 1.0,
@@ -77,20 +75,17 @@ const TempSweepTests = struct {
 
     test "temp_sweep: numPoints edge cases" {
         // A non-positive step is one point, a descending span none.
-        try testing.expectEqual(@as(u32, 1), numPoints(.{ .t_start = 0, .t_stop = 10, .t_step = 0 }));
-        try testing.expectEqual(@as(u32, 1), numPoints(.{ .t_start = 0, .t_stop = 10, .t_step = -1 }));
-        try testing.expectEqual(@as(u32, 0), numPoints(.{ .t_start = 10, .t_stop = 0, .t_step = 1 }));
+        try t.expectEqual(@as(u32, 1), numPoints(.{ .t_start = 0, .t_stop = 10, .t_step = 0 }));
+        try t.expectEqual(@as(u32, 1), numPoints(.{ .t_start = 0, .t_stop = 10, .t_step = -1 }));
+        try t.expectEqual(@as(u32, 0), numPoints(.{ .t_start = 10, .t_stop = 0, .t_step = 1 }));
         // The exact-integer ratio that lands just under itself keeps its endpoint.
-        try testing.expectEqual(@as(u32, 131), numPoints(.{ .t_start = 0.3, .t_stop = 0.95, .t_step = 0.005 }));
+        try t.expectEqual(@as(u32, 131), numPoints(.{ .t_start = 0.3, .t_stop = 0.95, .t_step = 0.005 }));
         // A step that does not divide the span stops short of t_stop.
-        try testing.expectEqual(@as(u32, 4), numPoints(.{ .t_start = 0, .t_stop = 1, .t_step = 0.3 }));
+        try t.expectEqual(@as(u32, 4), numPoints(.{ .t_start = 0, .t_stop = 1, .t_step = 0.3 }));
     }
 };
 
 const GroupsTests = struct {
-    const std = @import("std");
-    const t = std.testing;
-    const root = @import("../types.zig");
     const Groups = @import("../dc/dcmatch.zig").Groups;
     const Variations = @import("core").query.Variations;
 
@@ -167,8 +162,6 @@ const GroupsTests = struct {
 };
 
 const XfTests = struct {
-    const std = @import("std");
-    const t = std.testing;
     const xf = @import("../dc/xf.zig");
     const XfSource = @import("core").query.XfSource;
 
@@ -271,9 +264,6 @@ const XfTests = struct {
 /// Every DC analysis on 10 V across 1 kOhm over 3 kOhm, where v(out) =
 /// 10 * R2 / (R1 + R2) = 7.5 V and each answer has a closed form.
 const DividerTests = struct {
-    const std = @import("std");
-    const t = std.testing;
-    const analysis = @import("../types.zig");
     const converger = @import("solver").converger;
     const Builder = @import("builder").Builder;
     const Library = @import("device").Library;
@@ -287,7 +277,7 @@ const DividerTests = struct {
     const lanes = @import("../sweep/lanes.zig");
     const mc = @import("../sweep/mc.zig");
     const temp_sweep = @import("../sweep/temp_sweep.zig");
-    const GROUND = analysis.GROUND;
+    const GROUND = root.GROUND;
     const gpa = t.allocator;
 
     const vin: u32 = 1;
@@ -295,30 +285,57 @@ const DividerTests = struct {
     const probes = [_]u32{out};
     const labels = [_][]const u8{"v(out)"};
 
-    fn build(lib: *const Library) !@import("device").Circuit {
-        var b = try Builder.init(gpa, lib);
-        const n_in = try b.addNode();
-        const n_out = try b.addNode();
-        try t.expectEqual(vin, n_in);
-        try t.expectEqual(out, n_out);
-        try b.addDevice(models.vsource, "", &.{ .dc = 10 }, &.{}, .{ n_in, GROUND });
-        try b.addDevice(models.resistor, "", &.{ .r = 1000 }, &.{}, .{ n_in, n_out });
-        try b.addDevice(models.resistor, "", &.{ .r = 3000 }, &.{}, .{ n_out, GROUND });
-        return b.compile();
-    }
+    /// The divider and an `x` of its size. Initialized in place: the circuit
+    /// borrows the library and the compiled pattern.
+    const Divider = struct {
+        lib: Library,
+        prepared: @import("device").Circuit,
+        ckt: root.Circuit,
+        x: []f64,
 
-    fn branchRow(ckt: *const analysis.Circuit) !u32 {
+        fn init(d: *Divider) !void {
+            d.lib = try Library.init(gpa);
+            errdefer d.lib.deinit();
+            var b = try Builder.init(gpa, &d.lib);
+            const n_in = try b.addNode();
+            const n_out = try b.addNode();
+            try t.expectEqual(vin, n_in);
+            try t.expectEqual(out, n_out);
+            try b.addDevice(models.vsource, "", &.{ .dc = 10 }, &.{}, .{ n_in, GROUND });
+            try b.addDevice(models.resistor, "", &.{ .r = 1000 }, &.{}, .{ n_in, n_out });
+            try b.addDevice(models.resistor, "", &.{ .r = 3000 }, &.{}, .{ n_out, GROUND });
+            d.prepared = try b.compile();
+            errdefer d.prepared.deinit();
+            d.ckt = try root.Circuit.instantiate(&d.prepared, gpa);
+            errdefer d.ckt.deinit();
+            d.x = try gpa.alloc(f64, d.ckt.n);
+        }
+
+        fn deinit(d: *Divider) void {
+            gpa.free(d.x);
+            d.ckt.deinit();
+            d.prepared.deinit();
+            d.lib.deinit();
+        }
+
+        /// The operating point into `x`.
+        fn solveOp(d: *Divider) !void {
+            try t.expect((try op.solve(&d.ckt, d.x, .{}, &.{}, &.{})).converged);
+        }
+    };
+
+    fn branchRow(ckt: *const root.Circuit) !u32 {
         for (ckt.current_row, 0..) |is_branch, i| if (is_branch) return @intCast(i);
         return error.TestUnexpectedResult;
     }
 
     /// The ordinal in `refs` of the parameter `name` currently at `value`.
-    fn paramIndex(refs: []const analysis.ParamRef, name: []const u8, value: f64) !u32 {
+    fn paramIndex(refs: []const root.ParamRef, name: []const u8, value: f64) !u32 {
         for (refs, 0..) |r, i| if (std.mem.eql(u8, r.param_name, name) and r.get() == value) return @intCast(i);
         return error.TestUnexpectedResult;
     }
 
-    fn ctxFor(ckt: *analysis.Circuit, x_op: []f64, results: std.mem.Allocator) !analysis.RunCtx {
+    fn ctxFor(ckt: *root.Circuit, x_op: []f64, results: std.mem.Allocator) !root.RunCtx {
         return .{
             .circuit = ckt,
             .x_op = x_op,
@@ -332,7 +349,7 @@ const DividerTests = struct {
     }
 
     /// The divider's three parameters still at their nominals.
-    fn expectNominals(ckt: *analysis.Circuit) !void {
+    fn expectNominals(ckt: *root.Circuit) !void {
         const refs = try ckt.collectParams();
         _ = try paramIndex(refs, "dc", 10);
         _ = try paramIndex(refs, "r", 1000);
@@ -340,45 +357,39 @@ const DividerTests = struct {
     }
 
     test "op: divider operating point; nodesets and a standalone op's ic do not move it" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
-        const x = try gpa.alloc(f64, ckt.n);
-        defer gpa.free(x);
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
+        const x = d.x;
 
         const guess = [_]@import("core").Ic{.{ .node = out, .value = 1 }};
         for ([_][]const @import("core").Ic{ &.{}, &guess }, [_][]const @import("core").Ic{ &.{}, &.{} }) |nodeset, ic| {
-            const r = try op.solve(&ckt, x, .{}, nodeset, ic);
+            const r = try op.solve(ckt, x, .{}, nodeset, ic);
             try t.expect(r.converged);
             try t.expectApproxEqAbs(@as(f64, 10), x[vin], 1e-9);
             try t.expectApproxEqAbs(@as(f64, 7.5), x[out], 1e-9);
         }
         // `ic` binds only a TRANOP.
-        const r = try op.solve(&ckt, x, .{}, &.{}, &guess);
+        const r = try op.solve(ckt, x, .{}, &.{}, &guess);
         try t.expect(r.converged);
         try t.expectApproxEqAbs(@as(f64, 7.5), x[out], 1e-9);
     }
 
     test "tf: gain, input and output resistance, for a voltage and a current input" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
-        const x = try gpa.alloc(f64, ckt.n);
-        defer gpa.free(x);
-        try t.expect((try op.solve(&ckt, x, .{}, &.{}, &.{})).converged);
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
+        const x = d.x;
+        try d.solveOp();
 
-        const v = try tf.solve(&ckt, x, .{ .output_node = out }, try branchRow(&ckt), gpa);
+        const v = try tf.solve(ckt, x, .{ .output_node = out }, try branchRow(ckt), gpa);
         try t.expectApproxEqRel(@as(f64, 0.75), v.gain, 1e-9);
         try t.expectApproxEqRel(@as(f64, 4000), v.input_resistance, 1e-9);
         try t.expectApproxEqRel(@as(f64, 750), v.output_resistance, 1e-9);
         // A unit current into `out`: the transimpedance and Rin are R1 || R2.
-        const i = try tf.solve(&ckt, x, .{ .output_node = out, .input_nodes = .{ GROUND, out } }, 0, gpa);
+        const i = try tf.solve(ckt, x, .{ .output_node = out, .input_nodes = .{ GROUND, out } }, 0, gpa);
         try t.expectApproxEqRel(@as(f64, 750), i.gain, 1e-9);
         try t.expectApproxEqRel(@as(f64, 750), i.input_resistance, 1e-9);
         try t.expectApproxEqRel(@as(f64, 750), i.output_resistance, 1e-9);
@@ -399,7 +410,7 @@ const DividerTests = struct {
         try b.addDevice(models.vsource, "", &.{ .dc = 1 }, &.{}, .{ n_c, GROUND });
         var prepared = try b.compile();
         defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
+        var ckt = try root.Circuit.instantiate(&prepared, gpa);
         defer ckt.deinit();
         const x = try gpa.alloc(f64, ckt.n);
         defer gpa.free(x);
@@ -420,18 +431,15 @@ const DividerTests = struct {
     }
 
     test "dcxf: forward and adjoint transfers agree; dcinc follows the AC drive" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
-        const x = try gpa.alloc(f64, ckt.n);
-        defer gpa.free(x);
-        try t.expect((try op.solve(&ckt, x, .{}, &.{}, &.{})).converged);
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
+        const x = d.x;
+        try d.solveOp();
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
-        var ctx = try ctxFor(&ckt, x, arena.allocator());
+        var ctx = try ctxFor(ckt, x, arena.allocator());
 
         const sources = [_]@import("core").query.XfSource{
             .{ .name = "V1", .branch = ctx.source_branch },
@@ -459,32 +467,29 @@ const DividerTests = struct {
     }
 
     test "sens and dcmatch: closed-form dV/dp, and the two adjoint paths agree" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
-        const x = try gpa.alloc(f64, ckt.n);
-        defer gpa.free(x);
-        try t.expect((try op.solve(&ckt, x, .{}, &.{}, &.{})).converged);
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
+        const x = d.x;
+        try d.solveOp();
 
         const refs = try ckt.collectParams();
         const i_v = try paramIndex(refs, "dc", 10);
         const i_r1 = try paramIndex(refs, "r", 1000);
         const i_r2 = try paramIndex(refs, "r", 3000);
-        const s = try sens.solve(&ckt, x, refs, out, GROUND, gpa);
+        const s = try sens.solve(ckt, x, refs, out, GROUND, gpa);
         defer gpa.free(s);
         // v = V R2 / (R1 + R2): dv/dV = 0.75, dv/dR1 = -V R2 / 4e3^2, dv/dR2 = V R1 / 4e3^2.
         try t.expectApproxEqRel(@as(f64, 0.75), s[i_v], 1e-5);
         try t.expectApproxEqRel(@as(f64, -1.875e-3), s[i_r1], 1e-5);
         try t.expectApproxEqRel(@as(f64, 6.25e-4), s[i_r2], 1e-5);
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
 
         // Without a variation block dcmatch's columns are the same dy/dp.
         const each = try dcmatch.Groups.init(gpa, refs, .{});
         defer each.deinit(gpa);
-        const m = try dcmatch.solve(&ckt, x, out, GROUND, refs, each, gpa);
+        const m = try dcmatch.solve(ckt, x, out, GROUND, refs, each, gpa);
         defer gpa.free(m.contributions);
         var total: f64 = 0;
         for (m.contributions, s) |c, want| {
@@ -506,27 +511,24 @@ const DividerTests = struct {
         };
         const grouped = try dcmatch.Groups.init(gpa, refs, vars);
         defer grouped.deinit(gpa);
-        const g = try dcmatch.solve(&ckt, x, out, GROUND, refs, grouped, gpa);
+        const g = try dcmatch.solve(ckt, x, out, GROUND, refs, grouped, gpa);
         defer gpa.free(g.contributions);
         try t.expectApproxEqRel(@as(f64, -1.875e-2), g.contributions[0].sensitivity, 1e-5);
         try t.expectApproxEqAbs(@as(f64, 0), g.contributions[1].sensitivity, 1e-8);
         try t.expectApproxEqRel(@as(f64, 1.875e-2), g.total_sigma, 1e-5);
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
     }
 
     test "dc: source sweep, nested resistor sweep and temperature sweep, circuit restored" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
-        const x = try gpa.alloc(f64, ckt.n);
-        defer gpa.free(x);
-        try t.expect((try op.solve(&ckt, x, .{}, &.{}, &.{})).converged);
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
+        const x = d.x;
+        try d.solveOp();
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
-        const ctx = try ctxFor(&ckt, x, arena.allocator());
+        const ctx = try ctxFor(ckt, x, arena.allocator());
         const refs = try ckt.collectParams();
         const r2 = refs[try paramIndex(refs, "r", 3000)];
         const source: dc.Options.SweepTarget = .{ .device = .{ .type = Library.builtin("vsource"), .index = 0, .param_name = "dc" } };
@@ -535,7 +537,7 @@ const DividerTests = struct {
         try t.expectEqual(@as(usize, 3), inner.npoints);
         try t.expectEqualStrings("v(v-sweep)", inner.varnames[0]);
         for ([_]f64{ 0, 0, 5, 3.75, 10, 7.5 }, inner.data) |want, got| try t.expectApproxEqAbs(want, got, 1e-9);
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
 
         const nested = try dc.run(&ctx, .{
             .start = 0,
@@ -547,7 +549,7 @@ const DividerTests = struct {
         });
         try t.expectEqual(@as(usize, 6), nested.npoints);
         for ([_]f64{ 0, 0, 5, 2.5, 10, 5, 0, 0, 5, 3.75, 10, 7.5 }, nested.data) |want, got| try t.expectApproxEqAbs(want, got, 1e-9);
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
 
         // Tangent rows: row 1 sets R2 to 3.3k, row 2 sets R1 to 1.1k. Each
         // block is v(out) + dv with dv = -(F(row) - F) / (g1 + g2), F the
@@ -578,7 +580,7 @@ const DividerTests = struct {
             try t.expectEqual(vs, tangents.data[(3 * k + p) * 2]);
             try t.expectApproxEqRel(want, tangents.data[(3 * k + p) * 2 + 1], 1e-12);
         };
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
         // Under an outer sweep the tangent block follows every outer level.
         const nested_tangent = try dc.run(&tctx, .{
             .start = 0,
@@ -596,7 +598,7 @@ const DividerTests = struct {
             const row = (6 + 3 * po + p) * 2;
             try t.expectApproxEqRel(Tangent.predict(vs, 1000, r2v, 1100, r2v), nested_tangent.data[row + 1], 1e-12);
         };
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
 
         const temp_c = ckt.temp_c;
         const temps = try dc.run(&ctx, .{ .start = 0, .stop = 50, .step = 25, .target = .temp });
@@ -619,7 +621,7 @@ const DividerTests = struct {
         try b.addDevice(models.capacitor, "", &.{ .c = 1e-7 }, &.{}, .{ out, GROUND });
         var prepared = try b.compile();
         defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
+        var ckt = try root.Circuit.instantiate(&prepared, gpa);
         defer ckt.deinit();
         const x = try gpa.alloc(f64, ckt.n);
         defer gpa.free(x);
@@ -642,7 +644,7 @@ const DividerTests = struct {
         try t.expectEqual(len, tangents.npoints);
         try t.expectEqualSlices(f64, plain.data, tangents.data);
         try t.expectEqual(2 * 2 * len, tangents.tangents.len);
-        for ([_]analysis.ParamRef{ refs[ri], refs[ci] }, [_]f64{ 1000.1, 1.0001e-7 }, 1..) |ref, value, k| {
+        for ([_]root.ParamRef{ refs[ri], refs[ci] }, [_]f64{ 1000.1, 1.0001e-7 }, 1..) |ref, value, k| {
             const nominal = ref.get();
             ref.set(value);
             try ckt.recompute();
@@ -665,7 +667,7 @@ const DividerTests = struct {
     }
 
     const R2Lanes = struct {
-        ref: analysis.ParamRef,
+        ref: root.ParamRef,
         values: []const f64,
         nominal: f64,
         restores: u32 = 0,
@@ -681,12 +683,10 @@ const DividerTests = struct {
     };
 
     test "solveLanes: warm and cold lanes agree with the closed form, nominals restored" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
         const refs = try ckt.collectParams();
         const values = [_]f64{ 1000, 2000, 3000 };
         var results: [values.len]converger.Result = undefined;
@@ -696,24 +696,22 @@ const DividerTests = struct {
         @memset(warm_x, 0);
         for ([_]?[]const f64{ null, warm_x }, &rows) |warm, *pass_rows| {
             var setup: R2Lanes = .{ .ref = refs[try paramIndex(refs, "r", 3000)], .values = &values, .nominal = 3000 };
-            try lanes.solveLanes(&ckt, &setup, 0, &probes, pass_rows, &results, converger.optionsFromTolerances(.{}, null), .{}, warm, gpa);
+            try lanes.solveLanes(ckt, &setup, 0, &probes, pass_rows, &results, converger.optionsFromTolerances(.{}, null), .{}, warm, gpa);
             try t.expectEqual(@as(u32, 1), setup.restores);
             for (values, results, pass_rows) |r2, r, v| {
                 try t.expect(r.converged);
                 try t.expectApproxEqRel(10 * r2 / (1000 + r2), v, 1e-9);
             }
-            try expectNominals(&ckt);
+            try expectNominals(ckt);
         }
         for (rows[0], rows[1]) |cold, warm| try t.expectApproxEqAbs(cold, warm, 1e-9);
     }
 
     test "solveLanes: a lane whose plain Newton runs out of iterations takes the ladder" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
         const refs = try ckt.collectParams();
         const values = [_]f64{ 1000, 2000 };
         var results: [values.len]converger.Result = undefined;
@@ -723,27 +721,24 @@ const DividerTests = struct {
         var one = converger.optionsFromTolerances(.{}, null);
         one.max_iter = 1;
         var setup: R2Lanes = .{ .ref = refs[try paramIndex(refs, "r", 3000)], .values = &values, .nominal = 3000 };
-        try lanes.solveLanes(&ckt, &setup, 0, &probes, &rows, &results, one, .{}, null, gpa);
+        try lanes.solveLanes(ckt, &setup, 0, &probes, &rows, &results, one, .{}, null, gpa);
         for (values, results, rows) |r2, r, v| {
             try t.expect(r.converged);
             try t.expectApproxEqRel(10 * r2 / (1000 + r2), v, 1e-9);
         }
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
     }
 
     test "mc: zero variation is the nominal; a seed reproduces its trials" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
-        const x = try gpa.alloc(f64, ckt.n);
-        defer gpa.free(x);
-        try t.expect((try op.solve(&ckt, x, .{}, &.{}, &.{})).converged);
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
+        const x = d.x;
+        try d.solveOp();
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
-        const ctx = try ctxFor(&ckt, x, arena.allocator());
+        const ctx = try ctxFor(ckt, x, arena.allocator());
 
         const flat = try mc.run(&ctx, .{ .n_trials = 4, .variation = 0 });
         try t.expectEqual(@as(usize, 4), flat.npoints);
@@ -752,7 +747,7 @@ const DividerTests = struct {
             try t.expectApproxEqAbs(@as(f64, 7.5), flat.data[2 * k + 1], 1e-9);
         }
         const first = try mc.run(&ctx, .{ .n_trials = 8, .variation = 0.05, .seed = 7 });
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
         const again = try mc.run(&ctx, .{ .n_trials = 8, .variation = 0.05, .seed = 7 });
         try t.expectEqual(@as(usize, 8), first.npoints);
         try t.expectEqualSlices(f64, first.data, again.data);
@@ -768,22 +763,19 @@ const DividerTests = struct {
             const one = try mc.run(&ctx, .{ .n_trials = 8, .variation = 0.05, .seed = 7, .lane = @intCast(k) });
             try t.expectEqualSlices(f64, &.{ 0, first.data[2 * k + 1] }, one.data);
         }
-        try expectNominals(&ckt);
+        try expectNominals(ckt);
     }
 
     test "temp_sweep: one row per temperature; the circuit's own temperature comes back" {
-        var lib = try Library.init(gpa);
-        defer lib.deinit();
-        var prepared = try build(&lib);
-        defer prepared.deinit();
-        var ckt = try analysis.Circuit.instantiate(&prepared, gpa);
-        defer ckt.deinit();
-        const x = try gpa.alloc(f64, ckt.n);
-        defer gpa.free(x);
-        try t.expect((try op.solve(&ckt, x, .{}, &.{}, &.{})).converged);
+        var d: Divider = undefined;
+        try d.init();
+        defer d.deinit();
+        const ckt = &d.ckt;
+        const x = d.x;
+        try d.solveOp();
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
-        const ctx = try ctxFor(&ckt, x, arena.allocator());
+        const ctx = try ctxFor(ckt, x, arena.allocator());
 
         const temp_c = ckt.temp_c;
         const r = try temp_sweep.run(&ctx, .{ .t_start = 0, .t_stop = 50, .t_step = 25 });

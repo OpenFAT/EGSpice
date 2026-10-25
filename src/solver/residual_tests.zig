@@ -234,6 +234,25 @@ fn perturb(r: std.Random, sys: System) void {
     };
 }
 
+/// Fills the bordered block diagonal family: each group of size `s` at κ
+/// `kappa`, node 0 a unit border, the last `ncpl` unknowns a dominant
+/// coupling block with small E/F entries, and rows permuted inside groups
+/// (odd `t`) or scaled badly (`t % 4 == 3`). Freezes `sys`.
+fn fillBbd(gpa: Allocator, r: std.Random, sys: *System, groups: []const [2]u32, kappa: f64, s: u32, ncpl: u32, t: usize) !void {
+    givensGroups(r, sys.*, groups, kappa, s);
+    if (t % 2 == 1) permuteRows(r, sys.*, groups);
+    const cs = sys.n - ncpl;
+    sys.at(0, 0).* = 1;
+    for (0..ncpl) |i| sys.at(cs + i, cs + i).* = 2 + r.float(f64);
+    for (groups) |g| for (0..g[1]) |k| {
+        const cp = cs + r.uintLessThan(u32, ncpl);
+        sys.at(g[0] + k, cp).* = 0.25 * (r.float(f64) - 0.5);
+        sys.at(cp, g[0] + k).* = 0.25 * (r.float(f64) - 0.5);
+    };
+    if (t % 4 == 3) scaleBadly(r, sys.*, 6);
+    try sys.freeze(gpa);
+}
+
 const kappas = [_]f64{ 1, 1e4, 1e8, 1e12, 1e15 };
 
 test "scaled residual: general sparse, controlled κ, pivoting, bad scaling" {
@@ -321,19 +340,8 @@ test "scaled residual: bordered block diagonal, block κ controlled" {
             g.* = .{ lo, s };
             blk.* = .{ .start = lo, .size = s };
         }
-        givensGroups(r, sys, &groups, kappa, s);
-        if (t % 2 == 1) permuteRows(r, sys, &groups);
-        const cs = 1 + nb * s;
-        sys.at(0, 0).* = 1;
-        for (0..ncpl) |i| sys.at(cs + i, cs + i).* = 2 + r.float(f64);
-        for (groups) |g| for (0..g[1]) |k| {
-            const cp = cs + r.uintLessThan(u32, ncpl);
-            sys.at(g[0] + k, cp).* = 0.25 * (r.float(f64) - 0.5);
-            sys.at(cp, g[0] + k).* = 0.25 * (r.float(f64) - 0.5);
-        };
-        if (t % 4 == 3) scaleBadly(r, sys, 6);
-        try sys.freeze(gpa);
-        const info: num.BbdInfo = .{ .blocks = &blocks, .coupling_start = cs, .coupling_size = ncpl };
+        try fillBbd(gpa, r, &sys, &groups, kappa, s, ncpl, t);
+        const info: num.BbdInfo = .{ .blocks = &blocks, .coupling_start = 1 + nb * s, .coupling_size = ncpl };
         var demoted = false;
         const may_demote = kappa > 1e8 or t % 4 == 3;
         const got = try certify(gpa, r, sys, info, .bbd, if (may_demote) &demoted else null) orelse {
@@ -366,18 +374,7 @@ test "scaled residual: block-ill-conditioned systems through the flat LU, replay
         defer sys.deinit(gpa);
         var groups: [nb][2]u32 = undefined;
         for (&groups, 0..) |*g, i| g.* = .{ 1 + @as(u32, @intCast(i)) * s, s };
-        givensGroups(r, sys, &groups, kappa, s);
-        if (t % 2 == 1) permuteRows(r, sys, &groups);
-        const cs = 1 + nb * s;
-        sys.at(0, 0).* = 1;
-        for (0..ncpl) |i| sys.at(cs + i, cs + i).* = 2 + r.float(f64);
-        for (groups) |g| for (0..g[1]) |k| {
-            const cp = cs + r.uintLessThan(u32, ncpl);
-            sys.at(g[0] + k, cp).* = 0.25 * (r.float(f64) - 0.5);
-            sys.at(cp, g[0] + k).* = 0.25 * (r.float(f64) - 0.5);
-        };
-        if (t % 4 == 3) scaleBadly(r, sys, 6);
-        try sys.freeze(gpa);
+        try fillBbd(gpa, r, &sys, &groups, kappa, s, ncpl, t);
         const got = try certify(gpa, r, sys, null, .lu, null) orelse {
             try testing.expect(kappa >= 1e15);
             continue;

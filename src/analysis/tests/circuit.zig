@@ -161,10 +161,6 @@ test "a Newton stamp seeded from the baseline equals a full stamp" {
 }
 
 test "threaded stamps equal serial" {
-    try checkThreaded();
-}
-
-fn checkThreaded() !void {
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var prepared = try ladder(&lib, 6);

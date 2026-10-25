@@ -9,6 +9,8 @@ const solver = @import("solver");
 const converger = solver.converger;
 const direct = solver.direct;
 
+/// Idle workspaces keyed by pattern identity (the template's `col_ptr`
+/// address) and knobs; thread-safe. Linear `take`: it holds at most `cap`.
 pub const WsPool = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -49,6 +51,8 @@ pub const WsPool = struct {
         self.idle.appendAssumeCapacity(.{ .key = key, .newton = newton, .lu = lu, .ws = w });
     }
 
+    /// Frees every idle workspace. Workspaces taken and not given back are
+    /// their holders' to free.
     pub fn deinit(self: *WsPool) void {
         for (self.idle.items) |*e| e.ws.deinit(self.gpa);
         self.idle.deinit(self.gpa);

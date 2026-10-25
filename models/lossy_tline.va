@@ -54,6 +54,10 @@
 //
 // The `.model ltra` keywords are declared for card compatibility; only the
 // step-limit flags act. Noise: none (ngspice has no ltranoise.c).
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module lossy_tline(p1, n1, p2, n2);
     inout p1, n1, p2, n2;
     electrical p1, n1, p2, n2;

@@ -2,8 +2,7 @@
 //! recurrence, the companion step's Newton hook and the CKTterr LTE bound.
 //! tran.zig drives them per step; envelope and pss reuse the hook, and
 //! tran_noise the companion kernel.
-//! Cites ngspice nicomcof.c, niinteg.c, cktterr.c and dctran.c;
-//! dev/analysis/transient-integration.md.
+//! Cites ngspice nicomcof.c, niinteg.c, cktterr.c and dctran.c.
 const std = @import("std");
 const Method = @import("types.zig").Method;
 const num = @import("core").numerics;

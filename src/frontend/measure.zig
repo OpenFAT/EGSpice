@@ -349,7 +349,6 @@ pub fn parseCheck(arena: std.mem.Allocator, card: []const u8, text: []const u8, 
     const w = try words(arena, text);
     if (w.len == 0) return error.ParseError;
     var m: core.Measure = .{ .analysis = .tran, .name = "", .func = .check_slew, .first = .{}, .second = .{} };
-    var nodes = w;
     if (std.mem.eql(u8, card, "biaschk")) {
         // `'expr' [limit=] [max=] [min=] [simulation=tr] [tstart=] [tstop=] ...`
         if (w[0].lhs[0] != '\'' and w[0].lhs[0] != '"') return error.ParseError;
@@ -422,7 +421,7 @@ pub fn parseCheck(arena: std.mem.Allocator, card: []const u8, text: []const u8, 
     const Kind_ = enum { global_level, rise, fall, slew, setup, hold, edge, irdrop };
     const kind = std.meta.stringToEnum(Kind_, w[0].lhs) orelse return error.ParseError;
     const spec = try groupWords(arena, w[1].lhs);
-    nodes = w[2..];
+    var nodes = w[2..];
     var levels = global.*;
     if (nodes.len > 0 and nodes[nodes.len - 1].lhs[0] == '(') {
         levels = try parseLevels(arena, nodes[nodes.len - 1].lhs, ctx);
@@ -520,21 +519,24 @@ fn parseLevels(arena: std.mem.Allocator, group: []const u8, ctx: anytype) !Level
     return .{ .lo = th[1], .hi = th[0] };
 }
 
+/// Numbers by `std.fmt.parseFloat`, one stand-in expression, and every
+/// `.option` at 0.5.
+const Ctx = struct {
+    fn measureValue(_: Ctx, t: []const u8) !f64 {
+        return std.fmt.parseFloat(f64, t) catch error.ParseError;
+    }
+    fn measureExpr(_: Ctx, _: []const u8) ![]const core.MeasureOp {
+        return &.{.{ .measure = 0 }};
+    }
+    fn measureOption(_: Ctx, _: []const u8) ?f64 {
+        return 0.5;
+    }
+};
+
 test "meas cards parse like ngspice's word lists" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const Ctx = struct {
-        fn measureValue(_: @This(), t: []const u8) !f64 {
-            return std.fmt.parseFloat(f64, t) catch error.ParseError;
-        }
-        fn measureExpr(_: @This(), _: []const u8) ![]const core.MeasureOp {
-            return &.{.{ .measure = 0 }};
-        }
-        fn measureOption(_: @This(), _: []const u8) ?f64 {
-            return 0.5;
-        }
-    };
     const t = try parse(a, "tran tpd trig v(in) val = 0.9 rise=1 targ v(out) val= 0.9 fall =last td=1e-9", Ctx{}, null, false);
     try std.testing.expectEqual(.trig_targ, t.func);
     try std.testing.expectEqualStrings("v(out)", t.second.vec);
@@ -630,17 +632,6 @@ test "malformed measure cards are a ParseError, not a crash" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const Ctx = struct {
-        fn measureValue(_: @This(), t: []const u8) !f64 {
-            return std.fmt.parseFloat(f64, t) catch error.ParseError;
-        }
-        fn measureExpr(_: @This(), _: []const u8) ![]const core.MeasureOp {
-            return &.{.{ .measure = 0 }};
-        }
-        fn measureOption(_: @This(), _: []const u8) ?f64 {
-            return null;
-        }
-    };
     for ([_][]const u8{
         "",                              "tran",                        "=x y z",
         "tran x",                        "tran x find",                 "tran x find v(a) at",

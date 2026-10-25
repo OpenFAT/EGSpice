@@ -31,6 +31,10 @@
 //
 // Card keyword `abs` is a reserved word (LRM §4.3), so it is `brkabs` here and
 // needs a host alias, as in models/lossy_tline.va.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module ltra(p1, n1, p2, n2);
     inout p1, n1, p2, n2;
     electrical p1, n1, p2, n2;

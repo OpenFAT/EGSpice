@@ -1,3 +1,0 @@
-// A misspelled control keyword after the name is a no-node instance:
-// `chekc` is the master and `what=inst` a parameter.
-MyChk chekc what=inst

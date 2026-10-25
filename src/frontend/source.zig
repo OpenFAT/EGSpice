@@ -448,8 +448,9 @@ fn word(fields: *Fields) !?[]const u8 {
     return if (Fields.isWord(f)) f else error.InvalidInclude;
 }
 
-/// What a non-netlist file a deck names holds: an HDL module, or `data`
-/// that a card reads (an HSPICE RLGC or Touchstone file).
+/// What a non-netlist file a deck names holds: a compiled OSDI model
+/// (`osdi_include`, `pre_osdi`), HDL source (`verilog_a`, `verilog`), or
+/// `data` that a card reads (an HSPICE RLGC or Touchstone file).
 pub const ForeignKind = enum { osdi_include, pre_osdi, verilog_a, verilog, data };
 
 /// The HDL kind a path's extension names; null for a netlist include.

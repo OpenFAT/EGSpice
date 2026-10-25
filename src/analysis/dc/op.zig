@@ -11,6 +11,7 @@ const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
 const tran = @import("../tran/tran.zig");
+const gpu_lanes = @import("../gpu/lanes.zig");
 
 /// Query options, defined in core/query.zig.
 pub const Options = @import("core").query.Op;
@@ -52,9 +53,7 @@ pub fn solve(
     // power-on state from `ic` here, before any @(cross) can move it.
     // computeBaseline() evaluates const-Jacobian batches, so the state has to
     // be in place first.
-    ckt.setSimState(.{ .kind = if (options.tran_op) .ic else .dc, .initial_step = true });
-    if (!options.warm_start) coldStart(ckt, x);
-    try ckt.computeBaseline();
+    try beginSolve(ckt, x, options);
 
     const ws = try ckt.workspace();
     const gpa = ws.slv.gpa;
@@ -71,12 +70,24 @@ pub fn solve(
         } else force.appendAssumeCapacity(.{ .slot = ckt.diag_slots[ns.node], .row = ns.node, .value = ns.value });
     }
     const r = try nodesetLadder(ckt, ws, x, options, force.items, held.len);
-    // Commit device state so later analyses start from the accepted state.
-    if (r.converged) _ = ckt.stateCtl(.commit);
-    // Every later eval at this point (ac, tf, noise, post-processing) is not
-    // an initial step and must not re-latch.
-    ckt.setSimState(.{ .kind = if (options.tran_op) .ic else .dc });
+    endSolve(ckt, r.converged, options);
     return r;
+}
+
+/// `solve`'s setup: the static simulation state of the first step, the
+/// cold start unless `options.warm_start`, then the const-Jacobian baseline.
+fn beginSolve(ckt: *root.Circuit, x: []f64, options: Options) !void {
+    ckt.setSimState(.{ .kind = if (options.tran_op) .ic else .dc, .initial_step = true });
+    if (!options.warm_start) coldStart(ckt, x);
+    try ckt.computeBaseline();
+}
+
+/// `solve`'s close: commits the device state of a converged point so later
+/// analyses start from it, and leaves the initial step, since every later
+/// eval at this point (ac, tf, noise, post-processing) must not re-latch.
+fn endSolve(ckt: *root.Circuit, converged: bool, options: Options) void {
+    if (converged) _ = ckt.stateCtl(.commit);
+    ckt.setSimState(.{ .kind = if (options.tran_op) .ic else .dc });
 }
 
 /// The `.nodeset` step, then the ladder holding the first `n_hold` rows of
@@ -371,8 +382,9 @@ fn sourcesOffGmin(ckt: *root.Circuit, ws: *converger.Workspace, x: []f64, option
 /// a false success (stress/scaling_inverter_chain_4k). Under
 /// `needs_tran_op` with no holds, the settled state supplies the
 /// capacitor-only nodes, which that Newton holds there (`floatingHolds`).
-/// ngspice 44.2 runs this rung only when `optran` is given (cktop.c:94-97). The transient commits device state at every step, so it
-/// runs between a save and a restore: only `x` leaves it, and no timer,
+/// ngspice 44.2 runs this rung only when `optran` is given (cktop.c:94-97).
+/// The transient commits device state at every step, so it runs between a
+/// save and a restore: only `x` leaves it, and no timer,
 /// event or delay history runs ahead of the operating point's t = 0.
 fn transientOp(ckt: *root.Circuit, ws: *converger.Workspace, x: []f64, options: Options, hold: []const converger.Force) !converger.Result {
     const opa = ws.slv.gpa;
@@ -496,9 +508,7 @@ pub fn solveLanes(
     std.debug.assert(g >= 1 and g <= W and xs.len == g and out.len == g);
     const c0 = ckts[0];
     const held = if (options.tran_op) ic else &.{};
-    const pin = c0.knobs.newton.pin;
-    const laned = W > 1 and g > 1 and nodeset.len == 0 and !(c0.needs_tran_op and held.len == 0) and
-        (pin == .auto or pin == .direct) and !root.Circuit.certify;
+    const laned = W > 1 and g > 1 and nodeset.len == 0 and !(c0.needs_tran_op and held.len == 0) and lanesAllowed(c0);
     if (!laned) {
         for (ckts, xs, out) |c, x, *o| o.* = solve(c, x, options, nodeset, ic);
         return;
@@ -512,9 +522,7 @@ pub fn solveLanes(
     for (&lanes, &wss, 0..) |*c, *w, l| {
         c.* = ckts[if (l < g) l else 0];
         if (l < g) {
-            c.*.setSimState(.{ .kind = if (options.tran_op) .ic else .dc, .initial_step = true });
-            if (!options.warm_start) coldStart(c.*, xs[l]);
-            try c.*.computeBaseline();
+            try beginSolve(c.*, xs[l], options);
             w.* = try c.*.workspace();
         } else w.* = wss[0];
     }
@@ -548,15 +556,21 @@ pub fn solveLanes(
             o.* = e;
             continue;
         };
-        // As `solve` ends.
-        if (r.converged) _ = c.stateCtl(.commit);
-        c.setSimState(.{ .kind = if (options.tran_op) .ic else .dc });
+        endSolve(c, r.converged, options);
         o.* = r;
     }
 }
 
 /// One lane's `solve` outcome.
 pub const LaneOutcome = root.ErrorOf(solve)!converger.Result;
+
+/// Whether `c`'s Newton may run W lanes wide: a JFNK pin and `-Dcertify`
+/// both need each lane's own scalar `converger.run`. Shared by every
+/// lane-batched analysis (`.op`, `.dc`, the sweep lanes).
+pub fn lanesAllowed(c: *const root.Circuit) bool {
+    const pin = c.knobs.newton.pin;
+    return (pin == .auto or pin == .direct) and !root.Circuit.certify;
+}
 
 /// `solveLanes` for any number of lanes with every lane's plain rung on the
 /// GPU (06 6.9): one device Newton from INITFIX, as `solve` runs it; a lane
@@ -575,15 +589,13 @@ pub fn solveGpuLanes(
     ic: []const Ic,
     out: []LaneOutcome,
 ) !void {
-    const gpu_lanes = @import("../gpu/lanes.zig");
     std.debug.assert(xs.len == ckts.len and out.len == ckts.len);
     if (ckts.len == 0) return;
     const c0 = ckts[0];
     const held = if (options.tran_op) ic else &.{};
-    const pin = c0.knobs.newton.pin;
     const why: ?[]const u8 = if (ckts.len < 2 or nodeset.len != 0 or held.len != 0 or c0.needs_tran_op)
         "nodesets, holds or a floating start"
-    else if (!(pin == .auto or pin == .direct) or root.Circuit.certify)
+    else if (!lanesAllowed(c0))
         "a JFNK pin or certify"
     else
         gpu_lanes.staticRefusal(c0);
@@ -603,13 +615,8 @@ pub fn solveGpuLanes(
 /// `solveGpuLanes`' device half. Fails before any lane's outcome is set
 /// (a driver error or `GpuLanes` refusal) or with out of memory.
 fn solveOnDevice(ckts: []const *root.Circuit, xs: []const []f64, options: Options, out: []LaneOutcome) !void {
-    const gpu_lanes = @import("../gpu/lanes.zig");
     const gpa = ckts[0].gpa;
-    for (ckts, xs) |c, x| {
-        c.setSimState(.{ .kind = if (options.tran_op) .ic else .dc, .initial_step = true });
-        if (!options.warm_start) coldStart(c, x);
-        try c.computeBaseline();
-    }
+    for (ckts, xs) |c, x| try beginSolve(c, x, options);
     const res = try gpa.alloc(gpu_lanes.LaneNewton, ckts.len);
     defer gpa.free(res);
     {
@@ -632,11 +639,7 @@ fn solveOnDevice(ckts: []const *root.Circuit, xs: []const []f64, options: Option
             if (plain == null or !plain.?.converged) c.evalNewton(x, 0);
             break :blk afterPlain(c, ws, x, options, &.{}, plain);
         };
-        // As `solve` ends.
-        if (o.*) |rr| {
-            if (rr.converged) _ = c.stateCtl(.commit);
-        } else |_| {}
-        c.setSimState(.{ .kind = if (options.tran_op) .ic else .dc });
+        endSolve(c, if (o.*) |rr| rr.converged else |_| false, options);
     }
 }
 

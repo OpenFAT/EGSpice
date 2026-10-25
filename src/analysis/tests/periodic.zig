@@ -436,7 +436,7 @@ const MhbTests = struct {
         try testing.expect(!has(spec, 3800)); // 5·500 + 1300, order 3 + 1
     }
 
-    test "mhb spectrum: every allocation failure frees what it made (#202)" {
+    test "mhb spectrum: commensurate products merge onto the lowest order, and every allocation failure frees what it made (#202)" {
         // Two tones with commensurate products, so lines merge and the
         // tables are smaller than the candidate list.
         const run = struct {
@@ -445,6 +445,9 @@ const MhbTests = struct {
                 defer spec.deinit(gpa);
                 try testing.expectEqual(@as(usize, 7), spec.freqs.len);
                 try testing.expectEqual(@as(usize, 14), spec.mix.len);
+                for (spec.freqs, 0..) |hz, j| try testing.expectEqual(1000 * @as(f64, @floatFromInt(j)), hz);
+                // 2 kHz is tone 2 itself, not 2·f1 or the order-5 2·f2 - f1 - ...
+                try testing.expectEqualSlices(i16, &.{ 0, 1 }, spec.mix[4..6]);
             }
         }.f;
         try testing.checkAllAllocationFailures(testing.allocator, run, .{});
@@ -465,16 +468,6 @@ const MhbTests = struct {
         // A harmonic list that does not match the tones is refused before the spectrum.
         try testing.expectError(error.InvalidQueryOptions, impl.lineCount(a, .{ .f0 = 1e3, .extra_tones = &.{1300}, .extra_harmonics = &.{} }));
         try testing.expectEqual(@as(usize, 5), try impl.lineCount(a, .{ .f0 = 1e3, .n_harmonics = 1, .extra_tones = &.{1300}, .extra_harmonics = &.{1} }));
-    }
-
-    test "mhb spectrum: commensurate products merge onto the lowest order" {
-        const a = testing.allocator;
-        const spec = try impl.spectrum(a, &.{ 1000, 2000 }, &.{ 2, 2 }, 0, 1);
-        defer spec.deinit(a);
-        try testing.expectEqual(@as(usize, 7), spec.freqs.len);
-        for (spec.freqs, 0..) |f, j| try testing.expectEqual(1000 * @as(f64, @floatFromInt(j)), f);
-        // 2 kHz is tone 2 itself, not 2·f1 or the order-5 2·f2 - f1 - ...
-        try testing.expectEqualSlices(i16, &.{ 0, 1 }, spec.mix[4..6]);
     }
 
     test "mhb transform: the APFT inverts its own instants, one tone projects" {

@@ -33,14 +33,9 @@ pub fn writeHeader(w: *Io.Writer, plot: Plot) !void {
 /// numbered `first`: what `encode` writes after the header.
 pub fn writeRows(w: *Io.Writer, stride: usize, first: usize, rows: []const f64) !void {
     assert(rows.len % stride == 0);
-    var pt = first;
-    var at: usize = 0;
-    while (at < rows.len) : ({
-        at += stride;
-        pt += 1;
-    }) {
-        try w.print("{d}", .{pt});
-        for (rows[at..][0..stride]) |x| try w.print("\t{e}", .{x});
+    for (0..rows.len / stride) |k| {
+        try w.print("{d}", .{first + k});
+        for (rows[k * stride ..][0..stride]) |x| try w.print("\t{e}", .{x});
         try w.writeByte('\n');
     }
 }

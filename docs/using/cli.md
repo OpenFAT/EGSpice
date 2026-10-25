@@ -226,7 +226,7 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
 : Accepted for ngspice compatibility. ESPice always runs in batch mode.
 
 `-v`, `--version`
-: Print `espice 1.2.0 (VerA 0.12.1 <commit>; backends: cpu, cuda)`: the
+: Print `espice 0.3.0 (VerA 0.12.1 <commit>; backends: cpu, cuda)`: the
   VerA version and commit the binary was built with, and the backends
   compiled in.
 

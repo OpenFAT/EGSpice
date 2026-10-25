@@ -31,13 +31,7 @@ const passes = @import("measure").passes;
 const lane_color = @import("lane_color.zig");
 const hdl = @import("hdl.zig");
 const devices = @import("devices.zig");
-const artifacts = @import("gompute_kernels");
-const backend: ?gompute.Backend = if (artifacts.has_cuda)
-    .cuda
-else if (artifacts.has_hip)
-    .hip
-else
-    null;
+const backend = devices.backend;
 
 /// This binary carries kernel images; whether they include the lane
 /// kernels is found when `init` loads them.
@@ -49,9 +43,6 @@ pub const test_access = if (@import("builtin").is_test) struct {
     pub var admitted = std.atomic.Value(usize).init(0);
     /// Colour every batch whatever the card (`colorPolicy`).
     pub var force_color = false;
-    /// What `share` answers in tests: the hardware tests count every point
-    /// onto the device.
-    pub var share: f64 = 1;
     /// What `staticPolicy` answers in tests.
     pub var static = false;
     /// Measure on the host under device step control, the oracle of the
@@ -82,16 +73,18 @@ pub fn policy(config: anytype) bool {
     return switch (config.backend) {
         .cpu => false,
         .cuda, .hip => available,
-        .auto => available and fp64RatioAtMost(4),
+        // An unknown ratio (HIP, no driver) keeps the CPU.
+        .auto => available and (fp64Ratio() orelse return false) <= 4,
     };
 }
 
 /// `Config.gpu_share` for a Problem whose transients batch as GPU lanes,
 /// with `cpus` host threads beside the cards: the cards' work over all of
 /// it, each counted in host cores (`devices.table`). 1 (the devices keep
-/// every point) when no device reports its FP64 ratio.
+/// every point) when no device reports its FP64 ratio, and in tests, so the
+/// hardware tests count every point onto the device.
 pub fn share(cpus: usize) f64 {
-    if (@import("builtin").is_test) return test_access.share;
+    if (@import("builtin").is_test) return 1;
     const cards = devices.totalCap() orelse return 1;
     return cards / (cards + @as(f64, @floatFromInt(@max(cpus, 1))));
 }
@@ -124,12 +117,6 @@ fn fp64Ratio() ?u32 {
     var compute = gompute.runtime.dynamic.Compute.init(null) catch return null;
     defer compute.deinit();
     return compute.fp64Ratio() catch null;
-}
-
-/// The device's FP64:FP32 ratio is at most `r`. Unknown (HIP, or no
-/// driver) counts as false.
-fn fp64RatioAtMost(r: u32) bool {
-    return (fp64Ratio() orelse return false) <= r;
 }
 
 /// `arp_l<what>_<model>` for the batch whose eval kernel is
@@ -250,6 +237,23 @@ const LaneBatch = struct {
         self.eval.deinit();
     }
 };
+
+/// Whether `c` shares `c0`'s unknowns, sparse pattern and batch count, so
+/// both can be lanes of one device batch.
+fn samePattern(c: *const Circuit, c0: *const Circuit) bool {
+    return c.n == c0.n and c.nnz == c0.nnz and c.batches.len == c0.batches.len and
+        std.mem.eql(u32, c.col_ptr, c0.col_ptr) and std.mem.eql(u32, c.row_idx, c0.row_idx);
+}
+
+/// Whether batch payload `p` packs beside `p0`: the same kernel, row sizes
+/// and scatter tapes (`pack` asserts the tapes).
+fn sameRows(p: device_ir.GpuPayload, p0: device_ir.GpuPayload) bool {
+    return p.count == p0.count and p.n_u == p0.n_u and
+        p.instances.len == p0.instances.len and p.states.len == p0.states.len and
+        p.lim_x.len == p0.lim_x.len and std.mem.eql(u8, p.kernel, p0.kernel) and
+        std.mem.eql(u32, p.gath, p0.gath) and std.mem.eql(u32, p.rhs_idx, p0.rhs_idx) and
+        std.mem.eql(u32, p.slots, p0.slots);
+}
 
 /// Lane-major rows of one batch over every lane.
 const Packed = struct {
@@ -387,9 +391,11 @@ pub const Prof = struct {
     drain_ns: u64 = 0,
     last: u64 = 0,
 
+    /// The `ns` slot `lap` charges.
     pub const Phase = enum(u3) { host, predict, newton, probe, apply };
-    pub const TickPhase = enum(u3) { eval, assemble, lu, gates, state };
+    const TickPhase = enum(u3) { eval, assemble, lu, gates, state };
 
+    /// Monotonic nanoseconds; 0 off Linux, where the stats read zero.
     pub fn now() u64 {
         if (comptime @import("builtin").os.tag != .linux) return 0;
         var ts: std.os.linux.timespec = undefined;
@@ -559,7 +565,7 @@ pub const GpuLanes = struct {
     graph_a: ?GraphExec = null,
     graph_b: ?GraphExec = null,
     graph_opts: ?lk.NewtonOpts = null,
-    /// One device-controlled round with unrolled ticks (`captureRound`).
+    /// One device-controlled round with unrolled ticks (`roundKernels`).
     graph_round: ?GraphExec = null,
     /// Entries `d_lx`/`d_ux` hold per lane; a `retape` past them regrows.
     lx_cap: u32 = 0,
@@ -570,7 +576,6 @@ pub const GpuLanes = struct {
     dense_slots: u32 = 0,
     /// `initSteps` ran: rounds go through `deviceLaunch`.
     device_step: bool = false,
-    peel_lane: [1]u32 = .{0},
     /// Lanes `d_peel_idx`/`d_peel` hold.
     peel_cap: u32 = 0,
     /// Staging cells past the slots and rows of the planes, for the hub
@@ -616,19 +621,11 @@ pub const GpuLanes = struct {
         const n_probes: usize = probes.len;
 
         for (ckts) |c| {
-            if (c.n != c0.n or c.nnz != c0.nnz or c.batches.len != c0.batches.len or
-                !std.mem.eql(u32, c.col_ptr, c0.col_ptr) or !std.mem.eql(u32, c.row_idx, c0.row_idx))
-                return Error.IncompatibleLanes;
+            if (!samePattern(c, c0)) return Error.IncompatibleLanes;
             for (c.batches, c0.batches) |b, b0| {
                 const payload = b.hooks.gpu_payload orelse return Error.NoLaneImage;
                 const payload0 = b0.hooks.gpu_payload orelse return Error.NoLaneImage;
-                const p = payload(b.ctx);
-                const p0 = payload0(b0.ctx);
-                if (p.count != p0.count or p.n_u != p0.n_u or
-                    p.instances.len != p0.instances.len or p.states.len != p0.states.len or
-                    p.lim_x.len != p0.lim_x.len or !std.mem.eql(u8, p.kernel, p0.kernel) or
-                    !std.mem.eql(u32, p.gath, p0.gath) or !std.mem.eql(u32, p.rhs_idx, p0.rhs_idx) or
-                    !std.mem.eql(u32, p.slots, p0.slots)) return Error.IncompatibleLanes;
+                if (!sameRows(payload(b.ctx), payload0(b0.ctx))) return Error.IncompatibleLanes;
             }
         }
 
@@ -682,6 +679,17 @@ pub const GpuLanes = struct {
             if (b0.has_charge) chg = try hdl.kernel(backend.?, @ptrCast(b0.hooks.gpu_payload.?), laneName(&name, p0.kernel, "chg").?);
             const pk = try pack(gpa, ps);
             defer pk.deinit(gpa);
+            // Uploaded one at a time so a failure frees the ones already made.
+            const srcs = [_][]const u8{ pk.models, std.mem.sliceAsBytes(pk.model_of), pk.instances, pk.states, std.mem.sliceAsBytes(pk.lim), std.mem.sliceAsBytes(p0.gath), std.mem.sliceAsBytes(p0.rhs_idx), std.mem.sliceAsBytes(p0.slots) };
+            var d: [srcs.len + 1]Buffer = undefined;
+            var n_d: usize = 0;
+            errdefer for (d[0..n_d]) |*x| x.free();
+            for (srcs) |s| {
+                d[n_d] = try upload(k0, s);
+                n_d += 1;
+            }
+            d[n_d] = try zeros(k0, N * 4);
+            n_d += 1;
             batches[bi] = .{
                 .eval = eval,
                 .lim = lim,
@@ -692,15 +700,15 @@ pub const GpuLanes = struct {
                 .tape_off = tape_off,
                 .inst_size = if (p0.count == 0) 0 else p0.instances.len / p0.count,
                 .state_size = if (p0.count == 0) 0 else p0.states.len / p0.count,
-                .d_models = try upload(k0, pk.models),
-                .d_model_of = try upload(k0, std.mem.sliceAsBytes(pk.model_of)),
-                .d_instances = try upload(k0, pk.instances),
-                .d_states = try upload(k0, pk.states),
-                .d_lim = try upload(k0, std.mem.sliceAsBytes(pk.lim)),
-                .d_gath = try upload(k0, std.mem.sliceAsBytes(p0.gath)),
-                .d_rhs_idx = try upload(k0, std.mem.sliceAsBytes(p0.rhs_idx)),
-                .d_slots = try upload(k0, std.mem.sliceAsBytes(p0.slots)),
-                .d_limw = try zeros(k0, N * 4),
+                .d_models = d[0],
+                .d_model_of = d[1],
+                .d_instances = d[2],
+                .d_states = d[3],
+                .d_lim = d[4],
+                .d_gath = d[5],
+                .d_rhs_idx = d[6],
+                .d_slots = d[7],
+                .d_limw = d[8],
             };
             tape_off += tape_len;
             n_up += 1;
@@ -1241,9 +1249,7 @@ pub const GpuLanes = struct {
         return buf;
     }
 
-    fn arg(p: anytype) gompute.interface.Arg {
-        return gompute.interface.arg(p);
-    }
+    const arg = gompute.interface.arg;
 
     /// Launches `k` over `threads` threads at the lane block width.
     fn launch(self: *Self, k: *Raw, threads: usize, args: []const gompute.interface.Arg) !void {
@@ -1336,18 +1342,18 @@ pub const GpuLanes = struct {
                 var off: u64 = lo;
                 var n_ids: u64 = hi - lo;
                 try self.launch(&b.eval, (hi - lo) * N, &.{
-                    arg(&nl),              arg(&count),            self.d_sims.argPtr(),  mask.argPtr(),             b.d_limw.argPtr(),
-                    x.argPtr(),            b.d_gath.argPtr(),      col.d_rows.argPtr(),   col.d_slots.argPtr(),      b.d_models.argPtr(),
-                    b.d_model_of.argPtr(), b.d_instances.argPtr(), self.d_g.argPtr(),     self.d_c.argPtr(),         self.d_rhs.argPtr(),
-                    self.d_q.argPtr(),     b.d_lim.argPtr(),       col.d_order.argPtr(),  arg(&off),                 arg(&n_ids),
+                    arg(&nl),              arg(&count),            self.d_sims.argPtr(), mask.argPtr(),        b.d_limw.argPtr(),
+                    x.argPtr(),            b.d_gath.argPtr(),      col.d_rows.argPtr(),  col.d_slots.argPtr(), b.d_models.argPtr(),
+                    b.d_model_of.argPtr(), b.d_instances.argPtr(), self.d_g.argPtr(),    self.d_c.argPtr(),    self.d_rhs.argPtr(),
+                    self.d_q.argPtr(),     b.d_lim.argPtr(),       col.d_order.argPtr(), arg(&off),            arg(&n_ids),
                 });
             }
             inline for (.{ .{ "slot_hubs", "d_g", "d_c" }, .{ "row_hubs", "d_rhs", "d_q" } }) |h| {
                 const hubs = &@field(col, h[0]);
                 var n_hubs: u64 = hubs.n;
                 try self.launch(&self.k.hub_reduce, hubs.n * N, &.{
-                    arg(&nl),                   arg(&n_hubs),                  mask.argPtr(),            hubs.d_cells.argPtr(), hubs.d_starts.argPtr(),
-                    hubs.d_entries.argPtr(),    @field(self, h[1]).argPtr(),   @field(self, h[2]).argPtr(),
+                    arg(&nl),                arg(&n_hubs),                mask.argPtr(),               hubs.d_cells.argPtr(), hubs.d_starts.argPtr(),
+                    hubs.d_entries.argPtr(), @field(self, h[1]).argPtr(), @field(self, h[2]).argPtr(),
                 });
             }
         }
@@ -1361,18 +1367,17 @@ pub const GpuLanes = struct {
     }
 
     fn clearGraphs(self: *Self) void {
-        if (self.graph_a) |*g| g.deinit();
-        if (self.graph_b) |*g| g.deinit();
-        if (self.graph_round) |*g| g.deinit();
-        self.graph_a = null;
-        self.graph_b = null;
-        self.graph_round = null;
+        inline for (.{ "graph_a", "graph_b", "graph_round" }) |f| if (@field(self, f)) |*g| {
+            g.deinit();
+            @field(self, f) = null;
+        };
     }
 
-    /// Capture on a temporary nonblocking stream, then replay on the normal
-    /// blocking stream. Keeping that execution stream preserves ordering
-    /// with the existing synchronous uploads/downloads on the NULL stream.
-    fn captureTick(self: *Self, comptime linear: bool, opts: lk.NewtonOpts) !GraphExec {
+    /// `body(self, args...)` captured as a graph. Capture on a temporary
+    /// nonblocking stream, then replay on the normal blocking stream.
+    /// Keeping that execution stream preserves ordering with the existing
+    /// synchronous uploads/downloads on the NULL stream.
+    fn capture(self: *Self, comptime body: anytype, args: anytype) !GraphExec {
         var capture_stream = try self.k.refactor.createStreamNonBlocking();
         defer capture_stream.deinit();
         std.mem.swap(Stream, &self.stream, &capture_stream);
@@ -1387,7 +1392,7 @@ pub const GpuLanes = struct {
                 graph.deinit();
             } else |_| {}
         };
-        if (linear) try self.linearTick(opts) else try self.updateTick(opts);
+        try @call(.auto, body, .{self} ++ args);
         const ended = self.stream.endCapture();
         capturing = false;
         var graph = try ended;
@@ -1397,9 +1402,9 @@ pub const GpuLanes = struct {
 
     fn createGraphs(self: *Self, opts: lk.NewtonOpts) !void {
         try self.stream.synchronize();
-        var a = try self.captureTick(true, opts);
+        var a = try self.capture(linearTick, .{opts});
         errdefer a.deinit();
-        const b = try self.captureTick(false, opts);
+        const b = try self.capture(updateTick, .{opts});
         self.graph_a = a;
         self.graph_b = b;
     }
@@ -1466,10 +1471,10 @@ pub const GpuLanes = struct {
             try self.d_over.fillAsync(0, 4, &self.stream);
             var slots: u64 = self.dense_slots;
             try self.launch(&self.k.peel_dense, N, &.{
-                arg(&nl),               arg(&nn),               self.d_col_ptr.argPtr(), self.d_row_idx.argPtr(),   self.d_active.argPtr(),
-                self.d_fail.argPtr(),   self.d_a.argPtr(),      self.d_rhs.argPtr(),     self.d_dx.argPtr(),        self.d_dense.argPtr(),
-                arg(&slots),            self.d_slot_next.argPtr(), self.d_over.argPtr(), self.d_first.argPtr(),
-                self.d_seen.argPtr(),   self.d_seen_lo.argPtr(),
+                arg(&nl),                arg(&nn),                  self.d_col_ptr.argPtr(), self.d_row_idx.argPtr(), self.d_active.argPtr(),
+                self.d_fail.argPtr(),    self.d_a.argPtr(),         self.d_rhs.argPtr(),     self.d_dx.argPtr(),      self.d_dense.argPtr(),
+                arg(&slots),             self.d_slot_next.argPtr(), self.d_over.argPtr(),    self.d_first.argPtr(),   self.d_seen.argPtr(),
+                self.d_seen_lo.argPtr(),
             });
         }
         try self.tickLap(&mark, .lu);
@@ -1483,14 +1488,15 @@ pub const GpuLanes = struct {
         var nopts = opts;
         var mark = Prof.now();
         try self.launch(&self.k.update, N, &.{
-            arg(&nl),            arg(&nn),             arg(&nopts),       self.d_active.argPtr(), self.d_gate.argPtr(),
-            self.d_x.argPtr(),   self.d_dx.argPtr(),   self.d_x_old.argPtr(), self.d_cur_row.argPtr(), self.d_rhs.argPtr(),
-            self.d_a.argPtr(),   self.d_diag.argPtr(), self.d_flags.argPtr(),
+            arg(&nl),          arg(&nn),             arg(&nopts),           self.d_active.argPtr(),  self.d_gate.argPtr(),
+            self.d_x.argPtr(), self.d_dx.argPtr(),   self.d_x_old.argPtr(), self.d_cur_row.argPtr(), self.d_rhs.argPtr(),
+            self.d_a.argPtr(), self.d_diag.argPtr(), self.d_flags.argPtr(),
         });
         try self.limitPass(&self.d_active, &self.d_x, &self.d_x_old, device_ir.lim_pass_limit);
         try self.launch(&self.k.gates, N, &.{
-            arg(&nl),          arg(&nn),            arg(&nopts),       self.d_active.argPtr(), self.d_gate.argPtr(),
-            self.d_x.argPtr(), self.d_rhs.argPtr(), self.d_a.argPtr(), self.d_diag.argPtr(),   self.d_flags.argPtr(), self.d_stage.argPtr(),
+            arg(&nl),              arg(&nn),            arg(&nopts),       self.d_active.argPtr(), self.d_gate.argPtr(),
+            self.d_x.argPtr(),     self.d_rhs.argPtr(), self.d_a.argPtr(), self.d_diag.argPtr(),   self.d_flags.argPtr(),
+            self.d_stage.argPtr(),
         });
         try self.tickLap(&mark, .gates);
         try self.limitPass(&self.d_stage, &self.d_x_old, &self.d_x_old, device_ir.lim_pass_state);
@@ -1509,7 +1515,7 @@ pub const GpuLanes = struct {
     /// for the round lanes. `clearLimits` at the end.
     pub fn newton(self: *Self, opts: converger.Options, out: []LaneNewton) !void {
         std.debug.assert(opts.gmin_stamps.len == 0 and opts.force.len == 0);
-        const nopts: lk.NewtonOpts = .{ .reltol = opts.reltol, .abstol = opts.abstol, .vntol = opts.vntol, .gmin = opts.gmin, .residual_tol = opts.residual_tol, .max_iter = opts.max_iter };
+        const nopts = newtonOpts(opts);
         self.prepareGraphs(nopts);
         var active: u64 = 0;
         for (self.round) |r| active += @intFromBool(r != 0);
@@ -1541,6 +1547,11 @@ pub const GpuLanes = struct {
                 .reject = g.bits & 32 != 0,
             };
         }
+    }
+
+    /// The lane-uniform tolerances the tick kernels take, from `opts`.
+    fn newtonOpts(opts: converger.Options) lk.NewtonOpts {
+        return .{ .reltol = opts.reltol, .abstol = opts.abstol, .vntol = opts.vntol, .gmin = opts.gmin, .residual_tol = opts.residual_tol, .max_iter = opts.max_iter };
     }
 
     /// Newton's ticks for the lanes in `d_active` (`active` of them, or an
@@ -1691,9 +1702,8 @@ pub const GpuLanes = struct {
         const nnz: usize = self.nnz;
         const vals = try self.gpa.alloc(f64, nnz);
         defer self.gpa.free(vals);
-        self.peel_lane[0] = first;
         try self.ensurePeel(1);
-        try self.d_peel_idx.upload(&self.peel_lane, 4);
+        try self.d_peel_idx.upload(&first, 4);
         try self.packLanes(1, nnz, &self.d_a, 0);
         try self.d_peel.download(vals.ptr, nnz * @sizeOf(f64));
         const l: usize = first;
@@ -1760,19 +1770,12 @@ pub const GpuLanes = struct {
         }
         if (self.n_qt > 0) {
             // 3. The LTE bounds.
-            var nl: u64 = N;
-            var n_hist: u64 = self.n_hist;
-            var n_qt: u64 = self.n_qt;
-            try self.launch(&self.k.lte, N, &.{
-                arg(&nl), self.d_sc.argPtr(), self.d_ring_qt.argPtr(), self.d_perm_qt.argPtr(), self.d_ip_qt.argPtr(), arg(&n_hist), arg(&n_qt), self.d_lte_in.argPtr(), self.d_lte_out.argPtr(),
-            });
+            try self.lteKernel();
             try self.get(self.lte_out, &self.d_lte_out);
         }
         // 4. The probe rows.
         if (self.n_probes > 0) {
-            var nl: u64 = N;
-            var np: u64 = self.n_probes;
-            try self.launch(&self.k.gather, self.n_probes * N, &.{ arg(&nl), self.d_sc.argPtr(), self.d_x.argPtr(), self.d_probes.argPtr(), arg(&np), self.d_probe_out.argPtr() });
+            try self.gatherKernel();
             try self.get(self.probe_out[0 .. N * self.n_probes], &self.d_probe_out);
         }
         try self.get(self.query, &self.d_flags);
@@ -1808,16 +1811,7 @@ pub const GpuLanes = struct {
         try self.ctlPass();
         try self.put(&self.d_sc, self.sc);
         try self.put(&self.d_accept, self.accept_);
-        var nl: u64 = N;
-        var n: u64 = self.n;
-        var n_qt: u64 = self.n_qt;
-        var nh: u64 = self.n_hist;
-        var charge: u64 = @intFromBool(self.has_charge);
-        try self.launch(&self.k.accept, (self.n + self.n_qt) * N, &.{
-            arg(&nl),           arg(&n),                arg(&n_qt),         arg(&nh),                arg(&charge),
-            self.d_sc.argPtr(), self.d_accept.argPtr(), self.d_x.argPtr(),  self.d_cur.argPtr(),     self.d_prev.argPtr(),
-            self.d_q.argPtr(),  self.d_ring.argPtr(),   self.d_ip.argPtr(), self.d_ring_qt.argPtr(), self.d_ip_qt.argPtr(),
-        });
+        try self.acceptKernel();
         if (self.state_q) try self.rebaseRound();
         try self.put(&self.d_perm_q, self.perm_q);
         try self.put(&self.d_perm_qt, self.perm_qt);
@@ -1927,7 +1921,7 @@ pub const GpuLanes = struct {
         std.debug.assert(opts.gmin_stamps.len == 0 and opts.force.len == 0 and !opts.init_fix);
         const N: usize = self.n_lanes;
         var nl: u64 = N;
-        const nopts: lk.NewtonOpts = .{ .reltol = opts.reltol, .abstol = opts.abstol, .vntol = opts.vntol, .gmin = opts.gmin, .residual_tol = opts.residual_tol, .max_iter = opts.max_iter };
+        const nopts = newtonOpts(opts);
         self.prepareGraphs(nopts);
         // ponytail: N bytes up every launch for the host's stops; a flag
         // word first if that ever shows at 100k lanes.
@@ -1941,7 +1935,7 @@ pub const GpuLanes = struct {
         } else {
             if (self.graph_round == null) {
                 try self.stream.synchronize();
-                self.graph_round = try self.captureRound(nopts, opts.max_iter);
+                self.graph_round = try self.capture(roundKernels, .{ nopts, opts.max_iter, true });
             }
             for (0..rounds) |_| try self.graph_round.?.launch(&self.stream);
         }
@@ -2006,40 +2000,22 @@ pub const GpuLanes = struct {
             try self.launch(&self.k.slot_zero, N, &.{ arg(&nl), arg(&nh), arg(&probe_slot), self.d_perm_qt.argPtr(), self.d_sc.argPtr(), self.d_slot0.argPtr() });
             try self.chargeKernels(&self.d_decide, &self.d_x);
         }
-        var n_qt: u64 = self.n_qt;
-        if (self.n_qt > 0) {
-            try self.launch(&self.k.lte, N, &.{
-                arg(&nl), self.d_sc.argPtr(), self.d_ring_qt.argPtr(), self.d_perm_qt.argPtr(), self.d_ip_qt.argPtr(), arg(&nh), arg(&n_qt), self.d_lte_in.argPtr(), self.d_lte_out.argPtr(),
-            });
-        }
-        var np: u64 = self.n_probes;
-        if (self.n_probes > 0) {
-            try self.launch(&self.k.gather, self.n_probes * N, &.{ arg(&nl), self.d_sc.argPtr(), self.d_x.argPtr(), self.d_probes.argPtr(), arg(&np), self.d_probe_out.argPtr() });
-        }
+        if (self.n_qt > 0) try self.lteKernel();
+        if (self.n_probes > 0) try self.gatherKernel();
         // Decide (`Sim.end` to the commit).
         try self.launch(&self.k.step_end_a, N, &.{
-            arg(&nl),                arg(&nh),              self.d_decide.argPtr(), self.d_step.argPtr(),   self.d_gate.argPtr(), self.d_flags.argPtr(),
-            self.d_lte_out.argPtr(), self.d_ops.argPtr(),   self.d_accept.argPtr(), self.d_sc.argPtr(),   self.d_perm_q.argPtr(),
-            self.d_perm_qt.argPtr(), self.d_brk_t.argPtr(), self.d_best.argPtr(),
+            arg(&nl),                arg(&nh),             self.d_decide.argPtr(), self.d_step.argPtr(), self.d_gate.argPtr(),   self.d_flags.argPtr(),
+            self.d_lte_out.argPtr(), self.d_ops.argPtr(),  self.d_accept.argPtr(), self.d_sc.argPtr(),   self.d_perm_q.argPtr(), self.d_perm_qt.argPtr(),
+            self.d_brk_t.argPtr(),   self.d_best.argPtr(),
         });
         // Apply: the latches, the accepted histories, the stateful rebase.
         try self.d_flags.fillAsync(0, N * 4, &self.stream);
         try self.ctlPass();
-        var n: u64 = self.n;
-        var charge: u64 = @intFromBool(self.has_charge);
-        try self.launch(&self.k.accept, (self.n + self.n_qt) * N, &.{
-            arg(&nl),           arg(&n),                arg(&n_qt),         arg(&nh),                arg(&charge),
-            self.d_sc.argPtr(), self.d_accept.argPtr(), self.d_x.argPtr(),  self.d_cur.argPtr(),     self.d_prev.argPtr(),
-            self.d_q.argPtr(),  self.d_ring.argPtr(),   self.d_ip.argPtr(), self.d_ring_qt.argPtr(), self.d_ip_qt.argPtr(),
-        });
+        try self.acceptKernel();
         if (self.state_q) {
             try self.launch(&self.k.slot_zero, N, &.{ arg(&nl), arg(&nh), arg(&rebase_slot), self.d_perm_qt.argPtr(), self.d_sc.argPtr(), self.d_slot0.argPtr() });
             try self.chargeKernels(&self.d_accept, &self.d_cur);
-            try self.launch(&self.k.rebase, (self.n + self.n_qt) * N, &.{
-                arg(&nl),               arg(&n),           arg(&n_qt),           arg(&nh),           self.d_sc.argPtr(),
-                self.d_accept.argPtr(), self.d_q.argPtr(), self.d_ring.argPtr(), self.d_ip.argPtr(), self.d_ring_qt.argPtr(),
-                self.d_ip_qt.argPtr(),
-            });
+            try self.rebaseKernel();
         }
         // The next breakpoint at the committed state, then the landing.
         for (self.batches) |*b| {
@@ -2049,6 +2025,7 @@ pub const GpuLanes = struct {
             try self.launch(k, N, &.{ arg(&nl), arg(&count), self.d_accept.argPtr(), self.d_brk_t.argPtr(), b.d_models.argPtr(), b.d_model_of.argPtr(), b.d_instances.argPtr(), cache, self.d_best.argPtr() });
         }
         try self.launch(&self.k.step_end_b, N, &.{ arg(&nl), self.d_step.argPtr(), self.d_best.argPtr(), self.d_report.argPtr() });
+        var np: u64 = self.n_probes;
         try self.launch(&self.k.ring_put, N, &.{ arg(&nl), arg(&np), self.d_ring_slot.argPtr(), self.d_report.argPtr(), self.d_ring_report.argPtr(), self.d_probe_out.argPtr(), self.d_ring_rows.argPtr() });
         if (self.n_meas > 0) {
             var n_meas: u64 = self.n_meas;
@@ -2056,28 +2033,6 @@ pub const GpuLanes = struct {
             try self.launch(&self.k.meas, N, &.{ arg(&nl), arg(&n_meas), arg(&t_start), self.d_report.argPtr(), self.d_x.argPtr(), self.d_meas_cols.argPtr(), self.d_meas.argPtr(), self.d_meas_resolved.argPtr(), self.d_ring_slot.argPtr() });
         }
         try self.launch(&self.k.ring_next, 1, &.{self.d_ring_slot.argPtr()});
-    }
-
-    /// `roundKernels` with unrolled ticks, captured as `captureTick` does.
-    fn captureRound(self: *Self, nopts: lk.NewtonOpts, max_iter: u16) !GraphExec {
-        var capture_stream = try self.k.refactor.createStreamNonBlocking();
-        defer capture_stream.deinit();
-        std.mem.swap(Stream, &self.stream, &capture_stream);
-        defer std.mem.swap(Stream, &self.stream, &capture_stream);
-        try self.stream.beginCapture(.thread_local);
-        var capturing = true;
-        defer if (capturing) {
-            if (self.stream.endCapture()) |abandoned| {
-                var graph = abandoned;
-                graph.deinit();
-            } else |_| {}
-        };
-        try self.roundKernels(nopts, max_iter, true);
-        const ended = self.stream.endCapture();
-        capturing = false;
-        var graph = try ended;
-        defer graph.deinit();
-        return graph.instantiate();
     }
 
     /// Lane l's report in ring slot r of the last `deviceLaunch`.
@@ -2112,9 +2067,31 @@ pub const GpuLanes = struct {
     /// commits: the planes at cur, the tape into the tape's logical slot 0
     /// (`sqt[3]`), then `arp_lane_rebase`.
     fn rebaseRound(self: *Self) !void {
-        const N: usize = self.n_lanes;
         for (self.slot0, self.sc) |*s, sc| s.* = sc.sqt[3];
         try self.chargePass(&self.d_accept, &self.d_cur);
+        try self.rebaseKernel();
+    }
+
+    /// `arp_lane_accept`: each accepted lane's `prev <- cur <- x` and its
+    /// charge and tape histories (`d_accept`, `d_sc`'s ring slots).
+    fn acceptKernel(self: *Self) !void {
+        const N: usize = self.n_lanes;
+        var nl: u64 = N;
+        var n: u64 = self.n;
+        var n_qt: u64 = self.n_qt;
+        var nh: u64 = self.n_hist;
+        var charge: u64 = @intFromBool(self.has_charge);
+        try self.launch(&self.k.accept, (self.n + self.n_qt) * N, &.{
+            arg(&nl),           arg(&n),                arg(&n_qt),         arg(&nh),                arg(&charge),
+            self.d_sc.argPtr(), self.d_accept.argPtr(), self.d_x.argPtr(),  self.d_cur.argPtr(),     self.d_prev.argPtr(),
+            self.d_q.argPtr(),  self.d_ring.argPtr(),   self.d_ip.argPtr(), self.d_ring_qt.argPtr(), self.d_ip_qt.argPtr(),
+        });
+    }
+
+    /// `arp_lane_rebase` for the accepted lanes, after their charges at
+    /// cur landed in the q plane and the tape's slot 0.
+    fn rebaseKernel(self: *Self) !void {
+        const N: usize = self.n_lanes;
         var nl: u64 = N;
         var n: u64 = self.n;
         var n_qt: u64 = self.n_qt;
@@ -2124,6 +2101,25 @@ pub const GpuLanes = struct {
             self.d_accept.argPtr(), self.d_q.argPtr(), self.d_ring.argPtr(), self.d_ip.argPtr(), self.d_ring_qt.argPtr(),
             self.d_ip_qt.argPtr(),
         });
+    }
+
+    /// `arp_lane_lte`: each lane's LTE pair into `d_lte_out`.
+    fn lteKernel(self: *Self) !void {
+        const N: usize = self.n_lanes;
+        var nl: u64 = N;
+        var nh: u64 = self.n_hist;
+        var n_qt: u64 = self.n_qt;
+        try self.launch(&self.k.lte, N, &.{
+            arg(&nl), self.d_sc.argPtr(), self.d_ring_qt.argPtr(), self.d_perm_qt.argPtr(), self.d_ip_qt.argPtr(), arg(&nh), arg(&n_qt), self.d_lte_in.argPtr(), self.d_lte_out.argPtr(),
+        });
+    }
+
+    /// `arp_lane_gather`: each lane's probe rows of `d_x` into `d_probe_out`.
+    fn gatherKernel(self: *Self) !void {
+        const N: usize = self.n_lanes;
+        var nl: u64 = N;
+        var np: u64 = self.n_probes;
+        try self.launch(&self.k.gather, self.n_probes * N, &.{ arg(&nl), self.d_sc.argPtr(), self.d_x.argPtr(), self.d_probes.argPtr(), arg(&np), self.d_probe_out.argPtr() });
     }
 
     /// `Circuit.evalQ` at `x` for the lanes of `mask`: the q plane zeroed,
@@ -2173,8 +2169,8 @@ pub const GpuLanes = struct {
             const hubs = &col.row_hubs;
             var n_hubs: u64 = hubs.n;
             try self.launch(&self.k.hub_reduce, hubs.n * N, &.{
-                arg(&nl),                arg(&n_hubs),          mask.argPtr(), hubs.d_cells.argPtr(), hubs.d_starts.argPtr(),
-                hubs.d_entries.argPtr(), self.d_q.argPtr(),     self.d_q.argPtr(),
+                arg(&nl),                arg(&n_hubs),      mask.argPtr(),     hubs.d_cells.argPtr(), hubs.d_starts.argPtr(),
+                hubs.d_entries.argPtr(), self.d_q.argPtr(), self.d_q.argPtr(),
             });
         }
     }
@@ -2235,10 +2231,16 @@ pub const Samples = struct {
 
     const buffers = .{ "d_x", "d_f", "d_q", "d_g", "d_c", "d_sims", "d_active", "d_limw" };
 
-    /// The scalar sampled operator does not step analog state. Decline
-    /// history-dependent circuits before packing rather than silently
-    /// sampling one point's mutable history in another lane. Timer-only
-    /// source State is unused: its actual state hooks are null.
+    /// Packs and uploads every (sample, point) lane of `ckts` at `times`
+    /// with step `dt`. The sampled operator does not step analog state, so
+    /// a history-dependent circuit (VPI, display tasks, a load check,
+    /// stateful charge, a delay, or any state hook) fails with
+    /// `error.UnsupportedSampleState` before packing rather than sampling
+    /// one point's mutable history in another lane; timer-only source
+    /// State is unused, its state hooks null. Fails with
+    /// `error.InvalidSamples` on no lanes or a nonfinite time or step,
+    /// `error.IncompatibleSamples` across patterns, `Error.NoLaneImage`, or
+    /// the driver's error. Free with `deinit`.
     pub fn init(gpa: std.mem.Allocator, ckts: []const *Circuit, times: []const f64, dt: f64) !*Samples {
         if (comptime backend == null) return Error.NoLaneImage;
         if (ckts.len == 0 or times.len == 0 or !std.math.isFinite(dt) or dt <= 0) return error.InvalidSamples;
@@ -2254,9 +2256,7 @@ pub const Samples = struct {
         if (N > std.math.maxInt(u32)) return error.InvalidSamples;
         for (times) |time| if (!std.math.isFinite(time)) return error.InvalidSamples;
         for (ckts) |c| {
-            if (c.n != n or c.nnz != nnz or c.batches.len != c0.batches.len or
-                !std.mem.eql(u32, c.col_ptr, c0.col_ptr) or !std.mem.eql(u32, c.row_idx, c0.row_idx))
-                return error.IncompatibleSamples;
+            if (!samePattern(c, c0)) return error.IncompatibleSamples;
             if (c.vpi != null or c.display != null or c.load_check != null or c.has_state_q or c.minDelay() != null)
                 return error.UnsupportedSampleState;
             for (c.batches) |b| {
@@ -2279,11 +2279,7 @@ pub const Samples = struct {
             for (ps, 0..) |*p, lane_id| {
                 const b = ckts[lane_id % ckts.len].batches[bi];
                 p.* = b.hooks.gpu_payload.?(b.ctx);
-                if (p.count != p0.count or !std.mem.eql(u8, p.kernel, p0.kernel) or
-                    p.n_u != p0.n_u or p.instances.len != p0.instances.len or
-                    p.states.len != p0.states.len or p.lim_x.len != p0.lim_x.len or
-                    !std.mem.eql(u32, p.gath, p0.gath) or !std.mem.eql(u32, p.rhs_idx, p0.rhs_idx) or
-                    !std.mem.eql(u32, p.slots, p0.slots)) return error.IncompatibleSamples;
+                if (!sameRows(p.*, p0)) return error.IncompatibleSamples;
             }
             const pk = try pack(gpa, ps);
             defer pk.deinit(gpa);
@@ -2389,6 +2385,8 @@ pub const Samples = struct {
         return self;
     }
 
+    /// Drains the stream and frees everything; the point circuits are
+    /// untouched.
     pub fn deinit(self: *Samples) void {
         if (comptime backend == null) return;
         self.stream.synchronize() catch {};
@@ -2490,6 +2488,9 @@ pub fn integrateFixed(gpa: std.mem.Allocator, lanes: []const FixedLane, opts: co
     try dev.d_x.upload(host.ptr, host.len * @sizeOf(f64));
     @memset(dev.round, 1);
     @memset(out, true);
+    const records = for (lanes) |l| {
+        if (l.wave.len != 0) break true;
+    } else false;
     for (0..steps) |step| {
         if (std.mem.indexOfScalar(u8, dev.round, 1) == null) break;
         for (lanes, dev.round, 0..) |l, on, k| {
@@ -2518,9 +2519,6 @@ pub fn integrateFixed(gpa: std.mem.Allocator, lanes: []const FixedLane, opts: co
             dev.queueAccept(k);
         }
         try dev.apply();
-        const records = for (lanes) |l| {
-            if (l.wave.len != 0) break true;
-        } else false;
         if (records) {
             try dev.d_x.download(host.ptr, host.len * @sizeOf(f64));
             for (lanes, out, 0..) |l, ok, k| {
@@ -2594,6 +2592,9 @@ pub const Ops = struct {
         };
     }
 
+    /// Queues lane l into the next round with the step `a` that `Sim` `s`
+    /// attempts: its scalars, `SimState` and LTE inputs. Gear-3..6 is
+    /// unreachable.
     pub fn attempt(o: Ops, s: anytype, a: anytype) void {
         const g = o.g;
         const promote = methodCode(s.promoteMethod());
@@ -2613,28 +2614,37 @@ pub const Ops = struct {
         g.lte_in[o.l] = .{ .dt = s.dt, .dt1 = s.dt_old[0], .dt2 = s.dt_old[1], .reltol = s.options.tol.reltol, .abstol = s.options.tol.abstol, .chgtol = s.options.tol.chgtol, .trtol = s.options.tol.trtol, .ag0 = a.c.ag0, .ag1 = a.c.ag1, .ag2 = a.c.ag2 };
         g.round[o.l] = 1;
     }
+    /// Queues the latch revert of a rejected step for `GpuLanes.apply`.
     pub fn revert(o: Ops, _: anytype) void {
         o.g.ops[o.l] = 1 + @as(u8, @backingInt(StateCtlOp.revert));
     }
+    /// Always null: a reject request fails the lane instead
+    /// (`tran.runGpuLanes`).
     pub fn rejectAt(_: Ops, _: anytype) ?f64 {
-        return null; // a reject request fails the lane instead (`tran.runGpuLanes`)
+        return null;
     }
+    /// The device state-flip query `probe` ran, when `ask`.
     pub fn flipped(o: Ops, _: anytype, _: anytype, ask: bool) bool {
         return ask and o.g.query[o.l] & 1 != 0;
     }
+    /// Always null: a finite bound hands the lane back (`LaneNewton.reject`).
     pub fn boundStep(_: Ops, _: anytype) ?f64 {
-        return null; // a finite one hands the lane back (`LaneNewton.reject`)
+        return null;
     }
-    pub fn charges(_: Ops, _: anytype, _: anytype) void {} // `probe` did it for the round
+    /// A no-op: `probe` evaluated the round's charges.
+    pub fn charges(_: Ops, _: anytype, _: anytype) void {}
+    /// The LTE bound `probe` computed for `method`.
     pub fn bound(o: Ops, _: anytype, a: anytype, method: anytype, _: anytype) f64 {
         const out = o.g.lte_out[o.l];
         // `end` asks for the step's own method, or the order-2 promotion
         // probe (the only other order <= 2 call).
         return if (method == a.method) out[0] else out[1];
     }
+    /// Unreachable: gear-3..6 are not lane-eligible.
     pub fn boundGear(_: Ops, _: anytype, _: anytype, _: anytype, _: anytype) f64 {
-        unreachable; // gear-3..6 are not lane-eligible
+        unreachable;
     }
+    /// Rotates lane l's history permutations (`queueAccept`).
     pub fn advance(o: Ops, _: anytype, _: anytype) void {
         o.g.queueAccept(o.l);
     }
@@ -2652,6 +2662,7 @@ pub const Ops = struct {
         o.g.sc[o.l].sqt[3] = p[0];
         std.mem.swap(u8, &p[0], &p[1]);
     }
+    /// Lane l's n-long row: only its probe positions hold the solution.
     pub fn accepted(o: Ops, _: anytype) []const f64 {
         const n: usize = o.g.n;
         return o.g.rows[@as(usize, o.l) * n ..][0..n];

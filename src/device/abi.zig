@@ -35,9 +35,6 @@ pub const StateCtlOp = contract.StateCtlOp;
 /// `layoutHash` because GPU kernels take it too.
 pub const SimState = contract.SimState;
 
-/// A handle to one scalar parameter of one instance or model, for sweeps,
-/// Monte Carlo and sensitivity. Points into the batch's Model/Instance
-/// storage, which must outlive it.
 /// `Hooks.set_bypass`'s tolerances: the Newton test's.
 pub const BypassTol = struct { reltol: f64, vntol: f64, abstol: f64 };
 
@@ -78,6 +75,9 @@ pub const ParamLayout = struct {
     }
 };
 
+/// A handle to one scalar parameter of one instance or model, for sweeps,
+/// Monte Carlo and sensitivity. Points into the batch's Model/Instance
+/// storage, which must outlive it.
 pub const ParamRef = struct {
     /// The field's address; VerA emits every parameter as f64.
     ptr: *f64,

@@ -1,19 +1,18 @@
-//! Kernel lookup for batch kernels that also finds a runtime `.hdl` model's
-//! (performance TODO 01 1.8): the build-time images first, then the PTX
-//! `device.hdl_gpu` compiles for the loaded library the batch's code lives in.
+//! Kernel lookup for batch kernels that also finds a runtime `.hdl` model's:
+//! the build-time images first, then the PTX `device.hdl_gpu` compiles for
+//! the loaded library the batch's code lives in.
 
-const std = @import("std");
 const gompute = @import("gompute");
 const hdl_gpu = @import("device").hdl_gpu;
 const devices = @import("devices.zig");
 /// A build with CUDA images; the runtime path is CUDA only.
 const on = hdl_gpu.enabled and @import("gompute_kernels").has_cuda;
 
-/// `gompute.rawKernelByName` on this thread's device (`devices.ordinal`), or,
-/// when no built-in image has
-/// `name`, the kernel of that name in the runtime PTX of the loaded model
-/// whose library holds `payload_fn` (its `Hooks.gpu_payload`). Fails with
-/// `error.KernelNotFound` when neither has it, as a built-in miss does.
+/// `gompute.rawKernelByName` on this thread's device (`devices.ordinal`),
+/// or, when no built-in image has `name`, the kernel of that name in the
+/// runtime PTX of the loaded model whose library holds `payload_fn` (its
+/// `Hooks.gpu_payload`). Fails with `error.KernelNotFound` when neither has
+/// it, as a built-in miss does. Caller owns the result (`deinit`).
 pub fn kernel(comptime be: gompute.Backend, payload_fn: *const anyopaque, name: []const u8) !gompute.RawByName(be) {
     return gompute.rawKernelByName(be, name, devices.ordinal) catch |e| {
         if (comptime be != .cuda or !on) return e;
@@ -41,7 +40,7 @@ fn runtimeKernel(payload_fn: *const anyopaque, name: []const u8) !gompute.RawByN
 /// null (a built-in model, no device, Debug, a failed compile).
 pub fn runtimeImage(payload_fn: *const anyopaque) ?[:0]const u8 {
     if (comptime !on) return null;
-    var context = gompute.runtime.cuda.Context.init(0) catch return null;
+    var context = gompute.runtime.cuda.Context.init(devices.ordinal) catch return null;
     defer context.deinit();
     return hdl_gpu.ptx(payload_fn, context.computeCapability() catch return null);
 }

@@ -5,8 +5,7 @@
 //! In: the circuit at its operating point and the output node pair. Out:
 //! one real point of dVout/dp per parameter, named as ngspice names it.
 //! Cites ngspice cktsens.c and the IF_PRINCIPAL tables of res.c, cap.c,
-//! ind.c, vsrc.c and isrc.c; #71, #85, #91, #154;
-//! dev/analysis/sensitivity.md.
+//! ind.c, vsrc.c and isrc.c; #71, #85, #91, #154.
 const std = @import("std");
 const root = @import("../types.zig");
 const xf = @import("../dc/xf.zig");

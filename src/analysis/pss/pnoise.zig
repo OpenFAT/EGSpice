@@ -6,7 +6,7 @@
 //! modulation). `orbitSweep` is everything after the orbit, so `.hbnoise`
 //! runs it on the harmonic-balance solution instead (hb_lptv.zig).
 //!
-//! Cites: dev/analysis/periodic-noise.md; VACASK for the signed amplitude
+//! Cites: VACASK for the signed amplitude
 //! of a negative density; HSPICE `.ptdnoise` for the strobed density.
 const std = @import("std");
 const root = @import("../types.zig");
@@ -116,20 +116,7 @@ pub fn orbitSweep(
     const exponent = try allocator.alloc(f64, n_srcs);
     defer allocator.free(exponent);
 
-    for (0..n_samples) |k| {
-        const srcs_k = try ckt.collectNoiseSources(orb.state(k, n), allocator);
-        defer allocator.free(srcs_k);
-        if (srcs_k.len != n_srcs) return error.NoiseTopologyChanged;
-        for (srcs_k, noise_sources, 0..) |src, original, s| {
-            if (src.node_p != original.node_p or src.node_n != original.node_n)
-                return error.NoiseTopologyChanged;
-            amp[s * n_samples + k] = whiteAmp(src);
-            amp[terms + s * n_samples + k] = src.coeff * signedSqrt(src.flicker);
-            // ponytail: the flicker exponent is a model constant in every
-            // device, so sample 0 stands for the period.
-            if (k == 0) exponent[s] = src.ef;
-        }
-    }
+    for (0..n_samples) |k| try sampleAmplitudes(ckt, orb.state(k, n), noise_sources, k, n_samples, amp, exponent, allocator);
     try pac.spectra(amp[0..terms], n_samples, amp_hat[0..terms], allocator);
     try pac.spectra(amp[terms..], n_samples, amp_hat[terms..], allocator);
     const white_hat = amp_hat[0..terms];
@@ -165,9 +152,7 @@ pub fn orbitSweep(
                 var fl: Complex = .zero;
                 for (noise_sources[lead..end], lead..) |src, s| for (0..n_sb) |m| {
                     const bin = pac.mapHarmonicToFftBin(@as(i32, @intCast(m)) - @as(i32, @intCast(j)), n_samples) orelse continue;
-                    const hp = if (src.node_p != root.GROUND) h[m * n + src.node_p] else Complex.zero;
-                    const hn = if (src.node_n != root.GROUND) h[m * n + src.node_n] else Complex.zero;
-                    const hm = Complex.sub(hp, hn);
+                    const hm = across(h[m * n ..][0..n], src);
                     w = Complex.add(w, Complex.mul(hm, white_hat[bin * n_srcs + s]));
                     fl = Complex.add(fl, Complex.mul(hm, flicker_hat[bin * n_srcs + s]));
                 };
@@ -248,9 +233,7 @@ fn strobed(
                     for (noise_sources[lead..end], lead..) |src, s| for (0..n_sb) |m| {
                         const i = @as(i32, @intCast(m + p)) - 2 * @as(i32, @intCast(m_max));
                         const bin = pac.mapHarmonicToFftBin(i, n_samples) orelse continue;
-                        const hp = if (src.node_p != root.GROUND) h[m * n + src.node_p] else Complex.zero;
-                        const hn = if (src.node_n != root.GROUND) h[m * n + src.node_n] else Complex.zero;
-                        inner = Complex.add(inner, Complex.mul(Complex.sub(hp, hn), hat[bin * n_srcs + s]));
+                        inner = Complex.add(inner, Complex.mul(across(h[m * n ..][0..n], src), hat[bin * n_srcs + s]));
                     };
                     g = Complex.add(g, Complex.mul(phase[p], inner));
                 }
@@ -261,9 +244,35 @@ fn strobed(
     }
 }
 
+/// Sample `k` of every source's amplitude at the orbit state `x`: white at
+/// `amp[s * n_samples + k]`, flicker at `amp[(srcs.len + s) * n_samples + k]`,
+/// and at k = 0 each flicker exponent into `exponent[s]`.
+/// error.NoiseTopologyChanged when the sources at `x` are not `srcs`, node
+/// for node.
+pub fn sampleAmplitudes(ckt: *const root.Circuit, x: []const f64, srcs: []const NoiseSource, k: usize, n_samples: usize, amp: []f64, exponent: []f64, allocator: std.mem.Allocator) !void {
+    const at = try ckt.collectNoiseSources(x, allocator);
+    defer allocator.free(at);
+    if (at.len != srcs.len) return error.NoiseTopologyChanged;
+    for (at, srcs, 0..) |src, original, s| {
+        if (src.node_p != original.node_p or src.node_n != original.node_n) return error.NoiseTopologyChanged;
+        amp[s * n_samples + k] = whiteAmp(src);
+        amp[(srcs.len + s) * n_samples + k] = src.coeff * signedSqrt(src.flicker);
+        // ponytail: the flicker exponent is a model constant in every
+        // device, so sample 0 stands for the period.
+        if (k == 0) exponent[s] = src.ef;
+    }
+}
+
+/// h[node_p] - h[node_n] over one sideband's node row `h`, ground zero.
+inline fn across(h: []const Complex, src: NoiseSource) Complex {
+    const hp = if (src.node_p != root.GROUND) h[src.node_p] else Complex.zero;
+    const hn = if (src.node_n != root.GROUND) h[src.node_n] else Complex.zero;
+    return Complex.sub(hp, hn);
+}
+
 /// One orbit sample's white amplitude: coeff·sqrt(white), or coeff alone for
 /// a table row, whose spectrum `whiteShape` supplies.
-pub inline fn whiteAmp(src: NoiseSource) f64 {
+inline fn whiteAmp(src: NoiseSource) f64 {
     return src.coeff * if (src.table.points.len != 0) 1 else signedSqrt(src.white);
 }
 

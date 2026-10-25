@@ -1,0 +1,10 @@
+# Actions are pinned by commit SHA; this bumps them in one grouped PR a month.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

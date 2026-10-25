@@ -140,7 +140,7 @@ pub const Solver = struct {
         return initOrdered(gpa, n, col_ptr, row_idx, bbd, knobs, null);
     }
 
-    /// `init`, reusing `order` (a column order `computeOrdering` gave this
+    /// `init`, reusing `order` (the `q` another solver's LU computed on this
     /// same pattern, copied) when the engine is the sparse LU: a sweep's
     /// queries share one pattern, and BTF + AMD cost 95M instructions a
     /// call on a 100k-node ladder.
@@ -185,10 +185,7 @@ pub const Solver = struct {
         self.host_stale = false;
         self.params = .{};
         self.gen +%= 1;
-        if (self.par) |*p| p.deinit(self.gpa);
-        self.par = null;
-        if (self.sub) |*p| p.deinit(self.gpa);
-        self.sub = null;
+        self.dropPlans();
         if (self.sparse()) |lu| {
             lu.factored = false;
             self.par_epoch = lu.pattern_epoch;
@@ -219,14 +216,26 @@ pub const Solver = struct {
 
     /// Orders the pattern (once) and builds the general LU on it.
     fn initLu(self: *Self) !SparseLu {
-        if (instrument and self.knobs.stats) btfCensus(self.gpa, self.n, self.col_ptr, self.row_idx) catch {};
-        if (self.q.len == 0) self.q = try computeOrdering(self.gpa, self.n, self.col_ptr, self.row_idx);
-        assert(self.q.len == self.n);
-        var lu = try SparseLu.init(self.gpa, self.n, self.col_ptr, self.q);
-        errdefer lu.deinit(self.gpa);
-        lu.stats = self.knobs.stats;
+        const gpa = self.gpa;
+        const n = self.n;
+        if (instrument and self.knobs.stats) btfCensus(gpa, n, self.col_ptr, self.row_idx) catch {};
+        // One slab for the ordering and the fill bound; both restore it.
+        const ws_buf = try gpa.alloc(u32, order_mod.wsSize(n, self.col_ptr[n]));
+        defer gpa.free(ws_buf);
+        var ws = order_mod.Ws.init(ws_buf);
+        if (self.q.len == 0) {
+            const q = try gpa.alloc(u32, n);
+            errdefer gpa.free(q);
+            try order_mod.order(n, self.col_ptr, self.row_idx, q, &ws);
+            self.q = q;
+        }
+        assert(self.q.len == n);
         // At least nnz(A): a diagonal matrix bounds nothing.
-        lu.diag_fill = @max(try diagFill(self.gpa, self.n, self.col_ptr, self.row_idx, self.q), self.col_ptr[self.n]);
+        const diag_fill = @max(try order_mod.diagFill(n, self.col_ptr, self.row_idx, self.q, &ws), self.col_ptr[n]);
+        assert(ws.used == 0);
+        var lu = try SparseLu.init(gpa, n, self.col_ptr, self.q);
+        lu.stats = self.knobs.stats;
+        lu.diag_fill = diag_fill;
         return lu;
     }
 
@@ -261,10 +270,18 @@ pub const Solver = struct {
         return eng;
     }
 
+    /// Frees the multicore and subtree refactor plans of the current pivot
+    /// epoch; the next `refactorLu` on a new epoch prices them again.
+    fn dropPlans(self: *Self) void {
+        if (self.par) |*p| p.deinit(self.gpa);
+        self.par = null;
+        if (self.sub) |*p| p.deinit(self.gpa);
+        self.sub = null;
+    }
+
     /// Frees every engine and copy; the borrowed pattern stays the caller's.
     pub fn deinit(self: *Self) void {
-        if (self.par) |*p| p.deinit(self.gpa);
-        if (self.sub) |*p| p.deinit(self.gpa);
+        self.dropPlans();
         switch (self.engine) {
             .lu => |*lu| lu.deinit(self.gpa),
             .tri => |*tri| tri.deinit(self.gpa),
@@ -332,6 +349,8 @@ pub const Solver = struct {
         // A refactor that fails after overwriting the LU (the probe's OOM)
         // must not leave the old `vcopy` bypassing onto it.
         errdefer self.factored = false;
+        // BBD wants one value per pattern entry: drop the trash slot past it.
+        const pattern_vals = vals[0..self.col_ptr[self.n]];
         switch (self.engine) {
             .lu => {},
             // Thomas has no pivoting, so an MNA branch row's zero diagonal
@@ -342,9 +361,8 @@ pub const Solver = struct {
                 return;
             } else |_| try self.demote(),
             // A singular block, or a Schur reduction too unstable to refine.
-            // BBD wants one value per pattern entry: drop the trash slot past it.
-            .bbd => |*eng| if (eng.factorWithExecution(vals[0..self.col_ptr[self.n]], execution)) |_| {
-                if (!(eng.growth > bbd_refine_growth) or (self.probeOne(eng, false, vals[0..self.col_ptr[self.n]]) and self.probeOne(eng, true, vals[0..self.col_ptr[self.n]]))) {
+            .bbd => |*eng| if (eng.factorWithExecution(pattern_vals, execution)) |_| {
+                if (!(eng.growth > bbd_refine_growth) or (self.probeOne(eng, false, pattern_vals) and self.probeOne(eng, true, pattern_vals))) {
                     self.factored = true;
                     return;
                 }
@@ -439,10 +457,7 @@ pub const Solver = struct {
         if (threads < 2) return lu.refactor(self.col_ptr, vals, growth);
         if (self.par_epoch != lu.pattern_epoch) {
             self.par_epoch = lu.pattern_epoch;
-            if (self.par) |*p| p.deinit(self.gpa);
-            self.par = null;
-            if (self.sub) |*p| p.deinit(self.gpa);
-            self.sub = null;
+            self.dropPlans();
             // Out of memory for the tables: stay serial this epoch.
             if (parWorthIt(lu, self.knobs)) {
                 self.par = lu_kernels.HostRefactor.init(self.gpa, lu, self.col_ptr, growth) catch null;
@@ -480,12 +495,12 @@ pub const Solver = struct {
     /// growth says it may not be backward stable (#136).
     fn solveBbd(self: *Self, eng: *BbdEng, comptime transpose: bool, x: []f64) void {
         if (!(eng.growth > bbd_refine_growth) or self.vcopy.len == 0) {
-            if (transpose) eng.solveTInPlace(x) else eng.solveInPlace(x);
+            eng.solve(transpose, x);
             return;
         }
         const b = self.refine_buf[0..self.n];
         num.copySimd(b, x);
-        if (transpose) eng.solveTInPlace(x) else eng.solveInPlace(x);
+        eng.solve(transpose, x);
         self.refine(eng, transpose, self.vcopy, b, x);
     }
 
@@ -505,7 +520,7 @@ pub const Solver = struct {
             bi.* = @as(f64, @floatFromInt(h >> 11)) / 0x1p53 * 2 - 1;
         }
         num.copySimd(x, b);
-        if (transpose) eng.solveTInPlace(x) else eng.solveInPlace(x);
+        eng.solve(transpose, x);
         self.refine(eng, transpose, vals, b, x);
         // r = b - op(A) x and s = the row sums of |op(A)|.
         num.copySimd(r, b);
@@ -549,7 +564,7 @@ pub const Solver = struct {
             };
             if (!(berr > std.math.floatEps(f64) and 2 * berr <= last)) break;
             last = berr;
-            if (transpose) eng.solveTInPlace(r) else eng.solveInPlace(r);
+            eng.solve(transpose, r);
             num.axpy(x, 1, r);
         }
     }
@@ -708,26 +723,6 @@ comptime {
     assert(par_max_flops <= std.math.maxInt(u32));
 }
 
-/// BTF + AMD column ordering; caller owns the result.
-fn computeOrdering(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) ![]u32 {
-    const q = try gpa.alloc(u32, n);
-    errdefer gpa.free(q);
-    const ws_buf = try gpa.alloc(u32, order_mod.wsSize(n, col_ptr[n]));
-    defer gpa.free(ws_buf);
-    var ws = order_mod.Ws.init(ws_buf);
-    try order_mod.order(n, col_ptr, row_idx, q, &ws);
-    assert(ws.used == 0); // order restores the slab
-    return q;
-}
-
-/// `order.diagFill` on its own slab.
-fn diagFill(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, q: []const u32) !u64 {
-    const ws_buf = try gpa.alloc(u32, order_mod.wsSize(n, col_ptr[n]));
-    defer gpa.free(ws_buf);
-    var ws = order_mod.Ws.init(ws_buf);
-    return order_mod.diagFill(n, col_ptr, row_idx, q, &ws);
-}
-
 /// The census for a partial refactor (TODO 2.8): the share of A entries
 /// that changed since the last factor, and of pivot steps a replay would
 /// have to redo, those whose column changed or whose U names a redone step.
@@ -790,9 +785,8 @@ fn btfCensus(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32)
         off += @intFromBool(blk_of[r] != blk_of[j]);
     };
     std.debug.print("lu-btf: n={d} blocks={d} singletons={d} largest={d} ({d:.1}% of n) off_block_nnz={d} ({d:.1}% of nnz)\n", .{
-        n,                                                                                                      nb, singletons, largest,
-        100 * @as(f64, @floatFromInt(largest)) / @as(f64, @floatFromInt(@max(n, 1))), off,
-        100 * @as(f64, @floatFromInt(off)) / @as(f64, @floatFromInt(@max(col_ptr[n], 1))),
+        n,                                                                            nb,  singletons,                                                                        largest,
+        100 * @as(f64, @floatFromInt(largest)) / @as(f64, @floatFromInt(@max(n, 1))), off, 100 * @as(f64, @floatFromInt(off)) / @as(f64, @floatFromInt(@max(col_ptr[n], 1))),
     });
 }
 

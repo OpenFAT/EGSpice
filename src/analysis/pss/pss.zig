@@ -9,8 +9,8 @@
 //! the time shift would otherwise leave free. The Jacobian keeps its n x n
 //! shape, the osc column holding d(phi)/d(ln T) instead of d(phi)/d(x0[osc]).
 //!
-//! Cites: dev/analysis/pss-shooting-harmonic-balance.md, Verilog-A LRM
-//! §4.6.1 (sources follow their waveform only in the transient phase).
+//! Cites: Verilog-A LRM §4.6.1 (sources follow their waveform only in the
+//! transient phase).
 const std = @import("std");
 const root = @import("../types.zig");
 const take = root.take;
@@ -174,19 +174,6 @@ fn periodAccept(ckt: *root.Circuit, hook: *const PeriodHook, x: []const f64, pro
     return true;
 }
 
-/// Integrates one period from x0 into x_end, leaving x0 untouched.
-inline fn integrateFrom(
-    ckt: *root.Circuit,
-    ws: *converger.Workspace,
-    sc: *Companion,
-    x0: []const f64,
-    x_end: []f64,
-    options: Options,
-) error{ QueryCancelled, OutOfMemory }!bool {
-    num.copySimd(x_end, x0);
-    return integrateOnePeriod(ckt, ws, sc, x_end, &.{}, &.{}, options);
-}
-
 /// GMRES matvec context: one FD directional derivative of the shooting map.
 const ShootingKrylovCtx = struct {
     ckt: *root.Circuit,
@@ -226,7 +213,8 @@ fn shootingMatvec(ctx: *ShootingKrylovCtx, v: []const f64, w: []f64) void {
         opts.period *= 1 + ctx.options.fd_epsilon * v[osc];
     }
 
-    const ok = integrateFrom(ctx.ckt, ctx.ws, ctx.sc, ctx.x_pert, ctx.x_end_pert, opts) catch |err| blk: {
+    num.copySimd(ctx.x_end_pert, ctx.x_pert);
+    const ok = integrateOnePeriod(ctx.ckt, ctx.ws, ctx.sc, ctx.x_end_pert, &.{}, &.{}, opts) catch |err| blk: {
         ctx.failure = ctx.failure orelse err;
         break :blk false;
     };
@@ -253,7 +241,7 @@ fn fdColumn(out: []f64, x_end: []const f64, x_start: []const f64, phi: []const f
 const mono_budget: usize = 1 << 26;
 
 /// The shooting Jacobian Φ = dx(T)/dx0 by the trapezoid's own sensitivity
-/// recurrence over one recorded period (dev/solvers/monodromy-krylov.md),
+/// recurrence over one recorded period,
 /// instead of one period integration per column or matvec. The base
 /// integration records every step's x_k; `build` evaluates G_k and C_k
 /// there once per shooting iteration, and each product Φ·v is then one
@@ -443,6 +431,8 @@ const MonoKrylovCtx = struct {
     singular: bool = false,
     failure: ?error{OutOfMemory} = null,
 
+    /// The GMRES operator. Reports allocation failure in `failure` and a
+    /// singular step Jacobian in `singular`, since GMRES takes a void matvec.
     pub fn matvec(ctx: *MonoKrylovCtx, v: []const f64, w: []f64) void {
         const n = ctx.n;
         const osc = ctx.options.osc_node;
@@ -634,8 +624,8 @@ const Shoot = struct {
                     continue :sw .final;
                 }
                 if (s.iter != 0) try s.ckt.checkpoint(.{ .phase = .periodic, .completed = s.iter });
-                // integrateFrom(x0 -> x_end), recording the trajectory
-                // the monodromy recurrence linearizes around.
+                // x0 -> x_end, recording the trajectory the monodromy
+                // recurrence linearizes around.
                 num.copySimd(s.x_end, s.x0);
                 if (s.mono) |*m| return .{ .x = s.x_end, .probes = m.rows, .wave = m.traj, .opts = s.opts };
                 return .{ .x = s.x_end, .probes = &.{}, .wave = &.{}, .opts = s.opts };
@@ -754,6 +744,12 @@ const Shoot = struct {
         return true;
     }
 
+    /// Integrates every period the solve asks for on the host, to `result`.
+    fn runAlone(s: *Shoot) !SolveResult {
+        while (try s.next()) |r| try s.done(try integrateOnePeriod(s.ckt, s.ws, &s.sc, r.x, r.probes, r.wave, r.opts));
+        return s.result;
+    }
+
     /// The damped Newton update that ends a shooting iteration.
     fn update(s: *Shoot) void {
         var damping: f64 = 1.0;
@@ -792,8 +788,7 @@ pub fn solve(
     var s: Shoot = undefined;
     try s.init(ckt, x_dc, probes, wave, options, allocator);
     defer s.deinit();
-    while (try s.next()) |r| try s.done(try integrateOnePeriod(ckt, s.ws, &s.sc, r.x, r.probes, r.wave, r.opts));
-    return s.result;
+    return s.runAlone();
 }
 
 /// Starts an oscillator for the autonomous solve: kicks `x` (the DC point)
@@ -886,16 +881,17 @@ fn startOscillator(
 /// rows (time, probes...), n_samples+1 of them. Non-convergence prints a
 /// warning and still returns the last period.
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
-    try ctx.circuit.refuseDigital("pss");
-    const names = try root.probeNames(ctx, "time");
-    const data = try ctx.allocator.alloc(f64, (@as(usize, opts.n_samples) + 1) * names.len);
+    var shot: Shoot = undefined;
+    var names: []const []const u8 = undefined;
+    var data: []f64 = undefined;
+    try start(ctx, opts, &shot, &names, &data);
+    defer shot.deinit();
     errdefer ctx.allocator.free(data);
-    const res = try solve(ctx.circuit, ctx.x_op, ctx.probes, data, opts, ctx.scratch_allocator);
-    return finish(res, names, data, opts);
+    return finish(try shot.runAlone(), names, data, opts);
 }
 
-/// `run`'s setup for a lane: the same refusals, names and row buffer,
-/// then the shooting state in `shot`.
+/// `run`'s setup, shared with the lane drivers: the refusals, names and row
+/// buffer, then the shooting state in `shot`.
 fn start(ctx: *const root.RunCtx, opts: Options, shot: *Shoot, names: *[]const []const u8, data: *[]f64) !void {
     try ctx.circuit.refuseDigital("pss");
     names.* = try root.probeNames(ctx, "time");

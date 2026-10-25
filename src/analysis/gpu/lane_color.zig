@@ -1,5 +1,5 @@
-//! Thread-per-(instance, lane) evaluation for GPU lanes (performance TODO 06
-//! 6.11, opt-in `ESPICE_GPU_LANE_COLOR`). Thread-per-lane walks a batch's
+//! Thread-per-(instance, lane) evaluation for GPU lanes (opt-in
+//! `ESPICE_GPU_LANE_COLOR`). Thread-per-lane walks a batch's
 //! instances in order, which holds only N threads per batch: 10k lanes fill
 //! a laptop part but about 30 % of an H100. Here one launch per colour runs
 //! a thread per (instance of that colour, lane).
@@ -48,6 +48,7 @@ pub const Coloring = struct {
         }
     };
 
+    /// Frees every table `color` allocated in `gpa`.
     pub fn deinit(c: Coloring, gpa: std.mem.Allocator) void {
         gpa.free(c.order);
         gpa.free(c.starts);
@@ -57,6 +58,7 @@ pub const Coloring = struct {
         c.row_hubs.deinit(gpa);
     }
 
+    /// The number of colours, which launch in order 0, 1, ...
     pub fn colors(c: Coloring) usize {
         return c.starts.len - 1;
     }
@@ -64,7 +66,7 @@ pub const Coloring = struct {
 
 /// Cells touched by more than this many instances of a batch are hubs.
 // ponytail: a fixed bound; tune per card once a datacenter part can measure it.
-pub const hub_min = 4;
+const hub_min = 4;
 
 /// The colouring of a batch of `count` instances whose slot table holds
 /// `ks` entries per instance (cells < `trash_slot`, the trash slot itself
@@ -121,6 +123,7 @@ pub fn color(gpa: std.mem.Allocator, count: u32, ks: u32, slots: []const u32, n_
     for (level) |lv| out.starts[lv] += 1;
     for (1..out.starts.len) |c| out.starts[c] += out.starts[c - 1];
     out.order = try gpa.alloc(u32, count);
+    errdefer gpa.free(out.order);
     const fill = try gpa.dupe(u32, out.starts[0..n_colors]);
     defer gpa.free(fill);
     for (level, 0..) |lv, i| {
@@ -158,15 +161,11 @@ fn stage(gpa: std.mem.Allocator, hub: []const bool, table: []u32, base: u32) !st
         ix.* = n_hubs;
         n_hubs += @intFromBool(h);
     }
-    var hubs: Coloring.Hubs = .{
-        .cells = try gpa.alloc(u32, n_hubs),
-        .starts = try gpa.alloc(u32, n_hubs + 1),
-        .entries = undefined,
-    };
-    errdefer {
-        gpa.free(hubs.cells);
-        gpa.free(hubs.starts);
-    }
+    const cells = try gpa.alloc(u32, n_hubs);
+    errdefer gpa.free(cells);
+    const starts = try gpa.alloc(u32, n_hubs + 1);
+    errdefer gpa.free(starts);
+    var hubs: Coloring.Hubs = .{ .cells = cells, .starts = starts, .entries = undefined };
     @memset(hubs.starts, 0);
     var n_stage: u32 = 0;
     for (table) |cell| if (cell < hub.len and hub[cell]) {
@@ -178,6 +177,7 @@ fn stage(gpa: std.mem.Allocator, hub: []const bool, table: []u32, base: u32) !st
     };
     for (1..hubs.starts.len) |h| hubs.starts[h] += hubs.starts[h - 1];
     hubs.entries = try gpa.alloc(u32, n_stage);
+    errdefer gpa.free(hubs.entries);
     const fill = try gpa.dupe(u32, hubs.starts[0..n_hubs]);
     defer gpa.free(fill);
     var k: u32 = 0;
@@ -243,4 +243,16 @@ test "lane colouring: per-cell sums are bitwise the instance-order walk" {
         for (0..nnz) |cell| try std.testing.expectEqual(@as(u64, @bitCast(want[cell])), @as(u64, @bitCast(got[cell])));
         for (got[nnz + 1 ..]) |g| try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, -0.0))), @as(u64, @bitCast(g)));
     }
+}
+
+fn colorAndFree(gpa: std.mem.Allocator, slots: []const u32, rows: []const u32) !void {
+    const c = try color(gpa, 6, 2, slots, 1, rows, 3, 2, 4, 3);
+    c.deinit(gpa);
+}
+
+test "color frees everything on every allocation failure" {
+    // Slot cell 0 and row 0 are hubs (six touchers), cell 1 is not.
+    const slots = [_]u32{ 0, 1, 0, 3, 0, 1, 0, 2, 0, 3, 0, 1 };
+    const rows = [_]u32{ 0, 0, 1, 0, 0, 0 };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, colorAndFree, .{ &slots, &rows });
 }

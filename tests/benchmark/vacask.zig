@@ -20,24 +20,24 @@
 
 const std = @import("std");
 const common = @import("job.zig");
+/// The flag whose output the report header quotes as VACASK's version.
 pub const version_flag = "-h";
 /// Native controls apply only to VACASK, never injected into SPICE decks.
 pub const Options = struct {
+    /// VACASK's `tran_fs` option, in (0, 1].
     tran_fs: ?f64 = null,
+    /// Replaces the deck's TSTEP as VACASK's `step`; must be finite and positive.
     tran_step: ?f64 = null,
 };
 
 /// Translates `netlist` into `scratch`/runme.sim and returns the job that runs
-/// it there, or a refused job naming the untranslatable card. Translation is
-/// not timed.
-pub fn prepare(io: std.Io, a: std.mem.Allocator, bin: []const u8, netlist: []const u8, scratch: []const u8, hspice_dialect: bool) common.Error!common.Job {
-    return prepareWithOptions(io, a, bin, netlist, scratch, hspice_dialect, .{});
-}
-
-pub fn prepareWithOptions(io: std.Io, a: std.mem.Allocator, bin: []const u8, netlist: []const u8, scratch: []const u8, hspice_dialect: bool, options: Options) common.Error!common.Job {
+/// it there, or a refused job naming the untranslatable card. An HSPICE-dialect
+/// deck is refused before the file is read. Translation is not timed; every
+/// slice in the job is allocated in `a`.
+pub fn prepare(io: std.Io, a: std.mem.Allocator, bin: []const u8, netlist: []const u8, scratch: []const u8, hspice_dialect: bool, options: Options) common.Error!common.Job {
     if (hspice_dialect) return .{ .refused = "VACASK adapter translates ngspice syntax, not HSPICE semantics" };
     const spice = std.Io.Dir.cwd().readFileAlloc(io, netlist, a, .unlimited) catch return error.DeckFailed;
-    const sim = switch (try translateWithOptions(a, spice, options)) {
+    const sim = switch (try translate(a, spice, options)) {
         .sim => |text| text,
         .refused => |reason| return .{ .refused = reason },
     };
@@ -51,6 +51,7 @@ pub fn prepareWithOptions(io: std.Io, a: std.mem.Allocator, bin: []const u8, net
     };
 }
 
+/// What `translate` makes of one deck.
 pub const Output = union(enum) {
     /// A VACASK deck, ready to write into the fixture's scratch dir.
     sim: []const u8,
@@ -58,11 +59,10 @@ pub const Output = union(enum) {
     refused: []const u8,
 };
 
-pub fn translate(gpa: std.mem.Allocator, spice: []const u8) error{OutOfMemory}!Output {
-    return translateWithOptions(gpa, spice, .{});
-}
-
-pub fn translateWithOptions(gpa: std.mem.Allocator, spice: []const u8, options: Options) error{OutOfMemory}!Output {
+/// SPICE deck text in, VACASK netlist text or a refusal out, all allocated in
+/// `gpa` and never freed piecemeal: pass an arena. An `options` value out of
+/// range is a refusal, not an error.
+pub fn translate(gpa: std.mem.Allocator, spice: []const u8, options: Options) error{OutOfMemory}!Output {
     var x: Xlat = .{ .gpa = gpa, .native_options = options };
     if (options.tran_step) |step| {
         if (!(step > 0) or !std.math.isFinite(step))
@@ -1017,6 +1017,7 @@ pub const Card = struct {
         return c.fields.len;
     }
 
+    /// Field `i`, or null past the last field.
     pub fn tok(c: Card, i: usize) ?[]const u8 {
         return if (i < c.fields.len) c.fields[i] else null;
     }
@@ -1118,6 +1119,8 @@ fn isNumber(t: []const u8) bool {
     return parseNum(t) != null;
 }
 
+/// The value of a SPICE number with its scale suffix and unit (`1meg`, `5mA`),
+/// or null when `t` is not one (a `.param` name, an expression).
 pub fn parseSpice(t: []const u8) ?f64 {
     return if (parseNum(t)) |n| n.value else null;
 }
@@ -1181,7 +1184,7 @@ const Probe = struct {
     }
 
     fn sim(p: *Probe, spice: []const u8) ![]const u8 {
-        return switch (try translate(p.arena.allocator(), spice)) {
+        return switch (try translate(p.arena.allocator(), spice, .{})) {
             .sim => |s| s,
             .refused => |r| {
                 std.debug.print("unexpectedly refused: {s}\n", .{r});
@@ -1191,7 +1194,7 @@ const Probe = struct {
     }
 
     fn why(p: *Probe, spice: []const u8) ![]const u8 {
-        return switch (try translate(p.arena.allocator(), spice)) {
+        return switch (try translate(p.arena.allocator(), spice, .{})) {
             .sim => error.UnexpectedlyTranslated,
             .refused => |r| r,
         };
@@ -1656,7 +1659,7 @@ test "SFFM defaults and nonpositive frequencies follow ngspice 45" {
 }
 
 test "an untranslated HSPICE dialect is refused before reading the deck" {
-    const job = try prepare(std.testing.io, std.testing.allocator, "vacask", "unused", "unused", true);
+    const job = try prepare(std.testing.io, std.testing.allocator, "vacask", "unused", "unused", true, .{});
     try std.testing.expect(job.refused.len > 0);
     try std.testing.expectEqual(@as(usize, 0), job.argv.len);
 }
@@ -1707,13 +1710,13 @@ test "VACASK startup fraction is explicit native configuration" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const source = "startup\nV1 in 0 1\nR1 in 0 1k\n.tran 2p 200p uic\n.end\n";
-    const out = try translateWithOptions(arena.allocator(), source, .{ .tran_fs = 0.001 });
+    const out = try translate(arena.allocator(), source, .{ .tran_fs = 0.001 });
     try has(out.sim, "tran_fs=1e-3");
     try has(out.sim, "step=2p stop=200p maxstep=2e-12");
-    const refined = try translateWithOptions(arena.allocator(), "startup\nV1 in 0 1\nR1 in 0 1k\n.tran 0.2p 200p 0 2p uic\n.end\n", .{ .tran_fs = 0.001, .tran_step = 2e-12 });
+    const refined = try translate(arena.allocator(), "startup\nV1 in 0 1\nR1 in 0 1k\n.tran 0.2p 200p 0 2p uic\n.end\n", .{ .tran_fs = 0.001, .tran_step = 2e-12 });
     try has(refined.sim, "step=2e-12 stop=200p maxstep=2p");
     for ([_]f64{ 0, -1, 1.01, std.math.nan(f64), std.math.inf(f64) }) |fs| {
-        const refused = try translateWithOptions(arena.allocator(), source, .{ .tran_fs = fs });
+        const refused = try translate(arena.allocator(), source, .{ .tran_fs = fs });
         try testing.expect(refused == .refused);
     }
 }

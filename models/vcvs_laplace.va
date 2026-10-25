@@ -13,6 +13,9 @@
 // the runtime degree (trailing zeros dropped), and a common factor of s
 // cancels before the DC gain. ponytail: one direct-form section, so orders
 // past 8 are refused by the builder; a biquad cascade lifts that.
+
+`include "constants.vams"
+
 `include "disciplines.vams"
 
 `ifdef LAPLACE_ZP

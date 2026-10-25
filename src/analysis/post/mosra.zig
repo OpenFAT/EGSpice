@@ -1,4 +1,4 @@
-//! HSPICE MOSRA level 1 aging (dev/analysis/mosra.md): per-device stress
+//! HSPICE MOSRA level 1 aging: per-device stress
 //! integrated over a fresh transient, extrapolated to each reliability time
 //! as a power law, and turned into the `delvto`/`mulu0` writes of the aged
 //! runs plus the degradation table HSPICE writes as `.radeg`.
@@ -138,23 +138,11 @@ test "age: constant stress is A t^n, and DegF inverts it" {
     const gpa = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const md: core.MosraModel = .{ .tit0 = 1e-3, .titfd = 0.5, .tn = 0.25, .hci0 = 2e-4, .hcin = 0.5, .hcimu = 0.1 };
-    const m: core.Mosra = .{
-        .tran = .{ .t_stop = 1e-6 },
-        .rel_times = &.{ 1e6, 1e8 },
-        .aged_runs = true,
-        .deg_f = 0.05,
-        .models = &.{md},
-        .names = &.{"m1"},
-        .terminals = &.{.{ 1, 2, 0 }},
-        .pmos = &.{false},
-        .temp_k = &.{300},
-        .model = &.{0},
-        .delvto = &.{7},
-        .mulu0 = &.{8},
-        .delvto_fresh = &.{0.02},
-        .mulu0_fresh = &.{0.5},
-    };
+    var m = testMosra(false);
+    m.rel_times = &.{ 1e6, 1e8 };
+    m.deg_f = 0.05;
+    m.delvto_fresh = &.{0.02};
+    m.mulu0_fresh = &.{0.5};
     // vd = 1.5, vg = 1.2, constant over three samples.
     const data = [_]f64{ 0, 1.5, 1.2, 0, 0.5e-6, 1.5, 1.2, 0, 1e-6, 1.5, 1.2, 0 };
     const res: core.Result = .{ .plotname = "", .varnames = &.{ "time", "d", "g", "s" }, .is_complex = false, .npoints = 3, .data = &data };

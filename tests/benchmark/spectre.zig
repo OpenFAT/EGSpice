@@ -11,6 +11,7 @@ const std = @import("std");
 const common = @import("job.zig");
 const compare = @import("compare.zig");
 const hspice = @import("hspice.zig");
+/// The flag whose output the report header quotes as Spectre's version.
 pub const version_flag = "-V";
 
 /// Copies `netlist` into `scratch`/deck.sp through `hspice.stage` and returns

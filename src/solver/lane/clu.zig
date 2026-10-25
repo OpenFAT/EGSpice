@@ -28,6 +28,8 @@ pub fn ComplexLaneLu(comptime W: usize) type {
     }
     return struct {
         const Self = @This();
+        /// One entry's real or imaginary part across the lanes (lane l in
+        /// element l).
         pub const V = @Vector(W, f64);
         const I = @Vector(W, i64);
         const U = @Vector(W, u64);
@@ -85,6 +87,7 @@ pub fn ComplexLaneLu(comptime W: usize) type {
             };
         }
 
+        /// Frees the one value block; `base` stays the caller's.
         pub fn deinit(self: *Self, gpa: Allocator) void {
             const len = 2 * (self.lr.len + self.ur.len) + 6 * @as(usize, self.n);
             gpa.free(self.lr.ptr[0..len]);
@@ -103,6 +106,7 @@ pub fn ComplexLaneLu(comptime W: usize) type {
             re: []const V,
             im: []const V,
 
+            /// Writes column `c`'s entries to `wr`/`wi`, entry p at row `prow[p]`.
             pub inline fn load(self: Plane, c: usize, wr: []V, wi: []V, prow: []const u32) void {
                 for (self.col_ptr[c]..self.col_ptr[c + 1]) |p| {
                     wr[prow[p]] = self.re[p];

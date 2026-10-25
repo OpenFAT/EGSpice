@@ -11,11 +11,9 @@
 const std = @import("std");
 const num = @import("core").numerics;
 const Complex = num.Complex;
+const Eigs = @import("core").eigen.Eigs;
 
 const eps = std.math.floatEps(f64);
-
-/// How many finite roots were written, and whether the iteration finished.
-pub const Roots = struct { count: usize, converged: bool };
 
 /// Writes the finite roots of det(A − λB) = 0 into `out[0..count]`; `out`
 /// needs n slots. Roots at infinity (B singular) are dropped, and so is the
@@ -28,7 +26,7 @@ pub const Roots = struct { count: usize, converged: bool };
 /// below `tol` relative to its diagonal pair, or below eps·‖A‖_F.
 /// `converged` is false when one block exhausted `max_iter` QZ steps; its
 /// roots are then missing.
-pub fn roots(n: usize, a: []f64, b: []f64, out: []Complex, tol: f64, max_iter: u32) Roots {
+pub fn roots(n: usize, a: []f64, b: []f64, out: []Complex, tol: f64, max_iter: u32) Eigs {
     var count: usize = 0;
     const m = isolate(n, a, b, out, &count);
     if (m == 0) return .{ .count = count, .converged = true };
@@ -366,6 +364,43 @@ test roots {
     // The same pencil with no QZ steps allowed: its roots are missing.
     congruent(4, s, t, &a, &b);
     try std.testing.expect(!roots(4, &a, &b, &out, 1e-12, 0).converged);
+}
+
+test "roots: an index-2 block at infinity stays infinite" {
+    // (S, T) upper triangular: finite roots −1, 3 and −2 on the diagonal,
+    // and T = [[0, 1], [0, 0]] on rows 2..3, a Jordan block at infinity.
+    // Perturbed by eps it splits into finite roots near 1/√eps; only the
+    // zero-diagonal deflation keeps it infinite.
+    const n = 5;
+    const s_diag = [n]f64{ -2, 3, 1, 1, -8 };
+    const t_diag = [n]f64{ 2, 1, 0, 0, 4 };
+    var s: [n * n]f64 = @splat(0);
+    var t: [n * n]f64 = @splat(0);
+    for (0..n) |i| {
+        s[i * n + i] = s_diag[i];
+        t[i * n + i] = t_diag[i];
+        for (i + 1..n) |j| {
+            s[i * n + j] = 0.5 / @as(f64, @floatFromInt(i + j));
+            t[i * n + j] = if (i == 2 and j == 3) 1 else 0.25 * @as(f64, @floatFromInt(j - i));
+        }
+    }
+    var a: [n * n]f64 = undefined;
+    var b: [n * n]f64 = undefined;
+    congruent(n, s, t, &a, &b);
+
+    var out: [n]Complex = undefined;
+    const r = roots(n, &a, &b, &out, 1e-12, 1000);
+    try std.testing.expect(r.converged);
+    try std.testing.expectEqual(@as(usize, 3), r.count);
+    std.mem.sort(Complex, out[0..r.count], {}, struct {
+        fn lt(_: void, l: Complex, h: Complex) bool {
+            return l.re < h.re;
+        }
+    }.lt);
+    for (out[0..r.count], [_]f64{ -2, -1, 3 }) |z, want| {
+        try std.testing.expectApproxEqRel(want, z.re, 1e-12);
+        try std.testing.expectEqual(@as(f64, 0), z.im);
+    }
 }
 
 test isolate {

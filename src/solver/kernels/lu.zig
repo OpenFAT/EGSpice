@@ -39,15 +39,12 @@ pub const solve_block = 256;
 /// chain_bsim4_30k 5.17 -> 4.88.
 pub const panel = 64;
 /// Longest solve tail the cut search (`solveCost`) tries.
-pub const tail_max = 5120;
-/// `Tab.flags` bit: the step has a fabricated unit pivot
-/// (`SparseLu.void_col`).
-pub const void_bit: u32 = 1;
-/// `Tab.flags` bit: the pivot passed only the row-scaled test
-/// (`SparseLu.scaled_pivot`), so the growth monitor skips it.
-pub const scaled_bit: u32 = 2;
+const tail_max = 5120;
+// `Tab.flags` bits, the encoding `LaneTab.flags` uses.
+const void_bit = @import("lane.zig").void_bit;
+const scaled_bit = @import("lane.zig").scaled_bit;
 /// A narrow `dmap` entry (`Tab.dmap16`) naming the discard slot.
-pub const narrow_discard: u16 = 0xFFFF;
+const narrow_discard: u16 = 0xFFFF;
 /// u32 words ahead of the done stamps in the sync buffer: the refactor
 /// ticket, the fail word (`n - k` for the lowest failing pivot step k, 0
 /// when every step passed), and the forward and back solves' head tickets,
@@ -171,11 +168,11 @@ comptime {
 }
 
 /// The kernel bodies over the pointer type `Sy.P` (a global pointer on the
-/// device, a plain one on the host), `Sy.barrier`/`Sy.pause(spins)` and the done
-/// stamps' `Sy.acquire`/`Sy.release`. `sh` is
-/// the block's shared scratch (a `*Shared`, in the shared address space on
-/// the device); `tid`/`nt` are the lane and lane count (0 and 1 on the
-/// host), `nt` at most `lanes`.
+/// device, a plain one on the host), `Sy.barrier`/`Sy.pause(spins)` and the
+/// done stamps' `Sy.acquire`/`Sy.release`. `sh` is the block's shared
+/// scratch (a `*Shared`, in the shared address space on the device);
+/// `tid`/`nt` are the lane and lane count (0 and 1 on the host), `nt` at
+/// most `lanes`, a power of two for `refactor`'s column-max tree.
 pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
     return struct {
         const P = Sy.P;
@@ -420,16 +417,6 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
             return bad or nonfinite != 0;
         }
 
-        /// Forward solve: y = L^-1 P (-rhs), each row's subtractions in
-        /// ascending k, skipping y[k] == 0 as `SparseLu.solve` does. The
-        /// host form: every head ticket, then every panel. `sh` is a
-        /// `*SolveShared`, `psh` a `*PanelShared`. Does nothing when the
-        /// refactor failed.
-        pub fn lsolve(t: Tab, x: P(u32), val: P(f64), rhs: P(f64), y: P(f64), sy: P(u32), stamp: u32, sh: anytype, psh: anytype, tid: u32, nt: u32) void {
-            while (lhead(t, x, val, rhs, y, sy, stamp, sh, tid, nt)) {}
-            while (lpanel(t, x, val, y, sy, stamp, psh, tid, nt)) {}
-        }
-
         /// The forward head for the run its ticket names: each lane its
         /// rows' head entries (k < t0), after their rows' done stamps,
         /// then its own stamp. Returns false once the tickets run out, so
@@ -452,18 +439,11 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
             return true;
         }
 
-        /// Back solve: z = U^-1 y, each row's subtractions in descending
-        /// k, and dx[q[i]] = z[i]; y ends holding z. The tail panels run
-        /// first; head rows gather their tail entries afterwards, which is
-        /// still the host's descending order. The host form: every panel,
-        /// then every head ticket.
-        pub fn usolve(t: Tab, x: P(u32), val: P(f64), y: P(f64), dx: P(f64), sy: P(u32), stamp: u32, sh: anytype, psh: anytype, tid: u32, nt: u32) void {
-            while (upanel(t, x, val, y, dx, sy, stamp, psh, tid, nt)) {}
-            while (uhead(t, x, val, y, dx, sy, stamp, sh, tid, nt)) {}
-        }
-
         /// The back head for the run its ticket names, as `lhead`: a head
-        /// row waits only on head rows; the tail is final before it runs.
+        /// row waits only on head rows, because the tail panels (`upanel`)
+        /// finish before any head ticket; each row's subtractions still run
+        /// in the host's descending k. Sets dx[q[i]] = z[i]; y ends holding
+        /// z.
         pub fn uhead(t: Tab, x: P(u32), val: P(f64), y: P(f64), dx: P(f64), sy: P(u32), stamp: u32, sh: anytype, tid: u32, nt: u32) bool {
             const c = takeTicket(sy, 3, sh, tid);
             if (c >= t.u_chunks) return false;
@@ -513,7 +493,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                 Sy.barrier();
                 i = r0 + tid;
                 while (i < r1) : (i += nt) {
-                    const ga = gatherBelow(sh.a[i - r0], x, val, y + t.t0, t.tl_col, t.tl_slot, sh.e[i - r0], x[t.tl_ptr + i + 1], (j + 1) * panel);
+                    const ga = gatherUntil(true, sh.a[i - r0], x, val, y + t.t0, t.tl_col, t.tl_slot, sh.e[i - r0], x[t.tl_ptr + i + 1], (j + 1) * panel);
                     sh.a[i - r0] = ga.acc;
                     sh.e[i - r0] = ga.e;
                 }
@@ -564,7 +544,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                 Sy.barrier();
                 i = r0 + tid;
                 while (i < r1) : (i += nt) {
-                    const ga = gatherAtLeast(sh.a[i - r0], x, val, y + t.t0, t.tu_col, t.tu_slot, sh.e[i - r0], x[t.tu_ptr + i + 1], j * panel);
+                    const ga = gatherUntil(false, sh.a[i - r0], x, val, y + t.t0, t.tu_col, t.tu_slot, sh.e[i - r0], x[t.tu_ptr + i + 1], j * panel);
                     sh.a[i - r0] = ga.acc;
                     sh.e[i - r0] = ga.e;
                 }
@@ -617,14 +597,21 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
 
         const Ga = struct { acc: f64, e: u32 };
 
-        /// `acc` minus val[slot[e]] * yt[col[e]] from entry e on while
-        /// col[e] < hi (columns ascending), skipping yt == 0; eight
-        /// entries' loads go out before their subtractions.
-        inline fn gatherBelow(acc0: f64, x: P(u32), val: P(f64), yt: P(f64), col: u32, slot: u32, e0: u32, e1: u32, hi: u32) Ga {
+        /// `acc` minus val[slot[e]] * yt[col[e]] from entry e on while the
+        /// column is on the near side of `bound`: col[e] < bound with the
+        /// columns ascending (`below`), col[e] >= bound with them
+        /// descending. Skips yt == 0; eight entries' loads go out before
+        /// their subtractions.
+        inline fn gatherUntil(comptime below: bool, acc0: f64, x: P(u32), val: P(f64), yt: P(f64), col: u32, slot: u32, e0: u32, e1: u32, bound: u32) Ga {
+            const S = struct {
+                inline fn in(c: u32, b: u32) bool {
+                    return if (below) c < b else c >= b;
+                }
+            };
             const U = 8;
             var acc = acc0;
             var e = e0;
-            while (e + U <= e1 and x[col + e + U - 1] < hi) : (e += U) {
+            while (e + U <= e1 and S.in(x[col + e + U - 1], bound)) : (e += U) {
                 var yv: [U]f64 = undefined;
                 var lv: [U]f64 = undefined;
                 inline for (0..U) |u| {
@@ -633,28 +620,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
                 }
                 inline for (0..U) |u| acc = if (yv[u] != 0) acc - lv[u] * yv[u] else acc;
             }
-            while (e < e1 and x[col + e] < hi) : (e += 1) {
-                const yk = yt[x[col + e]];
-                if (yk != 0) acc -= val[x[slot + e]] * yk;
-            }
-            return .{ .acc = acc, .e = e };
-        }
-
-        /// `gatherBelow` for columns descending, while col[e] >= lo.
-        inline fn gatherAtLeast(acc0: f64, x: P(u32), val: P(f64), yt: P(f64), col: u32, slot: u32, e0: u32, e1: u32, lo: u32) Ga {
-            const U = 8;
-            var acc = acc0;
-            var e = e0;
-            while (e + U <= e1 and x[col + e + U - 1] >= lo) : (e += U) {
-                var yv: [U]f64 = undefined;
-                var lv: [U]f64 = undefined;
-                inline for (0..U) |u| {
-                    yv[u] = yt[x[col + e + u]];
-                    lv[u] = val[x[slot + e + u]];
-                }
-                inline for (0..U) |u| acc = if (yv[u] != 0) acc - lv[u] * yv[u] else acc;
-            }
-            while (e < e1 and x[col + e] >= lo) : (e += 1) {
+            while (e < e1 and S.in(x[col + e], bound)) : (e += 1) {
                 const yk = yt[x[col + e]];
                 if (yk != 0) acc -= val[x[slot + e]] * yk;
             }
@@ -687,7 +653,7 @@ pub fn Kernels(comptime Sy: type, comptime cap: u32, comptime lanes: u32) type {
 }
 
 /// The host instance: plain pointers, a block of one lane.
-pub const HostSy = struct {
+const HostSy = struct {
     /// A plain many-item pointer: host memory has one address space.
     pub fn P(comptime T: type) type {
         return [*]T;
@@ -710,6 +676,20 @@ pub const HostSy = struct {
         @atomicStore(u32, p, v, .release);
     }
 };
+
+/// One host thread's refactor: takes tickets until they run out, with the
+/// block scratch capped at `cap` slots (0 runs every column in `val`).
+fn RefactorLoop(comptime cap: u32) type {
+    return struct {
+        fn work(t: Tab, x: [*]u32, val: [*]f64, av: [*]f64, sy: [*]u32, stamp: u32) void {
+            const H = Kernels(HostSy, cap, 1);
+            var sh: H.Shared = undefined;
+            if (t.dmap16 != 0) {
+                while (H.refactor(u16, t, x, val, av, sy, stamp, &sh, 0, 1)) {}
+            } else while (H.refactor(u32, t, x, val, av, sy, stamp, &sh, 0, 1)) {}
+        }
+    };
+}
 
 /// Host buffers for one `runHost` call; `sync` must be zeroed once after
 /// the tables are built, and `stamp` must grow by one per call.
@@ -754,16 +734,8 @@ fn runHostCap(comptime cap: u32, t: Tab, b: HostBufs, stamp: u32, threads: u32) 
     const H = Kernels(HostSy, cap, 1);
     @memset(b.sync[0..sync_header], 0);
     const x = @constCast(b.idx.ptr);
-    const Worker = struct {
-        fn work(tt: Tab, bb: HostBufs, st: u32) void {
-            var sh: H.Shared = undefined;
-            const ix = @constCast(bb.idx.ptr);
-            const av = @constCast(bb.a.ptr);
-            if (tt.dmap16 != 0) {
-                while (H.refactor(u16, tt, ix, bb.val.ptr, av, bb.sync.ptr, st, &sh, 0, 1)) {}
-            } else while (H.refactor(u32, tt, ix, bb.val.ptr, av, bb.sync.ptr, st, &sh, 0, 1)) {}
-        }
-    };
+    const work = RefactorLoop(cap).work;
+    const args = .{ t, x, b.val.ptr, @constCast(b.a.ptr), b.sync.ptr, stamp };
     var pool: [63]std.Thread = undefined;
     const extra = @min(@max(threads, 1) - 1, pool.len);
     // Returning on a failed spawn would free `b` under the running threads.
@@ -771,18 +743,25 @@ fn runHostCap(comptime cap: u32, t: Tab, b: HostBufs, stamp: u32, threads: u32) 
     // Single-threaded (wasm) never names `spawn`: one thread, the oracle.
     if (!@import("builtin").single_threaded) {
         for (pool[0..extra]) |*th| {
-            th.* = std.Thread.spawn(.{}, Worker.work, .{ t, b, stamp }) catch break;
+            th.* = std.Thread.spawn(.{}, work, args) catch break;
             spawned += 1;
         }
     }
-    Worker.work(t, b, stamp);
+    @call(.auto, work, args);
     for (pool[0..spawned]) |th| th.join();
     var ssh: H.SolveShared = undefined;
     // 34 KB, too much for a worker thread's stack.
     const psh = try std.heap.page_allocator.create(H.PanelShared);
     defer std.heap.page_allocator.destroy(psh);
-    H.lsolve(t, x, b.val.ptr, @constCast(b.rhs.ptr), b.y.ptr, b.sync.ptr, stamp, &ssh, psh, 0, 1);
-    H.usolve(t, x, b.val.ptr, b.y.ptr, b.dx.ptr, b.sync.ptr, stamp, &ssh, psh, 0, 1);
+    // Forward, y = L^-1 P (-rhs): every head ticket, then every panel. Back,
+    // z = U^-1 y: every panel, then every head ticket. Each does nothing
+    // once the refactor failed.
+    const val = b.val.ptr;
+    const sy = b.sync.ptr;
+    while (H.lhead(t, x, val, @constCast(b.rhs.ptr), b.y.ptr, sy, stamp, &ssh, 0, 1)) {}
+    while (H.lpanel(t, x, val, b.y.ptr, sy, stamp, psh, 0, 1)) {}
+    while (H.upanel(t, x, val, b.y.ptr, b.dx.ptr, sy, stamp, psh, 0, 1)) {}
+    while (H.uhead(t, x, val, b.y.ptr, b.dx.ptr, sy, stamp, &ssh, 0, 1)) {}
     const f = b.sync[1];
     assert(f <= t.n);
     return if (f == 0) null else t.n - f;
@@ -797,8 +776,6 @@ const SparseLu = @import("../sparse_lu.zig").SparseLu;
 /// gpu-lu.md option 3): one pivot epoch's tables and buffers. Its factors
 /// are bitwise `SparseLu.refactor`'s, so callers may pick it by speed.
 pub const HostRefactor = struct {
-    const H = Kernels(HostSy, col_max, 1);
-
     /// `SparseLu.pattern_epoch` the tables were built from.
     epoch: u32,
     tb: Tables,
@@ -843,21 +820,14 @@ pub const HostRefactor = struct {
         for (lu.void_slots.items) |p| {
             if (vals[p] != 0) return error.SingularMatrix;
         }
-        const Work = struct {
-            fn work(t: Tab, x: [*]u32, val: [*]f64, av: [*]f64, sy: [*]u32, stamp: u32) void {
-                var sh: H.Shared = undefined;
-                if (t.dmap16 != 0) {
-                    while (H.refactor(u16, t, x, val, av, sy, stamp, &sh, 0, 1)) {}
-                } else while (H.refactor(u32, t, x, val, av, sy, stamp, &sh, 0, 1)) {}
-            }
-        };
+        const work = RefactorLoop(col_max).work;
         self.stamp +%= 1;
         @memset(self.sync[0..sync_header], 0);
         const args = .{ self.tb.tab, self.tb.idx.ptr, self.val.ptr, @constCast(vals.ptr), self.sync.ptr, self.stamp };
         var futures: [15]std.Io.Future(void) = undefined;
         const extra = @min(@max(threads, 1) - 1, futures.len);
-        for (futures[0..extra]) |*f| f.* = io.async(Work.work, args);
-        @call(.auto, Work.work, args);
+        for (futures[0..extra]) |*f| f.* = io.async(work, args);
+        @call(.auto, work, args);
         for (futures[0..extra]) |*f| f.await(io);
         const t = self.tb.tab;
         assert(self.sync[1] <= t.n);
@@ -1148,15 +1118,15 @@ pub fn build(gpa: std.mem.Allocator, lu: *const SparseLu, col_ptr: []const u32, 
     // Concatenate, each table at the Tab field of its name.
     const parts = .{
         .{ "dmap", dmap.items[0..dwords] }, .{ "coff", coff },                   .{ "up", up },               .{ "lp", lp },
-        .{ "ui", ui },             .{ "ul0", ul0 },                     .{ "ulen", ulen },           .{ "flags", flags },
-        .{ "q", lu.q },            .{ "col_ptr", col_ptr[0 .. n + 1] }, .{ "amap", amap },           .{ "dcol", dcol },
-        .{ "wlev", wlev },         .{ "lev_ptr", lev_ptr.items },       .{ "g_slot", g_slot.items }, .{ "g_cptr", g_cptr.items },
-        .{ "g_l", g_l.items },     .{ "g_u", g_u.items },               .{ "li", li }, .{ "t_diag", t_diag },               .{ "l_lev", l_sched.lev },   .{ "l_rows", l_sched.rows },
-        .{ "l_ptr", l_ptr },       .{ "l_col", l_col },                 .{ "l_slot", l_slot },       .{ "perm_in", perm_in },
-        .{ "u_lev", u_sched.lev }, .{ "u_rows", u_sched.rows },         .{ "u_ptr", u_ptr },         .{ "u_col", u_col },
-        .{ "u_slot", u_slot },     .{ "l_chunk", l_chunk },             .{ "u_chunk", u_chunk },
-        .{ "tl_ptr", tl_ptr },     .{ "tl_col", tl_col },               .{ "tl_slot", tl_slot },
-        .{ "tu_ptr", tu_ptr },     .{ "tu_col", tu_col },               .{ "tu_slot", tu_slot },
+        .{ "ui", ui },                      .{ "ul0", ul0 },                     .{ "ulen", ulen },           .{ "flags", flags },
+        .{ "q", lu.q },                     .{ "col_ptr", col_ptr[0 .. n + 1] }, .{ "amap", amap },           .{ "dcol", dcol },
+        .{ "wlev", wlev },                  .{ "lev_ptr", lev_ptr.items },       .{ "g_slot", g_slot.items }, .{ "g_cptr", g_cptr.items },
+        .{ "g_l", g_l.items },              .{ "g_u", g_u.items },               .{ "li", li },               .{ "t_diag", t_diag },
+        .{ "l_lev", l_sched.lev },          .{ "l_rows", l_sched.rows },         .{ "l_ptr", l_ptr },         .{ "l_col", l_col },
+        .{ "l_slot", l_slot },              .{ "perm_in", perm_in },             .{ "u_lev", u_sched.lev },   .{ "u_rows", u_sched.rows },
+        .{ "u_ptr", u_ptr },                .{ "u_col", u_col },                 .{ "u_slot", u_slot },       .{ "l_chunk", l_chunk },
+        .{ "u_chunk", u_chunk },            .{ "tl_ptr", tl_ptr },               .{ "tl_col", tl_col },       .{ "tl_slot", tl_slot },
+        .{ "tu_ptr", tu_ptr },              .{ "tu_col", tu_col },               .{ "tu_slot", tu_slot },
     };
     var tab: Tab = undefined;
     tab.n = n;
@@ -1375,7 +1345,7 @@ fn gatherColumn(
     const cptr0 = g_cptr.items.len - 1; // g_cptr[item0] exists
     try g_cptr.resize(ar, cptr0 + 1 + n_items);
     const cp = g_cptr.items[cptr0..];
-    for (L, C, 0..) |_, cn, s| if (cn > 0) {
+    for (C, 0..) |cn, s| if (cn > 0) {
         cp[slot_item[s] + 1] = cn;
     };
     cp[0] = c0;
@@ -1398,4 +1368,3 @@ fn gatherColumn(
     }
     return true;
 }
-

@@ -16,7 +16,7 @@ pub const std_options: std.Options = .{ .signal_stack_size = if (@import("builti
 pub const vera_validate_contract = @import("builtin").mode == .debug;
 
 /// `--version`; a test pins it to build.zig.zon's `.version`.
-const version = "1.2.0";
+const version = "0.3.0";
 /// The backends compiled in, for `--version`; a GPU one also needs its
 /// device at run time.
 const backends = blk: {
@@ -282,10 +282,6 @@ test "--version matches build.zig.zon" {
     const zon = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "build.zig.zon", std.testing.allocator, .limited(1 << 16));
     defer std.testing.allocator.free(zon);
     try std.testing.expect(std.mem.indexOf(u8, zon, ".version = \"" ++ version ++ "\",") != null);
-}
-
-test autoJobs {
-    try std.testing.expect(autoJobs() >= 1);
 }
 
 test "optionValue: separate, joined, missing and empty values" {

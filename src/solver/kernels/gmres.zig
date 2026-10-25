@@ -6,9 +6,13 @@
 //! std only, so the same bodies compile for the host oracle and GPU kernels.
 const std = @import("std");
 
+/// What the driver must run for a point before its next `advance`: nothing,
+/// `output = A input`, or `output = M^-1 input`.
 pub const Request = enum(u8) { done = 0, matvec = 1, precond = 2 };
 const Phase = enum(u32) { done, cycle_residual, arnoldi_precond, arnoldi_matvec, update_precond, final_residual };
 
+/// The batch's dimensions and stopping rule, shared by every point.
+/// `preconditioned` nonzero routes each Arnoldi vector through `precond`.
 pub const Shape = extern struct {
     points: u64,
     n: u32,
@@ -31,6 +35,9 @@ pub const Layout = extern struct {
     r: u64,
     rows: u64,
 
+    /// Lays out the rows of an n-unknown, depth-m workspace.
+    /// `InvalidKrylovShape` when n or m is 0; `Overflow` when the row
+    /// count passes u64.
     pub fn init(n: u32, m: u32) !Layout {
         if (n == 0 or m == 0) return error.InvalidKrylovShape;
         var next: u64 = 0;
@@ -57,6 +64,9 @@ pub const Layout = extern struct {
     }
 };
 
+/// One point's resumable solver state, written by `start` and `advance`.
+/// `converged`, `singular` and `residual` are final once the point's
+/// request is `.done`.
 pub const State = extern struct {
     b_norm: f64 = 0,
     abs_tol: f64 = 0,
@@ -70,9 +80,10 @@ pub const State = extern struct {
     phase: Phase = .done,
 };
 
+/// The per-point bodies over the pointer type `P`; a point reads and writes
+/// only its own column of every buffer.
 pub fn Bodies(comptime P: fn (type) type) type {
     return struct {
-        const Self = @This();
         const Vec = struct { ptr: P(f64), start: u64 = 0 };
 
         fn get(v: Vec, row: u64, count: u64, point: u64) f64 {

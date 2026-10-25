@@ -16,6 +16,7 @@ pub fn Lanes(comptime W: usize) type {
         assert(W <= 64);
     }
     return struct {
+        /// The lane count, for code holding only `V` (`Of`).
         pub const width = W;
         /// One value per lane; f64 itself at W = 1.
         pub const V = if (W == 1) f64 else @Vector(W, f64);
@@ -25,17 +26,21 @@ pub fn Lanes(comptime W: usize) type {
         /// `&` on two u1 masks, and the W = 1 Newton probes are IDENTICAL
         /// only with the former.
         pub const Mask = if (W == 1) bool else @Int(.unsigned, W);
+        /// No lane set, and every lane set.
         pub const none: Mask = if (W == 1) false else 0;
         pub const every: Mask = if (W == 1) true else std.math.maxInt(Mask);
 
+        /// `x` in every lane; `x` itself at W = 1.
         pub inline fn splat(x: f64) V {
             return if (W == 1) x else @splat(x);
         }
 
+        /// Whether some lane is set; `m` itself at W = 1.
         pub inline fn any(m: Mask) bool {
             return m != none;
         }
 
+        /// Whether every lane is set; `m` itself at W = 1.
         pub inline fn all(m: Mask) bool {
             return m == every;
         }
@@ -87,9 +92,11 @@ pub fn Lanes(comptime W: usize) type {
             return .{ .bits = if (W == 1) @intFromBool(m) else m };
         }
 
+        /// `each`'s cursor: a copy of the mask, cleared lowest bit first.
         pub const Iter = struct {
             bits: @Int(.unsigned, W),
 
+            /// The lowest lane still set, cleared; null once none is.
             pub inline fn next(it: *Iter) ?usize {
                 if (it.bits == 0) return null;
                 const l: usize = @ctz(it.bits);

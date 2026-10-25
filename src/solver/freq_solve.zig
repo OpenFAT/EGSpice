@@ -128,7 +128,7 @@ pub const FreqSolver = struct {
         cx_held: []ComplexLaneLu(W) = &.{},
     };
 
-    /// The complex frequency lanes (TODO 2.10): a real SparseLu laid on
+    /// The complex frequency lanes: a real SparseLu laid on
     /// the n x n source pattern from the moduli |A(ω)_ij| at one chunk's
     /// centre is the pivot tape, and `ComplexLaneLu` replays W frequencies
     /// of A(ω) on it with its own growth test. A lane that fails takes the
@@ -452,17 +452,13 @@ pub const FreqSolver = struct {
         try indexDyn(gpa, sp, dyn);
         var base: usize = if (self.complex_lanes) try self.complexBatch(sp, omegas, dyn, rhs, x_out, adjoint) else 0;
         if (base == omegas.len) return;
-        if (sp.lane_work.len == 0)
-            sp.lane_work = try gpa.alloc(@Vector(W, f64), 2 * nn);
+        try ensureLaneWork(gpa, sp, nn);
         const b_plane = sp.lane_work[0..nn];
         const x_plane = sp.lane_work[nn..];
 
         while (base < omegas.len) : (base += W) {
             const cnt = @min(W, omegas.len - base);
-            // Pad a ragged tail by repeating its last ω.
-            var ow: [W]f64 = undefined;
-            for (0..W) |l| ow[l] = omegas[base + @min(l, cnt - 1)];
-            const omega_vec: @Vector(W, f64) = ow;
+            const omega_vec: @Vector(W, f64) = chunkOmegas(omegas, base, cnt);
 
             // The lanes replay the current pivot sequence; only the first
             // chunk, or one after a failed factor, pays a scalar factor.
@@ -490,7 +486,7 @@ pub const FreqSolver = struct {
                 for (rhs[r..][0..nn], b_plane) |value, *lane| lane.* = @splat(value);
                 if (adjoint) sp.lanes.?.solveT(b_plane, x_plane) else sp.lanes.?.solve(b_plane, x_plane);
                 for (0..cnt) |l| {
-                    if ((bad & (@as(u64, 1) << @intCast(l))) != 0) continue;
+                    if ((bad >> @intCast(l)) & 1 != 0) continue;
                     const dst = x_out[(base + l) * m + r ..][0..nn];
                     for (0..nn) |i| {
                         const row: [W]f64 = x_plane[i];
@@ -513,12 +509,9 @@ pub const FreqSolver = struct {
         const n: usize = self.n;
         const nn: usize = self.nn;
         const m = rhs.len;
-        if (sp.cx == null) {
-            sp.cx = try Complex.init(gpa, self.n, sp.src_col_ptr, sp.src_row_idx);
-            if (sp.cx == null) {
-                self.complex_lanes = false;
-                return 0;
-            }
+        if (!try self.ensureComplex(gpa, sp)) {
+            self.complex_lanes = false;
+            return 0;
         }
         const cx = &sp.cx.?;
         const br = cx.work[0..n];
@@ -534,10 +527,8 @@ pub const FreqSolver = struct {
                 cx.lanes = null;
             };
             if (cx.lanes == null) cx.lanes = try ComplexLaneLu(W).init(gpa, &cx.lu);
-            var ow: [W]f64 = undefined;
-            for (0..W) |l| ow[l] = omegas[base + @min(l, cnt - 1)];
             const lanes = &cx.lanes.?;
-            const bad = lanes.refactor(ComplexFill(W).of(sp, ow, dyn, base, cnt), sp.slv.params.refactor_growth_limit);
+            const bad = lanes.refactor(ComplexFill(W).of(sp, chunkOmegas(omegas, base, cnt), dyn, base, cnt), sp.slv.params.refactor_growth_limit);
             if (self.complexOwnFailure(fresh, cnt, bad)) return base;
             var r: usize = 0;
             while (r < m) : (r += nn) {
@@ -657,12 +648,9 @@ pub const FreqSolver = struct {
                 return null;
             },
         };
-        if (sp.cx == null) {
-            sp.cx = try Complex.init(sp.slv.gpa, self.n, sp.src_col_ptr, sp.src_row_idx);
-            if (sp.cx == null) {
-                self.complex_lanes = false;
-                return null;
-            }
+        if (!try self.ensureComplex(sp.slv.gpa, sp)) {
+            self.complex_lanes = false;
+            return null;
         }
         const fresh = (try self.complexChunkTape(sp, omegas, .{}, base, cnt, rhs, x_out, adjoint)) orelse return null;
         const lu = &sp.cx.?.lu;
@@ -714,7 +702,7 @@ pub const FreqSolver = struct {
     /// path, in lane order, after every lane solve: a failed lane's full
     /// factor may repivot the tape the next chunk replays.
     fn chunkPeel(self: *Self, omegas: []const f64, dyn: Dyn, base: usize, cnt: usize, bad: u64, rhs: []const f64, x_out: []f64, adjoint: bool) !void {
-        for (0..cnt) |l| if ((bad & (@as(u64, 1) << @intCast(l))) != 0)
+        for (0..cnt) |l| if ((bad >> @intCast(l)) & 1 != 0)
             try self.solveBatchSerial(omegas, dyn, base + l, 1, rhs, x_out, adjoint);
     }
 
@@ -771,6 +759,10 @@ pub const FreqSolver = struct {
             try self.solveBatchSerial(omegas, .{}, base, cnt, rhs, x_out, adjoint);
             return null;
         }
+        return laneChunk(sp, lu);
+    }
+
+    fn laneChunk(sp: *const Sparse, lu: *const SparseLu) LaneChunk {
         return .{
             .lu = lu,
             .src_col_ptr = sp.src_col_ptr,
@@ -798,15 +790,7 @@ pub const FreqSolver = struct {
             .dense => return null,
         };
         if (sp.held.len == 0) return null;
-        return .{
-            .lu = sp.held[0].base,
-            .src_col_ptr = sp.src_col_ptr,
-            .col_ptr = sp.col_ptr,
-            .row_idx = sp.row_idx,
-            .g = sp.g_vals,
-            .c = sp.c_vals,
-            .growth = sp.slv.params.refactor_growth_limit,
-        };
+        return laneChunk(sp, sp.held[0].base);
     }
 
     /// Host pivot-selection boundary for a resident factorEach provider.
@@ -848,15 +832,7 @@ pub const FreqSolver = struct {
             for (0..omegas.len) |k| self.held_id.appendAssumeCapacity(@intCast(k));
             return null;
         };
-        return .{
-            .lu = lu,
-            .src_col_ptr = sp.src_col_ptr,
-            .col_ptr = sp.col_ptr,
-            .row_idx = sp.row_idx,
-            .g = sp.g_vals,
-            .c = sp.c_vals,
-            .growth = sp.slv.params.refactor_growth_limit,
-        };
+        return laneChunk(sp, lu);
     }
 
     /// Publish one provider replay's failed harmonics in ascending order,
@@ -879,8 +855,7 @@ pub const FreqSolver = struct {
         const lu = sp.slv.sparse().?;
         errdefer self.held_location = .recovery_failed;
         try self.held_id.ensureTotalCapacity(self.gpa, omegas.len);
-        if (sp.lane_work.len == 0)
-            sp.lane_work = try self.gpa.alloc(@Vector(W, f64), 2 * @as(usize, self.nn));
+        try ensureLaneWork(self.gpa, sp, self.nn);
         freeHeld(self.gpa, sp);
         freeComplexHeld(self.gpa, sp);
         self.held_id.clearRetainingCapacity();
@@ -906,11 +881,7 @@ pub const FreqSolver = struct {
             .host, .device => {
                 assert(self.held_count == omegas.len);
                 errdefer self.held_location = .recovery_failed;
-                if (self.strategy == .sp) {
-                    const sp = &self.strategy.sp;
-                    if (sp.lane_work.len == 0)
-                        sp.lane_work = try self.gpa.alloc(@Vector(W, f64), 2 * @as(usize, self.nn));
-                }
+                if (self.strategy == .sp) try ensureLaneWork(self.gpa, &self.strategy.sp, self.nn);
                 // A singular final candidate may have no usable LU tape.
                 // solveEach already copies every all-identity RHS.
                 if (self.held_location == .device and self.held_id.items.len != omegas.len)
@@ -1050,9 +1021,7 @@ pub const FreqSolver = struct {
         assert(sp.slv.gpa.ptr == gpa.ptr);
         if (self.complex_held and try self.factorEachComplex(sp, omegas)) return;
         freeComplexHeld(gpa, sp);
-        const nn: usize = self.nn;
-        if (sp.lane_work.len == 0)
-            sp.lane_work = try gpa.alloc(@Vector(W, f64), 2 * nn);
+        try ensureLaneWork(gpa, sp, self.nn);
         var tried: [3]usize = undefined;
         var tries: usize = 0;
         var best: usize = undefined;
@@ -1109,30 +1078,16 @@ pub const FreqSolver = struct {
             for (sp.held) |*h| h.base = lu;
         } else {
             freeHeld(gpa, sp);
-            try self.allocHeld(sp, lu, groups);
+            sp.held = try initGroups(lane_lu.LaneLu(W), gpa, lu, groups);
         }
         for (sp.held, 0..) |*h, g| {
             const base = g * W;
             const cnt = @min(W, omegas.len - base);
-            var ow: [W]f64 = undefined;
-            for (0..W) |l| ow[l] = omegas[base + @min(l, cnt - 1)];
-            const bad = h.refactor(Stacked(W).of(sp, ow, .{}, base, cnt), sp.slv.params.refactor_growth_limit);
+            const bad = h.refactor(Stacked(W).of(sp, chunkOmegas(omegas, base, cnt), .{}, base, cnt), sp.slv.params.refactor_growth_limit);
             for (0..cnt) |l| if ((bad >> @intCast(l)) & 1 != 0)
                 self.held_id.appendAssumeCapacity(@intCast(base + l));
         }
         return self.held_id.items.len;
-    }
-
-    fn allocHeld(self: *Self, sp: *Sparse, lu: *SparseLu, groups: usize) Allocator.Error!void {
-        const gpa = self.gpa;
-        const LL = lane_lu.LaneLu(W);
-        sp.held = try gpa.alloc(LL, groups);
-        for (sp.held, 0..) |*h, g| h.* = LL.init(gpa, lu) catch |err| {
-            for (sp.held[0..g]) |*done| done.deinit(gpa);
-            gpa.free(sp.held);
-            sp.held = &.{};
-            return err;
-        };
     }
 
     /// Solves right-hand side k (the stacked 2n vector at `rhs[k*2n..]`)
@@ -1198,6 +1153,22 @@ pub const FreqSolver = struct {
         sp.cx_held = &.{};
     }
 
+    /// The lane RHS and solution planes, 2 * nn lanes, on first use.
+    fn ensureLaneWork(gpa: Allocator, sp: *Sparse, nn: usize) Allocator.Error!void {
+        if (sp.lane_work.len == 0) sp.lane_work = try gpa.alloc(@Vector(W, f64), 2 * nn);
+    }
+
+    /// `groups` lane factors on `lu`'s tape; on failure none is left.
+    fn initGroups(comptime T: type, gpa: Allocator, lu: *SparseLu, groups: usize) Allocator.Error![]T {
+        const out = try gpa.alloc(T, groups);
+        for (out, 0..) |*h, g| h.* = T.init(gpa, lu) catch |err| {
+            for (out[0..g]) |*done| done.deinit(gpa);
+            gpa.free(out);
+            return err;
+        };
+        return out;
+    }
+
     /// `factorEach` on the complex tape: one proxy factor at the middle ω,
     /// every group replayed on it. False, with no complex groups left, when
     /// the tape cannot be laid or some ω fails to replay it; the caller
@@ -1205,12 +1176,9 @@ pub const FreqSolver = struct {
     /// unchanged. On success the stacked groups are freed and no ω is held.
     fn factorEachComplex(self: *Self, sp: *Sparse, omegas: []const f64) !bool {
         const gpa = self.gpa;
-        if (sp.cx == null) {
-            sp.cx = try Complex.init(gpa, self.n, sp.src_col_ptr, sp.src_row_idx);
-            if (sp.cx == null) {
-                self.complex_held = false;
-                return false;
-            }
+        if (!try self.ensureComplex(gpa, sp)) {
+            self.complex_held = false;
+            return false;
         }
         const cx = &sp.cx.?;
         // `solveBatch`'s lanes replay this tape no more.
@@ -1224,27 +1192,18 @@ pub const FreqSolver = struct {
                 return false;
             },
         };
-        const CL = ComplexLaneLu(W);
         const groups = (omegas.len + W - 1) / W;
         const reuse = sp.cx_held.len == groups and for (sp.cx_held) |h| {
             if (h.lr.len != cx.lu.lx.items.len or h.ur.len != cx.lu.ux.items.len) break false;
         } else true;
         if (!reuse) {
             freeComplexHeld(gpa, sp);
-            sp.cx_held = try gpa.alloc(CL, groups);
-            for (sp.cx_held, 0..) |*h, g| h.* = CL.init(gpa, &cx.lu) catch |err| {
-                for (sp.cx_held[0..g]) |*done| done.deinit(gpa);
-                gpa.free(sp.cx_held);
-                sp.cx_held = &.{};
-                return err;
-            };
+            sp.cx_held = try initGroups(ComplexLaneLu(W), gpa, &cx.lu, groups);
         }
         for (sp.cx_held, 0..) |*h, g| {
             const base = g * W;
             const cnt = @min(W, omegas.len - base);
-            var ow: [W]f64 = undefined;
-            for (0..W) |l| ow[l] = omegas[base + @min(l, cnt - 1)];
-            const bad = h.refactor(ComplexFill(W).of(sp, ow, .{}, base, cnt), sp.slv.params.refactor_growth_limit);
+            const bad = h.refactor(ComplexFill(W).of(sp, chunkOmegas(omegas, base, cnt), .{}, base, cnt), sp.slv.params.refactor_growth_limit);
             if (bad != 0) {
                 freeComplexHeld(gpa, sp);
                 return false;
@@ -1303,6 +1262,21 @@ pub const FreqSolver = struct {
         .indexDyn = indexDyn,
         .Sparse = Sparse,
     } else {};
+
+    /// The ω of lanes `[base, base + cnt)`, a ragged tail padded by repeating
+    /// its last ω.
+    fn chunkOmegas(omegas: []const f64, base: usize, cnt: usize) [W]f64 {
+        var ow: [W]f64 = undefined;
+        for (0..W) |l| ow[l] = omegas[base + @min(l, cnt - 1)];
+        return ow;
+    }
+
+    /// Builds `sp.cx` on first use; false when the ordering's fill cap
+    /// refuses it, which leaves the stacked lanes as the only path.
+    fn ensureComplex(self: *const Self, gpa: Allocator, sp: *Sparse) !bool {
+        if (sp.cx == null) sp.cx = try Complex.init(gpa, self.n, sp.src_col_ptr, sp.src_row_idx);
+        return sp.cx != null;
+    }
 
     /// The lane path's oracle: `setOmega` with `dyn` and a solve per ω, over
     /// `omegas[first..][0..count]`, into the `x_out` rows `solveBatch` uses.

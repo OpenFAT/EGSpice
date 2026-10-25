@@ -1,6 +1,6 @@
 //! Ids every layer shares that no other core leaf owns: the dense device
 //! type id and the ground row. A leaf so `query.zig` and `deck.zig` need not
-//! import `root.zig` (AGENTS.md §2.8).
+//! import `root.zig` (`restricted_imports` in build.zig).
 const std = @import("std");
 
 /// Dense id of a device type in a `device.Library`: built-ins first, in

@@ -1,16 +1,16 @@
 .{
     .name = .espice,
-    .version = "1.2.0",
+    .version = "0.3.0",
     .fingerprint = 0x8b858d53fd1540a,
     .minimum_zig_version = "0.18.0-dev.349+d924f83bf",
     .dependencies = .{
         .vera = .{
-            .url = "git+https://github.com/OmarSiwy/VerA#7150cf4ddc263888c24e9dd22982f15e9b0683cc",
-            .hash = "vera-0.12.1-fzAu7Cu0cwGUkAjWlKeC4NVOzX-yiaYtA4N9ksspsxDK",
+            .url = "git+https://github.com/OmarSiwy/VerA#8f9cb28cfd746da377b9638c504da6946a38be00",
+            .hash = "vera-0.20.0-fzAu7Jl5MAHMmactWCpIh2BGb_2do27ch6fg_gaabk8R",
         },
         .gompute = .{
-            .url = "git+https://github.com/OmarSiwy/Gompute#abd75e41e9027b37b271348ae23e4e80ff002ddc",
-            .hash = "gompute-1.4.0-YJVc1u9XCABbNS2dh8sfuPWORX_ZA35Qhvv0OfKSBIil",
+            .url = "git+https://github.com/OmarSiwy/Gompute#15ab58137b094db1a82a74f67b0b0cba1c57d7af",
+            .hash = "gompute-1.5.0-YJVc1qjKCAC0sRRUEgn07hJbNHviJzrSf2fHE7XnWN7g",
         },
     },
     .paths = .{

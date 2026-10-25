@@ -40,7 +40,7 @@ const direct = @import("solver").direct;
 const numerics = @import("core").numerics;
 const combinePlanes = @import("../Circuit.zig").combinePlanes;
 
-const Complex = @import("core").numerics.Complex;
+const Complex = numerics.Complex;
 const GROUND = root.GROUND;
 
 /// Query options, defined in core/query.zig.

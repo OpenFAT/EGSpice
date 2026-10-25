@@ -15,7 +15,6 @@ pub const gmres = @import("gmres.zig");
 pub const gcrodr = @import("gcrodr.zig");
 pub const converger = @import("converger.zig");
 pub const lanes = @import("lane/lanes.zig");
-pub const lane_solver = @import("lane/solver.zig");
 pub const lane_system = @import("lane/system.zig");
 pub const lane_kernels = @import("kernels/lane.zig");
 pub const frequency_kernels = @import("kernels/frequency.zig");

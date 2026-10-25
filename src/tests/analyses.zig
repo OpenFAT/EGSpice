@@ -1,8 +1,15 @@
-//! Numerical regressions run end to end through the Problem API.
+//! Numerical regressions run end to end through the Problem API: deck text
+//! in, published results out. Oracles: closed forms (RC-ladder poles,
+//! bridge zeros, dividers, the `.ic`/uic start), ngspice's printed values
+//! (branch-current signs, bsource expressions), two solvers that must agree
+//! (hbnoise against shooting pnoise, multi-tone hb against qpss), the same
+//! run under an equivalent option (`tran_ceiling=duration` against TMAX,
+//! tnoimod 0 against 1), and the named refusal or failure a run must end in.
 const std = @import("std");
 const api = @import("espice");
 const Result = api.Result;
 
+/// Parses `source` and runs every query; the caller deinits the problem.
 fn runDeck(source: []const u8) !*api.Problem {
     const problem = try api.Problem.init(std.testing.allocator, std.testing.io, .{
         .source = .{ .bytes = .{ .data = source, .origin = "legacy.cir" } },
@@ -12,6 +19,8 @@ fn runDeck(source: []const u8) !*api.Problem {
     return problem;
 }
 
+/// The result of the `ordinal`-th query the deck itself requested, skipping
+/// implicit prerequisites such as the operating point.
 fn requestedResult(problem: *const api.Problem, ordinal: usize) !Result {
     var found: usize = 0;
     for (0..problem.query_count()) |i| {
@@ -655,8 +664,10 @@ const CeilingEventRun = struct {
     accepted: u32,
 };
 
-// Checkpoint quanta expose actual attempted/accepted work without enabling
-// numerical instrumentation or inferring rejections from output row counts.
+/// Runs the deck's one requested `.tran` by checkpoint quanta, recording the
+/// attempted and accepted step counts the progress events report (real
+/// work, with no instrumentation and no guessing rejections from row
+/// counts); the caller deinits `problem`.
 fn runCeilingEventDeck(source: []const u8) !CeilingEventRun {
     const p = try api.Problem.init(std.testing.allocator, std.testing.io, .{
         .source = .{ .bytes = .{ .data = source, .origin = "ceiling-event.cir" } },

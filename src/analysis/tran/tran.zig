@@ -5,8 +5,7 @@
 //! `Options`. Out: the probes at every accepted point, as `Waveform` rows.
 //! Cites ngspice dctran.c, traninit.c, cktsetbk.c, ckttrunc.c, niconv.c,
 //! indload.c, capload.c and AlmostEqualUlps (maths/misc/equality.c);
-//! Verilog-AMS LRM §4.5, §5.10.2, §9.10 and §9.17.2; #161;
-//! dev/analysis/transient-integration.md.
+//! Verilog-AMS LRM §4.5, §5.10.2, §9.10 and §9.17.2; #161.
 const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
@@ -19,17 +18,14 @@ const W = std.simd.suggestVectorLength(f64) orelse 8;
 // documented in types.zig.
 const tran_types = @import("types.zig");
 
-/// The swept plot's name and scale column (`session.schemaOf` reports them).
+/// The swept plot's name (`session.schemaOf` reports it).
 pub const plotname = "Transient Analysis";
+/// The scale column's name, column 0 of every row `run` publishes.
 pub const scale = "time";
 const Method = tran_types.Method;
-/// See types.zig `Options`.
 pub const Options = tran_types.Options;
-/// See types.zig `Waveform`.
 pub const Waveform = tran_types.Waveform;
-/// See types.zig `Column`.
 pub const Column = tran_types.Column;
-/// See types.zig `initialCapacity`.
 pub const initialCapacity = tran_types.initialCapacity;
 const measure = @import("measure");
 const Stream = measure.Stream;
@@ -72,10 +68,8 @@ fn uicStart(ckt: *root.Circuit, ws: *converger.Workspace, x: []const f64, scratc
     ckt.setSimState(.{ .t = 0, .dt = 1 / hook.c.ag0, .kind = .tran, .initial_step = true });
     defer ckt.setSimState(.{ .t = 0, .dt = 0, .kind = .tran, .initial_step = true });
     num.copySimd(scratch, x);
-    var nr_opts = converger.optionsFromTolerances(options.tol, options.tol.itl4);
-    nr_opts.residual_tol = std.math.inf(f64);
     ckt.reject_at = null;
-    const nr = converger.run(ckt, ws, scratch, 0, nr_opts, hook) catch |err| switch (err) {
+    const nr = converger.run(ckt, ws, scratch, 0, newtonOptions(options), hook) catch |err| switch (err) {
         error.QueryCancelled, error.OutOfMemory => return err,
         else => null, // else: a numerical failure keeps the `.ic` row
     };
@@ -84,8 +78,7 @@ fn uicStart(ckt: *root.Circuit, ws: *converger.Workspace, x: []const f64, scratc
 }
 
 /// The first-order trajectories of `Options.tangents`, one per variant row,
-/// on the base run's own time grid (dev/analysis/optimize.md, "Direct
-/// sensitivities"). At the operating point and at every accepted step,
+/// on the base run's own time grid (direct sensitivities). At the operating point and at every accepted step,
 /// `advance` moves each row's state by -A⁻¹ (R(x, row) - R(x)): R the
 /// step's residual, with the row's parameter values, charge history and
 /// device state (Meyer `$prev`, delay lines) on the row side, A the step's
@@ -312,6 +305,16 @@ fn simulateWith(
     return s.drive();
 }
 
+/// The Newton options of every transient step. ngspice's transient Newton
+/// accepts on the per-row delta test alone (niconv.c): a step that has
+/// converged in x but leaves a residual on a row, e.g. a Meyer gate cap's
+/// curvature at a source-driven node, is not iterated again.
+fn newtonOptions(options: Options) converger.Options {
+    var o = converger.optionsFromTolerances(options.tol, options.tol.itl4);
+    o.residual_tol = std.math.inf(f64);
+    return o;
+}
+
 /// What one attempt asks of Newton: `trial` from the predictor, solved at
 /// `t_dev` under `hook` with `nr_opts`. `dts`, `ag` and `c` are the step's
 /// own history and coefficients, which `end` reads again.
@@ -336,7 +339,6 @@ const Verdict = enum { go, stop, underflow };
 /// statement but the Newton solve. Pinned: `init` fills it in place.
 /// `begin` prepares an attempt, the caller solves it, `end` takes the
 /// verdict, and `finish` closes a run that left `begin`'s loop.
-/// dev/research/lane-batched-simulation.md §7.
 const Sim = struct {
     ckt: *root.Circuit,
     x: []f64,
@@ -744,14 +746,7 @@ const Sim = struct {
         const options = s.options;
         if (!(s.t < options.t_stop and !atStop(s.t, options.t_stop) and s.steps < options.max_steps)) return null;
         const ckt = s.ckt;
-        if (s.st.attempts != 0) try ckt.checkpoint(.{
-            .phase = .transient,
-            .completed = s.st.attempts,
-            .simulation_time = s.t,
-            .step_size = s.attempted_dt,
-            .next_step = s.dt,
-            .accepted = s.steps,
-        });
+        if (s.st.attempts != 0) try ckt.checkpoint(s.event(s.dt));
         s.attempted_dt = s.dt;
         const t = s.t;
         const dt = s.dt;
@@ -795,12 +790,7 @@ const Sim = struct {
             break :blk .{ .ag0 = a.ag[0], .ag2 = 0 };
         } else integrator.coeffs(eff_method, dt, s.dt_old[0], options.xmu);
         ops.attempt(s, &a);
-        // ngspice's transient Newton accepts on the per-row delta test alone
-        // (niconv.c): a step that has converged in x but leaves a residual on
-        // a row, e.g. a Meyer gate cap's curvature at a source-driven node,
-        // is not iterated again.
-        a.nr_opts = converger.optionsFromTolerances(options.tol, options.tol.itl4);
-        a.nr_opts.residual_tol = std.math.inf(f64);
+        a.nr_opts = newtonOptions(options);
         return a;
     }
 
@@ -831,21 +821,7 @@ const Sim = struct {
             if (s.order > 1) s.st.order_drops += 1;
             s.order = 1;
             s.dt = dt / 8.0;
-            // A sub-floor proposal does not prove the floor will fail. Try it
-            // once; rejection from the floor still terminates (dctran.c:974).
-            if (s.dt < options.dt_min and dt > options.dt_min and t + options.dt_min > t) {
-                if (s.stats_on) std.debug.print("tran-floor-retry: reason=newton t={e:.17} old_dt={e:.17} proposed={e:.17} retry={e:.17}\n", .{ t, dt, s.dt, options.dt_min });
-                s.dt = options.dt_min;
-            }
-            if (s.dt < options.dt_min) {
-                // The stats block in `finish` is skipped by this return.
-                if (s.stats_on) std.debug.print(
-                    "tran-stats: DT UNDERFLOW (newton) at t={e:.6} dt={e:.3} accepted={d} attempts={d} nr_iters={d}\n",
-                    .{ t, s.dt, s.steps, s.st.attempts, s.st.nr_iters },
-                );
-                return .underflow;
-            }
-            return .go;
+            return s.floorRetry("newton", dt);
         }
 
         // A device located an event inside this step and asked for the step
@@ -916,20 +892,7 @@ const Sim = struct {
                     s.order = 1;
                     s.dt = dt / 8.0;
                 } else s.dt = del;
-                // Recompute the unchanged LTE test at the existing floor
-                // before declaring failure, with the same retry guard as Newton.
-                if (s.dt < options.dt_min and dt > options.dt_min and t + options.dt_min > t) {
-                    if (s.stats_on) std.debug.print("tran-floor-retry: reason=lte t={e:.17} old_dt={e:.17} proposed={e:.17} retry={e:.17}\n", .{ t, dt, s.dt, options.dt_min });
-                    s.dt = options.dt_min;
-                }
-                if (s.dt < options.dt_min) {
-                    if (s.stats_on) std.debug.print(
-                        "tran-stats: DT UNDERFLOW (lte) at t={e:.6} dt={e:.3} accepted={d} attempts={d} nr_iters={d}\n",
-                        .{ t, s.dt, s.steps, s.st.attempts, s.st.nr_iters },
-                    );
-                    return .underflow;
-                }
-                return .go;
+                return s.floorRetry("lte", dt);
             }
             // Growth capped at 2x per accepted step, as in ngspice, and
             // lower at gear-3..6 (`maxGrowth`).
@@ -972,7 +935,7 @@ const Sim = struct {
             s.order_run = if (s.order == s.run_order) s.order_run + 1 else 1;
             s.run_order = s.order;
             if (s.steps > 0 and s.order == 1) {
-                const trial_del = ops.bound(s, a, methodAt(options.method, 2), lte);
+                const trial_del = ops.bound(s, a, s.promoteMethod(), lte);
                 // A NaN probe (prev3 non-finite) keeps BE and the step.
                 if (!std.math.isNan(trial_del)) {
                     const nd2 = @min(2.0 * dt, trial_del);
@@ -1053,13 +1016,9 @@ const Sim = struct {
                 if (s.echo_td) |td_| {
                     const e = t_new + td_;
                     if (e < options.t_stop and s.n_echo < s.echo_bps.len) {
-                        var dup = false;
-                        for (s.echo_bps[0..s.n_echo]) |old| {
-                            if (@abs(old - e) <= s.min_break) {
-                                dup = true;
-                                break;
-                            }
-                        }
+                        const dup = for (s.echo_bps[0..s.n_echo]) |old| {
+                            if (@abs(old - e) <= s.min_break) break true;
+                        } else false;
                         if (!dup) {
                             s.echo_bps[s.n_echo] = e;
                             s.n_echo += 1;
@@ -1116,21 +1075,39 @@ const Sim = struct {
         return .go;
     }
 
+    /// A rejected step of `dt` has proposed `s.dt`: below `dt_min` it is
+    /// retried once at the floor, since a sub-floor proposal does not prove
+    /// the floor fails, and a rejection from the floor (or a floor that does
+    /// not advance t) ends the run (dctran.c:974).
+    fn floorRetry(s: *Sim, comptime reason: []const u8, dt: f64) Verdict {
+        const t = s.t;
+        const dt_min = s.options.dt_min;
+        if (s.dt < dt_min and dt > dt_min and t + dt_min > t) {
+            if (s.stats_on) std.debug.print("tran-floor-retry: reason=" ++ reason ++ " t={e:.17} old_dt={e:.17} proposed={e:.17} retry={e:.17}\n", .{ t, dt, s.dt, dt_min });
+            s.dt = dt_min;
+        }
+        if (!(s.dt < dt_min)) return .go;
+        if (s.stats_on) std.debug.print(
+            "tran-stats: DT UNDERFLOW (" ++ reason ++ ") at t={e:.6} dt={e:.3} accepted={d} attempts={d} nr_iters={d}\n",
+            .{ t, s.dt, s.steps, s.st.attempts, s.st.nr_iters },
+        );
+        return .underflow;
+    }
+
     /// The step loop's tail: the last checkpoint, the stats line, `x`
     /// holding the last accepted solution. True on reaching t_stop or once
     /// every card resolved.
     fn finish(s: *Sim) !bool {
         const options = s.options;
-        try s.ckt.checkpoint(.{
-            .phase = .transient,
-            .completed = s.st.attempts,
-            .simulation_time = s.t,
-            .step_size = s.attempted_dt,
-            .next_step = if (s.t < options.t_stop) s.dt else 0,
-            .accepted = s.steps,
-        });
+        try s.ckt.checkpoint(s.event(if (s.t < options.t_stop) s.dt else 0));
         if (s.cur.ptr != s.x.ptr) num.copySimd(s.x, s.cur);
         return s.resolved or s.t >= options.t_stop or atStop(s.t, options.t_stop);
+    }
+
+    /// The progress checkpoint at the last accepted point, `next_step` the
+    /// step after it.
+    fn event(s: *const Sim, next_step: f64) @import("../worker.zig").Event {
+        return .{ .phase = .transient, .completed = s.st.attempts, .simulation_time = s.t, .step_size = s.attempted_dt, .next_step = next_step, .accepted = s.steps };
     }
 
     fn traceLte(s: *Sim, a: *const Attempt, nr: converger.Result, lte: integrator.LteIn, bound: f64) void {
@@ -1274,8 +1251,9 @@ const HostOps = struct {
     }
 };
 
-/// `lteSnap` and `nextBp`, hoisted out of `simulateWith` unchanged so
-/// `Sim` can call them.
+/// The LTE states at the circuit's current charges into `dst`: the device
+/// charge tape, its `zero` spans cleared, then `q_vec` at each of `rows`.
+/// `dst` is `n_qt + rows.len` long.
 fn lteSnap(c: *root.Circuit, dst: []f64, zero: []const [2]u32, rows: []const u32) void {
     const n_tape = dst.len - rows.len;
     c.snapshotQTape(dst[0..n_tape]);
@@ -1283,6 +1261,8 @@ fn lteSnap(c: *root.Circuit, dst: []f64, zero: []const [2]u32, rows: []const u32
     for (rows, dst[n_tape..]) |r, *d| d.* = c.q_vec[r];
 }
 
+/// The earliest breakpoint at or after `after` among the devices', the line
+/// echoes and `extra`; null when there is none.
 fn nextBp(c: *root.Circuit, echo: []const f64, extra: ?f64, after: f64) ?f64 {
     var best = std.math.inf(f64);
     if (c.nextBreakpoint(after)) |bp| best = bp;
@@ -1318,11 +1298,7 @@ fn methodAt(top: Method, k: u8) Method {
 /// breakpoint sum that rounds one ulp short of t_stop leaves a 1e-23 s step
 /// that fails as TimestepTooSmall.
 fn atStop(t: f64, t_stop: f64) bool {
-    if (t == t_stop) return true;
-    if ((t < 0) != (t_stop < 0)) return false;
-    const a: i64 = @bitCast(t);
-    const b: i64 = @bitCast(t_stop);
-    return @abs(a - b) <= 100;
+    return almostEqualUlps(t, t_stop, 100);
 }
 
 test "atStop: within 100 ulps of t_stop, not past them" {
@@ -1512,13 +1488,18 @@ const Run = struct {
     }
 };
 
+/// Each lane's `run`, one after another.
+fn runEach(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
+    for (ctxs, out) |*c, *o| o.* = run(c, opts);
+}
+
 const LaneError = root.ErrorOf(run);
 /// One lane's `run` outcome.
 pub const LaneOutcome = LaneError!root.Result;
 
 /// `run` for the lanes of one batch: `.tran` queries on one pattern, each
-/// from its own operating point (or `uic` start) and variant row, in rounds
-/// (dev/research/lane-batched-simulation.md §7). Each round every live lane
+/// from its own operating point (or `uic` start) and variant row, in
+/// rounds. Each round every live lane
 /// `begin`s an attempt at its own (t, dt), one `newtonLanes` solves them,
 /// and each `end`s it with its own step control, so no decision couples
 /// lanes and lane l's result lands in `out[l]` bitwise `run` on `ctxs[l]`.
@@ -1529,10 +1510,8 @@ pub fn runLanes(comptime width: usize, ctxs: []const root.RunCtx, opts: Options,
     std.debug.assert(g >= 1 and g <= width and out.len == g);
     const c0 = ctxs[0].circuit;
     const pin = c0.knobs.newton.pin;
-    if (width == 1 or g == 1 or !(pin == .auto or pin == .direct) or root.Circuit.certify or c0.vpi != null) {
-        for (ctxs, out) |*c, *o| o.* = run(c, opts);
-        return;
-    }
+    if (width == 1 or g == 1 or !(pin == .auto or pin == .direct) or root.Circuit.certify or c0.vpi != null)
+        return runEach(ctxs, opts, out);
     const L = @import("solver").lanes.Lanes(width);
     const System = @import("solver").lane_system.LaneSystem(width, root.Circuit, TranHook);
     const bit = struct {
@@ -1702,18 +1681,10 @@ fn gpuLaneRefusal(ckt: *const root.Circuit, opts: Options) ?[]const u8 {
     return null;
 }
 
-/// `runLanes` on the GPU (dev/research/plans/phase4-gpu-lanes.md G7): any
-/// number of `.tran` queries on one pattern, each its own `Sim` on the host
-/// (step control, breakpoints, measures) over one `GpuLanes` that holds
-/// every lane's numerics. Each round: every live lane `begin`s, the device
-/// predicts and solves Newton for all of them and computes their step-end
-/// numbers, each lane `end`s from those, and the device applies the
-/// verdicts. Within tolerance of `runLanes`, not bitwise. Falls back to
-/// each lane's `run` when the lanes are not eligible or the device cannot
-/// take them; a lane whose device asks to reject a step reruns on the CPU.
 /// The unknowns lane `r` reads from an accepted row: its recorded probes
-/// and its `.meas` stream's columns, sorted and without repeats. Every
-/// lane of a batch shares the deck, so the first lane's set serves all.
+/// and, with `fed_rows`, its `.meas` stream's columns, sorted and without
+/// repeats. Every lane of a batch shares the deck, so the first lane's set
+/// serves all. The caller frees the result with `gpa`.
 fn laneProbes(gpa: std.mem.Allocator, r: *const Run, fed_rows: bool) ![]u32 {
     const rec = r.sim.probes;
     const fed: []const u32 = if (!fed_rows) &.{} else if (r.stream) |sm| sm.nodes else &.{};
@@ -1730,23 +1701,24 @@ fn laneProbes(gpa: std.mem.Allocator, r: *const Run, fed_rows: bool) ![]u32 {
     return gpa.realloc(out, k);
 }
 
+/// `runLanes` on the GPU: any
+/// number of `.tran` queries on one pattern, each its own `Sim` on the host
+/// (step control, breakpoints, measures) over one `GpuLanes` that holds
+/// every lane's numerics. Each round: every live lane `begin`s, the device
+/// predicts and solves Newton for all of them and computes their step-end
+/// numbers, each lane `end`s from those, and the device applies the
+/// verdicts. Within tolerance of `runLanes`, not bitwise. Falls back to
+/// each lane's `run` when the lanes are not eligible or the device cannot
+/// take them; a lane whose device asks to reject a step reruns on the CPU.
+/// Asserts `ctxs` is non-empty and as long as `out`.
 pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
     const g = ctxs.len;
     std.debug.assert(g >= 1 and out.len == g);
-    if (comptime !gpu_lanes.available) {
-        for (ctxs, out) |*c, *o| o.* = run(c, opts);
-        return;
-    }
+    if (comptime !gpu_lanes.available) return runEach(ctxs, opts, out);
     const gpa = ctxs[0].scratch_allocator;
-    const runs = gpa.alloc(Run, g) catch {
-        for (ctxs, out) |*c, *o| o.* = run(c, opts);
-        return;
-    };
+    const runs = gpa.alloc(Run, g) catch return runEach(ctxs, opts, out);
     defer gpa.free(runs);
-    const live = gpa.alloc(bool, g) catch {
-        for (ctxs, out) |*c, *o| o.* = run(c, opts);
-        return;
-    };
+    const live = gpa.alloc(bool, g) catch return runEach(ctxs, opts, out);
     defer gpa.free(live);
     @memset(live, false);
     var n_live: usize = 0;
@@ -1776,7 +1748,7 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
     // per round: under measures-only a few columns, not the deck's whole
     // probe list. `GpuLanes` borrows it, so it is freed after `d.deinit`.
     const all_probes = ctxs[first].probes;
-    // The `.meas` passes run on the device when every lane can (06 6.8):
+    // The `.meas` passes run on the device when every lane can:
     // device step control, a measure bound only on all cards (the device
     // knows when all its passes are over, not one card), and every card a
     // one-row pass (`measure.Stream.deviceScans`). Their columns then stay
@@ -1810,29 +1782,11 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
     d.prof.on = ctxs[first].circuit.knobs.gpu_stats != .off;
     if (d.prof.on) std.debug.print("gpu-lanes: {d} lanes\n", .{g});
 
-    const atts = gpa.alloc(Attempt, g) catch |e| {
-        for (runs, live, out) |*r, *on, *o| if (on.*) {
-            r.deinit();
-            on.* = false;
-            o.* = e;
-        };
-        return;
-    };
+    const atts = gpa.alloc(Attempt, g) catch |e| return GpuLane.failAll(runs, live, out, e);
     defer gpa.free(atts);
-    const nr = gpa.alloc(gpu_lanes.LaneNewton, g) catch |e| {
-        for (runs, live, out) |*r, *on, *o| if (on.*) {
-            r.deinit();
-            on.* = false;
-            o.* = e;
-        };
-        return;
-    };
+    const nr = gpa.alloc(gpu_lanes.LaneNewton, g) catch |e| return GpuLane.failAll(runs, live, out, e);
     defer gpa.free(nr);
-    const nr_opts = blk: {
-        var o = converger.optionsFromTolerances(opts.tol, opts.tol.itl4);
-        o.residual_tol = std.math.inf(f64);
-        break :blk o;
-    };
+    const nr_opts = newtonOptions(opts);
     const Lane = GpuLane;
     // The two host passes per round, one lane per call. Each touches only
     // lane l's run, outcome and slots of `d`, so `forLanes` may split them.
@@ -1910,14 +1864,7 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
         for (d.sc) |*sc| sc.flags = 0;
         if (threaded) if (progress) |cb| {
             const s = &runs[lead].sim;
-            if (s.st.attempts != 0) cb.checkpoint(.{
-                .phase = .transient,
-                .completed = s.st.attempts,
-                .simulation_time = s.t,
-                .step_size = s.attempted_dt,
-                .next_step = s.dt,
-                .accepted = s.steps,
-            }) catch |e| return Lane.failAll(runs, live, out, e);
+            if (s.st.attempts != 0) cb.checkpoint(s.event(s.dt)) catch |e| return Lane.failAll(runs, live, out, e);
         };
         forLanes(g, &pass, Pass.begin);
         // `Ops.attempt` marks every lane that attempts this round.
@@ -2048,7 +1995,7 @@ fn laneStep(s: *const Sim, opts: Options, max_iter: u16) LK.LaneStep {
         .event = LK.step_idle,
         .op_revert = 1 + @as(u8, @backingInt(Ctl.revert)),
         .op_commit = 1 + @as(u8, @backingInt(Ctl.commit)),
-        .kind_tran = @intFromEnum(tran_kind),
+        .kind_tran = @backingInt(tran_kind),
     };
 }
 

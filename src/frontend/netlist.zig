@@ -22,11 +22,9 @@ const csr = @import("csr.zig");
 pub const expr = @import("expr.zig");
 const measure = @import("measure.zig");
 const pattern = @import("pattern.zig");
-const spectre = @import("spectre.zig");
 const core = @import("core");
 const Name = core.Name;
-const InternPool = @import("core").InternPool;
-const requests = @import("core").query;
+const InternPool = core.InternPool;
 
 /// Input syntax: ngspice, HSPICE or Spectre.
 pub const Dialect = lines.Dialect;
@@ -35,7 +33,7 @@ pub const VertexId = csr.VertexId;
 /// A device: a row of `Netlist.graph`'s edge table, in card order.
 pub const EdgeId = csr.EdgeId;
 /// Analysis kind, shared with the query layer.
-pub const Kind = requests.Kind;
+pub const Kind = core.query.Kind;
 /// Net 0; `0`, `gnd` and `ground` all name it.
 pub const ground: VertexId = @fromBackingInt(@intCast(0));
 /// Missing id in every u32 index space here.
@@ -534,45 +532,46 @@ pub const Netlist = struct {
         };
         for (live.ops, live.scale, 0..) |span, scale, k| {
             const at = nl.slot(k);
-            const ops = nl.exprOps(span);
-            const x = scale * if (@TypeOf(draw) == @TypeOf(null))
-                try expr.eval(gpa, stack, ops, nl.consts, values, null)
-            else
-                try expr.eval(gpa, stack, ops, nl.consts, values, SiteDraw(@TypeOf(draw)){ .inner = draw, .base = span.start, .ops = live.site_ops, .keys = live.site_keys });
+            const x = scale * try nl.evalLive(gpa, stack, span, values, draw);
             changed = changed or at.num != x;
             at.* = .{ .num = x };
         }
         for (live.site_rows, live.site_spans) |row, span| {
-            const ops = nl.exprOps(span);
-            const x = if (@TypeOf(draw) == @TypeOf(null))
-                try expr.eval(gpa, stack, ops, nl.consts, values, null)
-            else
-                try expr.eval(gpa, stack, ops, nl.consts, values, SiteDraw(@TypeOf(draw)){ .inner = draw, .base = span.start, .ops = live.site_ops, .keys = live.site_keys });
+            const x = try nl.evalLive(gpa, stack, span, values, draw);
             changed = changed or pool[row] != x;
             pool[row] = x;
         }
         // Each binned card with live geometry takes the bin its new L and W
         // select, read off the card as the slots above left them (scaled).
-        const R = Reader(lines.ngspice);
         const bins = live.bins;
         const model_of = nl.graph.edges.items(.model);
         const kv_of = nl.graph.edges.items(.kv);
         const positional_of = nl.graph.edges.items(.positional);
         for (bins.edges, bins.per_finger, 0..) |e, per_finger, k| {
             const kv = nl.kvs[kv_of[e].start..][0..kv_of[e].len];
-            const l = R.number(kv, "l") orelse return error.ParseError;
-            const nf = if (per_finger) R.number(kv, "nf") orelse 1 else 1;
-            const w = (R.number(kv, "w") orelse return error.ParseError) / nf;
+            const l = kvNumber(kv, "l") orelse return error.ParseError;
+            const nf = if (per_finger) kvNumber(kv, "nf") orelse 1 else 1;
+            const w = (kvNumber(kv, "w") orelse return error.ParseError) / nf;
             const lo = bins.starts[k];
             const hi = bins.starts[k + 1];
             const row = for (bins.rows[lo..hi], bins.bounds[lo..hi]) |row, b| {
-                if (R.binHolds(b, l, w)) break row;
+                if (binHolds(b, l, w)) break row;
             } else return error.ModelBinNotFound;
             changed = changed or model_of[e] != row;
             model_of[e] = row;
             @constCast(nl.values)[positional_of[e].start] = .{ .name = nl.models[row].name };
         }
         return changed;
+    }
+
+    /// Evaluates the postfix `span` at live values `values`, each
+    /// distribution call answered by `draw` (`null` keeps nominals).
+    fn evalLive(nl: *const Netlist, gpa: Allocator, stack: *std.ArrayList(expr.Val), span: Span, values: []const f64, draw: anytype) !f64 {
+        const ops = nl.exprOps(span);
+        return if (@TypeOf(draw) == @TypeOf(null))
+            expr.eval(gpa, stack, ops, nl.consts, values, null)
+        else
+            expr.eval(gpa, stack, ops, nl.consts, values, SiteDraw(@TypeOf(draw)){ .inner = draw, .base = span.start, .ops = nl.live.site_ops, .keys = nl.live.site_keys });
     }
 
     /// Sets live slot k to `values[k]` without evaluating its postfix, as
@@ -611,11 +610,7 @@ fn SiteDraw(comptime D: type) type {
         /// inner sampler's, under that call's site key. O(log sites).
         pub fn value(self: @This(), i: usize, f: expr.Fn, args: []const f64) f64 {
             const at: u32 = self.base + @as(u32, @intCast(i));
-            const k = std.sort.lowerBound(u32, self.ops, at, struct {
-                fn order(a: u32, b: u32) std.math.Order {
-                    return std.math.order(a, b);
-                }
-            }.order);
+            const k = std.sort.lowerBound(u32, self.ops, at, orderU32);
             return self.inner.sample(self.keys[k], f, args);
         }
     };
@@ -1211,7 +1206,7 @@ fn Reader(comptime S: type) type {
             };
             // Spectre statements become the SPICE cards the walks read.
             if (dialect == .spectre) {
-                const translated = try spectre.translate(arena, r.lines.items);
+                const translated = try spectre_rewrite.translate(arena, r.lines.items);
                 r.lines = .empty;
                 try r.lines.appendSlice(arena, translated.lines);
                 r.kinds = translated.kinds;
@@ -1251,35 +1246,28 @@ fn Reader(comptime S: type) type {
                 try r.kvs.ensureTotalCapacity(arena, eq_hint + extra.kvs);
             }
             const top: Frame = .{ .scopes = &r.global_scopes };
-            // A MONTE sweep draws the distributions per trial, so the models
-            // read next (a PDK's shared bins) keep their sites: the analysis
-            // cards are read after them (#100).
-            for (directive_lines.items) |i| if (analysisOf(r.lines.items[i]) != null and setsKey(r.lines.items[i], "monte")) {
-                r.monte = true;
-                break;
-            };
-            // ngspice draws agauss/gauss/unif/aunif on every run; a seed makes
-            // that one reproducible sample, so the draws need their sites,
-            // and the models read next (a PDK's shared bins) need them too.
+            // Three kinds of card make the models read next (a PDK's shared
+            // bins) keep their distribution sites. A MONTE sweep draws them
+            // per trial; the analysis cards are read after the models
+            // (#100). ngspice draws agauss/gauss/unif/aunif on every run, and
+            // a seed makes that one reproducible sample. `.dcmatch`,
+            // `.acmatch` and `.dcsens` without a `.variation` block read the
+            // mismatch off the calls (`variants.Planner.siteVariations`).
             // ponytail: a top-level `.param` read in walk 1 stays nominal;
             // the PDK distributions sit in model cards and subcircuit params.
-            if (dialect == .ngspice and !r.monte) for (directive_lines.items) |i| {
-                if (seedOption(r.lines.items[i])) {
-                    r.monte = true;
-                    r.draw_seed = true;
-                    break;
-                }
-            };
-            // `.dcmatch`, `.acmatch` and `.dcsens` without a `.variation`
-            // block read the mismatch off the distribution calls
-            // (`variants.Planner.siteVariations`), so those keep sites too.
-            if (!r.monte) for (directive_lines.items) |i| {
-                const kind = analysisOf(r.lines.items[i]) orelse continue;
-                if (kind == .dcmatch or kind == .acmatch or kind == .dcsens) {
-                    r.monte = true;
-                    break;
-                }
-            };
+            var monte_card = false;
+            var seed = false;
+            var mismatch = false;
+            for (directive_lines.items) |i| {
+                const line = r.lines.items[i];
+                seed = seed or seedOption(line);
+                const kind = analysisOf(line) orelse continue;
+                monte_card = monte_card or setsKey(line, "monte");
+                mismatch = mismatch or kind == .dcmatch or kind == .acmatch or kind == .dcsens;
+            }
+            seed = seed and dialect == .ngspice;
+            r.draw_seed = seed and !monte_card;
+            r.monte = monte_card or seed or mismatch;
             // The caller's live names, registered before any model,
             // directive or device reads them, so a card that cannot follow a
             // later value (an analysis, `.ic`, `.options`) is refused.
@@ -1634,10 +1622,7 @@ fn Reader(comptime S: type) type {
             } else if (t.len >= 2 and (t[0] == '"' or t[0] == '\'') and t[t.len - 1] == t[0]) {
                 path = t[1 .. t.len - 1];
             }
-            const at = @intFromPtr(path.ptr);
-            const base = @intFromPtr(r.text.ptr);
-            if (at >= base and at + path.len <= base + r.text.len) return r.orig[at - base ..][0..path.len];
-            return path;
+            return r.written(path);
         }
 
         /// `name(a, b) [=] body`: a user function, from `.func` or from
@@ -1777,7 +1762,7 @@ fn Reader(comptime S: type) type {
             // Read before any `localRow`, which reuses the card scratch.
             const kv = r.card_kv.items;
             const lg = try r.cardLength(kv, "l") orelse return r.model_ids.get(name) orelse none;
-            const use_nf = if (number(kv, "wnflag")) |flag| flag != 0 else r.wnflag;
+            const use_nf = if (kvNumber(kv, "wnflag")) |flag| flag != 0 else r.wnflag;
             const nfg: Geometry = if (use_nf) try r.cardLength(kv, "nf") orelse .{ .num = 1 } else .{ .num = 1 };
             const wg = try r.cardLength(kv, "w") orelse return r.model_ids.get(name) orelse none;
             const l = lg.num * r.scale;
@@ -1841,9 +1826,7 @@ fn Reader(comptime S: type) type {
                 .num => |n| return .{ .num = n },
                 .expr => |span| {
                     const ops = r.ops.items[span.start..][0..span.len];
-                    var reads = false;
-                    for (ops) |op| reads = reads or op.code == .live;
-                    if (!reads) return null;
+                    if (!readsLive(ops)) return null;
                     const v = try expr.fold(r.arena, &r.stack, ops, r.consts.items, false, r.live_nominal.items);
                     return if (v.known) .{ .num = v.num, .live = true } else null;
                 },
@@ -2708,9 +2691,7 @@ fn Reader(comptime S: type) type {
                 },
                 .expr => |span| {
                     const sited = r.holdsSite(span.start, span.start + span.len);
-                    var reads = false;
-                    for (r.ops.items[span.start..][0..span.len]) |op| reads = reads or op.code == .live;
-                    if (!reads and !sited) return;
+                    if (!sited and !readsLive(r.ops.items[span.start..][0..span.len])) return;
                     const folded = try expr.fold(r.arena, &r.stack, r.ops.items[span.start..][0..span.len], r.consts.items, false, r.live_nominal.items);
                     if (folded.known) {
                         try slots.at.append(r.arena, at);
@@ -2779,10 +2760,6 @@ fn Reader(comptime S: type) type {
                 else => {},
             };
             return out.items;
-        }
-
-        fn orderU32(a: u32, b: u32) std.math.Order {
-            return std.math.order(a, b);
         }
 
         /// Logs `line` as `what` and fails the parse with `UnsupportedCard`.
@@ -2942,26 +2919,17 @@ fn Reader(comptime S: type) type {
                 const head = f.next().?[1..];
                 if (std.mem.eql(u8, head, "check") or std.mem.eql(u8, head, "dout") or std.mem.eql(u8, head, "biaschk")) {
                     const n = r.measures.items.len;
-                    measure.parseCheck(r.arena, head, f.rest(), r, &global_level, checks + 1, &r.measures) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line}),
-                    };
+                    measure.parseCheck(r.arena, head, f.rest(), r, &global_level, checks + 1, &r.measures) catch |err| try skipBad(err, line);
                     if (r.measures.items.len > n) checks += 1;
                     continue;
                 }
                 if (std.mem.eql(u8, head, "power")) {
                     powers += 1;
-                    r.readPower(&f, powers) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line}),
-                    };
+                    r.readPower(&f, powers) catch |err| try skipBad(err, line);
                     continue;
                 }
                 if (std.mem.startsWith(u8, head, "stim")) {
-                    r.readStim(&f, &stims) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line}),
-                    };
+                    r.readStim(&f, &stims) catch |err| try skipBad(err, line);
                     continue;
                 }
                 if (std.mem.eql(u8, head, "jitter")) {
@@ -2983,6 +2951,13 @@ fn Reader(comptime S: type) type {
                 };
                 try r.measures.append(r.arena, m);
             }
+        }
+
+        /// Logs a card `readMeasures` cannot take and goes on, as ngspice
+        /// does; only `OutOfMemory` fails the parse.
+        fn skipBad(err: anyerror, line: []const u8) error{OutOfMemory}!void {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line});
         }
 
         /// HSPICE `.power signal [REF=] [FROM=] [TO=]` [CR .POWER] as four
@@ -3203,8 +3178,7 @@ fn Reader(comptime S: type) type {
             const ops = r.ops.items[ops_mark..];
             const v = try expr.fold(r.arena, &r.stack, ops, r.consts.items, geometry, r.live_nominal.items);
             if (v.known) {
-                var reads = false;
-                for (ops) |op| reads = reads or op.code == .live;
+                const reads = readsLive(ops);
                 const sited = r.site_ops.items.len > sites_mark;
                 if (reads and !r.in_card and !r.live_ok) {
                     if (!@import("builtin").is_test) std.log.err("netlist: a swept parameter is read outside a device or model value", .{});
@@ -4317,10 +4291,10 @@ fn Reader(comptime S: type) type {
                 if (first.* != .name) continue;
                 var bin = names.get(first.name) orelse continue;
                 if (std.mem.eql(u8, first.name, models[bin].name)) continue;
-                const l = number(kv, "l") orelse return error.ParseError;
-                const use_nf = if (number(kv, "wnflag")) |flag| flag != 0 else wnflag;
-                const nf = if (use_nf) number(kv, "nf") orelse 1 else 1;
-                const w = (number(kv, "w") orelse return error.ParseError) / nf;
+                const l = kvNumber(kv, "l") orelse return error.ParseError;
+                const use_nf = if (kvNumber(kv, "wnflag")) |flag| flag != 0 else wnflag;
+                const nf = if (use_nf) kvNumber(kv, "nf") orelse 1 else 1;
+                const w = (kvNumber(kv, "w") orelse return error.ParseError) / nf;
                 // A swept or sampled l/w: every bin is a candidate a point
                 // may pick (`Live.bins`).
                 if (swept_geometry) {
@@ -4341,36 +4315,43 @@ fn Reader(comptime S: type) type {
                 if (bin == none) return error.ModelBinNotFound;
             }
         }
-
-        /// Whether `model` is a bin of `base`: `base.<n>`.
-        fn isBinOf(model: []const u8, base: []const u8) bool {
-            if (model.len <= base.len + 1 or !std.mem.startsWith(u8, model, base) or model[base.len] != '.') return false;
-            _ = std.fmt.parseInt(u32, model[base.len + 1 ..], 10) catch return false;
-            return true;
-        }
-
-        /// A bin card's `{lmin, lmax, wmin, wmax}`, null unless all four are numbers.
-        fn binBounds(kv: []const Kv) ?[4]f64 {
-            return .{
-                number(kv, "lmin") orelse return null, number(kv, "lmax") orelse return null,
-                number(kv, "wmin") orelse return null, number(kv, "wmax") orelse return null,
-            };
-        }
-
-        /// Whether bin bounds `b` hold `l` and `w`, each within 1 nm.
-        fn binHolds(b: [4]f64, l: f64, w: f64) bool {
-            return (@abs(l - b[0]) < 1e-9 or @abs(l - b[1]) < 1e-9 or (l > b[0] and l < b[1])) and
-                (@abs(w - b[2]) < 1e-9 or @abs(w - b[3]) < 1e-9 or (w > b[2] and w < b[3]));
-        }
-
-        fn number(kv: []const Kv, key: []const u8) ?f64 {
-            for (kv) |item| if (std.mem.eql(u8, item.key, key)) return switch (item.value) {
-                .num => |n| n,
-                else => null,
-            };
-            return null;
-        }
     };
+}
+
+/// Whether `model` is a bin of `base`: `base.<n>`.
+fn isBinOf(model: []const u8, base: []const u8) bool {
+    if (model.len <= base.len + 1 or !std.mem.startsWith(u8, model, base) or model[base.len] != '.') return false;
+    _ = std.fmt.parseInt(u32, model[base.len + 1 ..], 10) catch return false;
+    return true;
+}
+
+/// A bin card's `{lmin, lmax, wmin, wmax}`, null unless all four are numbers.
+fn binBounds(kv: []const Kv) ?[4]f64 {
+    return .{
+        kvNumber(kv, "lmin") orelse return null, kvNumber(kv, "lmax") orelse return null,
+        kvNumber(kv, "wmin") orelse return null, kvNumber(kv, "wmax") orelse return null,
+    };
+}
+
+/// Whether bin bounds `b` hold `l` and `w`, each within 1 nm.
+fn binHolds(b: [4]f64, l: f64, w: f64) bool {
+    return (@abs(l - b[0]) < 1e-9 or @abs(l - b[1]) < 1e-9 or (l > b[0] and l < b[1])) and
+        (@abs(w - b[2]) < 1e-9 or @abs(w - b[3]) < 1e-9 or (w > b[2] and w < b[3]));
+}
+
+/// The first `key` row's number; null when no row has `key` or the first is no number.
+fn kvNumber(kv: []const Kv, key: []const u8) ?f64 {
+    return if (kvIndex(kv, key)) |i| kv[i].value.number() else null;
+}
+
+/// Whether postfix `ops` reads a live name.
+fn readsLive(ops: []const expr.Op) bool {
+    for (ops) |op| if (op.code == .live) return true;
+    return false;
+}
+
+fn orderU32(a: u32, b: u32) std.math.Order {
+    return std.math.order(a, b);
 }
 
 /// A sweep grid: `lin` from an increment or a point count, `dec`/`oct`
@@ -4489,7 +4470,7 @@ test {
     _ = csr;
     _ = measure;
     _ = pattern;
-    _ = spectre;
+    _ = spectre_rewrite;
     _ = @import("vec.zig");
     _ = @import("tests/netlist.zig");
     _ = @import("tests/fuzz.zig");

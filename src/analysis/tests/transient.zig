@@ -21,17 +21,6 @@ const EnvelopeTests = struct {
         try testing.expect(mp2 <= mp1);
     }
 
-    test "envelope: maxPoints leaves room for DC and one step" {
-        const opts: Options = .{
-            .t_carrier = 1e-6,
-            .t_stop = 1e-3,
-            .min_periods_per_step = 1,
-            .max_periods_per_step = 32,
-        };
-        const mp = maxPoints(opts);
-        try testing.expect(mp >= 3); // at least DC + one step + slack
-    }
-
     test "envelope: stepCount covers the window without a roundoff step" {
         const stepCount = impl.test_access.stepCount;
         // A fine window that came out of a subtraction is a carrier period
@@ -296,16 +285,25 @@ const TranTests = struct {
         }
     }
 
-    test "almostEqualUlps counts representable doubles, as ngspice's does" {
+    test "almostEqualUlps counts representable doubles, as ngspice's does, across zero" {
         const eq = impl.test_access.almostEqualUlps;
         const x: f64 = 1.0e-9;
-        try std.testing.expect(eq(x, std.math.nextAfter(f64, x, 1), 1));
+        try testing.expect(eq(x, std.math.nextAfter(f64, x, 1), 1));
         var y = x;
         for (0..3) |_| y = std.math.nextAfter(f64, y, 0);
-        try std.testing.expect(eq(x, y, 3));
-        try std.testing.expect(!eq(x, y, 2));
-        try std.testing.expect(eq(0.0, -0.0, 1));
-        try std.testing.expect(!eq(1.0, 1.0 + 1e-12, 100));
+        try testing.expect(eq(x, y, 3));
+        try testing.expect(!eq(x, y, 2));
+        try testing.expect(eq(0.0, -0.0, 1));
+        try testing.expect(!eq(1.0, 1.0 + 1e-12, 100));
+        // The ulp count runs straight across zero.
+        const tiny = std.math.floatTrueMin(f64);
+        try testing.expect(eq(-tiny, tiny, 2));
+        try testing.expect(!eq(-tiny, tiny, 1));
+        try testing.expect(eq(-0.0, tiny, 1));
+        // Opposite extremes are 2^64 - 2^53 - 2 apart: no i64 overflow.
+        try testing.expect(!eq(-std.math.floatMax(f64), std.math.floatMax(f64), std.math.maxInt(i64)));
+        // Identical NaN bits count as equal, as in ngspice: 0 ulps apart.
+        try testing.expect(eq(std.math.nan(f64), std.math.nan(f64), 0));
     }
 
     test "waveform: doubling fallback keeps the rows intact" {
@@ -428,18 +426,6 @@ const TranTests = struct {
         var ckt = try rcCircuit(testing.allocator);
         defer ckt.deinit();
         try testing.checkAllAllocationFailures(testing.allocator, runFamily, .{&ckt});
-    }
-
-    test "almostEqualUlps: the ulp count runs straight across zero" {
-        const eq = impl.test_access.almostEqualUlps;
-        const tiny = std.math.floatTrueMin(f64);
-        try testing.expect(eq(-tiny, tiny, 2));
-        try testing.expect(!eq(-tiny, tiny, 1));
-        try testing.expect(eq(-0.0, tiny, 1));
-        // Opposite extremes are 2^64 - 2^53 - 2 apart: no i64 overflow.
-        try testing.expect(!eq(-std.math.floatMax(f64), std.math.floatMax(f64), std.math.maxInt(i64)));
-        // Identical NaN bits count as equal, as in ngspice: 0 ulps apart.
-        try testing.expect(eq(std.math.nan(f64), std.math.nan(f64), 0));
     }
 
     test "column: lowerBound, from and strided reads" {
@@ -795,6 +781,13 @@ const TranTests = struct {
         const abstol: f64 = 1e-12;
         const chgtol: f64 = 1e-14;
         const trtol: f64 = 7.0;
+        const lte: integrator.LteIn = .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol };
+        // Backward Euler at a uniform dt, history past prev and i_prev zero.
+        const beBound = struct {
+            fn f(cur: []const f64, prev: []const f64, zero: []const f64, l: integrator.LteIn) f64 {
+                return integrator.stepBound(W, .backward_euler, .backward_euler, .{ cur, prev, zero, zero }, zero, .{ .ag0 = 1.0 / l.dt, .ag2 = 0 }, l);
+            }
+        }.f;
 
         // 2*W+1: W cancelling pairs through the vector body, one dead slot so the
         // scalar tail runs too.
@@ -812,24 +805,8 @@ const TranTests = struct {
         // Row view: every pair sums to zero, and so does its whole history.
         const row: [W + 1]f64 = @splat(0);
 
-        const del_state = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &s_cur, &s_prev, &s_zero, &s_zero },
-            &s_zero,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
-        const del_row = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &row, &row, &row, &row },
-            &row,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
+        const del_state = beBound(&s_cur, &s_prev, &s_zero, lte);
+        const del_row = beBound(&row, &row, &row, lte);
 
         // Closed form, so the CKTterr formula is pinned and not just the inequality:
         //   i_new     = (1/dt)*(3e-12 - 1e-12)            = 2e-3
@@ -852,24 +829,8 @@ const TranTests = struct {
         const mirrored = [_]f64{ 3e-12, -3e-12 };
         const mirrored_p = [_]f64{ 1e-12, -1e-12 };
         const pair_zero = [_]f64{ 0, 0 };
-        const del_one = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &one_sided, &one_sided_p, &pair_zero, &pair_zero },
-            &pair_zero,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
-        const del_mirror = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &mirrored, &mirrored_p, &pair_zero, &pair_zero },
-            &pair_zero,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
+        const del_one = beBound(&one_sided, &one_sided_p, &pair_zero, lte);
+        const del_mirror = beBound(&mirrored, &mirrored_p, &pair_zero, lte);
         try testing.expectEqual(del_one, del_mirror);
 
         // CKTterr is homogeneous of degree zero in the charge: tol and |dd| both
@@ -881,15 +842,7 @@ const TranTests = struct {
         // inductor's single INDflux (indload.c:70-77; MUT has no MUTtrunc).
         const big: [2]f64 = .{ s_cur[0] * 1e3, 0 };
         const big_p: [2]f64 = .{ s_prev[0] * 1e3, 0 };
-        const del_big = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &big, &big_p, &pair_zero, &pair_zero },
-            &pair_zero,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
+        const del_big = beBound(&big, &big_p, &pair_zero, lte);
         try testing.expectApproxEqRel(del_one, del_big, 1e-9);
     }
 

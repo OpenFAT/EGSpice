@@ -23,21 +23,25 @@ const LaneLu = @import("lu.zig").LaneLu;
 const Lanes = @import("lanes.zig").Lanes;
 const Execution = @import("core").numerics.Execution;
 
+/// W borrowed `direct.Solver`s solved as one; W >= 2 (W = 1 is the solver
+/// itself, the oracle).
 pub fn LaneSolver(comptime W: usize) type {
     comptime assert(W >= 2); // W = 1 is `direct.Solver` itself
     return struct {
         const Self = @This();
         const L = Lanes(W);
+        /// Lane l's value in element l (`Lanes(W).V`).
         pub const V = L.V;
+        /// Bit l for lane l (`Lanes(W).Mask`).
         pub const Mask = L.Mask;
 
         /// Lane l's own solver, borrowed; all on one pattern.
         lanes: [W]*direct.Solver,
+        /// Rows of every lane; `converger.newtonLanes` reads it as `direct.Solver.n`.
         n: u32,
-        /// The replay over `lanes[lead]`'s tape; null while no lane has a
-        /// factored sparse LU.
+        /// The replay over the lead's tape (the first lane with a factored
+        /// sparse LU); null while no lane has one.
         lu: ?LaneLu(W) = null,
-        lead: usize = 0,
         /// Lanes whose tape is the lead's, the lead included.
         joined: Mask = L.none,
         /// Each lane's `tapeKey` when `joined` was last computed.
@@ -61,6 +65,7 @@ pub fn LaneSolver(comptime W: usize) type {
             return .{ .lanes = lanes, .n = s0.n, .scratch = try gpa.alloc(f64, s0.col_ptr[s0.n] + @as(usize, s0.n)), .gpa = gpa };
         }
 
+        /// Frees the replay and scratch; the lanes' solvers stay the caller's.
         pub fn deinit(self: *Self) void {
             if (self.lu) |*lu| lu.deinit(self.gpa);
             self.gpa.free(self.scratch);
@@ -181,7 +186,6 @@ pub fn LaneSolver(comptime W: usize) type {
             self.lu = null;
             self.joined = L.none;
             const lead = std.mem.indexOfNone(u64, &keys, &.{no_lu}) orelse return;
-            self.lead = lead;
             const base = self.lanes[lead].sparse().?;
             self.lu = try LaneLu(W).init(self.gpa, base);
             for (self.lanes, keys, 0..) |s, k, l| {

@@ -22,6 +22,10 @@
 //
 // ponytail: no flicker noise (resnoise.c, gated on KF, default 0). Add it
 // when a deck names it.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module resistor(p, n);
     inout p, n;
     electrical p, n;

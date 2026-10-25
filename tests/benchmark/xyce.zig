@@ -3,8 +3,13 @@
 //! analyses. Unsupported dialect cards are refused rather than rewritten.
 const std = @import("std");
 const common = @import("job.zig");
+/// The flag whose output the report header quotes as Xyce's version.
 pub const version_flag = "-v";
 
+/// A job writing `raw`, or a refusal naming why Xyce would not run the same
+/// analysis. A deck with `.save` runs from `xyce-input.cir` beside `raw`, its
+/// selection rewritten as `.PRINT ... FORMAT=RAW`; otherwise Xyce reads the
+/// deck itself with `-r`, which dumps every solution vector.
 pub fn prepare(io: std.Io, a: std.mem.Allocator, bin: []const u8, source: []const u8, raw: []const u8, dialect: ?[]const u8) common.Error!common.Job {
     if (dialect) |d| if (!std.mem.eql(u8, d, "ngspice")) return .{ .refused = "Xyce adapter requires an ngspice-dialect deck" };
     const text = std.Io.Dir.cwd().readFileAlloc(io, source, a, .unlimited) catch return error.DeckFailed;
@@ -30,6 +35,7 @@ pub fn prepare(io: std.Io, a: std.mem.Allocator, bin: []const u8, source: []cons
     };
 }
 
+/// Why Xyce would read `text` differently from ngspice, or null.
 fn refusal(text: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     _ = lines.next(); // title
@@ -77,6 +83,8 @@ const declarations = std.StaticStringMap(void).initComptime(.{
     .{ ".param", {} }, .{ ".global", {} }, .{ ".end", {} },
 });
 
+/// `text` with its `.save` cards folded into one `.PRINT FORMAT=RAW` before
+/// `.end`, or null when the deck saves nothing.
 fn selectedDeck(a: std.mem.Allocator, text: []const u8, raw_name: []const u8) !?[]const u8 {
     var selected: std.Io.Writer.Allocating = .init(a);
     var analysis: []const u8 = "";

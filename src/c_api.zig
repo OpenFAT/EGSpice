@@ -328,9 +328,8 @@ export fn espice_create(options: ?*const CreateOptions, out: ?*?*Token, diagnost
 }
 
 /// `espice_create` over `gpa`, which the handle keeps for its own free.
-/// Not exported: every C entry point passes `allocator` (SmpAllocator, the
-/// page allocator on single-threaded wasm); only the in-file allocation
-/// sweep passes another.
+/// Not exported: every C entry point passes `allocator`; only the in-file
+/// allocation sweep passes another.
 fn create(gpa: std.mem.Allocator, options: *const CreateOptions) !*Token {
     // A caller built before the toolchain fields passes a struct ending at
     // `output_path`; the fields past its size are never read.
@@ -344,9 +343,8 @@ fn create(gpa: std.mem.Allocator, options: *const CreateOptions) !*Token {
     const zig_path = if (toolchain) try constSlice(u8, options.zig_path.data, options.zig_path.len) else "";
     const share_path = if (toolchain) try constSlice(u8, options.share_path.data, options.share_path.len) else "";
     const live_bytes = if (live) try constSlice(Bytes, options.live_params, options.live_param_count) else &.{};
-    const live_params = try gpa.alloc([]const u8, live_bytes.len);
+    const live_params = try strings(gpa, live_bytes);
     defer gpa.free(live_params);
-    for (live_bytes, live_params) |b, *name| name.* = try constSlice(u8, b.data, b.len);
     if (source.len == 0 or options.explicit_gpu > 1) return error.InvalidArgument;
     var config: api.Options = .{
         .source = switch (options.source_kind) {
@@ -506,9 +504,8 @@ export fn espice_set_params(handle: ?*Token, names: ?[*]const Bytes, values: ?[*
     const h = handles.get(handle) catch |err| return status(err);
     const name_bytes = constSlice(Bytes, names, count) catch |err| return h.fail(err);
     const numbers = constSlice(f64, values, count) catch |err| return h.fail(err);
-    const keys = allocator.alloc([]const u8, count) catch |err| return h.fail(err);
+    const keys = strings(allocator, name_bytes) catch |err| return h.fail(err);
     defer allocator.free(keys);
-    for (name_bytes, keys) |b, *key| key.* = constSlice(u8, b.data, b.len) catch |err| return h.fail(err);
     h.problem.set_params(keys, numbers) catch |err| return h.fail(err);
     return 0;
 }
@@ -630,9 +627,8 @@ export fn espice_copy_point_measures(handle: ?*Token, first_id: u32, count: usiz
     const len = std.math.mul(usize, count, measure_count) catch |err| return h.fail(err);
     const values = mutableSlice(f64, out, len) catch |err| return h.fail(err);
     const codes = mutableSlice(u32, reasons, count) catch |err| return h.fail(err);
-    const keys = allocator.alloc([]const u8, measure_count) catch |err| return h.fail(err);
+    const keys = strings(allocator, name_bytes) catch |err| return h.fail(err);
     defer allocator.free(keys);
-    for (name_bytes, keys) |b, *key| key.* = constSlice(u8, b.data, b.len) catch |err| return h.fail(err);
     // `Reason` is u32-backed, so the caller's array holds the codes as is.
     h.problem.point_measures(@fromBackingInt(@intCast(first_id)), keys, values, @ptrCast(codes)) catch |err| return h.fail(err);
     return 0;
@@ -644,9 +640,8 @@ export fn espice_copy_point_tangents(handle: ?*Token, first_id: u32, count: usiz
     const len = std.math.mul(usize, count, measure_count) catch |err| return h.fail(err);
     const total = std.math.mul(usize, len, h.problem.live.len) catch |err| return h.fail(err);
     const values = mutableSlice(f64, out, total) catch |err| return h.fail(err);
-    const keys = allocator.alloc([]const u8, measure_count) catch |err| return h.fail(err);
+    const keys = strings(allocator, name_bytes) catch |err| return h.fail(err);
     defer allocator.free(keys);
-    for (name_bytes, keys) |b, *key| key.* = constSlice(u8, b.data, b.len) catch |err| return h.fail(err);
     h.problem.point_tangents(@fromBackingInt(@intCast(first_id)), count, keys, values) catch |err| return h.fail(err);
     return 0;
 }
@@ -668,6 +663,15 @@ export fn espice_lane_width(handle: ?*Token, out: ?*u32) u32 {
 fn constSlice(comptime T: type, ptr: ?[*]const T, len: usize) ![]const T {
     if (len == 0) return &.{};
     return (ptr orelse return error.InvalidArgument)[0..len];
+}
+
+/// Each C string of `bytes` as a slice, in a table the caller frees with
+/// `gpa`. Fails as `constSlice` does on a NULL string of nonzero length.
+fn strings(gpa: std.mem.Allocator, bytes: []const Bytes) ![][]const u8 {
+    const out = try gpa.alloc([]const u8, bytes.len);
+    errdefer gpa.free(out);
+    for (bytes, out) |b, *s| s.* = try constSlice(u8, b.data, b.len);
+    return out;
 }
 
 fn mutableSlice(comptime T: type, ptr: ?[*]T, len: usize) ![]T {
@@ -874,7 +878,7 @@ test "handles: a full table refuses create without leaking, and a retired slot n
     try t.expectError(error.InvalidHandle, handles.get(next));
 }
 
-// Stateful fuzz (TESTING-METHODOLOGY 2.1 item 10): random espice_* calls on
+// Stateful fuzz (TESTING.md, C ABI misuse): random espice_* calls on
 // up to three live problems, stale and forged handles mixed in. The model
 // predicts every status code from include/espice.h alone: what was
 // appended, which directive text maps to which id, what run_all completed,

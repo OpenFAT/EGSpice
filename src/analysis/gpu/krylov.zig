@@ -8,17 +8,21 @@ const lanes = @import("solver").gmres_lanes;
 const Gmres = @import("solver").gmres.Gmres;
 const block = @import("device").abi.gpu_lane_block_size;
 
+/// Host rounds of one `solve`: each a wait on the two request counts, and
+/// how many of them served a matvec or a preconditioner request.
 pub const Stats = struct {
     rounds: usize = 0,
     matvec_rounds: usize = 0,
     precond_rounds: usize = 0,
 };
 
+/// The masked GMRES driver on `backend`: its three kernels, one stream and
+/// work buffers that grow to the largest `solve` and are kept.
 pub fn Engine(comptime backend: gompute.Backend) type {
     return struct {
         const Self = @This();
-        pub const Raw = gompute.RawByName(backend);
-        pub const Buffer = Raw.Buffer;
+        const Raw = gompute.RawByName(backend);
+        const Buffer = Raw.Buffer;
         const Id = enum { states, work, input, output, matvec_mask, precond_mask, counts };
         const Storage = struct { buffer: ?Buffer = null, capacity: usize = 0 };
 
@@ -31,6 +35,8 @@ pub fn Engine(comptime backend: gompute.Backend) type {
         count: usize = 0,
         completed: bool = false,
 
+        /// Loads the kernels on device 0. Fails with the driver's error,
+        /// `error.KernelNotFound` included. Free with `deinit`.
         pub fn init(allocator: std.mem.Allocator) !Self {
             var start_kernel = try gompute.rawKernelByName(backend, "arp_gmres_start", 0);
             errdefer start_kernel.deinit();
@@ -42,6 +48,7 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             return .{ .allocator = allocator, .start_kernel = start_kernel, .advance_kernel = advance_kernel, .advance_only_kernel = advance_only_kernel, .stream = stream };
         }
 
+        /// Drains the stream, then frees every buffer and kernel.
         pub fn deinit(self: *Self) void {
             self.stream.synchronize() catch {};
             for (&self.buffers) |*storage| if (storage.buffer) |*b| b.free();
@@ -160,6 +167,9 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             return stats;
         }
 
+        /// Each point's convergence, iterations and residual from the last
+        /// `solve`, in point order. Fails with `error.KrylovResultUnavailable`
+        /// unless that solve succeeded. Caller frees with `allocator`.
         pub fn downloadResults(self: *Self, allocator: std.mem.Allocator) ![]Gmres.SolveResult {
             if (!self.completed) return error.KrylovResultUnavailable;
             const results = try allocator.alloc(Gmres.SolveResult, self.count);

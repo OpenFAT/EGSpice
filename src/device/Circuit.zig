@@ -14,8 +14,9 @@ allocator: std.mem.Allocator,
 n: u32,
 /// Structural nonzeros; also the trash slot ground stamps land in.
 nnz: u32,
-/// CSC column starts, n + 1 entries; rows ascend within a column.
+/// CSC column starts, n + 1 entries.
 col_ptr: []u32,
+/// CSC row of each slot, nnz entries, ascending within a column.
 row_idx: []u32,
 /// CSC slot of each diagonal entry.
 diag_slots: []u32,
@@ -94,6 +95,7 @@ pub const Facts = struct {
     /// Per `DeviceType`, whether the type runs a digital engine
     /// (`Library.digital`); types past its end are analog.
     digital: []const bool = &.{},
+    /// Becomes `Circuit.vpi`.
     vpi: ?*const Library.Vpi = null,
 };
 
@@ -135,12 +137,7 @@ pub fn freeze(
     // Every diagonal is in the pattern, so it holds at least n entries.
     std.debug.assert(nnz >= n);
     std.debug.assert(row_idx.len == nnz);
-    const view: abi.PatternView = .{
-        .col_ptr = col_ptr,
-        .row_idx = row_idx,
-        .n = n,
-        .trash_slot = nnz,
-    };
+    const view: abi.PatternView = .{ .col_ptr = col_ptr, .row_idx = row_idx, .n = n, .trash_slot = nnz };
     const diagonal = try allocator.alloc(u32, n);
     errdefer allocator.free(diagonal);
     // Every diagonal was added above.
@@ -258,12 +255,8 @@ pub fn nodeName(self: Circuit, node: u32) []const u8 {
 /// pattern.
 pub fn findSlot(self: Circuit, row: u32, col: u32) ?u32 {
     if (row >= self.n or col >= self.n) return null;
-    return (abi.PatternView{
-        .col_ptr = self.col_ptr,
-        .row_idx = self.row_idx,
-        .n = self.n,
-        .trash_slot = self.nnz,
-    }).findSlot(row, col);
+    const view: abi.PatternView = .{ .col_ptr = self.col_ptr, .row_idx = self.row_idx, .n = self.n, .trash_slot = self.nnz };
+    return view.findSlot(row, col);
 }
 
 /// A one-instance device that stamps (row, col) and owns one heap word, so

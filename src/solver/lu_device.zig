@@ -5,8 +5,9 @@
 //! `dmap`, `Tab.dmap16`), the solves' heads `arp_lu_lhead`/`arp_lu_uhead`
 //! (one block per run of rows, by ticket the same way) and their tails
 //! `arp_lu_lpanel`/`arp_lu_upanel` (one block of `panel` lanes per panel,
-//! by ticket in solve order).
-//! The bodies are `kernels/lu.zig`'s, shared with the host threads. In: the
+//! by ticket in solve order), plus the resident Newton matrix's
+//! `arp_gc_combine`/`arp_gc_gather`/`arp_gc_scatter`.
+//! The LU bodies are `kernels/lu.zig`'s, shared with the host threads. In: the
 //! tables and values the host uploads. Out: the factors and solutions in
 //! device memory.
 
@@ -62,8 +63,8 @@ fn uhead(t: lu.Tab, x: P(u32), val: P(f64), y: P(f64), dx: P(f64), sy: P(u32), s
     _ = Solve.uhead(t, x, val, y, dx, sy, stamp, &ssh, gompute.builtins.localIdX(), lu.solve_block);
 }
 
-/// The resident Newton matrix (02 2.3; `analysis/gpu/context.zig` and
-/// `gpu/lu.zig` launch these at `gc_block` threads): one thread per entry.
+/// Block width of the resident Newton matrix kernels below, one thread per
+/// entry; `analysis/gpu/context.zig` and `gpu/lu.zig` launch at this width.
 const gc_block = 256;
 
 /// `a[i] = g[i] + alpha * c[i]`, uncontracted, as `Circuit.combinePlanes`.

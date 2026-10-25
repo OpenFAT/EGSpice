@@ -28,7 +28,7 @@ pub const std_options: std.Options = .{ .signal_stack_size = null };
 /// Only a host device object (eval.zig as the build root) has the per-model
 /// `models` module; a runtime `.hdl` build (VerA's shim re-exports this decl
 /// from `dyn`) has neither it nor GPU kernels, so it keeps the Debug checks.
-pub const vera_validate_contract = @import("builtin").mode == .debug and
+pub const vera_validate_contract = builtin.mode == .debug and
     !(@import("root") == @This() and gpuKernelsBuilt());
 
 fn gpuKernelsBuilt() bool {
@@ -58,6 +58,16 @@ const fma_ok = switch (builtin.target.cpu.arch) {
     .aarch64, .aarch64_be => true,
     .nvptx64, .amdgcn => true,
     else => false, // else: no shipped target beyond these has a fused multiply-add guaranteed
+};
+
+/// Safety panics of this root's objects. On a GPU a failed check traps: the
+/// default handler formats its message through an `Io.Writer` (a 4 KB stack
+/// buffer and indirect calls) that no device prints, and that AMDGPU's LLVM
+/// backend cannot lay out in ReleaseSafe ("Cannot scavenge register in FI
+/// elimination"). The host keeps the default.
+pub const panic = switch (builtin.target.cpu.arch) {
+    .nvptx64, .amdgcn => std.debug.no_panic,
+    else => std.debug.FullPanic(std.debug.defaultPanic),
 };
 
 /// A `Dual` family over lanes `0..n` with unknown u on lane u, every value
@@ -361,7 +371,8 @@ fn RealFor(comptime collapsed: bool) type {
             return .{ .v = v };
         }
         pub fn sel(c: Self, a: Self, b: Self) Self {
-            return if (c.v != 0.0) a else b;
+            // The bit test `DualFor.sel` uses, not `c.v != 0.0` (#25).
+            return if (@as(u64, @bitCast(c.v)) << 1 != 0) a else b;
         }
         pub fn to(a: Self, comptime _: anytype) Self {
             return a;
@@ -746,7 +757,7 @@ fn narrowEligible(comptime D: type) bool {
 /// rows are homogeneous in their own unknowns. VerA scales hierarchical
 /// children itself and leaves the top-level instance to the host. A model
 /// with its own `m` parameter keeps `mfactor` at 1.
-pub inline fn mfactorOf(comptime D: type, inst: anytype) f64 {
+inline fn mfactorOf(comptime D: type, inst: anytype) f64 {
     return if (comptime @hasField(D.Instance, "mfactor")) inst.mfactor else 1.0;
 }
 
@@ -910,8 +921,7 @@ fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, sink: 
 
 /// One write `RecordSink` keeps: the cell's address with bit 0 set for a
 /// store (staging positions, the charge tape), clear for an add, and the
-/// value.
-/// `tag`: kind << 16 | local row << 8 | local column (residual and
+/// value. `tag`: kind << 16 | local row << 8 | local column (residual and
 /// Jacobian writes); 0 for the charge tape.
 const RecordWrite = struct { ptr: usize, val: f64, tag: u32 = 0 };
 const rec_res = 1;
@@ -1007,8 +1017,7 @@ const host_pad = true;
 /// The first `w` lanes of `v`: the unpadded basis, so the correction dot
 /// product sums exactly the lanes it sums without padding.
 inline fn head(comptime w: usize, v: anytype) @Vector(w, f64) {
-    const wide: @Vector(@typeInfo(@TypeOf(v)).vector.len, f64) = @floatCast(v);
-    return @shuffle(f64, wide, undefined, std.simd.iota(i32, w));
+    return @shuffle(f64, v, undefined, std.simd.iota(i32, w));
 }
 
 /// `@reduce(.Or, v != 0)` computed on the bits: true when any lane is nonzero
@@ -1488,16 +1497,16 @@ const timer_only_state = std.StaticStringMap(void).initComptime(.{
 /// model, a runtime `.hdl` one included, always evaluates.
 // ponytail: hand-kept list (grep of the generated sources); a VerA flag for time reads would replace it.
 const bypass_models = std.StaticStringMap(void).initComptime(.{
-    .{"asmesd"},       .{"asmesd_dio"},     .{"asmhemt"},      .{"b3soidd"},        .{"b3soifd"},
-    .{"bjt505"},       .{"bjt505t"},        .{"bsim1"},        .{"bsim2"},          .{"bsim3"},
-    .{"bsim4va"},      .{"bsimbulk"},       .{"bsimcmg_std"},  .{"bsimimg"},        .{"bsimsoi"},
-    .{"diode_cmc"},    .{"diode"},          .{"gummel_poon"},  .{"hfet1"},          .{"hfet2"},
-    .{"hicumL0_v2p1p0"}, .{"hicumL2_v320"}, .{"hisim2_va"},    .{"hisimhv"},        .{"hisimsoi_std"},
-    .{"hisimsotb_std"}, .{"jfet2"},         .{"jfet"},         .{"juncap200"},      .{"L_UTSOI_102"},
-    .{"mesa"},         .{"mes"},            .{"mosvar"},       .{"mvsg_cmc_5.0.0"}, .{"psp103"},
-    .{"psp103t"},      .{"psp104"},         .{"psp104t"},      .{"r2_cmc"},         .{"r3_cmc"},
-    .{"vbic13_4t"},    .{"vdmos"},          .{"mos1"},         .{"mos2"},           .{"mos3"},
-    .{"mos6"},         .{"mos9"},
+    .{"asmesd"},         .{"asmesd_dio"},   .{"asmhemt"},     .{"b3soidd"},        .{"b3soifd"},
+    .{"bjt505"},         .{"bjt505t"},      .{"bsim1"},       .{"bsim2"},          .{"bsim3"},
+    .{"bsim4va"},        .{"bsimbulk"},     .{"bsimcmg_std"}, .{"bsimimg"},        .{"bsimsoi"},
+    .{"diode_cmc"},      .{"diode"},        .{"gummel_poon"}, .{"hfet1"},          .{"hfet2"},
+    .{"hicumL0_v2p1p0"}, .{"hicumL2_v320"}, .{"hisim2_va"},   .{"hisimhv"},        .{"hisimsoi_std"},
+    .{"hisimsotb_std"},  .{"jfet2"},        .{"jfet"},        .{"juncap200"},      .{"L_UTSOI_102"},
+    .{"mesa"},           .{"mes"},          .{"mosvar"},      .{"mvsg_cmc_5.0.0"}, .{"psp103"},
+    .{"psp103t"},        .{"psp104"},       .{"psp104t"},     .{"r2_cmc"},         .{"r3_cmc"},
+    .{"vbic13_4t"},      .{"vdmos"},        .{"mos1"},        .{"mos2"},           .{"mos3"},
+    .{"mos6"},           .{"mos9"},
 });
 
 fn skipsTimerState(comptime D: type) bool {
@@ -1524,6 +1533,19 @@ fn hasSpiceBreaks(comptime D: type) bool {
 
 /// `extern`: `GpuPayload.brk` hands these to device step control as bytes.
 const SrcBrk = extern struct { req: f64 = std.math.inf(f64), at: f64 = std.math.inf(f64) };
+
+/// Model `m`'s next breakpoint after `t`, through its cache `c`: kept until a
+/// query reaches it or goes back before the request that set it. Shared by
+/// `nextBreakpointFn` and `LaneBreakKernel`, so host and device round alike.
+/// isrcacct.c requests the raw PWL table times, so only the V source rounds
+/// its PWL corners.
+inline fn srcBreak(comptime D: type, c: *SrcBrk, m: *const D.Model, t_acc: f64, t: f64) f64 {
+    if (t < c.req or t >= c.at)
+        c.* = .{ .req = t, .at = spicePulseBreak(m, t_acc, t) orelse
+            (if (comptime std.mem.eql(u8, baseName(D), "vsource")) spicePwlBreak(m, t_acc, t) else null) orelse
+            D.nextBreakpoint(m, t) orelse std.math.inf(f64) };
+    return c.at;
+}
 
 /// Models whose ngspice load extrapolates the first Newton iterate of a
 /// transient step over CKTdeltaOld[2], the step two back, where the host
@@ -1750,10 +1772,10 @@ pub fn DeviceBatch(comptime D: type) type {
     // Native lines rewrite `Model.brk` as they step, so theirs are not.
     const has_bp = @hasDecl(D, "nextBreakpoint") and skipsTimerState(D);
     const has_src_brk = hasSpiceBreaks(D);
-    // isrcacct.c requests the raw PWL table times, so only the V source
-    // rounds its PWL corners.
-    const is_vsource = comptime std.mem.eql(u8, baseName(D), "vsource");
     const Ac = AcTerms(D);
+    // `update_state` stages: not the delay lines (`commit_state`), not
+    // timer-only state.
+    const stages_update = @hasDecl(D, "updateState") and !hasAbsdelayState(D) and !skipsTimerState(D);
     const has_ac_dyn = @hasDecl(Ac, "ac_dyn_slots");
 
     return struct {
@@ -1830,21 +1852,20 @@ pub fn DeviceBatch(comptime D: type) type {
             !(@hasDecl(D, "constant") and D.constant.g) and @hasDecl(D, "u_kinds") and
             @sizeOf(D.Instance) <= 4096 and bypass_models.has(baseName(D));
 
-        /// One recorded sink write: `ptr` with bit 0 set for a store
-        /// (staging positions and the charge tape), clear for an add.
-        const BypassWrite = RecordWrite;
-
         /// Per instance: the limited unknowns and the writes of its last
         /// full Newton evaluation, and what that evaluation depended on.
         const Bypass = struct {
             tol: ir.BypassTol,
             ref: []f64, // count * n_u
             meta: []Meta, // count
-            writes: []BypassWrite, // count * max_writes
+            writes: []RecordWrite, // count * max_writes
             /// Instance evaluations that replayed and that evaluated, summed
             /// over ParEval's lanes; read between solves (`setSimState`).
-            hits: std.atomic.Value(u64) = .init(0),
-            misses: std.atomic.Value(u64) = .init(0),
+            /// usize: wasm32 has no 64-bit atomics.
+            // ponytail: wraps after 2^32 evaluations on 32-bit targets, which
+            // only skews `review`'s ratio there; u64 again if that matters.
+            hits: std.atomic.Value(usize) = .init(0),
+            misses: std.atomic.Value(usize) = .init(0),
             /// Set once the hit rate proved too low to pay for recording:
             /// the batch evaluates plainly for the rest of the run.
             off: bool = false,
@@ -1926,10 +1947,10 @@ pub fn DeviceBatch(comptime D: type) type {
             .mark_current_rows = if (@hasDecl(D, "u_kinds")) markCurrentRows else null,
             // Delay history runs once per accepted point; everything else
             // per converged solve. See `Hooks.commit_state`.
-            .update_state = if (@hasDecl(D, "updateState") and !hasAbsdelayState(D) and !skipsTimerState(D)) updateState else null,
-            .update_range = if (@hasDecl(D, "updateState") and !hasAbsdelayState(D) and !skipsTimerState(D)) updateRange else null,
+            .update_state = if (stages_update) updateState else null,
+            .update_range = if (stages_update) updateRange else null,
             .set_bypass = if (bypassable) setBypass else null,
-            .update_done = if (@hasDecl(D, "updateState") and !hasAbsdelayState(D) and !skipsTimerState(D)) updateDone else null,
+            .update_done = if (stages_update) updateDone else null,
             .commit_state = if (@hasDecl(D, "updateState") and hasAbsdelayState(D)) updateState else null,
             .state_ctl = if (@hasDecl(D, "stateCtl") and !skipsTimerState(D)) stateCtl else null,
             // Only `updateState` writes `bound_step`.
@@ -2083,13 +2104,18 @@ pub fn DeviceBatch(comptime D: type) type {
                 self.evalBypass(bp, &sink, first, last, sim, limiting, pl, staged);
                 return;
             };
+            self.evalSplit(&sink, first, last, sim, limiting);
+        }
+
+        /// `evalRange` over `[first, last)`, the narrow basis on the part
+        /// below `narrow_count`: a ParEval slice may straddle the boundary.
+        inline fn evalSplit(self: *const Self, sink: anytype, first: u32, last: u32, sim: SimState, limiting: bool) void {
             if (comptime narrowable) {
-                // A ParEval slice may straddle the partition boundary.
                 const split = std.math.clamp(self.narrow_count, first, last);
-                if (split > first) evalRange(D, true, host_pad, &sink, first, split, sim, limiting);
-                if (last > split) evalRange(D, false, host_pad, &sink, split, last, sim, limiting);
+                if (split > first) evalRange(D, true, host_pad, sink, first, split, sim, limiting);
+                if (last > split) evalRange(D, false, host_pad, sink, split, last, sim, limiting);
             } else {
-                evalRange(D, false, host_pad, &sink, first, last, sim, limiting);
+                evalRange(D, false, host_pad, sink, first, last, sim, limiting);
             }
         }
 
@@ -2107,7 +2133,7 @@ pub fn DeviceBatch(comptime D: type) type {
             const t = tol orelse return;
             const ref = staging_gpa.alloc(f64, self.count * n_u) catch return;
             const meta = staging_gpa.alloc(Bypass.Meta, self.count) catch return staging_gpa.free(ref);
-            const writes = staging_gpa.alloc(BypassWrite, self.count * max_writes) catch {
+            const writes = staging_gpa.alloc(RecordWrite, self.count * max_writes) catch {
                 staging_gpa.free(meta);
                 return staging_gpa.free(ref);
             };
@@ -2146,18 +2172,14 @@ pub fn DeviceBatch(comptime D: type) type {
             // branch on it), so a later iterate's recording reaches the
             // next timepoint.
             if (sim.iteration <= 1) {
-                if (comptime narrowable) {
-                    const split = std.math.clamp(self.narrow_count, first, last);
-                    if (split > first) evalRange(D, true, host_pad, sink, first, split, sim, limiting);
-                    if (last > split) evalRange(D, false, host_pad, sink, split, last, sim, limiting);
-                } else evalRange(D, false, host_pad, sink, first, last, sim, limiting);
+                self.evalSplit(sink, first, last, sim, limiting);
                 return;
             }
-            const class: u16 = 1 + 2 * @as(u16, @intCast(@intFromEnum(sim.kind))) + 64 * @as(u16, @intFromBool(sim.analog_initial)) +
+            const class: u16 = 1 + 2 * @as(u16, @intCast(@backingInt(sim.kind))) + 64 * @as(u16, @intFromBool(sim.analog_initial)) +
                 128 * @as(u16, @intFromBool(sim.initial_step)) + 256 * @as(u16, @intFromBool(sim.final_step)) + 512 * @as(u16, @intFromBool(sim.t > 0));
             const lim_writes = comptime if (has_limit) limitWritesOf(D) else 0;
-            var hits: u64 = 0;
-            var misses: u64 = 0;
+            var hits: usize = 0;
+            var misses: usize = 0;
             defer {
                 _ = bp.hits.fetchAdd(hits, .monotonic);
                 _ = bp.misses.fetchAdd(misses, .monotonic);
@@ -2218,9 +2240,7 @@ pub fn DeviceBatch(comptime D: type) type {
                 misses += 1;
                 // Full evaluation, recorded.
                 var rec: RecordSink(SinkT) = .{ .inner = sink, .id = id, .out = bp.writes[@as(usize, id) * max_writes ..][0..max_writes] };
-                if (comptime narrowable) {
-                    if (id < self.narrow_count) evalRange(D, true, host_pad, &rec, id, id + 1, sim, limiting) else evalRange(D, false, host_pad, &rec, id, id + 1, sim, limiting);
-                } else evalRange(D, false, host_pad, &rec, id, id + 1, sim, limiting);
+                self.evalSplit(&rec, id, id + 1, sim, limiting);
                 @memcpy(ref, &lx);
                 m.* = if (corr or rec.overflow) .{} else .{ .class = class, .len = @intCast(rec.n), .key = state_key };
             }
@@ -2228,12 +2248,9 @@ pub fn DeviceBatch(comptime D: type) type {
 
         /// A recorded residual write's first-order move to `d`.
         fn bypassDelta(w: RecordWrite, jl: *const [n_u][n_u]f64, d: *const [n_u]f64) f64 {
-            const m = switch (w.tag >> 16) {
-                rec_res => jl,
-                else => return 0,
-            };
+            if (w.tag >> 16 != rec_res) return 0;
             var dv: f64 = 0;
-            for (m[(w.tag >> 8) & 0xff], d) |j, dx| dv += j * dx;
+            for (jl[(w.tag >> 8) & 0xff], d) |j, dx| dv += j * dx;
             return dv;
         }
 
@@ -2354,17 +2371,15 @@ pub fn DeviceBatch(comptime D: type) type {
 
         fn applyLimits(ctx: *anyopaque, x: []f64, x_old: []const f64) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            // `limitRange` never touches the planes, but `host` reads their
-            // pointers, and `undefined` would trap in Debug.
-            const no_planes: Planes = .{ .g_vals = &.{}, .c_vals = &.{}, .rhs = &.{}, .q_vec = &.{} };
-            var sink = Sink(D, false, false, false).host(self, &no_planes, x, x_old.ptr);
-            const any = limitRange(D, &sink, 0, @intCast(self.count), self.lim_active, self.sim);
+            const any = limitRangeHook(ctx, x, x_old, 0, self.count);
             self.lim_active = true;
-            return any != 0;
+            return any;
         }
 
         fn limitRangeHook(ctx: *anyopaque, x: []f64, x_old: []const f64, first: u32, last: u32) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
+            // `limitRange` never touches the planes, but `host` reads their
+            // pointers, and `undefined` would trap in Debug.
             const no_planes: Planes = .{ .g_vals = &.{}, .c_vals = &.{}, .rhs = &.{}, .q_vec = &.{} };
             var sink = Sink(D, false, false, false).host(self, &no_planes, x, x_old.ptr);
             return limitRange(D, &sink, first, last, self.lim_active, self.sim) != 0;
@@ -2407,18 +2422,8 @@ pub fn DeviceBatch(comptime D: type) type {
         /// `commit_state`), not per Newton iteration.
         fn updateState(ctx: *anyopaque, x: []const f64) ?f64 {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            var min_reject: ?f64 = null;
-            for (0..self.count) |id| {
-                const lx = self.localX(x, id);
-                switch (D.updateState(Real, self.model(id), &self.instances[id], lx, &self.states[id], self.sim)) {
-                    .ok => {},
-                    .request_reject_at => |tr| {
-                        min_reject = if (min_reject) |cur| @min(cur, tr) else tr;
-                    },
-                }
-            }
-            self.held_initial = true;
-            self.sim.analog_initial = false;
+            const min_reject = updateRange(ctx, x, 0, self.count);
+            updateDone(ctx);
             return min_reject;
         }
 
@@ -2541,7 +2546,7 @@ pub fn DeviceBatch(comptime D: type) type {
         fn gpuPayload(ctx: *anyopaque) GpuPayload {
             const self: *Self = @ptrCast(@alignCast(ctx));
             return .{
-                .kernel = comptime kernelName(D),
+                .kernel = comptime kernelSym(D, "eval"),
                 .count = self.count,
                 .n_u = n_u,
                 .models = std.mem.sliceAsBytes(self.models),
@@ -2550,9 +2555,9 @@ pub fn DeviceBatch(comptime D: type) type {
                 .gath = self.gath,
                 .rhs_idx = self.rhs_idx,
                 .slots = self.slots,
-                .lim_kernel = comptime if (hasStateKernel(D)) stateKernelName(D) else "",
-                .ctl_kernel = comptime if (hasCtlKernel(D)) ctlKernelName(D) else "",
-                .reduce_kernel = comptime reduceKernelName(D),
+                .lim_kernel = comptime if (hasStateKernel(D)) kernelSym(D, "lim") else "",
+                .ctl_kernel = comptime if (hasCtlKernel(D)) kernelSym(D, "ctl") else "",
+                .reduce_kernel = comptime kernelSym(D, "reduce"),
                 .lim_x = if (comptime has_limit) self.lim_x else &.{},
                 .states = if (comptime has_state) std.mem.sliceAsBytes(self.states) else &.{},
                 .lim_active = if (comptime has_limit) self.lim_active else false,
@@ -2626,12 +2631,7 @@ pub fn DeviceBatch(comptime D: type) type {
             var best: f64 = std.math.inf(f64);
             if (comptime @hasDecl(D, "nextBreakpoint")) for (self.models, 0..) |*m, i| {
                 if (comptime has_src_brk) {
-                    const b = &self.src_brk[i];
-                    if (t < b.req or t >= b.at)
-                        b.* = .{ .req = t, .at = spicePulseBreak(m, t_acc, t) orelse
-                            (if (comptime is_vsource) spicePwlBreak(m, t_acc, t) else null) orelse
-                            D.nextBreakpoint(m, t) orelse std.math.inf(f64) };
-                    best = @min(best, b.at);
+                    best = @min(best, srcBreak(D, &self.src_brk[i], m, t_acc, t));
                     continue;
                 }
                 if (D.nextBreakpoint(m, t)) |bp| best = @min(best, bp);
@@ -2982,8 +2982,6 @@ pub fn DeviceBatch(comptime D: type) type {
         }
 
         fn binding(self: *Self) Batch {
-            const const_g = @hasDecl(D, "constant") and D.constant.g;
-            const const_c = @hasDecl(D, "constant") and D.constant.c;
             return .{
                 .ctx = self,
                 .eval = eval,
@@ -2991,7 +2989,7 @@ pub fn DeviceBatch(comptime D: type) type {
                 .count = self.count,
                 .n_u = n_u,
                 .has_charge = has_q,
-                .has_const_jacobian = const_g and (!has_q or const_c),
+                .has_const_jacobian = comptime constJacobian(D),
                 .type_name = comptime baseName(D),
                 .hooks = &hooks,
             };
@@ -3192,45 +3190,16 @@ fn baseName(comptime D: type) []const u8 {
     return full[dot + 1 ..];
 }
 
-// Kernel symbols, derived from the type so the build root that exports them
-// and `gpuPayload` that names them for the launcher cannot drift apart.
-
-fn kernelName(comptime D: type) [:0]const u8 {
-    return "arp_eval_" ++ comptime baseName(D);
-}
-
-fn stateKernelName(comptime D: type) [:0]const u8 {
-    return "arp_lim_" ++ comptime baseName(D);
-}
-
-fn ctlKernelName(comptime D: type) [:0]const u8 {
-    return "arp_ctl_" ++ comptime baseName(D);
-}
-
-/// The reduce body is device-independent, but gompute needs kernel names
-/// unique across the per-device build roots, so each device exports a copy.
-fn reduceKernelName(comptime D: type) [:0]const u8 {
-    return "arp_reduce_" ++ comptime baseName(D);
-}
-
-/// Not carried in the frozen `GpuPayload`: the host derives it from
-/// `kernelName`, so the prefix swap there must match this.
-/// Lane kernel symbols, named from `kernelName` by the host
-/// (`gpu_lanes.laneName`), not carried in the frozen `GpuPayload`.
-fn laneKernelName(comptime D: type, comptime what: []const u8) [:0]const u8 {
-    return "arp_l" ++ what ++ "_" ++ comptime baseName(D);
-}
-
-fn qTapeKernelName(comptime D: type) [:0]const u8 {
-    return "arp_qtp_" ++ comptime baseName(D);
-}
-
-fn chargeKernelName(comptime D: type) [:0]const u8 {
-    return "arp_qonly_" ++ comptime baseName(D);
-}
-
-fn constKernelName(comptime D: type) [:0]const u8 {
-    return "arp_evalc_" ++ comptime baseName(D);
+/// Kernel symbol `arp_<what>_<model>`, derived from the type so the build
+/// root that exports it and `gpuPayload` that names it for the launcher
+/// cannot drift apart. `what`: `eval`, `evalc` (constant Jacobian), `lim`,
+/// `ctl`, `qtp`, `qonly`, and `reduce`, whose body is device-independent but
+/// whose name gompute needs unique across the per-device build roots. The
+/// lane kernels (`l` ++ what) are not carried in the frozen `GpuPayload`:
+/// the host derives them from the eval name (`gpu_lanes.laneName`), so the
+/// prefix swap there must match this.
+fn kernelSym(comptime D: type, comptime what: []const u8) [:0]const u8 {
+    return "arp_" ++ what ++ "_" ++ comptime baseName(D);
 }
 
 /// D's whole Jacobian is constant (`Batch.has_const_jacobian`), so its g
@@ -3254,8 +3223,6 @@ fn constJacobian(comptime D: type) bool {
 fn Sink(comptime D: type, comptime device: bool, comptime skip_const: bool, comptime staged: bool) type {
     if (device and staged) @compileError("staging is host only");
     const n_u: usize = comptime contract.nU(D);
-    const const_g = @hasDecl(D, "constant") and D.constant.g;
-    const const_c = @hasDecl(D, "constant") and D.constant.c;
     const BatchT = DeviceBatch(D);
     return struct {
         xs: gompute.GlobalPtr(f64),
@@ -3283,7 +3250,7 @@ fn Sink(comptime D: type, comptime device: bool, comptime skip_const: bool, comp
         // is constant (`Batch.has_const_jacobian`). A lone constant half has
         // no baseline copy, so skipping it would drop it from the Newton
         // matrix: an idt's charge (C = 1) beside a non-constant G, say.
-        const in_baseline = const_g and (!@hasDecl(D, "q") or const_c);
+        const in_baseline = constJacobian(D);
         pub const skip_g = skip_const and in_baseline;
         pub const skip_c = skip_const and in_baseline;
         pub const on_device = device;
@@ -3451,7 +3418,7 @@ fn DeviceKernel(comptime D: type, comptime block_size: u32, comptime skip_const:
 // Zig 0.18.0-dev.349's AMDGPU backend aborts with "Cannot scavenge register
 // in FI elimination!" on the outlined coupled-line updateState call.
 // Inline it into both state kernels to avoid that call's frame lowering.
-// Keep CUDA's existing inlining policy. `test-hip-codegen` emits machine
+// Keep CUDA's existing inlining policy. `zig build test`'s HIP probe emits machine
 // code for all three coupled-line widths, including their lane kernels.
 const gpu_state_call: std.lang.CallModifier = if (builtin.target.cpu.arch == .amdgcn) .always_inline else .auto;
 
@@ -3749,6 +3716,20 @@ fn LaneSink(comptime D: type) type {
     };
 }
 
+/// Thread `tid`'s lane and instance range in a lane kernel: with `n_ids` > 0
+/// instance `ids[ids_off + tid / n_lanes]` on lane `tid % n_lanes` (lanes
+/// innermost, 06 6.11, `gpu/lane_color.zig`), else lane `tid` over all
+/// `count` instances. Null for a thread past the grid's end.
+inline fn laneRange(tid: usize, n_lanes: u64, count: u64, ids: gompute.GlobalPtr(u32), ids_off: u64, n_ids: u64) ?struct { l: u32, first: u32, last: u32 } {
+    if (n_ids == 0) {
+        if (tid >= n_lanes) return null;
+        return .{ .l = @intCast(tid), .first = 0, .last = @intCast(count) };
+    }
+    if (tid >= n_ids * n_lanes) return null;
+    const first = ids[@intCast(ids_off + tid / n_lanes)];
+    return .{ .l = @intCast(tid % n_lanes), .first = first, .last = first + 1 };
+}
+
 /// GPU lane eval for D: thread l is lane l of `n_lanes`, evaluating every
 /// instance of the batch at its own x under its own `sims[l]`, skipped
 /// when `active[l] == 0` (a frozen or finished lane). `limiting[0]` is the
@@ -3774,26 +3755,13 @@ fn LaneEvalKernel(comptime D: type, comptime block_size: u32) type {
             rhs: gompute.GlobalPtr(f64),
             q_vec: gompute.GlobalPtr(f64),
             lim: gompute.GlobalPtr(f64),
-            // `n_ids` > 0: a thread per (instance `ids[ids_off + k]`, lane),
-            // lanes innermost (06 6.11, `gpu/lane_color.zig`); else a thread
-            // per lane over every instance.
+            // `laneRange` maps threads to (lane, instances).
             ids: gompute.GlobalPtr(u32),
             ids_off: u64,
             n_ids: u64,
         ) callconv(gompute.kernel_callconv) void {
-            const tid = gompute.globalIdX(block_size);
-            var first: u32 = 0;
-            var last: u32 = @intCast(count);
-            var l: u32 = undefined;
-            if (n_ids == 0) {
-                if (tid >= n_lanes) return;
-                l = @intCast(tid);
-            } else {
-                if (tid >= n_ids * n_lanes) return;
-                l = @intCast(tid % n_lanes);
-                first = ids[@intCast(ids_off + tid / n_lanes)];
-                last = first + 1;
-            }
+            const r = laneRange(gompute.globalIdX(block_size), n_lanes, count, ids, ids_off, n_ids) orelse return;
+            const l = r.l;
             if (active[l] == 0) return;
             var sink: LaneSink(D) = .{
                 .n = @intCast(n_lanes),
@@ -3811,7 +3779,7 @@ fn LaneEvalKernel(comptime D: type, comptime block_size: u32) type {
                 .q_vec = q_vec,
                 .lim_ = lim,
             };
-            evalRange(D, false, false, &sink, first, last, sims[l], limiting[l] != 0);
+            evalRange(D, false, false, &sink, r.first, r.last, sims[l], limiting[l] != 0);
         }
     };
 }
@@ -3956,19 +3924,8 @@ fn LaneChargeKernel(comptime D: type, comptime block_size: u32) type {
             n_ids: u64,
         ) callconv(gompute.kernel_callconv) void {
             _ = n_hist; // the lane-major tape ring needs no per-lane base
-            const tid = gompute.globalIdX(block_size);
-            var first: u32 = 0;
-            var last: u32 = @intCast(count);
-            var l: u32 = undefined;
-            if (n_ids == 0) {
-                if (tid >= n_lanes) return;
-                l = @intCast(tid);
-            } else {
-                if (tid >= n_ids * n_lanes) return;
-                l = @intCast(tid % n_lanes);
-                first = ids[@intCast(ids_off + tid / n_lanes)];
-                last = first + 1;
-            }
+            const r = laneRange(gompute.globalIdX(block_size), n_lanes, count, ids, ids_off, n_ids) orelse return;
+            const l = r.l;
             if (mask[l] == 0) return;
             var sink: LaneSink(D) = .{
                 .n = @intCast(n_lanes),
@@ -3988,7 +3945,7 @@ fn LaneChargeKernel(comptime D: type, comptime block_size: u32) type {
                 // Lane-major ring: entry j of slot k at `(k * n_qt + j) * N + l`.
                 .tape_ = tape + ((@as(usize, slot0[l]) * @as(usize, @intCast(n_qt)) + @as(usize, @intCast(off))) * @as(usize, @intCast(n_lanes)) + l),
             };
-            evalQRange(D, RealFor(@hasDecl(D, "collapse")), &sink, first, last, sims[l], null);
+            evalQRange(D, RealFor(@hasDecl(D, "collapse")), &sink, r.first, r.last, sims[l], null);
         }
     };
 }
@@ -4025,12 +3982,7 @@ fn LaneBreakKernel(comptime D: type, comptime block_size: u32) type {
             if (comptime @hasDecl(D, "nextBreakpoint")) for (0..@as(usize, @intCast(count))) |id| {
                 const m: *const D.Model = @addrSpaceCast(&models[model_of[id * N + l]]);
                 if (comptime hasSpiceBreaks(D)) {
-                    const c: *SrcBrk = @addrSpaceCast(&brk[id * N + l]);
-                    if (t < c.req or t >= c.at)
-                        c.* = .{ .req = t, .at = spicePulseBreak(m, t_acc, t) orelse
-                            (if (comptime std.mem.eql(u8, baseName(D), "vsource")) spicePwlBreak(m, t_acc, t) else null) orelse
-                            D.nextBreakpoint(m, t) orelse std.math.inf(f64) };
-                    b = @min(b, c.at);
+                    b = @min(b, srcBreak(D, @addrSpaceCast(&brk[id * N + l]), m, t_acc, t));
                     continue;
                 }
                 if (D.nextBreakpoint(m, t)) |bp| b = @min(b, bp);
@@ -4223,22 +4175,22 @@ comptime {
             if (gompute.is_device) {
                 const block_size = ir.gpu_block_size;
                 if (gpuEligible(D)) {
-                    gompute.exportRaw(kernelName(D), &DeviceKernel(D, block_size, false).run);
-                    if (constJacobian(D)) gompute.exportRaw(constKernelName(D), &DeviceKernel(D, block_size, true).run);
-                    if (hasStateKernel(D)) gompute.exportRaw(stateKernelName(D), &StateKernel(D, block_size).run);
-                    if (hasCtlKernel(D)) gompute.exportRaw(ctlKernelName(D), &CtlKernel(D, block_size).run);
-                    if (@hasDecl(D, "q")) gompute.exportRaw(qTapeKernelName(D), &QTapeKernel(D, block_size).run);
-                    if (@hasDecl(D, "q")) gompute.exportRaw(chargeKernelName(D), &ChargeKernel(D, block_size).run);
-                    gompute.exportRaw(reduceKernelName(D), &ReduceKernel(D, block_size).run);
+                    gompute.exportRaw(kernelSym(D, "eval"), &DeviceKernel(D, block_size, false).run);
+                    if (constJacobian(D)) gompute.exportRaw(kernelSym(D, "evalc"), &DeviceKernel(D, block_size, true).run);
+                    if (hasStateKernel(D)) gompute.exportRaw(kernelSym(D, "lim"), &StateKernel(D, block_size).run);
+                    if (hasCtlKernel(D)) gompute.exportRaw(kernelSym(D, "ctl"), &CtlKernel(D, block_size).run);
+                    if (@hasDecl(D, "q")) gompute.exportRaw(kernelSym(D, "qtp"), &QTapeKernel(D, block_size).run);
+                    if (@hasDecl(D, "q")) gompute.exportRaw(kernelSym(D, "qonly"), &ChargeKernel(D, block_size).run);
+                    gompute.exportRaw(kernelSym(D, "reduce"), &ReduceKernel(D, block_size).run);
                     // `-Dgpu-lanes`: also the lane kernels (phase 4), always
                     // at the lane block width (`lane_block_size`).
                     if (@import("lane_options").enabled) {
                         const lb = lane_block_size;
-                        gompute.exportRaw(laneKernelName(D, "eval"), &LaneEvalKernel(D, lb).run);
-                        if (hasStateKernel(D)) gompute.exportRaw(laneKernelName(D, "lim"), &LaneStateKernel(D, lb).run);
-                        if (hasCtlKernel(D)) gompute.exportRaw(laneKernelName(D, "ctl"), &LaneCtlKernel(D, lb).run);
-                        if (@hasDecl(D, "q")) gompute.exportRaw(laneKernelName(D, "chg"), &LaneChargeKernel(D, lb).run);
-                        if (@hasDecl(D, "nextBreakpoint") or walksPending(D)) gompute.exportRaw(laneKernelName(D, "brk"), &LaneBreakKernel(D, lb).run);
+                        gompute.exportRaw(kernelSym(D, "leval"), &LaneEvalKernel(D, lb).run);
+                        if (hasStateKernel(D)) gompute.exportRaw(kernelSym(D, "llim"), &LaneStateKernel(D, lb).run);
+                        if (hasCtlKernel(D)) gompute.exportRaw(kernelSym(D, "lctl"), &LaneCtlKernel(D, lb).run);
+                        if (@hasDecl(D, "q")) gompute.exportRaw(kernelSym(D, "lchg"), &LaneChargeKernel(D, lb).run);
+                        if (@hasDecl(D, "nextBreakpoint") or walksPending(D)) gompute.exportRaw(kernelSym(D, "lbrk"), &LaneBreakKernel(D, lb).run);
                     }
                 } else gompute.exportRaw("arp_nop_" ++ decl_name, &placeholder);
             } else {
@@ -4264,10 +4216,8 @@ comptime {
 /// Private decls exposed to the test suites. Tests live in tests/eval.zig,
 /// not here: this file is a dependency module of every test root, and Zig
 /// runs only the root module's tests.
-pub const test_access = if (@import("builtin").is_test) .{
+pub const test_access = if (builtin.is_test) .{
     .narrowEligible = narrowEligible,
-    .basisOf = basisOf,
-    .DualFor = DualFor,
     .NoiseFamily = NoiseFamily,
     .gpuRefusal = gpuRefusal,
     .GpuRefusal = GpuRefusal,

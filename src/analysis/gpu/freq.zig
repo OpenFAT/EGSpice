@@ -18,7 +18,6 @@ const root = @import("../types.zig");
 const gpu = @import("context.zig");
 const freq = @import("../ac/freq.zig");
 
-pub const available = artifacts.has_cuda or artifacts.has_hip;
 const block = @import("device").abi.gpu_lane_block_size;
 pub const test_hooks = if (@import("builtin").is_test) struct {
     /// Fail one replay only after its host pivot candidate was selected.
@@ -51,8 +50,11 @@ pub const RoundPoint = struct {
     adjoint: bool,
 };
 
+/// A point's own numerical failure, as its host `solveBatch` reports it.
 pub const SolveError = root.ErrorOf(FS.solveBatch);
 
+/// Points served, device lanes run, launch groups, and lanes that failed a
+/// device refactor and peeled to the host.
 pub const Stats = struct {
     points: usize = 0,
     lanes: usize = 0,
@@ -102,16 +104,21 @@ pub const RoundDriver = struct {
     hip: if (artifacts.has_hip) ?Engine(.hip) else void = if (artifacts.has_hip) null else {},
     disabled: bool = false,
 
+    /// Touches no driver: the engine loads on the first round that needs it.
     pub fn init(allocator: std.mem.Allocator, requested: gpu.Request) RoundDriver {
         return .{ .allocator = allocator, .requested = requested };
     }
 
+    /// Frees the engine, if one loaded.
     pub fn deinit(self: *RoundDriver) void {
         if (comptime artifacts.has_cuda) if (self.cuda) |*engine| engine.deinit();
         if (comptime artifacts.has_hip) if (self.hip) |*engine| engine.deinit();
         self.* = undefined;
     }
 
+    /// `solveRound` on this driver's engine. Asserts that `failures` has
+    /// one slot per point, that each point asks for 1 to `FS.W`
+    /// frequencies, and that no two points share a solver.
     pub fn solve(self: *RoundDriver, points: []const RoundPoint, failures: []?SolveError) std.mem.Allocator.Error!Stats {
         std.debug.assert(points.len == failures.len);
         // Every point brings its own solver and one chunk of frequencies.
@@ -148,20 +155,26 @@ fn runRound(comptime backend: gompute.Backend, gpa: std.mem.Allocator, points: [
     defer gpa.free(counts);
     const chunks = try gpa.alloc(?Chunk, points.len);
     defer gpa.free(chunks);
+    const cchunks = try gpa.alloc(?CChunk, points.len);
+    defer gpa.free(cchunks);
     const used = try gpa.alloc(bool, points.len);
     defer gpa.free(used);
     const ids = try gpa.alloc(usize, points.len);
     defer gpa.free(ids);
     const bad = try gpa.alloc(u64, points.len);
     defer gpa.free(bad);
+    const solved = try gpa.alloc(bool, points.len);
+    defer gpa.free(solved);
     @memset(bases, 0);
     @memset(chunks, null);
-    @memset(used, false);
+    @memset(cchunks, null);
     @memset(bad, 0);
+    @memset(solved, false);
     var stats: Stats = .{ .points = points.len };
-    // The device replays stacked tapes; host fallbacks must match them.
-    for (points) |p| p.fs.complex_lanes = false;
-    for (points, counts, chunks, failures) |p, *count, *chunk, *failure| {
+    // Each point's chunk takes the lanes its host `solveBatch` would: the
+    // complex lanes while they are on, else the stacked ones, so a device
+    // replay and every host fallback are bitwise the scalar solve.
+    for (points, counts, chunks, cchunks, failures) |p, *count, *chunk, *cchunk, *failure| {
         count.* = p.omegas.len;
         std.debug.assert(count.* > 0 and count.* <= FS.W);
         std.debug.assert(p.out.len == p.omegas.len * p.rhs.len);
@@ -169,48 +182,83 @@ fn runRound(comptime backend: gompute.Backend, gpa: std.mem.Allocator, points: [
             solveHost(p, failure);
             continue;
         }
+        if (p.fs.complex_lanes) {
+            cchunk.* = p.fs.beginComplexChunk(p.omegas, 0, count.*, p.rhs, p.out, p.adjoint) catch |err| {
+                failure.* = err;
+                continue;
+            };
+            // Null with the lanes still on: solved serially.
+            if (cchunk.* != null or p.fs.complex_lanes) continue;
+        }
         chunk.* = p.fs.beginLaneChunk(p.omegas, 0, count.*, p.rhs, p.out, p.adjoint) catch |err| {
             failure.* = err;
             continue;
         };
     }
+    @memset(used, false);
     for (chunks, 0..) |candidate, first| {
-        const head = candidate orelse continue;
-        if (used[first]) continue;
-        var n: usize = 0;
-        for (chunks[first..], first..) |other, k| {
-            if (used[k] or points[k].adjoint != points[first].adjoint or points[k].rhs.len != points[first].rhs.len) continue;
-            const chunk = other orelse continue;
-            if (!head.sameTape(chunk)) continue;
-            ids[n] = k;
-            n += 1;
-            used[k] = true;
-        }
-        if (!disabled.* and engine.* == null) {
-            engine.* = Engine(backend).init() catch null;
-            disabled.* = engine.* == null;
-        }
-        if (!disabled.*) engine.*.?.group(gpa, points, bases, counts, chunks, ids[0..n], bad, &stats) catch {
-            // group synchronizes before unwinding its host buffers.
-            engine.*.?.deinit();
-            engine.* = null;
-            disabled.* = true;
-        };
-        for (ids[0..n]) |id| {
-            const p = points[id];
-            if (disabled.*) {
-                // beginLaneChunk has only selected this chunk's center
-                // tape. No peel has run, so its ordinary solveBatch now
-                // replays exactly that tape and finishes in scalar order.
-                solveHost(p, &failures[id]);
-            } else {
-                p.fs.finishLaneChunk(p.omegas, 0, counts[id], bad[id], p.rhs, p.out, p.adjoint) catch |err| {
-                    failures[id] = err;
-                };
-            }
+        if (candidate == null or used[first]) continue;
+        const n = gather(points, chunks, first, used, ids);
+        if (deviceGroup(backend, gpa, engine, disabled, points, bases, counts, chunks, ids[0..n], bad, &stats))
+            for (ids[0..n]) |id| {
+                solved[id] = true;
+            };
+    }
+    @memset(used, false);
+    for (cchunks, 0..) |candidate, first| {
+        if (candidate == null or used[first]) continue;
+        const n = gather(points, cchunks, first, used, ids);
+        if (deviceGroup(backend, gpa, engine, disabled, points, bases, counts, cchunks, ids[0..n], bad, &stats))
+            for (ids[0..n]) |id| {
+                solved[id] = true;
+            };
+    }
+    for (points, counts, chunks, cchunks, bad, solved, failures) |p, count, chunk, cchunk, mask, on_device, *failure| {
+        // A chunk the device did not solve has only laid its tape and run
+        // no peel, so `solveBatch` replays exactly that tape and finishes
+        // in scalar order.
+        if (chunk == null and cchunk == null) continue;
+        if (!on_device) {
+            solveHost(p, failure);
+        } else if (cchunk) |cc| {
+            // False: the fresh tape failed at its own centre, the complex
+            // lanes are off, and `solveBatch` redoes the chunk stacked.
+            const kept = p.fs.finishComplexChunk(p.omegas, 0, count, mask, cc.fresh, p.rhs, p.out, p.adjoint) catch |err| {
+                failure.* = err;
+                continue;
+            };
+            if (!kept) solveHost(p, failure);
+        } else {
+            p.fs.finishLaneChunk(p.omegas, 0, count, mask, p.rhs, p.out, p.adjoint) catch |err| {
+                failure.* = err;
+            };
         }
     }
     return stats;
+}
+
+/// Runs one launch group (`Engine.group` for stacked chunks, `groupComplex`
+/// for complex ones) unless the device is `disabled`; true when it ran. A
+/// driver failure disables the device for the rest of the driver's life.
+fn deviceGroup(comptime backend: gompute.Backend, gpa: std.mem.Allocator, engine: *?Engine(backend), disabled: *bool, points: []const RoundPoint, bases: []const usize, counts: []const usize, chunks: anytype, ids: []const usize, bad: []u64, stats: *Stats) bool {
+    if (!disabled.* and engine.* == null) {
+        engine.* = Engine(backend).init() catch null;
+        disabled.* = engine.* == null;
+    }
+    if (disabled.*) return false;
+    const e = &engine.*.?;
+    const result = if (@TypeOf(chunks) == []const ?CChunk or @TypeOf(chunks) == []?CChunk)
+        e.groupComplex(gpa, points, bases, counts, chunks, ids, bad, stats)
+    else
+        e.group(gpa, points, bases, counts, chunks, ids, bad, stats);
+    result catch {
+        // A group synchronizes before unwinding its host buffers.
+        e.deinit();
+        engine.* = null;
+        disabled.* = true;
+        return false;
+    };
+    return true;
 }
 
 /// Retained harmonic/sideband factors for a periodic Krylov operator.
@@ -223,12 +271,18 @@ pub const Held = struct {
     solve_fn: *const fn (*anyopaque, []const f64, []f64, bool) bool,
     deinit_fn: *const fn (*anyopaque) void,
 
+    /// Uploads `fs`'s held factors for `count` harmonics. Fails with
+    /// `error.GpuBackendUnavailable` without images, `error.NoLaneTape`
+    /// when `fs` holds no sparse tape, or the driver's error. Free with
+    /// `deinit`.
     pub fn init(gpa: std.mem.Allocator, fs: *const FS, count: usize, stats: bool) !Held {
         if (comptime artifacts.has_cuda) return DeviceHeld(.cuda).create(gpa, fs, count, stats);
         if (comptime artifacts.has_hip) return DeviceHeld(.hip).create(gpa, fs, count, stats);
         return error.GpuBackendUnavailable;
     }
 
+    /// Re-uploads `fs`'s current held factors. After a failure the caller
+    /// must `deinit` and use the host factors.
     pub fn refresh(self: *Held, fs: *const FS, count: usize) !void {
         try self.refresh_fn(self.context, fs, count);
     }
@@ -239,6 +293,7 @@ pub const Held = struct {
         return self.solve_fn(self.context, rhs, out, adjoint);
     }
 
+    /// Frees the device factors and the context.
     pub fn deinit(self: *Held) void {
         self.deinit_fn(self.context);
         self.* = undefined;
@@ -295,6 +350,8 @@ pub fn DeviceHeld(comptime backend: gompute.Backend) type {
             return .{ .context = self, .refresh_fn = refresh, .solve_fn = apply, .deinit_fn = destroy };
         }
 
+        /// Loads the kernels on device 0 and uploads `fs`'s held factors
+        /// (`update`). Free with `deinit`.
         pub fn init(gpa: std.mem.Allocator, fs: *const FS, count: usize, stats: bool) !Self {
             var self: Self = .{ .engine = try Engine(backend).init(), .gpa = gpa, .stats = stats };
             errdefer {
@@ -438,6 +495,10 @@ pub fn DeviceHeld(comptime backend: gompute.Backend) type {
             try self.update(fs, count);
         }
 
+        /// Uploads the host-factored held tape of `fs` for `count`
+        /// harmonics, its identity harmonics marked. Fails with
+        /// `error.GpuBackendUnavailable` once poisoned or
+        /// `error.NoLaneTape` without a held tape.
         pub fn update(self: *Self, fs: *const FS, count: usize) !void {
             if (self.poisoned) return error.GpuBackendUnavailable;
             const tape = fs.heldTape() orelse return error.NoLaneTape;
@@ -520,10 +581,14 @@ pub fn DeviceHeld(comptime backend: gompute.Backend) type {
             });
         }
 
+        /// One byte per harmonic, nonzero for an identity block, on the
+        /// device. Valid until the next `update` or `factorEach`.
         pub fn identityBuffer(self: *Self) *Raw.Buffer {
             return self.engine.buffer(.fail);
         }
 
+        /// Prints the `ESPICE_GPU_STATS` line, then frees everything. The
+        /// caller's stream must have finished with `identityBuffer`.
         pub fn deinit(self: *Self) void {
             if (self.stats and self.solves != 0)
                 std.debug.print("gpu-freq-held: {d} harmonics, {d} factorizations, {d} device solves\n", .{ self.count, self.factors, self.solves });
@@ -602,33 +667,15 @@ fn run(comptime backend: gompute.Backend, gpa: std.mem.Allocator, points: []cons
         }
         if (!any) break;
         for (chunks, 0..) |candidate, first| {
-            const head = candidate orelse continue;
-            if (used[first]) continue;
-            var n: usize = 0;
-            for (chunks[first..], first..) |other, k| {
-                if (used[k] or points[k].adjoint != points[first].adjoint or points[k].rhs.len != points[first].rhs.len) continue;
-                const c = other orelse continue;
-                if (!head.sameTape(c)) continue;
-                ids[n] = k;
-                n += 1;
-                used[k] = true;
-            }
+            if (candidate == null or used[first]) continue;
+            const n = gather(points, chunks, first, used, ids);
             if (engine == null) engine = try Engine(backend).init();
             try engine.?.group(gpa, points, bases, counts, chunks, ids[0..n], bad, &stats);
         }
         @memset(used, false);
         for (cchunks, 0..) |candidate, first| {
-            const head = candidate orelse continue;
-            if (used[first]) continue;
-            var n: usize = 0;
-            for (cchunks[first..], first..) |other, k| {
-                if (used[k] or points[k].adjoint != points[first].adjoint or points[k].rhs.len != points[first].rhs.len) continue;
-                const c = other orelse continue;
-                if (!head.sameTape(c)) continue;
-                ids[n] = k;
-                n += 1;
-                used[k] = true;
-            }
+            if (candidate == null or used[first]) continue;
+            const n = gather(points, cchunks, first, used, ids);
             if (engine == null) engine = try Engine(backend).init();
             try engine.?.groupComplex(gpa, points, bases, counts, cchunks, ids[0..n], bad, &stats);
         }
@@ -666,6 +713,23 @@ fn run(comptime backend: gompute.Backend, gpa: std.mem.Allocator, points: []cons
         }
     }
     return stats;
+}
+
+/// Lists in `ids` every unused chunk from `first` on (`first` included)
+/// that shares `chunks[first]`'s tape, adjoint flag and rhs width, marks
+/// them `used`, and returns how many. `chunks[first]` must be non-null.
+fn gather(points: anytype, chunks: anytype, first: usize, used: []bool, ids: []usize) usize {
+    const head = chunks[first].?;
+    var n: usize = 0;
+    for (chunks[first..], first..) |other, k| {
+        if (used[k] or points[k].adjoint != points[first].adjoint or points[k].rhs.len != points[first].rhs.len) continue;
+        const chunk = other orelse continue;
+        if (!head.sameTape(chunk)) continue;
+        ids[n] = k;
+        n += 1;
+        used[k] = true;
+    }
+    return n;
 }
 
 fn Engine(comptime backend: gompute.Backend) type {
@@ -748,33 +812,18 @@ fn Engine(comptime backend: gompute.Backend) type {
             try kernel.launchOn(&self.stream, gompute.Dim3.linear(@intCast(threads), block), .{ .x = block }, 0, args);
         }
 
-        fn group(self: *Self, gpa: std.mem.Allocator, points: anytype, bases: []const usize, counts: []const usize, chunks: []const ?Chunk, ids: []const usize, bad: []u64, stats: *Stats) !void {
-            // Complete queued work before host temporaries or a replaced
-            // device allocation can be released after a launch failure.
-            var arena = std.heap.ArenaAllocator.init(gpa);
-            defer arena.deinit();
-            defer self.stream.synchronize() catch {};
-            const a = arena.allocator();
-            const first = ids[0];
-            const head = chunks[first].?;
-            const nnz = head.g.len;
-            const nn: usize = points[first].fs.nn;
+        /// Uploads `ids`' chunks for one launch: their g and c planes
+        /// slot-major with the points innermost, each lane's point and
+        /// omega, and an all-on lane mask. Returns the lane count.
+        fn uploadGroup(self: *Self, a: std.mem.Allocator, points: anytype, bases: []const usize, counts: []const usize, chunks: anytype, ids: []const usize) !usize {
+            const nnz = chunks[ids[0]].?.g.len;
+            const np = ids.len;
             var N: usize = 0;
             for (ids) |id| N += counts[id];
-            const np = ids.len;
-            var built = try lk.buildTab(a, head.lu, head.col_ptr, head.growth, solver.direct.pivot_tol);
-            // FreqSolver's LaneLu uses the growth monitor, without
-            // LaneSolver's additional Newton multiplier threshold.
-            built.tab.wide = std.math.inf(f64);
-            const pos = try a.alloc(u32, 4 * nnz);
-            fk.positions(head.src_col_ptr, pos);
             const g = try a.alloc(f64, nnz * np);
             const c = try a.alloc(f64, nnz * np);
             const point = try a.alloc(u32, N);
             const omega = try a.alloc(f64, N);
-            const rhs = try a.alloc(f64, nn * N);
-            const out = try a.alloc(f64, nn * N);
-            const fail = try a.alloc(u8, N);
             const active = try a.alloc(u8, N);
             @memset(active, 1);
             var lane: usize = 0;
@@ -790,13 +839,38 @@ fn Engine(comptime backend: gompute.Backend) type {
                     lane += 1;
                 }
             }
-            try self.upload(.idx, built.idx);
-            try self.upload(.positions, pos);
             try self.upload(.g, g);
             try self.upload(.c, c);
             try self.upload(.point, point);
             try self.upload(.omega, omega);
             try self.upload(.active, active);
+            return N;
+        }
+
+        fn group(self: *Self, gpa: std.mem.Allocator, points: anytype, bases: []const usize, counts: []const usize, chunks: []const ?Chunk, ids: []const usize, bad: []u64, stats: *Stats) !void {
+            // Complete queued work before host temporaries or a replaced
+            // device allocation can be released after a launch failure.
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            defer self.stream.synchronize() catch {};
+            const a = arena.allocator();
+            const first = ids[0];
+            const head = chunks[first].?;
+            const nnz = head.g.len;
+            const nn: usize = points[first].fs.nn;
+            const np = ids.len;
+            var built = try lk.buildTab(a, head.lu, head.col_ptr, head.growth, solver.direct.pivot_tol);
+            // FreqSolver's LaneLu uses the growth monitor, without
+            // LaneSolver's additional Newton multiplier threshold.
+            built.tab.wide = std.math.inf(f64);
+            const pos = try a.alloc(u32, 4 * nnz);
+            fk.positions(head.src_col_ptr, pos);
+            try self.upload(.idx, built.idx);
+            try self.upload(.positions, pos);
+            const N = try self.uploadGroup(a, points, bases, counts, chunks, ids);
+            const rhs = try a.alloc(f64, nn * N);
+            const out = try a.alloc(f64, nn * N);
+            const fail = try a.alloc(u8, N);
             try self.ensure(.a, 4 * nnz * N * @sizeOf(f64));
             try self.ensure(.lx, @as(usize, built.tab.nnz_l) * N * @sizeOf(f64));
             try self.ensure(.ux, @as(usize, built.tab.nnz_u) * N * @sizeOf(f64));
@@ -823,7 +897,7 @@ fn Engine(comptime backend: gompute.Backend) type {
             });
             try self.buffer(.fail).downloadAtAsync(fail.ptr, 0, N, &self.stream);
             try self.stream.synchronize();
-            lane = 0;
+            var lane: usize = 0;
             for (ids) |id| for (0..counts[id]) |k| {
                 if (fail[lane] != 0) {
                     bad[id] |= @as(u64, 1) << @intCast(k);
@@ -870,41 +944,16 @@ fn Engine(comptime backend: gompute.Backend) type {
             const head = chunks[first].?;
             const nnz = head.g.len;
             const nn: usize = points[first].fs.nn;
-            var N: usize = 0;
-            for (ids) |id| N += counts[id];
             const np = ids.len;
             var built = try lk.buildTab(a, head.lu, head.src_col_ptr, head.growth, solver.direct.pivot_tol);
             built.tab.wide = std.math.inf(f64);
-            const g = try a.alloc(f64, nnz * np);
-            const c = try a.alloc(f64, nnz * np);
-            const point = try a.alloc(u32, N);
-            const omega = try a.alloc(f64, N);
+            try self.upload(.idx, built.idx);
+            const N = try self.uploadGroup(a, points, bases, counts, chunks, ids);
             // Every right-hand side in one launch: noise's adjoints, sp's ports.
             const n_rhs = points[first].rhs.len / nn;
             const rhs = try a.alloc(f64, n_rhs * nn * N);
             const out = try a.alloc(f64, n_rhs * nn * N);
             const fail = try a.alloc(u8, N);
-            const active = try a.alloc(u8, N);
-            @memset(active, 1);
-            var lane: usize = 0;
-            for (ids, 0..) |id, p| {
-                const chunk = chunks[id].?;
-                for (chunk.g, chunk.c, 0..) |gv, cv, slot| {
-                    g[slot * np + p] = gv;
-                    c[slot * np + p] = cv;
-                }
-                for (0..counts[id]) |k| {
-                    point[lane] = @intCast(p);
-                    omega[lane] = points[id].omegas[bases[id] + k];
-                    lane += 1;
-                }
-            }
-            try self.upload(.idx, built.idx);
-            try self.upload(.g, g);
-            try self.upload(.c, c);
-            try self.upload(.point, point);
-            try self.upload(.omega, omega);
-            try self.upload(.active, active);
             try self.ensure(.a, 2 * nnz * N * @sizeOf(f64));
             try self.ensure(.lx, 2 * @as(usize, built.tab.nnz_l) * N * @sizeOf(f64));
             try self.ensure(.ux, 2 * @as(usize, built.tab.nnz_u) * N * @sizeOf(f64));
@@ -920,16 +969,16 @@ fn Engine(comptime backend: gompute.Backend) type {
             const adjoint: u64 = @intFromBool(points[first].adjoint);
             const scalar = gompute.interface.arg;
             try self.launch(&self.cfill, nnz * N, &.{
-                scalar(&nl),     scalar(&np64),    scalar(&nz64), self.arg(.g),
-                self.arg(.c),    self.arg(.point), self.arg(.omega), self.arg(.a),
+                scalar(&nl),  scalar(&np64),    scalar(&nz64),    self.arg(.g),
+                self.arg(.c), self.arg(.point), self.arg(.omega), self.arg(.a),
             });
             try self.launch(&self.crefactor, N, &.{
-                scalar(&nl),     scalar(&built.tab), self.arg(.idx),  self.arg(.active), self.arg(.a),
-                self.arg(.lx),   self.arg(.ux),      self.arg(.diag), self.arg(.w),      self.arg(.fail),
+                scalar(&nl),      scalar(&built.tab), self.arg(.idx),  self.arg(.active), self.arg(.a),
+                self.arg(.lx),    self.arg(.ux),      self.arg(.diag), self.arg(.w),      self.arg(.fail),
                 self.arg(.fails),
             });
             // The solve skips the failed lanes itself: one wait per group.
-            lane = 0;
+            var lane: usize = 0;
             for (ids) |id| for (0..counts[id]) |_| {
                 for (points[id].rhs, 0..) |v, row| rhs[row * N + lane] = v;
                 lane += 1;
@@ -937,9 +986,9 @@ fn Engine(comptime backend: gompute.Backend) type {
             try self.upload(.rhs, rhs);
             const nr64: u64 = n_rhs;
             try self.launch(&self.csolve, N, &.{
-                scalar(&nl),     scalar(&nr64),  scalar(&built.tab), self.arg(.idx),
-                self.arg(.fail), self.arg(.lx),  self.arg(.ux),      self.arg(.diag),
-                self.arg(.rhs),  self.arg(.y),   self.arg(.out),     scalar(&adjoint),
+                scalar(&nl),     scalar(&nr64), scalar(&built.tab), self.arg(.idx),
+                self.arg(.fail), self.arg(.lx), self.arg(.ux),      self.arg(.diag),
+                self.arg(.rhs),  self.arg(.y),  self.arg(.out),     scalar(&adjoint),
             });
             try self.buffer(.fail).downloadAtAsync(fail.ptr, 0, N, &self.stream);
             try self.buffer(.out).downloadAtAsync(out.ptr, 0, out.len * @sizeOf(f64), &self.stream);

@@ -241,25 +241,10 @@ pub const SparseLu = struct {
     /// caller's.
     pub fn deinit(self: *Self, gpa: Allocator) void {
         self.dropScratch(gpa);
-        inline for (.{ self.pinv, self.lp, self.up, self.prow, self.prev }) |s|
+        inline for (.{ self.pinv, self.lp, self.up, self.prow, self.prev, self.void_col, self.scaled_pivot, self.tape_col, self.amap, self.udiag, self.w, self.y }) |s|
             gpa.free(s);
-        gpa.free(self.void_col);
-        gpa.free(self.scaled_pivot);
-        gpa.free(self.tape_col);
-        gpa.free(self.amap);
-        self.tape.deinit(gpa);
-        self.lsrc.deinit(gpa);
-        self.tv.deinit(gpa);
-        self.panels.deinit(gpa);
-        self.panel_rows.deinit(gpa);
-        self.panel_vals.deinit(gpa);
-        self.void_slots.deinit(gpa);
-        inline for (.{ self.udiag, self.w, self.y }) |s|
-            gpa.free(s);
-        self.li.deinit(gpa);
-        self.lx.deinit(gpa);
-        self.ui.deinit(gpa);
-        self.ux.deinit(gpa);
+        inline for (.{ &self.tape, &self.lsrc, &self.tv, &self.panels, &self.panel_rows, &self.panel_vals, &self.void_slots, &self.li, &self.lx, &self.ui, &self.ux }) |l|
+            l.deinit(gpa);
     }
 
     /// Full symbolic and numeric factorization. Per column: DFS reach,
@@ -981,9 +966,8 @@ pub const SparseLu = struct {
     /// non-finite or falls below `growth_limit` times its column max (steps
     /// in `scaled_pivot` excepted; 0 disables the test), an L or U entry is
     /// non-finite, or a fabricated pivot's row or column turned nonzero;
-    /// the caller then
-    /// runs a full `factor`, and the old factors are unusable until it
-    /// does. Asserts that a `factor` has succeeded and that `col_ptr` and
+    /// the caller then runs a full `factor`, and the old factors are
+    /// unusable until it does. Asserts that a `factor` has succeeded and that `col_ptr` and
     /// `vals` cover its pattern. Allocates nothing and leaves `w` all-zero
     /// on every path.
     pub fn refactor(

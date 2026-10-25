@@ -243,6 +243,7 @@ pub fn rewrite(a: Allocator, src: []const u8, kind: Kind) Allocator.Error!?Varia
 
 const testing = std.testing;
 
+// Oracle: ngspice manual §2.1.2 scale factors, worked by hand.
 test "numbers read as ngspice reads them" {
     try testing.expectEqual(@as(?f64, 1000), number("1k"));
     try testing.expectEqual(@as(?f64, 2.2e-6), number("2.2u"));
@@ -252,6 +253,7 @@ test "numbers read as ngspice reads them" {
     try testing.expectEqual(@as(?f64, null), number("abc"));
 }
 
+// Oracle: each rewritten deck written out by hand.
 test "each rewrite keeps the relation it states" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();

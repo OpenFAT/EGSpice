@@ -12,6 +12,10 @@
 // g--sp, channel current dp--sp, normal/inverse mode swap on sign(vds).
 // Evaluation order: bias -> limit -> gate diodes -> mode select -> 3-region
 // channel -> gate charges -> stamps -> noise.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module jfet(d, g, s);
     inout d, g, s;
     electrical d, g, s;

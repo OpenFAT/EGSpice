@@ -32,6 +32,9 @@
 // Nodes: ngspice cplsetup binds each conductor to ground and ignores the
 // card's reference nodes, so r1/r2 are declared for the card shape and unused.
 
+`include "constants.vams"
+`include "disciplines.vams"
+
 `ifndef CPL_N
 `define CPL_N 2
 `define CPL_MODULE coupled_ltra

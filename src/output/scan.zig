@@ -30,7 +30,11 @@ pub const Bounds = extern struct {
 /// The analysis the scale belongs to, as the passes tell them apart.
 pub const Mode = enum(u8) { tran, dc, ac, other };
 
+/// An extremum and the scale value where it was taken, or an average and
+/// the last scale value read.
 pub const Stat = extern struct { value: f64, at: f64 };
+/// An integral or RMS and the window it covers; NaN throughout when no
+/// sample was read.
 pub const Integral = extern struct { value: f64, from: f64, to: f64 };
 
 /// The line through (x0, y0) and (x1, y1) at `at`, in slope-intercept form
@@ -173,6 +177,8 @@ pub const At = extern struct {
     pv: f64 = 0,
     value: f64 = nan,
 
+    /// Reads sample (`xv`, `v`); true once a segment holds `at`, with
+    /// `value` set.
     pub fn feed(s: *At, xv: f64, v: f64) bool {
         if (s.rows > 0 and ((s.px <= s.at and xv >= s.at) or (s.dc and s.px >= s.at and xv <= s.at))) {
             s.value = if (s.slope) (v - s.pv) / (xv - s.px) else s.pv + (s.at - s.px) * (v - s.pv) / (xv - s.px);
@@ -200,6 +206,8 @@ pub const Extremum = extern struct {
 
     pub const Op = enum(u8) { min, max, avg };
 
+    /// Reads sample (`xv`, `v`); true at the first sample past a nonzero
+    /// `to`, where the whole-waveform loop stops.
     pub fn feed(s: *Extremum, xv: f64, v: f64) bool {
         s.xv = xv;
         if (s.dc) {
@@ -235,6 +243,7 @@ pub const Extremum = extern struct {
         return false;
     }
 
+    /// The value so far. An average of no samples is 0; of one, 0/0.
     pub fn stat(s: Extremum) Stat {
         return if (s.op == .avg) .{ .value = s.m / (if (s.first) s.span else 1), .at = s.xv } else .{ .value = s.m, .at = s.m_at };
     }
@@ -263,6 +272,8 @@ pub const Integ = extern struct {
     cut_x: f64 = nan,
     sum: [3]f64 = .{ 0, 0, 0 },
 
+    /// Reads sample (`xv`, `v`); true at the first sample past a nonzero
+    /// `to`, which it reads as the value at `to`.
     pub fn feed(s: *Integ, xv: f64, v: f64) bool {
         defer {
             s.rows += 1;
@@ -314,6 +325,8 @@ pub const Integ = extern struct {
         std.mem.copyForwards([2]f64, s.p[0..keep], s.p[avail - keep .. avail]);
     }
 
+    /// Folds the points still pending into panels, then returns the
+    /// integral, or with `rms` the RMS over the window.
     pub fn result(s: *Integ) Integral {
         if (s.rows == 0) return .{ .value = nan, .from = nan, .to = nan };
         while (s.np > 1) s.panel(@intCast(s.np));
@@ -339,13 +352,19 @@ pub const Find = extern struct {
 
     pub const State = enum(u8) { waiting, armed, none };
 
+    /// Appends `row` to the `len` rows of `ring`, dropping the oldest once
+    /// it holds three. `measure.Stream` keeps its host ring the same way.
+    pub fn push(ring: *[3][2]f64, len: *u8, row: [2]f64) void {
+        if (len.* == ring.len) std.mem.copyForwards([2]f64, ring[0..2], ring[1..3]);
+        len.* = @min(len.* + 1, ring.len);
+        ring[len.* - 1] = row;
+    }
+
     /// `Stream.next`'s stage step for the row (`x`, `y`) after `when` read
     /// it; true where the pass is over.
     fn feed(f: *Find, when: *const Dev, x: f64, y: f64) bool {
         if (f.state == .armed) return f.at.feed(x, y) or x > f.at.at;
-        if (f.ring_len == f.ring.len) std.mem.copyForwards([2]f64, f.ring[0..2], f.ring[1..3]);
-        f.ring_len = @min(f.ring_len + 1, f.ring.len);
-        f.ring[f.ring_len - 1] = .{ x, y };
+        push(&f.ring, &f.ring_len, .{ x, y });
         f.rows += 1;
         if (!when.over) return false;
         // `Scan.found`'s event: the count's own, or a LAST one.
@@ -441,6 +460,7 @@ pub const Program = extern struct {
         return if (n == 1) stack[0] else nan;
     }
 
+    /// Op-by-op equality, constants compared by their bits.
     pub fn eql(a: *const Program, b: *const Program) bool {
         if (a.len != b.len) return false;
         for (a.ops[0..a.len], b.ops[0..b.len]) |x, y| {
@@ -458,6 +478,7 @@ pub const DevColumns = extern struct {
     prog: Program = .{},
     prog2: Program = .{},
 
+    /// `y2` of a pass with no level vector.
     pub const none = std.math.maxInt(u32);
 
     /// The sample (`y`, `y2`) at scale `x`, `ctx.at(u)` reading unknown u.
@@ -467,6 +488,7 @@ pub const DevColumns = extern struct {
         return .{ y, y2 };
     }
 
+    /// Same columns and programs, as `Program.eql` compares them.
     pub fn eql(a: *const DevColumns, b: *const DevColumns) bool {
         return a.y == b.y and a.y2 == b.y2 and a.prog.eql(&b.prog) and a.prog2.eql(&b.prog2);
     }

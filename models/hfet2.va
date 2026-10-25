@@ -37,6 +37,10 @@
 // when off == 0, else 0. Only the pnjlim leg is declared ($limit): its first
 // argument must be an access function, so the fetlim(TVTO) leg that follows
 // cannot be chained onto it.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module hfet2(d, g, s);
     inout d, g, s;
     electrical d, g, s;

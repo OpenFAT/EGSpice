@@ -3,13 +3,14 @@
 //! cold, or from one fixed `warm` reference (the nominal OP), never from
 //! another lane, so a lane is the same whichever lanes run beside it and
 //! the session can run each as its own row (#213). A lane keeps only its
-//! probe values.
-//! No outside source; dev/analysis/ensemble-sweeps.md and
-//! dev/analysis/dc-sweep.md describe the lane axis.
+//! probe values. No outside source.
 const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
 const op = @import("../dc/op.zig");
+
+/// A lane a numerical failure left without an answer.
+const unconverged: converger.Result = .{ .converged = false, .iterations = 0 };
 
 /// Lanes `first..first + count` of a sweep of `total`: all of them, or the
 /// one lane a split row (`lane`) solves.
@@ -58,12 +59,10 @@ pub fn solveLanes(
     const ws = try ckt.workspace();
     for (results, 0..) |*result, i| {
         if (i != 0) try ckt.checkpoint(.{ .phase = .sweep, .completed = i, .total = results.len });
-        try setup.apply(first + i);
-        try ckt.recompute();
-        start(ckt, x, warm);
+        try install(ckt, setup, first + i, x, warm);
         result.* = converger.run(ckt, ws, x, 0, opts, root.EvalHook{}) catch |err| switch (err) {
             error.QueryCancelled, error.OutOfMemory => return err,
-            else => converger.Result{ .converged = false, .iterations = 0 }, // else: a numerical failure marks the lane unconverged
+            else => unconverged, // else: a numerical failure marks the lane unconverged
         };
         if (!result.converged) result.* = try rescue(ckt, x, warm, ladder);
         if (result.converged) for (probes, rows[i * probes.len ..][0..probes.len]) |node, *out| {
@@ -87,15 +86,15 @@ fn start(ckt: *root.Circuit, x: []f64, warm: ?[]const f64) void {
 /// A lane whose plain Newton failed: the operating-point ladder (plain
 /// Newton at the OP's budget, then gmin and source stepping, JFNK, OPtran)
 /// from the lane's own start, as a `.dc` point whose warm Newton fails
-/// cold-starts through it. Without it the lane was dropped as unconverged
-/// (04 4.10). Its numerical failure is a non-converged result.
+/// cold-starts through it. Without it the lane was dropped as unconverged.
+/// Its numerical failure is a non-converged result.
 fn rescue(ckt: *root.Circuit, x: []f64, warm: ?[]const f64, ladder: op.Options) !converger.Result {
     start(ckt, x, warm);
     var o = ladder;
     o.warm_start = warm != null;
     return op.solve(ckt, x, o, &.{}, &.{}) catch |err| switch (err) {
         error.QueryCancelled, error.OutOfMemory => |e| return e,
-        else => .{ .converged = false, .iterations = 0 }, // else: a numerical failure leaves the lane unconverged
+        else => unconverged, // else: a numerical failure leaves the lane unconverged
     };
 }
 
@@ -215,12 +214,10 @@ pub fn runBatch(comptime W: usize, comptime M: type, ctxs: []const root.RunCtx, 
 fn solveBatch(comptime W: usize, ckts: []const *root.Circuit, xs: []const []f64, opts: converger.Options, results: []converger.Result, gpa: std.mem.Allocator) LaneError!void {
     const g = ckts.len;
     std.debug.assert(g >= 1 and g <= W and xs.len == g and results.len == g);
-    const pin = ckts[0].knobs.newton.pin;
-    if (W == 1 or g == 1 or !(pin == .auto or pin == .direct) or root.Circuit.certify) {
+    if (W == 1 or g == 1 or !op.lanesAllowed(ckts[0])) {
         for (ckts, xs, results) |c, x, *r| r.* = converger.run(c, try c.workspace(), x, 0, opts, root.EvalHook{}) catch |err| switch (err) {
-            error.QueryCancelled => return error.QueryCancelled,
-            error.OutOfMemory => return error.OutOfMemory,
-            else => .{ .converged = false, .iterations = 0 },
+            error.QueryCancelled, error.OutOfMemory => |e| return e,
+            else => unconverged, // else: a numerical failure marks the lane unconverged
         };
         return;
     }
@@ -247,10 +244,9 @@ fn solveBatch(comptime W: usize, ckts: []const *root.Circuit, xs: []const []f64,
     // A numerical failure of the whole batch marks every lane unconverged,
     // as `solveLanes` marks a lane's.
     const r = res catch |err| switch (err) {
-        error.QueryCancelled => return error.QueryCancelled,
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            @memset(results, .{ .converged = false, .iterations = 0 });
+        error.QueryCancelled, error.OutOfMemory => |e| return e,
+        else => { // else: a numerical failure of the batch
+            @memset(results, unconverged);
             return;
         },
     };

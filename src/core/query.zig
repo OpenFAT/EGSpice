@@ -18,6 +18,7 @@ pub const invalid_query: QueryId = @fromBackingInt(@intCast(std.math.maxInt(u32)
 pub const Method = enum { backward_euler, trapezoidal, gear_2, gear_3, gear_4, gear_5, gear_6 };
 /// Re-exported so a query reads its sweep type from one place.
 pub const FreqSweep = @import("numerics.zig").FreqSweep;
+/// Reachable by embedders only here: `espice.requests` exports `query`, not `numerics`.
 pub const SweepKind = @import("numerics.zig").SweepKind;
 
 /// One `.sp` port: the node rows and branch row of its source and its

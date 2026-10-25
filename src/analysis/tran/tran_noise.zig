@@ -8,8 +8,8 @@
 //! the noise that sampled runs on the same steps would add (`Covariance`).
 //! In: a circuit at its operating point and its noise sources. Out: the
 //! probes at every accepted point, plus `onoise` under SDE.
-//! Cites HSPICE `.trannoise` (SEED, TIME=, SAMPLES), Verilog-AMS LRM §9.10
-//! and dev/analysis/transient-noise.md.
+//! Cites HSPICE `.trannoise` (SEED, TIME=, SAMPLES) and Verilog-AMS LRM
+//! §9.10.
 const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
@@ -201,7 +201,7 @@ const Injection = struct {
 ///   Kxy_k = A^-1 (P Kxy D + J V),
 /// with K = E[x x^T] and Kxy = E[x y^T], both zero at t = 0. A is the
 /// circuit's sparse LU, so a step costs 2n + poles sparse solves and the
-/// O(n nnz) products, not a dense O(n^3) factor (TODO 9.6).
+/// O(n nnz) products, not a dense O(n^3) factor.
 // ponytail: K itself stays dense, n^2 memory and O(n^2) a step. A
 // low-rank factor of K is the upgrade past a few thousand unknowns.
 const Covariance = struct {
@@ -420,6 +420,7 @@ fn simulate(
     var t: f64 = 0;
     var dt: f64 = options.dt_init;
     var steps: u32 = 0;
+    const nr_opts = converger.optionsFromTolerances(options.tol, options.tol.itl4);
 
     var attempts: u64 = 0;
     while (t < options.t_stop and steps < options.max_steps) {
@@ -451,8 +452,7 @@ fn simulate(
         // targets (§9.10 `$abstime`); a rejected step retries from here.
         ckt.setSimState(.{ .t = t + dt, .dt = dt, .kind = .tran, .initial_step = steps == 0 });
         numerics.copySimd(x_try, x);
-        const tn_nr_opts = converger.optionsFromTolerances(options.tol, options.tol.itl4);
-        const nr = converger.run(ckt, ws, x_try, t + dt, tn_nr_opts, hook) catch |err| switch (err) {
+        const nr = converger.run(ckt, ws, x_try, t + dt, nr_opts, hook) catch |err| switch (err) {
             error.QueryCancelled, error.OutOfMemory => return err,
             else => converger.Result{ .converged = false, .iterations = 0 }, // else: a numerical failure retries the step
         };

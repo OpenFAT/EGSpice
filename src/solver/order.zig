@@ -114,9 +114,7 @@ pub fn order(n: u32, col_ptr: []const u32, row_idx: []const u32, q: []u32, ws: *
         var sub_nnz: u32 = 0;
         sub_cp[0] = 0;
         for (verts, 0..) |v, j| {
-            for (col_ptr[v]..col_ptr[v + 1]) |p| {
-                if (blk_of[row_idx[p]] == b) sub_nnz += 1;
-            }
+            for (row_idx[col_ptr[v]..col_ptr[v + 1]]) |r| sub_nnz += @intFromBool(blk_of[r] == b);
             sub_cp[j + 1] = sub_nnz;
         }
         const sub_ri = try ws.alloc(sub_nnz);
@@ -469,9 +467,7 @@ fn amd(n: u32, col_ptr: []const u32, row_idx: []const u32, q: []u32, ws: *Ws) Er
     const isq: u32 = std.math.sqrt(n);
     const dense_thresh: u32 = @max(@as(u32, 16), 10 * isq);
     var ndense: u32 = 0;
-    for (0..n) |i| {
-        if (va_len[i] >= dense_thresh) ndense += 1;
-    }
+    for (va_len) |l| ndense += @intFromBool(l >= dense_thresh);
     const dense_start = n - ndense;
     {
         var di: u32 = 0;

@@ -19,7 +19,8 @@ pub const Plot = struct {
     data: []const f64,
 };
 
-/// `parseRawBlob` over a file; null if it cannot be read.
+/// `parseRawBlob` over a file; null if it cannot be read. The plots borrow
+/// the file's bytes, both allocated in `gpa`: pass an arena.
 pub fn parseRawFile(io: Io, gpa: std.mem.Allocator, path: []const u8) ?[]const Plot {
     const blob = Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch return null;
     return parseRawBlob(gpa, blob);
@@ -307,8 +308,7 @@ fn comparePlots(gpa: std.mem.Allocator, ng: Plot, zp: Plot, rtol: f64) ?Accuracy
                     const dt_cand = zp_scale[@min(j + 1, zp_scale.len - 1)] - zp_scale[j];
                     const w = @max(dt_lo, dt_hi, dt_cand);
                     var best = @abs(ya - yb);
-                    var k: usize = 0;
-                    while (k <= 8) : (k += 1) {
+                    for (0..9) |k| {
                         const frac = (@as(f64, @floatFromInt(k)) / 4.0) - 1.0; // -1..+1
                         const cand = interp(zp_scale, zp_var, x + frac * w);
                         if (!std.math.isNan(cand)) best = @min(best, @abs(ya - cand));
@@ -408,22 +408,13 @@ fn extractCol(data: []const f64, nvars: usize, col: usize, parts: usize, part: u
 
 fn colPeak(col: []const f64) f64 {
     var mx: f64 = 0;
-    for (col) |v| {
-        const a = @abs(v);
-        if (a > mx) mx = a;
-    }
+    for (col) |v| mx = @max(mx, @abs(v));
     return mx;
 }
 
 fn colPtp(col: []const f64) f64 {
     if (col.len == 0) return 0;
-    var lo = col[0];
-    var hi = col[0];
-    for (col) |v| {
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-    }
-    return hi - lo;
+    return std.mem.max(f64, col) - std.mem.min(f64, col);
 }
 
 fn interp(xs: []const f64, ys: []const f64, x: f64) f64 {
@@ -668,7 +659,7 @@ test "the ASCII raw parser reads Spectre's nutascii plots" {
     try std.testing.expectEqualStrings("v(out)", plots[0].varnames[1]);
     try std.testing.expectEqualSlices(f64, &.{ 1000, 0, 0.5, -0.25, 2000, 0, 0.25, -1e-3 }, plots[0].data);
     try std.testing.expectEqualSlices(f64, &.{ 0, -1e-3 }, plots[1].data);
-    try std.testing.expect(parseRawBlob(a, raw[0 .. std.mem.indexOf(u8, raw, "\t-1e-3").?]) == null);
+    try std.testing.expect(parseRawBlob(a, raw[0..std.mem.indexOf(u8, raw, "\t-1e-3").?]) == null);
 }
 
 test "a plot with no points parses: a pole-zero run that finds no poles" {

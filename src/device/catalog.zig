@@ -1,7 +1,7 @@
 //! The build-time model catalog: every decl of the generated `models`
 //! module, reflected at comptime into (binding name, device type) rows, and
 //! each built-in's vtable from its separately compiled object. A leaf, so
-//! `Library.zig` reads it without importing `root.zig` (AGENTS.md §2.8).
+//! `Library.zig` reads it without importing `root.zig` (`restricted_imports` in build.zig).
 const std = @import("std");
 const abi = @import("device_abi");
 

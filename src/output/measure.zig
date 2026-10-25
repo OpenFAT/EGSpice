@@ -2,6 +2,7 @@
 //! com_measure2.c: the same event counting, linear interpolation and
 //! quadrature, printed in the same lines. A card whose event never happens
 //! reports on the error writer, as ngspice does, and prints no value.
+//! `Stream` measures the same cards row by row while a transient runs.
 const std = @import("std");
 const core = @import("core");
 const Writer = std.Io.Writer;
@@ -16,6 +17,8 @@ const At = passes.At;
 const Extremum = passes.Extremum;
 const Integ = passes.Integ;
 const line = passes.line;
+const Stat = passes.Stat;
+const Integral = passes.Integral;
 const almostEqualUlps = passes.almostEqualUlps;
 
 comptime {
@@ -187,7 +190,8 @@ pub fn sample(c: Clause, result: core.Result, at: []const f64, out: []f64) error
             const mid = (lo + hi) / 2;
             if (x.get(mid) < t) lo = mid + 1 else hi = mid;
         }
-        v.* = if (lo == 0) y.get(0) else if (lo == n) y.get(n - 1) else interpolate(x, y, lo - 1, lo, t);
+        // ngspice measure_interpolate, 'y' mode, between the samples around t.
+        v.* = if (lo == 0) y.get(0) else if (lo == n) y.get(n - 1) else line(x.get(lo - 1), y.get(lo - 1), x.get(lo), y.get(lo), t);
     }
 }
 
@@ -284,6 +288,8 @@ pub const Stream = struct {
 
     /// `names` and `nodes` are a transient's columns (the scale first,
     /// then each probe's unknown); `recorded` names the ones it records.
+    /// Borrows `measures` and the name strings, which must outlive it; free
+    /// with `deinit`. Asserts one node per name after the scale.
     pub fn init(gpa: std.mem.Allocator, measures: []const core.Measure, names: []const []const u8, nodes: []const u32, recorded: []const []const u8) !Stream {
         assert(names.len == nodes.len + 1);
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -329,6 +335,8 @@ pub const Stream = struct {
         return s;
     }
 
+    /// Frees everything `init` allocated; slices from `measured` and
+    /// `deviceScans` are the caller's and survive it.
     pub fn deinit(s: *Stream) void {
         s.arena.deinit();
         s.* = undefined;
@@ -365,8 +373,6 @@ pub const Stream = struct {
         return if (s.abort_card) |k| !s.cards[k].done else s.open > 0;
     }
 
-    /// Each card's passes for `core.Result.measured`: what a `.scan` card
-    /// found, nothing for the others.
     /// Every pass of the open `.tran` cards as a device pass and what it
     /// reads (`passes.Dev`, `passes.DevColumns`), in card then pass order,
     /// so a GPU lane can measure without the host seeing a row (performance
@@ -395,26 +401,15 @@ pub const Stream = struct {
         const cols = try gpa.alloc(passes.DevColumns, n);
         var k: usize = 0;
         for (s.cards) |*c| if (!c.done) for (c.scans[0..c.n], 0..) |*sc, j| {
-            scans[k] = .{ .kind = undefined, .over = sc.over, .time = sc.time[0], .pass = undefined };
-            switch (sc.pass) {
-                .cross => |v| {
-                    scans[k].kind = .cross;
-                    scans[k].pass = .{ .cross = v };
-                },
-                .at => |v| {
-                    scans[k].kind = .at;
-                    scans[k].pass = .{ .at = v };
-                },
-                .extremum => |v| {
-                    scans[k].kind = .extremum;
-                    scans[k].pass = .{ .extremum = v };
-                },
-                .integ => |v| {
-                    scans[k].kind = .integ;
-                    scans[k].pass = .{ .integ = v };
+            scans[k] = switch (sc.pass) {
+                inline .cross, .at, .extremum, .integ => |v, tag| .{
+                    .kind = @field(passes.Dev.Kind, @tagName(tag)),
+                    .over = sc.over,
+                    .time = sc.time[0],
+                    .pass = @unionInit(@FieldType(passes.Dev, "pass"), @tagName(tag), v),
                 },
                 else => unreachable, // else: refused above
-            }
+            };
             cols[k] = s.devColumns(sc.y, sc.y2);
             k += 1;
             if (c.stage == .find and j + 1 == c.n) {
@@ -442,13 +437,10 @@ pub const Stream = struct {
                 k += 1;
                 sc.over = d.over;
                 sc.time[0] = d.time;
-                switch (d.kind) {
-                    .cross => sc.pass = .{ .cross = d.pass.cross },
-                    .at => sc.pass = .{ .at = d.pass.at },
-                    .extremum => sc.pass = .{ .extremum = d.pass.extremum },
-                    .integ => sc.pass = .{ .integ = d.pass.integ },
+                sc.pass = switch (d.kind) {
+                    inline .cross, .at, .extremum, .integ => |tag| @unionInit(Scan.Pass, @tagName(tag), @field(d.pass, @tagName(tag))),
                     .find => unreachable, // a card's `.find` pass comes after its own
-                }
+                };
             }
             if (c.stage == .find) {
                 const d = scans[k];
@@ -514,6 +506,8 @@ pub const Stream = struct {
         return .{ .y = a[0], .y2 = b[0], .prog = a[1], .prog2 = b[1] };
     }
 
+    /// Each card's passes for `core.Result.measured`: what a `.scan` card
+    /// found, nothing for the others. Caller owns the slice.
     pub fn measured(s: *Stream, gpa: std.mem.Allocator) ![]core.Measured {
         const out = try gpa.alloc(core.Measured, s.cards.len);
         for (s.cards, out) |*c, *o| {
@@ -620,11 +614,7 @@ pub const Stream = struct {
     /// ring, and starts scan 1 at scan 0's event.
     fn next(s: *Stream, c: *Card, data: []const f64) void {
         if (c.stage == .none) return;
-        if (c.ring_y) |y| {
-            if (c.ring_len == c.ring.len) std.mem.copyForwards([2]f64, c.ring[0..2], c.ring[1..3]);
-            c.ring_len = @min(c.ring_len + 1, c.ring.len);
-            c.ring[c.ring_len - 1] = .{ s.row[0], y.get(0) };
-        }
+        if (c.ring_y) |y| passes.Find.push(&c.ring, &c.ring_len, .{ s.row[0], y.get(0) });
         if (!c.scans[0].over) return;
         const event = c.scans[0].found();
         const stage = c.stage;
@@ -1165,8 +1155,6 @@ fn columnIndex(names: []const []const u8, name: []const u8) ?usize {
     return null;
 }
 
-const Stat = passes.Stat;
-
 /// The result a card reads; column 0 is the scale (time, frequency, sweep).
 const Wave = struct {
     result: core.Result,
@@ -1358,8 +1346,6 @@ const Wave = struct {
         return s.stat();
     }
 
-    const Integral = passes.Integral;
-
     const Jitter = struct { rms: f64, pp: f64, period: f64, edges: u32 };
 
     /// Time interval error of the repeating event `c` names (rising edges
@@ -1444,13 +1430,6 @@ fn positiveArea(v0: f64, v1: f64, dx: f64) f64 {
     return 0.5 * hi * dx * hi / (hi - @min(v0, v1));
 }
 
-/// ngspice measure_interpolate, 'y' mode: the line through samples i and j
-/// at scale value `at`, in slope-intercept form for the same rounding.
-fn interpolate(x: Column, y: Column, i: usize, j: usize, at: f64) f64 {
-    assert(i < j);
-    return line(x.get(i), y.get(i), x.get(j), y.get(j), at);
-}
-
 // The passes below read a waveform one sample at a time, in order, and
 // `feed` returns true where the whole-waveform loop would stop. `Wave` runs
 // them over a recording and `Stream` over a run as it goes, so both give
@@ -1477,7 +1456,7 @@ const EmAvg = struct {
         return false;
     }
 
-    fn result(s: EmAvg) Wave.Integral {
+    fn result(s: EmAvg) Integral {
         const span = s.to - s.from;
         if (!(span > 0)) return .{ .value = nan, .from = s.from, .to = s.to };
         return .{ .value = (@max(s.pos, s.neg) - s.c.val * @min(s.pos, s.neg)) / span, .from = s.from, .to = s.to };
@@ -1615,8 +1594,6 @@ fn cardWave(result: core.Result, analysis: Kind, values: []const f64, i: usize, 
     return w;
 }
 
-/// C's `%.*e`, digit for digit: the exact binary value rounded half-to-even
-/// (glibc's default), at least two exponent digits and an explicit sign.
 /// A discarding writer for an `evaluate` whose text nobody reads, only its
 /// value: `Sci` prints nothing into it, which skips the exact big-integer
 /// decimal (most of a card's cost when `point_measures` or a `Stream`
@@ -1629,6 +1606,8 @@ fn quiet(buffer: []u8) Writer.Discarding {
 
 const quiet_vtable: Writer.VTable = .{ .drain = Writer.Discarding.drain, .sendFile = Writer.Discarding.sendFile };
 
+/// C's `%.*e`, digit for digit: the exact binary value rounded half-to-even
+/// (glibc's default), at least two exponent digits and an explicit sign.
 fn sci(x: f64, comptime precision: u8) Sci {
     return .{ .x = x, .precision = precision };
 }

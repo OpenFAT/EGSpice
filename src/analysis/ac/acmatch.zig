@@ -11,6 +11,7 @@ const std = @import("std");
 const freq = @import("freq.zig");
 const root = @import("../types.zig");
 const dcmatch = @import("../dc/dcmatch.zig");
+const dcxf = @import("../dc/xf.zig");
 const fdStep = @import("../sweep/sens.zig").fdStep;
 const num = @import("core").numerics;
 const Complex = num.Complex;
@@ -51,6 +52,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const drive = sol[2 * n_points * nn ..][0..nn];
     const e_out = sol[2 * n_points * nn + nn ..][0..nn];
     if (ctx.ac_drive.len == nn) @memcpy(drive, ctx.ac_drive) else @memset(drive, 0);
+    const out: dcxf.Output = .{ .node = opts.output_node, .neg = opts.output_neg, .branch = null };
     root.outputDrive(e_out, opts.output_node, opts.output_neg);
     {
         var fs = try FreqSolver.fromCircuit(scratch, ckt, ctx.x_op);
@@ -142,8 +144,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     for (0..n_points) |k| {
         const row = data[k * row_len ..][0..row_len];
         const x = sol[k * nn ..][0..nn];
-        var y = Complex{ .re = x[opts.output_node], .im = x[n + opts.output_node] };
-        if (opts.output_neg != root.GROUND) y = y.sub(.{ .re = x[opts.output_neg], .im = x[n + opts.output_neg] });
+        const y = out.read(x, n);
         row[0] = freqs[k];
         row[1] = 0;
         var var_m: f64 = 0;

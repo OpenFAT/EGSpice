@@ -1,4 +1,9 @@
 //! C ABI contract through include/espice.h, linked against libespice.a.
+//! Oracles: the status code and diagnostic the header promises for each
+//! misuse (bad versions, tags, pointers, stale handles), a model of valid
+//! handle and query states for random call sequences, closed forms for the
+//! RC and divider values, and the same rows swept through `.data` (bit for
+//! bit) for the points API.
 const std = @import("std");
 const c = @import("espice_h");
 
@@ -296,13 +301,7 @@ test "C creation routes .hdl display-task lines to the display callback (#127)" 
 
 test "C calls on a live handle validate every pointer, scope and preview" {
     const t = std.testing;
-    const deck = "C arguments\nV1 in 0 1\nR1 in 0 1k\n.op\n.end\n";
-    var options: c.espice_create_options = undefined;
-    c.espice_default_options(&options);
-    options.source_kind = c.ESPICE_BYTES;
-    options.source = .{ .data = deck.ptr, .len = deck.len };
-    var handle: ?*c.espice_problem = null;
-    try t.expectEqual(@as(u32, c.ESPICE_OK), c.espice_create(&options, &handle, null, 0));
+    const handle = try createDeck("C arguments\nV1 in 0 1\nR1 in 0 1k\n.op\n.end\n");
     defer _ = c.espice_destroy(handle);
     const invalid: u32 = c.ESPICE_INVALID_ARGUMENT;
     var n: usize = 0;
@@ -563,7 +562,8 @@ test "C random create/append/advance/result/destroy sequences match a model of v
     }
 }
 
-/// v(out) of `deck`'s operating point, through one handle's whole life.
+/// v(out) of `handle`'s first query (the deck's `.op`) after running every
+/// query; the handle stays live.
 fn dividerOut(handle: *c.espice_problem) !f64 {
     if (c.espice_run_all(handle) != c.ESPICE_OK) return error.RunFailed;
     var values: [8]f64 = undefined;
@@ -749,6 +749,8 @@ fn createLive(deck: []const u8, live: []const c.espice_bytes) !*c.espice_problem
     return createDialect(deck, live, c.ESPICE_NGSPICE);
 }
 
+/// A problem over `deck` in `dialect`, `live` declared live and four
+/// parallel workers; prints the create diagnostic when it fails.
 fn createDialect(deck: []const u8, live: []const c.espice_bytes, dialect: u32) !*c.espice_problem {
     var options: c.espice_create_options = undefined;
     c.espice_default_options(&options);
@@ -777,6 +779,7 @@ fn runPoints(h: *c.espice_problem, rows: []const f64, count: usize, names: []con
     try std.testing.expectEqual(@as(u32, c.ESPICE_OK), c.espice_copy_point_measures(h, first, count, names.ptr, names.len, out.ptr, reasons.ptr));
 }
 
+/// Prints `h`'s last error message, for a failing test's log.
 fn printError(h: *c.espice_problem) void {
     var buf: [64]u8 = @splat(0);
     var needed: usize = 0;
@@ -784,6 +787,7 @@ fn printError(h: *c.espice_problem) void {
     std.debug.print("espice_error_message: {s}\n", .{std.mem.sliceTo(&buf, 0)});
 }
 
+/// Equal bit for bit, so NaN payloads and signed zeros count.
 fn expectSameBits(want: []const f64, got: []const f64) !void {
     try std.testing.expectEqualSlices(u64, @ptrCast(want), @ptrCast(got));
 }
@@ -845,6 +849,7 @@ fn firstRequested(h: *c.espice_problem) !u32 {
         if (info.requested == 1) break @as(u32, @intCast(id));
     } else error.NoRequestedQuery;
 }
+
 test "C points: the per-lane stimulus rows (#212) equal their .data sweep bit for bit" {
     const t = std.testing;
     const source = try std.Io.Dir.cwd().readFileAlloc(t.io, "tests/conformance/tests/netlist/variants/data_lane_stimulus.sp", t.allocator, .unlimited);
@@ -1004,6 +1009,8 @@ const reason_cases = [_]ReasonCase{
     },
 };
 
+/// `names` as C byte views written into `out`, which must hold them all;
+/// the views borrow `names`.
 fn bytes(names: []const []const u8, out: []c.espice_bytes) []const c.espice_bytes {
     for (names, out[0..names.len]) |n, *b| b.* = .{ .data = n.ptr, .len = n.len };
     return out[0..names.len];
@@ -1153,6 +1160,7 @@ test "C points: argument errors change nothing" {
     try expectDiagnostic(stepped, "SweptTemplate");
 }
 
+/// Expects `h`'s last error message to be `want`.
 fn expectDiagnostic(h: *c.espice_problem, want: []const u8) !void {
     var buf: [64]u8 = undefined;
     var needed: usize = 0;
@@ -1173,16 +1181,7 @@ test "C points: 100 batches of 100 on one handle, released as they are read, kee
     const t = std.testing;
     const deck = "C batches\n.param rv=1k\nV1 in 0 pulse(0 1 0.1n 0.1n 0.1n 20n 40n)\nR1 in out {rv}\nC1 out 0 0.1p\n.tran 1p 2n\n" ++
         ".meas tran tpd trig v(in) val=0.5 rise=1 targ v(out) val=0.5 rise=1\n.end\n";
-    const live = [_]c.espice_bytes{.{ .data = "rv", .len = 2 }};
-    var options: c.espice_create_options = undefined;
-    c.espice_default_options(&options);
-    options.source_kind = c.ESPICE_BYTES;
-    options.source = .{ .data = deck.ptr, .len = deck.len };
-    options.live_params = &live;
-    options.live_param_count = 1;
-    options.max_parallel = 4;
-    var handle: ?*c.espice_problem = null;
-    try t.expectEqual(@as(u32, 0), c.espice_create(&options, &handle, null, 0));
+    const handle = try createLive(deck, rc_live[0..1]);
     defer _ = c.espice_destroy(handle);
     var points = pointsOptions();
     points.measures_only = 1;

@@ -29,10 +29,7 @@ const max_restarts = 300;
 const qr_tol = 1e-12;
 const qr_max_iter = 1000;
 
-/// How many eigenvalues `dominant` wrote, and whether all it wanted converged.
-pub const Eigs = struct { count: usize, converged: bool };
-
-/// The (up to) k largest-magnitude eigenvalues of the n×n operator `op`
+/// Writes the (up to) k largest-magnitude eigenvalues of the n×n operator `op`
 /// (`op.apply(x, y)` writes y = A·x, never aliased), largest first, into
 /// `out`, which needs k + 1 slots: a complex pair is never split, so k grows
 /// by one when the k-th value is half of one. Values below n·eps·|θ₁| count
@@ -46,7 +43,7 @@ pub const Eigs = struct { count: usize, converged: bool };
 /// high order leaves (see below). That drops a defective genuine
 /// eigenvalue too, which without it comes back as the same ring a dense QR
 /// gives. error.PzDidNotConverge when the QR on H runs out of steps.
-pub fn dominant(gpa: std.mem.Allocator, n: usize, k: usize, op: anytype, out: []Complex, stable_only: bool) !Eigs {
+pub fn dominant(gpa: std.mem.Allocator, n: usize, k: usize, op: anytype, out: []Complex, stable_only: bool) !qr.Eigs {
     std.debug.assert(k >= 1 and out.len >= k + 1);
     const m = @min(n, 2 * k + 20);
     var arena: std.heap.ArenaAllocator = .init(gpa);

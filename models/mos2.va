@@ -21,6 +21,10 @@
 
 // One damped-Newton step on the Baum quartic x^4+a1x^3+b1x^2+c1x+d1 = 0.
 // Fixed trip count (four steps from the Grove-Frohman root).
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 `define BAUMSTEP \
     fx  = (((xr + a1)*xr + b1)*xr + c1)*xr + d1; \
     fpx = ((4.0*xr + 3.0*a1)*xr + 2.0*b1)*xr + c1; \

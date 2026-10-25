@@ -16,6 +16,10 @@
 //     ceqbs/ceqbd/ceqqg and the B1mosCap argument+output swap).
 //   * Model-level TEMP (degC) is not declared: Verilog-A cannot carry two
 //     `temp` parameters and no equation reads it; the instance TEMP (K) feeds Vt.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module bsim1(d, g, s, b);
     inout d, g, s, b;
     electrical d, g, s, b;

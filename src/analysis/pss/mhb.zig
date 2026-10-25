@@ -21,7 +21,7 @@
 //! (the APFT; VACASK `lib/corehbcoloc.cpp`, after Kundert, White and
 //! Sangiovanni-Vincentelli, 1990, App. B).
 //!
-//! Cites: dev/analysis/multitone-hb.md, VACASK `lib/spurs.cpp` (line
+//! Cites: VACASK `lib/spurs.cpp` (line
 //! merging in `spectrum`), Verilog-A LRM §4.6.1 (sources follow their
 //! waveform only in the transient phase), #83 (NaN residuals).
 const std = @import("std");
@@ -184,7 +184,6 @@ const Transform = struct {
 /// split into four partial sums: even/odd lines times cos/sin. `dft` folds
 /// the samples the same way before m-long dots. Values match the dense pair
 /// up to summation order (the angles are the same table entries).
-/// dev/solvers/structured-preconditioners.md has the symmetry argument.
 const Fold = struct {
     /// Base samples: 0..m-1.
     m: usize,
@@ -202,6 +201,8 @@ const Fold = struct {
     /// differences (2·H) and the four folded sample arrays (4·m).
     work: []f64,
 
+    /// Folds the dense one-tone pair `tr` of `spec`. Asserts one tone on the
+    /// uniform nt = 2·nf grid. Free with `deinit` on `gpa`.
     pub fn init(gpa: std.mem.Allocator, spec: Spectrum, tr: Transform) !*Fold {
         const m = spec.freqs.len;
         const nf = 2 * m - 1;
@@ -244,6 +245,7 @@ const Fold = struct {
         return self;
     }
 
+    /// Frees the fold and every table `init` allocated on `gpa`.
     pub fn deinit(self: *const Fold, gpa: std.mem.Allocator) void {
         const nf = self.perm.len;
         gpa.free(self.inv.ptr[0 .. 2 * self.m * nf + self.work.len]);
@@ -562,6 +564,24 @@ const Operator = struct {
 /// slot-major, `nt` samples contiguous in each.
 const Planes = struct { x: []f64, f: []f64, q: []f64, g: []f64, c: []f64 };
 
+/// Carves `Planes` out of `slab` at `off`: x, f and q `node_len` each, then
+/// g and c `slot_len` each.
+fn takePlanes(slab: []f64, off: *usize, node_len: usize, slot_len: usize) Planes {
+    return .{
+        .x = take(slab, off, node_len),
+        .f = take(slab, off, node_len),
+        .q = take(slab, off, node_len),
+        .g = take(slab, off, slot_len),
+        .c = take(slab, off, slot_len),
+    };
+}
+
+/// The step `sample` declares to the devices, 1/(nt·f_1) with f_1 the
+/// lowest line.
+fn sampleDt(spec: Spectrum) f64 {
+    return 1 / (spec.freqs[1] * @as(f64, @floatFromInt(transformSamples(spec))));
+}
+
 /// Evaluates the circuit at every instant of `tr` on `x_hat`'s waveform
 /// into `p`; `p.c` is left alone without charge. `x_sample` (n) is scratch.
 fn sample(ckt: *root.Circuit, tr: Transform, nf: usize, dt: f64, x_hat: []const f64, x_sample: []f64, p: Planes) void {
@@ -587,8 +607,35 @@ fn sample(ckt: *root.Circuit, tr: Transform, nf: usize, dt: f64, x_hat: []const 
     }
 }
 
-/// The shortest step the line search takes before it stops shortening.
-const min_step: f64 = 1.0 / 1024.0;
+/// The backtracking line search both HB Newtons take on their own residual
+/// evaluation: a step that made the residual worse (or non-finite, hence
+/// the negated comparison) is undone and retaken at half length, and a step
+/// that helped earns the length back. A full Newton step can hand a diode
+/// the whole source swing at once.
+pub const LineSearch = struct {
+    step: f64 = 1,
+    prev_residual: f64 = std.math.inf(f64),
+    retrying: bool = false,
+
+    /// The shortest step before the search stops shortening.
+    const min_step: f64 = 1.0 / 1024.0;
+
+    /// Judges the step that produced `residual`. True: rewind it and retake
+    /// it at the halved `step`. False: the step stands and `step` is the
+    /// next one's length. `first` (the starting point, or a judgement that
+    /// must not rewind) never backtracks.
+    pub fn backtrack(ls: *LineSearch, first: bool, residual: f64) bool {
+        if (!first and !(residual <= ls.prev_residual) and ls.step > min_step) {
+            ls.step *= 0.5;
+            ls.retrying = true;
+            return true;
+        }
+        ls.prev_residual = residual;
+        if (!ls.retrying) ls.step = @min(ls.step * 2, 1);
+        ls.retrying = false;
+        return false;
+    }
+};
 
 /// GMRES stopping tolerance relative to the Newton residual.
 const gmres_tol: f64 = 1e-7;
@@ -622,7 +669,7 @@ pub fn dcSeed(ckt: *root.Circuit, x_hat: []f64, x_sample: []f64, nf: usize, tol:
 /// Driven harmonic balance on `spec` (tones `tones` Hz) from the DC
 /// operating point. `x_hat` (n·(2m-1), caller-owned) receives node-major
 /// blocks [dc, c_1, s_1, ...], the last iterate when Newton does not
-/// converge. Newton takes `hb.zig`'s backtracking line search; each step
+/// converge. Newton takes the `LineSearch`; each step
 /// is GMRES on the matrix-free Jacobian with the block-diagonal
 /// preconditioner. Memory is O(nnz·nt + m·LU) for the sampled planes and
 /// the held factors. Asserts `spec` has two or more lines and x_hat.len is
@@ -677,9 +724,7 @@ const Newton = struct {
     gpu_held: ?@import("../gpu/freq.zig").Held = null,
     gpu_held_disabled: bool = false,
     gpu_operator: ?@import("../gpu/periodic.zig").Operator = null,
-    step: f64 = 1,
-    prev_residual: f64 = std.math.inf(f64),
-    retrying: bool = false,
+    ls: LineSearch = .{},
     iter: u16 = 0,
     backtracks: usize = 0,
 
@@ -702,13 +747,7 @@ const Newton = struct {
         const q_hat = take(slab, &off, total);
         const dx = take(slab, &off, total);
         const x_prev = take(slab, &off, total);
-        const planes: Planes = .{
-            .x = take(slab, &off, n * nt),
-            .f = take(slab, &off, n * nt),
-            .q = take(slab, &off, n * nt),
-            .g = take(slab, &off, nnz * nt),
-            .c = take(slab, &off, nnz * nt),
-        };
+        const planes = takePlanes(slab, &off, n * nt, nnz * nt);
         const g0 = take(slab, &off, nnz);
         const c0 = take(slab, &off, nnz);
         const p_rhs = take(slab, &off, 2 * m * n);
@@ -750,7 +789,7 @@ const Newton = struct {
             .x_hat = x_hat,
             .tr = tr,
             .nf = nf,
-            .dt = 1 / (spec.freqs[1] * @as(f64, @floatFromInt(nt))),
+            .dt = sampleDt(spec),
             .f_hat = f_hat,
             .q_hat = q_hat,
             .dx = dx,
@@ -796,24 +835,19 @@ const Newton = struct {
             addOmega(self.omegas, self.q_hat, self.f_hat);
         }
         const residual = num.normInf(self.f_hat);
-        if (self.ckt.knobs.hb_trace) std.debug.print("MHB iter={d} res={e} step={e}\n", .{ self.iter, residual, self.step });
+        if (self.ckt.knobs.hb_trace) std.debug.print("MHB iter={d} res={e} step={e}\n", .{ self.iter, residual, self.ls.step });
         if (residual < self.options.hb_tol) {
             self.result = .{ .converged = true, .iterations = self.iter + 1, .residual_norm = residual };
             self.phase = .done;
             return;
         }
-        if (self.iter != 0 and !(residual <= self.prev_residual) and self.step > min_step) {
-            self.step *= 0.5;
+        if (self.ls.backtrack(self.iter == 0, residual)) {
             self.backtracks += 1;
             num.copySimd(self.x_hat, self.x_prev);
-            num.axpy(self.x_hat, self.step, self.dx);
-            self.retrying = true;
+            num.axpy(self.x_hat, self.ls.step, self.dx);
             self.iterationComplete();
             return;
         }
-        self.prev_residual = residual;
-        if (!self.retrying) self.step = @min(self.step * 2, 1);
-        self.retrying = false;
         const nt = self.tr.nt;
         const inv_nt = 1 / @as(f64, @floatFromInt(nt));
         for (0..self.ckt.nnz) |slot| {
@@ -840,7 +874,7 @@ const Newton = struct {
         std.debug.assert(self.phase == .linear);
         if (self.ckt.knobs.hb_trace) std.debug.print("  gmres it={d} res={e} conv={}\n", .{ result.iterations, result.residual, result.converged });
         num.copySimd(self.x_prev, self.x_hat);
-        num.axpy(self.x_hat, self.step, self.dx);
+        num.axpy(self.x_hat, self.ls.step, self.dx);
         self.iterationComplete();
     }
 
@@ -885,7 +919,10 @@ const Newton = struct {
     }
 };
 
-pub const LaneOutcome = root.ErrorOf(@import("hb.zig").run)!root.Result;
+/// One point's `.hb` outcome, as `hb.run` returns it.
+pub const LaneOutcome = @import("hb.zig").LaneOutcome;
+/// Test-only counters of points the device batch admitted and of their line
+/// search backtracks; empty outside tests.
 pub const gpu_test_access = if (@import("builtin").is_test) struct {
     pub var admitted = std.atomic.Value(usize).init(0);
     pub var backtracks = std.atomic.Value(usize).init(0);
@@ -907,11 +944,14 @@ fn dispatchGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const 
     };
 }
 
+/// Writes `input` as point `point`'s column of the point-minor batch `out`:
+/// out[row * points + point] = input[row].
 fn interleave(out: []f64, input: []const f64, point: usize, points: usize) void {
     std.debug.assert(out.len == input.len * points);
     for (input, 0..) |value, row| out[row * points + point] = value;
 }
 
+/// `interleave`'s inverse: point `point`'s column of `input` into `out`.
 fn scatter(out: []f64, input: []const f64, point: usize, points: usize) void {
     std.debug.assert(input.len == out.len * points);
     for (out, 0..) |*value, row| value.* = input[row * points + point];
@@ -925,9 +965,7 @@ fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.
     const n: usize = ctxs[0].circuit.n;
     const nnz: usize = ctxs[0].circuit.nnz;
     var tones: [max_tones]f64 = undefined;
-    var nharms: [max_tones]u16 = undefined;
-    const tone_count = try toneList(options, &tones, &nharms);
-    const spec = try spectrum(a, tones[0..tone_count], nharms[0..tone_count], options.intmodmax, options.subharms);
+    const spec = try querySpectrum(a, options, &tones);
     defer spec.deinit(a);
     if (spec.freqs.len < 2) return error.InvalidQueryOptions;
     const nf = 2 * spec.freqs.len - 1;
@@ -960,7 +998,7 @@ fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.
             out[p] = err;
             continue;
         };
-        states[p] = Newton.init(ctx.circuit, spectra[p], spec, tones[0..tone_count], options, ctx.scratch_allocator, false) catch |err| {
+        states[p] = Newton.init(ctx.circuit, spectra[p], spec, tones[0..spec.tones], options, ctx.scratch_allocator, false) catch |err| {
             out[p] = err;
             continue;
         };
@@ -979,13 +1017,7 @@ fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.
     const sample_slab = try a.alloc(f64, sample_size);
     defer a.free(sample_slab);
     var sample_offset: usize = 0;
-    const sampled: Planes = .{
-        .x = take(sample_slab, &sample_offset, sample_values),
-        .f = take(sample_slab, &sample_offset, sample_values),
-        .q = take(sample_slab, &sample_offset, sample_values),
-        .g = take(sample_slab, &sample_offset, plane_values),
-        .c = take(sample_slab, &sample_offset, plane_values),
-    };
+    const sampled = takePlanes(sample_slab, &sample_offset, sample_values, plane_values);
     const rhs = try a.alloc(f64, values);
     defer a.free(rhs);
     const dx = try a.alloc(f64, values);
@@ -1133,15 +1165,18 @@ fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.
     }
 }
 
-/// The tones and harmonic counts of `opts`, f0 first.
-fn toneList(opts: Options, tones: *[max_tones]f64, nharms: *[max_tones]u16) !usize {
+/// `spectrum` of `opts`' tones, f0 first, which land in `tones[0..spec.tones]`.
+/// error.InvalidQueryOptions for more than `max_tones` tones or a harmonic
+/// list that does not match them, and as `spectrum` otherwise.
+fn querySpectrum(gpa: std.mem.Allocator, opts: Options, tones: *[max_tones]f64) !Spectrum {
     const count = 1 + opts.extra_tones.len;
     if (count > max_tones or opts.extra_harmonics.len != opts.extra_tones.len) return error.InvalidQueryOptions;
+    var nharms: [max_tones]u16 = undefined;
     tones[0] = opts.f0;
     nharms[0] = opts.n_harmonics;
     @memcpy(tones[1..count], opts.extra_tones);
     @memcpy(nharms[1..count], opts.extra_harmonics);
-    return count;
+    return spectrum(gpa, tones[0..count], nharms[0..count], opts.intmodmax, opts.subharms);
 }
 
 /// Contract entry for `.hb TONES=` (any tone count) and the positional
@@ -1153,20 +1188,19 @@ fn toneList(opts: Options, tones: *[max_tones]f64, nharms: *[max_tones]u16) !usi
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const scratch = ctx.scratch_allocator;
     var tones: [max_tones]f64 = undefined;
-    var nharms: [max_tones]u16 = undefined;
-    const count = try toneList(opts, &tones, &nharms);
-    const spec = try spectrum(scratch, tones[0..count], nharms[0..count], opts.intmodmax, opts.subharms);
+    const spec = try querySpectrum(scratch, opts, &tones);
     defer spec.deinit(scratch);
     if (spec.freqs.len < 2) return error.InvalidQueryOptions;
     const nf = 2 * spec.freqs.len - 1;
     const x_hat = try scratch.alloc(f64, @as(usize, ctx.circuit.n) * nf);
     defer scratch.free(x_hat);
-    const st = try solve(ctx.circuit, x_hat, spec, tones[0..count], opts, scratch);
+    const st = try solve(ctx.circuit, x_hat, spec, tones[0..spec.tones], opts, scratch);
     if (!st.converged) return error.HbDidNotConverge;
 
     return publish(ctx, opts, spec, x_hat);
 }
 
+/// `run`'s published rows from the converged `x_hat`, in `ctx.allocator`.
 fn publish(ctx: *const root.RunCtx, opts: Options, spec: Spectrum, x_hat: []const f64) !root.Result {
     const a = ctx.allocator;
     const nf = 2 * spec.freqs.len - 1;
@@ -1224,41 +1258,35 @@ pub const Orbit = struct {
 /// `allocator`.
 pub fn orbit(ckt: *root.Circuit, opts: Options, allocator: std.mem.Allocator) !Orbit {
     var tones: [max_tones]f64 = undefined;
-    var nharms: [max_tones]u16 = undefined;
-    const count = try toneList(opts, &tones, &nharms);
-    const spec = try spectrum(allocator, tones[0..count], nharms[0..count], opts.intmodmax, opts.subharms);
+    const spec = try querySpectrum(allocator, opts, &tones);
     errdefer spec.deinit(allocator);
+    const tone_list = tones[0..spec.tones];
     if (spec.freqs.len < 2) return error.InvalidQueryOptions;
     const n: usize = ckt.n;
     const nnz: usize = ckt.nnz;
     const nf = 2 * spec.freqs.len - 1;
     const nt = transformSamples(spec);
-    const buf = try allocator.alloc(f64, n * nf + nt + 2 * nt * nf + 3 * n * nt + 2 * nnz * nt + n);
+    const len = n * nf + nt + 2 * nt * nf + 3 * n * nt + 2 * nnz * nt + n;
+    const buf = try allocator.alloc(f64, len);
     errdefer allocator.free(buf);
-    const x_hat = buf[0 .. n * nf];
-    const tr_buf = buf[n * nf ..][0 .. nt + 2 * nt * nf];
-    const td = buf[n * nf + tr_buf.len ..];
-    const p: Planes = .{
-        .x = td[0 .. n * nt],
-        .f = td[n * nt ..][0 .. n * nt],
-        .q = td[2 * n * nt ..][0 .. n * nt],
-        .g = td[3 * n * nt ..][0 .. nnz * nt],
-        .c = td[3 * n * nt + nnz * nt ..][0 .. nnz * nt],
-    };
-    const st = try solve(ckt, x_hat, spec, tones[0..count], opts, allocator);
+    var off: usize = 0;
+    const x_hat = take(buf, &off, n * nf);
+    const tr_buf = take(buf, &off, nt + 2 * nt * nf);
+    const p = takePlanes(buf, &off, n * nt, nnz * nt);
+    const x_sample = take(buf, &off, n);
+    std.debug.assert(off == len);
+    const st = try solve(ckt, x_hat, spec, tone_list, opts, allocator);
     if (!st.converged) return error.HbDidNotConverge;
-    const tr = try transform(spec, tones[0..count], tr_buf, allocator);
+    const tr = try transform(spec, tone_list, tr_buf, allocator);
     @memset(p.c, 0);
-    sample(ckt, tr, nf, 1 / (spec.freqs[1] * @as(f64, @floatFromInt(nt))), x_hat, td[3 * n * nt + 2 * nnz * nt ..], p);
+    sample(ckt, tr, nf, sampleDt(spec), x_hat, x_sample, p);
     return .{ .spec = spec, .tr = tr, .x_td = p.x, .g_td = p.g, .c_td = p.c, .buf = buf };
 }
 
-/// Spectral lines of `opts`' spectrum, DC included. As `spectrum` fails.
+/// Spectral lines of `opts`' spectrum, DC included. Fails as `querySpectrum`.
 pub fn lineCount(gpa: std.mem.Allocator, opts: Options) !usize {
     var tones: [max_tones]f64 = undefined;
-    var nharms: [max_tones]u16 = undefined;
-    const count = try toneList(opts, &tones, &nharms);
-    const spec = try spectrum(gpa, tones[0..count], nharms[0..count], opts.intmodmax, opts.subharms);
+    const spec = try querySpectrum(gpa, opts, &tones);
     defer spec.deinit(gpa);
     return spec.freqs.len;
 }

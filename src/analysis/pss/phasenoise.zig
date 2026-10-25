@@ -24,7 +24,7 @@
 //! matching d(ln w) = (1/T) integral v.b harmonic by harmonic gives
 //! v = -(y_dc + 2 sum_h y_ch cos + y_sh sin), which `hb.orbit` samples.
 //!
-//! Cites: dev/analysis/phase-noise.md, the Demir paper above, HSPICE
+//! Cites: the Demir paper above, HSPICE
 //! `.phasenoise` (METHOD, PHNOISE_LORENTZ, carrierindex).
 const std = @import("std");
 const root = @import("../types.zig");
@@ -39,7 +39,7 @@ const min_samples: usize = 64;
 
 /// Phase diffusion of an oscillator, c(f_m) = white + sum_s dc_s^2 /
 /// (2 f_m^ef_s), in s.
-pub const Diffusion = struct {
+const Diffusion = struct {
     white: f64,
     /// Per noise source: (1/T) integral coeff·(v_p - v_n) sqrt(flicker_s(t))
     /// dt, and its flicker exponent. A correlated group sums into its first

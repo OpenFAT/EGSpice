@@ -10,7 +10,10 @@ const std = @import("std");
 const gompute = @import("gompute");
 const lk = @import("solver").lane_kernels;
 const artifacts = @import("gompute_kernels");
-const backend: ?gompute.Backend = if (artifacts.has_cuda) .cuda else if (artifacts.has_hip) .hip else null;
+/// The backend this binary carries kernel images for, CUDA first. Comptime,
+/// because naming `gompute.RawByName(.cuda)` is a compile error in a build
+/// without CUDA artifacts.
+pub const backend: ?gompute.Backend = if (artifacts.has_cuda) .cuda else if (artifacts.has_hip) .hip else null;
 
 /// The device this thread's GPU handles open on (`rawKernelByName`'s
 /// ordinal). 0 unless a batch leader handed this thread a slice.
@@ -130,6 +133,8 @@ pub const Placement = struct {
     slot: ?usize,
     prev: c_int,
 
+    /// Restores this thread's previous `ordinal` and drops the query from
+    /// its device's live count. Call once.
     pub fn release(self: Placement) void {
         ordinal = self.prev;
         if (self.slot) |i| _ = live[i].fetchSub(1, .monotonic);
@@ -162,7 +167,7 @@ pub fn place() Placement {
 
 /// A device's slice smaller than this many rows goes to the slice before:
 /// its context and kernel loads would cost more than its lanes return.
-pub const min_slice = 64;
+const min_slice = 64;
 
 /// Cuts `rows` lanes into contiguous row-order slices by capacity, one per
 /// device that gets at least `min_slice` rows (the first device takes what
@@ -221,6 +226,9 @@ pub const TapeShare = struct {
         return .{ .idx = try gpa.dupe(u32, self.idx), .tab = self.tab };
     }
 
+    /// Slice 0 hands its tape to the waiting slices; copies `idx` into
+    /// `gpa`. A no-op once published or failed; an allocation failure
+    /// `fail`s instead.
     pub fn publish(self: *TapeShare, tab: lk.LaneTab, idx: []const u32) void {
         if (self.state.load(.acquire) != 0) return;
         self.idx = self.gpa.dupe(u32, idx) catch return self.fail();
@@ -233,6 +241,7 @@ pub const TapeShare = struct {
         if (self.state.load(.acquire) == 0) self.state.store(2, .release);
     }
 
+    /// Frees the published copy. Every slice must have finished `take`.
     pub fn deinit(self: *TapeShare) void {
         self.gpa.free(self.idx);
     }

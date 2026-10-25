@@ -52,6 +52,8 @@ pub const Session = struct {
         side_name: []u8,
         buffer: [64 * 1024]u8,
 
+        /// Where rows go: the replacement or side file, else a discard that
+        /// only counts them.
         pub fn writer(s: *Stream) *Io.Writer {
             return if (s.atomic != null or s.side != null) &s.file.interface else &s.discard.writer;
         }
@@ -100,34 +102,31 @@ pub const Session = struct {
 
     fn deliver(self: *Session, io: Io, path: []const u8, plot: types.Plot) !void {
         const format = self.selection.format;
-        const ordinal = self.published;
         if (!dispatch.concatenates(format)) {
-            if (ordinal == 0) return dispatch.write(io, path, format, plot);
-            const numbered = try self.allocator.print("{s}.{d}", .{ path, ordinal + 1 });
-            defer self.allocator.free(numbered);
-            return dispatch.write(io, numbered, format, plot);
+            const numbered = try self.plotPath(path);
+            defer if (numbered) |n| self.allocator.free(n);
+            return dispatch.write(io, numbered orelse path, format, plot);
         }
         // A device or FIFO cannot be renamed over: it takes each plot as it comes.
-        const s = self.pending orelse try self.open(io, path, ordinal != 0) orelse
+        const s = self.pending orelse try self.open(io, path, self.published != 0) orelse
             return dispatch.write(io, path, format, plot);
         self.pending = s;
         try dispatch.encode(&s.file.interface, format, plot);
     }
 
+    /// The next plot's own file in a format that holds one plot: `path`
+    /// for plot 0 (null), else `path.<number + 1>`, which the caller frees.
+    fn plotPath(self: *Session, path: []const u8) !?[]u8 {
+        if (self.published == 0) return null;
+        return try self.allocator.print("{s}.{d}", .{ path, self.published + 1 });
+    }
+
     /// A replacement for the file at `path`, holding the file's bytes when
     /// `keep`; null when `path` is a device or FIFO.
     fn open(self: *Session, io: Io, path: []const u8, keep: bool) !?*Stream {
-        if (Io.Dir.cwd().statFile(io, path, .{})) |stat| {
-            if (stat.kind != .file) return null;
-        } else |_| {}
-        const s = try self.allocator.create(Stream);
+        if (dispatch.isDevice(io, path)) return null;
+        const s = try self.create();
         errdefer self.allocator.destroy(s);
-        s.discard = .init(&.{});
-        s.count_at = 0;
-        s.rows_at = 0;
-        s.complex = false;
-        s.side = null;
-        s.side_name = &.{};
         s.atomic = try Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
         errdefer s.atomic.?.deinit(io);
         s.file = s.atomic.?.file.writer(io, &s.buffer);
@@ -141,6 +140,20 @@ pub const Session = struct {
             var reader = old.reader(io, &rbuf);
             _ = try reader.interface.streamRemaining(&s.file.interface);
         }
+        return s;
+    }
+
+    /// A stream with no file behind it: no replacement, no side file, rows
+    /// counted and dropped. `file` and `buffer` are left undefined.
+    fn create(self: *Session) !*Stream {
+        const s = try self.allocator.create(Stream);
+        s.atomic = null;
+        s.discard = .init(&.{});
+        s.count_at = 0;
+        s.rows_at = 0;
+        s.complex = false;
+        s.side = null;
+        s.side_name = &.{};
         return s;
     }
 
@@ -168,13 +181,7 @@ pub const Session = struct {
         assert(self.pending == null);
         try types.validatePlot(.binary, plot);
         const path = self.selection.path orelse {
-            const s = try self.allocator.create(Stream);
-            s.discard = .init(&.{});
-            s.atomic = null;
-            s.side = null;
-            s.side_name = &.{};
-            s.count_at = 0;
-            s.rows_at = 0;
+            const s = try self.create();
             s.complex = plot.result.is_complex;
             self.stream = s;
             return s.writer();
@@ -249,23 +256,11 @@ pub const Session = struct {
     pub fn beginSide(self: *Session, io: Io) !?*Stream {
         const format = self.selection.format;
         if (!sideFormat(format) or self.state == .failed) return null;
+        if (self.selection.path) |path| if (dispatch.isDevice(io, path)) return null;
         try self.sides.ensureUnusedCapacity(self.allocator, 1);
-        const s = try self.allocator.create(Stream);
+        const s = try self.create();
         errdefer self.allocator.destroy(s);
-        s.discard = .init(&.{});
-        s.atomic = null;
-        s.count_at = 0;
-        s.rows_at = 0;
-        s.complex = false;
-        s.side = null;
-        s.side_name = &.{};
         if (self.selection.path) |path| {
-            if (Io.Dir.cwd().statFile(io, path, .{})) |stat| {
-                if (stat.kind != .file) {
-                    self.allocator.destroy(s);
-                    return null;
-                }
-            } else |_| {}
             // Beside the destination, readable for `endSide`, named
             // `<path>.<n>.side` with the first `n` free; `drop` deletes it.
             while (true) : (self.side_serial +%= 1) {
@@ -312,8 +307,7 @@ pub const Session = struct {
             self.pending = out;
             try self.copySide(io, &out.file.interface, s, plot);
         } else {
-            // Its own file, named as `deliver` names it.
-            const numbered = if (self.published == 0) null else try self.allocator.print("{s}.{d}", .{ path, self.published + 1 });
+            const numbered = try self.plotPath(path);
             defer if (numbered) |n| self.allocator.free(n);
             var atomic = try Io.Dir.cwd().createFileAtomic(io, numbered orelse path, .{ .replace = true });
             defer atomic.deinit(io);

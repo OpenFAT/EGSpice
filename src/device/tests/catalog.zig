@@ -1,4 +1,6 @@
-//! Tests for the model catalog and HDL loader error propagation.
+//! Tests for the model catalog and HDL loader error propagation. Oracles:
+//! `byName` and `modelName` as inverses, and the declared error of the
+//! first bad file in list order with the library left at its built-ins.
 const std = @import("std");
 const catalog = @import("../catalog.zig");
 const loader = @import("../loader.zig");

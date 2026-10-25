@@ -14,8 +14,37 @@ const castField = device.abi.bind.castField;
 const bindKv = builder.test_access.bindKv;
 const ta = builder.test_access;
 
-fn card(name: []const u8, positional: []const Value) netlist.Netlist.View {
-    return .{ .name = name, .kind = 'v', .pins = &.{}, .positional = positional, .kv = &.{}, .model = null, .subckt_instance = 0 };
+/// A pinless, modelless card view: what the source binders read.
+fn cardWith(name: []const u8, kind: u8, positional: []const Value, kv: []const netlist.Kv) netlist.Netlist.View {
+    return .{ .name = name, .kind = kind, .pins = &.{}, .positional = positional, .kv = kv, .model = null, .subckt_instance = 0 };
+}
+
+const Compiled = struct { nb: builder.NetBuilder, circuit: device.Circuit };
+
+/// `source` (an ngspice deck, title line first) parsed and built on `a`,
+/// then frozen with the protos and circuit on `gpa` (`Builder.gpa`). The
+/// caller deinits `circuit`; `nb` stays readable while `a` lives.
+fn compileDeck(a: std.mem.Allocator, gpa: std.mem.Allocator, source: []const u8) !Compiled {
+    const nl = try netlist.parse(a, source, .ngspice);
+    const lib = try a.create(device.Library);
+    lib.* = try device.Library.init(a);
+    const b = try a.create(Builder);
+    b.* = try Builder.init(gpa, lib);
+    errdefer b.deinit();
+    var nb = try builder.NetBuilder.init(a, b, nl);
+    try nb.build();
+    const circuit = try b.compile();
+    nb.b = undefined; // consumed by compile; a test that reads it trips in Debug
+    return .{ .nb = nb, .circuit = circuit };
+}
+
+/// The value of the first parameter `name` the circuit's first batch collects.
+fn firstParam(a: std.mem.Allocator, circuit: *const device.Circuit, name: []const u8) !f64 {
+    var params: std.ArrayList(device.abi.ParamRef) = .empty;
+    const batch = circuit.batches[0];
+    try batch.hooks.collect_params(batch.ctx, a, &params).unwrap();
+    for (params.items) |param| if (std.mem.eql(u8, param.param_name, name)) return param.get();
+    return error.MissingParameter;
 }
 
 // Source binding: the two things that break silently when the .va and the
@@ -34,7 +63,7 @@ test "V card: PWL table lands in the flattened Model slots" {
         .{ .num = 0.0 },
     };
     const positional = [_]Value{.{ .group = .{ .items = &items } }};
-    const dev = card("Vc", &positional);
+    const dev = cardWith("Vc", 'v', &positional, &.{});
 
     var model: devices.vsource.Model = .{};
     applySourceWaveform(&model, dev);
@@ -56,7 +85,7 @@ test "V/I cards: unspecified PULSE edges stay at the -1 sentinel" {
     // .tran card; until it runs they must still read as "unset".
     const items = [_]Value{ .{ .name = "PULSE" }, .{ .num = 0.0 }, .{ .num = 5.0 } };
     const positional = [_]Value{.{ .group = .{ .items = &items } }};
-    const dev = card("V1", &positional);
+    const dev = cardWith("V1", 'v', &positional, &.{});
 
     inline for (.{ devices.vsource, devices.isource }) |D| {
         var model: D.Model = .{};
@@ -183,17 +212,9 @@ test "held variables and switch latches stage per converged solve" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const nl = try netlist.parse(a, "* held state routing\n" ++ case ++ ".end\n", .ngspice);
-        const lib = try device.Library.init(a);
-        var b = try Builder.init(a, &lib);
-        var compiled = false;
-        defer if (!compiled) b.deinit();
-        var nb = try builder.NetBuilder.init(a, &b, nl);
-        try nb.build();
-        var circuit = try b.compile();
-        compiled = true;
-        defer circuit.deinit();
-        const hooks = circuit.batches[0].hooks;
+        var c = try compileDeck(a, a, "* held state routing\n" ++ case ++ ".end\n");
+        defer c.circuit.deinit();
+        const hooks = c.circuit.batches[0].hooks;
         try std.testing.expect(hooks.update_state != null and hooks.state_ctl != null);
     }
 }
@@ -202,18 +223,10 @@ test "source breakpoints match an uncached walk, forward and backward" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const nl = try netlist.parse(a, "* breakpoint cache\n" ++
-        "V1 a 0 PULSE(0 1 1n 1n 1n 5n 20n)\nV2 b 0 PWL(0 0 3n 1 7n 0)\nR1 a b 1k\n.end\n", .ngspice);
-    const lib = try device.Library.init(a);
-    var b = try Builder.init(a, &lib);
-    var compiled = false;
-    defer if (!compiled) b.deinit();
-    var nb = try builder.NetBuilder.init(a, &b, nl);
-    try nb.build();
-    var circuit = try b.compile();
-    compiled = true;
-    defer circuit.deinit();
-    const src = for (circuit.batches) |bt| {
+    var c = try compileDeck(a, a, "* breakpoint cache\n" ++
+        "V1 a 0 PULSE(0 1 1n 1n 1n 5n 20n)\nV2 b 0 PWL(0 0 3n 1 7n 0)\nR1 a b 1k\n.end\n");
+    defer c.circuit.deinit();
+    const src = for (c.circuit.batches) |bt| {
         if (bt.hooks.next_breakpoint != null) break bt;
     } else return error.TestUnexpectedResult;
     // Timer-only sources run no per-step state pass.
@@ -264,58 +277,19 @@ test "RG line retains the checked instance length alias" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const nl = try netlist.parse(a, "* static RG length override\nO1 a 0 b 0 line length=2\n.model line LTRA r=1 g=1 len=1\n.end\n", .ngspice);
-    const lib = try device.Library.init(a);
-    var b = try Builder.init(a, &lib);
-    var compiled = false;
-    defer if (!compiled) b.deinit();
-    var nb = try builder.NetBuilder.init(a, &b, nl);
-    try nb.build();
-    var circuit = try b.compile();
-    compiled = true;
-    defer circuit.deinit();
-    var params: std.ArrayList(device.abi.ParamRef) = .empty;
-    defer params.deinit(a);
-    const batch = circuit.batches[0];
-    try batch.hooks.collect_params(batch.ctx, a, &params).unwrap();
-    for (params.items) |param| {
-        if (std.mem.eql(u8, param.param_name, "len")) {
-            try std.testing.expectEqual(@as(f64, 2), param.get());
-            return;
-        }
-    }
-    return error.MissingLineLength;
+    var c = try compileDeck(a, a, "* static RG length override\nO1 a 0 b 0 line length=2\n.model line LTRA r=1 g=1 len=1\n.end\n");
+    defer c.circuit.deinit();
+    try std.testing.expectEqual(@as(f64, 2), try firstParam(a, &c.circuit, "len"));
 }
 
 test "V card: PWL td= and r= suffixes bind, and r=0 means repeat" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const nl = try netlist.parse(a, "* pwl suffixes\nV1 a 0 pwl(0 0 1n 1 2n 0) td=0.5n r=0\n.end\n", .ngspice);
-    const lib = try device.Library.init(a);
-    var b = try Builder.init(a, &lib);
-    var compiled = false;
-    defer if (!compiled) b.deinit();
-    var nb = try builder.NetBuilder.init(a, &b, nl);
-    try nb.build();
-    var circuit = try b.compile();
-    compiled = true;
-    defer circuit.deinit();
-    var params: std.ArrayList(device.abi.ParamRef) = .empty;
-    defer params.deinit(a);
-    const batch = circuit.batches[0];
-    try batch.hooks.collect_params(batch.ctx, a, &params).unwrap();
-    var seen: u8 = 0;
-    for (params.items) |param| {
-        if (std.mem.eql(u8, param.param_name, "pwl_td")) {
-            try std.testing.expectEqual(@as(f64, 0.5e-9), param.get());
-            seen += 1;
-        } else if (std.mem.eql(u8, param.param_name, "pwl_repeat")) {
-            try std.testing.expectEqual(@as(f64, 0), param.get());
-            seen += 1;
-        }
-    }
-    try std.testing.expectEqual(@as(u8, 2), seen);
+    var c = try compileDeck(a, a, "* pwl suffixes\nV1 a 0 pwl(0 0 1n 1 2n 0) td=0.5n r=0\n.end\n");
+    defer c.circuit.deinit();
+    try std.testing.expectEqual(@as(f64, 0.5e-9), try firstParam(a, &c.circuit, "pwl_td"));
+    try std.testing.expectEqual(@as(f64, 0), try firstParam(a, &c.circuit, "pwl_repeat"));
 }
 
 test "branch probes land on the branch row when the card's nets are new" {
@@ -324,17 +298,10 @@ test "branch probes land on the branch row when the card's nets are new" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const nl = try netlist.parse(a, "* probes\nB1 x 0 V=2*V(c)\nE1 y 0 d 0 3\nV1 c 0 1\nV2 d 0 1\n.end\n", .ngspice);
-    const lib = try device.Library.init(a);
-    var b = try Builder.init(a, &lib);
-    var compiled = false;
-    defer if (!compiled) b.deinit();
-    var nb = try builder.NetBuilder.init(a, &b, nl);
-    try nb.build();
-    var circuit = try b.compile();
-    compiled = true;
-    defer circuit.deinit();
-    const published = try nb.publish(a, &circuit, null);
+    var c = try compileDeck(a, a, "* probes\nB1 x 0 V=2*V(c)\nE1 y 0 d 0 3\nV1 c 0 1\nV2 d 0 1\n.end\n");
+    defer c.circuit.deinit();
+    const circuit = &c.circuit;
+    const published = try c.nb.publish(a, circuit, null);
     var found: u8 = 0;
     for (published.probe_labels, published.probes) |label, row| {
         if (label[0] != 'i') continue;
@@ -350,7 +317,7 @@ test "compile frees the BBD permutation it does not return" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const nl = try netlist.parse(a,
+    var c = try compileDeck(a, std.testing.allocator,
         \\* two subcircuit instances
         \\.subckt rc p q
         \\r1 p m 1k
@@ -359,20 +326,8 @@ test "compile frees the BBD permutation it does not return" {
         \\x1 in mid rc
         \\x2 mid 0 rc
         \\.end
-    , .ngspice);
-    const lib = try device.Library.init(a);
-    var b = try Builder.init(std.testing.allocator, &lib);
-    var compiled = false;
-    defer if (!compiled) b.deinit();
-    var nb = try builder.NetBuilder.init(a, &b, nl);
-    try nb.build();
-    var circuit = try b.compile();
-    compiled = true;
-    circuit.deinit();
-}
-
-fn cardWith(name: []const u8, kind: u8, positional: []const Value, kv: []const netlist.Kv) netlist.Netlist.View {
-    return .{ .name = name, .kind = kind, .pins = &.{}, .positional = positional, .kv = kv, .model = null, .subckt_instance = 0 };
+    );
+    c.circuit.deinit();
 }
 
 test "source cards: DC, AC, DISTOF and waveform keywords read as ngspice reads them" {
@@ -559,18 +514,9 @@ test "URC expands into its lump ladder" {
 /// Builds and freezes `body` (no title, no `.end`) and returns its
 /// published `.sp` ports, or publish's error.
 fn publishPorts(a: std.mem.Allocator, comptime body: []const u8) ![]const @import("core").query.Port {
-    const nl = try netlist.parse(a, "* ports\n" ++ body ++ ".end\n", .ngspice);
-    const lib = try a.create(device.Library);
-    lib.* = try device.Library.init(a);
-    var b = try Builder.init(a, lib);
-    var compiled = false;
-    defer if (!compiled) b.deinit();
-    var nb = try builder.NetBuilder.init(a, &b, nl);
-    try nb.build();
-    var circuit = try b.compile();
-    compiled = true;
-    defer circuit.deinit();
-    return (try nb.publish(a, &circuit, null)).bindings.ports;
+    var c = try compileDeck(a, a, "* ports\n" ++ body ++ ".end\n");
+    defer c.circuit.deinit();
+    return (try c.nb.publish(a, &c.circuit, null)).bindings.ports;
 }
 
 test "publish orders .sp ports by portnum and refuses a gapped or doubled set" {
@@ -630,18 +576,10 @@ test "AC sources land in one stacked excitation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const nl = try netlist.parse(a, "* ac\nV1 b 0 0 AC 1 90\nI1 0 a AC 2\nR1 a 0 1\nR2 b 0 1\n.end\n", .ngspice);
-    const lib = try device.Library.init(a);
-    var b = try Builder.init(a, &lib);
-    var compiled = false;
-    defer if (!compiled) b.deinit();
-    var nb = try builder.NetBuilder.init(a, &b, nl);
-    try nb.build();
-    var circuit = try b.compile();
-    compiled = true;
-    defer circuit.deinit();
-    const out = try nb.publish(a, &circuit, null);
-    const n = circuit.n;
+    var c = try compileDeck(a, a, "* ac\nV1 b 0 0 AC 1 90\nI1 0 a AC 2\nR1 a 0 1\nR2 b 0 1\n.end\n");
+    defer c.circuit.deinit();
+    const out = try c.nb.publish(a, &c.circuit, null);
+    const n = c.circuit.n;
     try std.testing.expectEqual(2 * @as(usize, n), out.ac_drive.len);
     const row_a = for (out.probe_labels, out.probes) |label, row| {
         if (std.mem.eql(u8, label, "v(a)")) break row;
@@ -782,21 +720,13 @@ test "equal device cards bind once and share a Model row" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const nl = try netlist.parse(a, "* memo\nV1 d 0 1\nR1 d a 1k\nR2 a b 1k\nR3 b 0 2k\n.model nch nmos level=54\n" ++
-        "M1 d a 0 0 nch w=1u l=0.1u\nM2 d b 0 0 nch w=1u l=0.1u\nM3 a b 0 0 nch w=2u l=0.1u\n.end\n", .ngspice);
-    const lib = try device.Library.init(a);
-    var b = try Builder.init(std.testing.allocator, &lib);
-    var compiled = false;
-    defer if (!compiled) b.deinit();
-    var nb = try builder.NetBuilder.init(a, &b, nl);
-    try nb.build();
+    var c = try compileDeck(a, std.testing.allocator, "* memo\nV1 d 0 1\nR1 d a 1k\nR2 a b 1k\nR3 b 0 2k\n.model nch nmos level=54\n" ++
+        "M1 d a 0 0 nch w=1u l=0.1u\nM2 d b 0 0 nch w=1u l=0.1u\nM3 a b 0 0 nch w=2u l=0.1u\n.end\n");
+    defer c.circuit.deinit();
     // Two MOSFET inputs; R and V cards bind on their own paths.
-    try std.testing.expectEqual(@as(u32, 2), nb.memo.count());
-    var c = try b.compile();
-    compiled = true;
-    defer c.deinit();
+    try std.testing.expectEqual(@as(u32, 2), c.nb.memo.count());
     var seen = false;
-    for (c.batches) |batch| {
+    for (c.circuit.batches) |batch| {
         if (!std.mem.eql(u8, batch.type_name, "bsim4va")) continue;
         seen = true;
         const l = try batch.hooks.param_layout.?(batch.ctx).unwrap();

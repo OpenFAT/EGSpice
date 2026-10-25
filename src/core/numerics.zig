@@ -168,7 +168,7 @@ pub fn norm2(buf: []const f64) f64 {
         const t = x / amax;
         acc += t * t;
     }
-    std.debug.assert(acc >= 1);
+    assert(acc >= 1);
     return amax * @sqrt(acc);
 }
 
@@ -311,10 +311,10 @@ pub const FreqSweep = struct {
             assert(k < self.list.len);
             return self.list[k];
         }
-        assert(k < self.count());
+        const n = self.count();
+        assert(k < n);
         const kf: f64 = @floatFromInt(k);
         if (self.kind == .lin) {
-            const n = self.count();
             if (n <= 1) return self.f_start;
             const frac = kf / @as(f64, @floatFromInt(n - 1));
             return self.f_start + frac * (self.f_stop - self.f_start);

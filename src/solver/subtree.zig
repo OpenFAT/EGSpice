@@ -92,6 +92,7 @@ pub const Plan = struct {
     /// Phases at most: each costs a spawn and a join.
     const max_phases = 8;
 
+    /// Phases of lanes before the tail, 1 to `max_phases`.
     pub fn phases(self: *const Plan) u32 {
         return @intCast((self.lane_ptr.len - 1) / self.width);
     }
@@ -262,6 +263,7 @@ pub const Plan = struct {
         }
     }
 
+    /// Frees the schedule and lane accumulators; `lu` stays the caller's.
     pub fn deinit(self: *Plan, gpa: Allocator) void {
         gpa.free(self.lane_ptr);
         gpa.free(self.steps);
@@ -364,7 +366,6 @@ pub const Plan = struct {
     fn lane(r: SparseLu.Replay, w: []f64, steps: []const u32, failed: *std.atomic.Value(bool), nonfinite: *u64, mult: *f64) void {
         var bits: u64 = nonfinite.*;
         var m: f64 = mult.*;
-        defer mult.* = m;
         for (steps) |k| {
             if (!r.column(w, k, &bits, &m)) {
                 failed.store(true, .monotonic);
@@ -372,6 +373,7 @@ pub const Plan = struct {
             }
         }
         nonfinite.* = bits;
+        mult.* = m;
     }
 };
 

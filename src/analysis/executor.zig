@@ -51,6 +51,8 @@ pub const Config = struct {
     /// build with kernels): a query the GPU declines runs on the CPU
     /// without a warning, since the user asked for nothing.
     gpu_quiet: bool = false,
+    /// Solver threads; above 1 it also fixes the multicore refactor's
+    /// lanes, which otherwise follow `device_threads` (`materialize`).
     solver_threads: u8 = 1,
     /// Device-stamp lanes; above 1 each query builds a ParEval.
     device_threads: u32 = 1,
@@ -145,6 +147,7 @@ pub const ThreadPool = struct {
         }
     }
 
+    /// Returns `n` threads a `take` handed out.
     pub fn give(pool: *ThreadPool, n: u32) void {
         if (n != 0) _ = pool.free.fetchAdd(n, .monotonic);
     }
@@ -170,13 +173,10 @@ fn wantLanes(ckt: *const types.Circuit) u32 {
 pub const lane_width = std.simd.suggestVectorLength(f64) orelse 4;
 
 /// Whether `Session` groups ready queries into lane batches:
-/// `ESPICE_LANES` when set, else `Config.lanes`, else the backend's
-/// default. Off on the CPU, where lanes measured no faster (#211); a
-/// backend where they pay turns its default on here.
+/// `ESPICE_LANES` when set, else `Config.lanes`. Off by default on every
+/// backend: on the CPU lanes measured no faster (#211).
 pub fn lanesOn(config: Config) bool {
-    return config.knobs.lanes orelse (config.lanes or switch (config.backend) {
-        .cpu, .auto, .cuda, .hip => false,
-    });
+    return config.knobs.lanes orelse config.lanes;
 }
 
 /// Most points `Session` runs together as one lane batch under `config`:
@@ -433,12 +433,7 @@ pub const Executor = struct {
         const self: *Executor = @ptrCast(@alignCast(ctx));
         if (self.peers.len != 0) return self.executeBatch();
         try self.materialize();
-        const res = self.runQuery() catch |err| {
-            try self.refuseLatched();
-            return err;
-        };
-        try self.refuseLatched();
-        return res;
+        return self.finishAlone();
     }
 
     /// Runs this query and its `peers` as one lane batch: each builds its
@@ -457,9 +452,7 @@ pub const Executor = struct {
         members[0] = self;
         @memcpy(members[1..g], self.peers);
         var outcomes: [lane_width]QueryError!types.Result = @splat(error.QueryCancelled);
-        defer for (members[1..g], outcomes[1..g]) |p, o| {
-            if (o) |r| p.published = r else |err| p.peer_failure = err;
-        };
+        defer publishPeers(members[0..g], outcomes[0..g]);
         // Lanes whose circuit built, as indices into `members`.
         var live: [lane_width]usize = undefined;
         var n_live: usize = 0;
@@ -486,65 +479,42 @@ pub const Executor = struct {
             // publishes as it would alone.
             inline .dc, .pss => |opts, tag| {
                 const M = module(tag);
-                const transient = @as(requests.Kind, self.job).transient();
                 var ctxs: [lane_width]types.RunCtx = undefined;
-                for (live[0..n_live], 0..) |k, l| {
-                    members[k].circuit.setSimState(.{ .kind = if (transient) .ic else .dc });
-                    ctxs[l] = members[k].runCtx();
-                }
+                laneCtxs(members[0..g], live[0..n_live], &ctxs);
                 var swept: [lane_width]M.LaneOutcome = undefined;
                 if (n_live != 0) M.runLanes(lane_width, ctxs[0..n_live], opts, swept[0..n_live]);
-                for (live[0..n_live], swept[0..n_live]) |k, o| {
-                    outcomes[k] = if (o) |r| members[k].label(r) else |err| err;
-                    members[k].refuseLatched() catch |err| {
-                        outcomes[k] = err;
-                    };
-                }
+                for (live[0..n_live], swept[0..n_live]) |k, o|
+                    outcomes[k] = members[k].settleLabeled(o);
                 return outcomes[0];
             },
             // `.mc`/`.temp` lane rows (#213), each its own lane (`Session.gather`).
             inline .mc, .temp => |_, tag| {
                 const M = module(tag);
                 var ctxs: [lane_width]types.RunCtx = undefined;
-                for (live[0..n_live], 0..) |k, l| {
-                    members[k].circuit.setSimState(.{ .kind = .dc });
-                    ctxs[l] = members[k].runCtx();
-                }
+                laneCtxs(members[0..g], live[0..n_live], &ctxs);
                 var opts: [lane_width]M.Options = undefined;
                 for (live[0..n_live], opts[0..n_live]) |k, *o| o.* = @field(members[k].job, @tagName(tag));
                 var swept: [lane_width]sweep_lanes.LaneOutcome = undefined;
                 if (n_live != 0) sweep_lanes.runBatch(lane_width, M, ctxs[0..n_live], opts[0..n_live], swept[0..n_live]);
-                for (live[0..n_live], swept[0..n_live]) |k, o| {
-                    outcomes[k] = if (o) |r| members[k].label(r) else |err| err;
-                    members[k].refuseLatched() catch |err| {
-                        outcomes[k] = err;
-                    };
-                }
+                for (live[0..n_live], swept[0..n_live]) |k, o|
+                    outcomes[k] = members[k].settleLabeled(o);
                 return outcomes[0];
             },
             else => {},
         }
         if (self.job == .tran) {
+            // `runQuery`'s transient start: the `uic` x when no operating
+            // point ran.
+            for (live[0..n_live]) |k| if (members[k].job.uic()) members[k].seedUic() catch |err| {
+                for (live[0..n_live]) |j| outcomes[j] = err;
+                return outcomes[0];
+            };
             var ctxs: [lane_width]types.RunCtx = undefined;
-            for (live[0..n_live], 0..) |k, l| {
-                const e = members[k];
-                // `runQuery`'s transient start: the `.ic` kind, and the
-                // `uic` x when no operating point ran.
-                e.circuit.setSimState(.{ .kind = .ic });
-                if (e.job.uic()) e.seedUic() catch |err| {
-                    for (live[0..n_live]) |j| outcomes[j] = err;
-                    return outcomes[0];
-                };
-                ctxs[l] = e.runCtx();
-            }
+            laneCtxs(members[0..g], live[0..n_live], &ctxs);
             var ran: [lane_width]tran.LaneOutcome = undefined;
             if (n_live != 0) tran.runLanes(lane_width, ctxs[0..n_live], self.job.tran, ran[0..n_live]);
-            for (live[0..n_live], ran[0..n_live]) |k, o| {
-                outcomes[k] = if (o) |r| members[k].label(r) else |err| err;
-                members[k].refuseLatched() catch |err| {
-                    outcomes[k] = err;
-                };
-            }
+            for (live[0..n_live], ran[0..n_live]) |k, o|
+                outcomes[k] = members[k].settleLabeled(o);
             return outcomes[0];
         }
         var ckts: [lane_width]*types.Circuit = undefined;
@@ -552,7 +522,7 @@ pub const Executor = struct {
         var options: op.Options = undefined;
         for (live[0..n_live], 0..) |k, l| {
             const e = members[k];
-            e.circuit.setSimState(.{ .kind = if (e.job.op.tran_op) .ic else .dc });
+            e.circuit.setSimState(.{ .kind = simKind(e.job) });
             options = e.opStart() catch |err| {
                 for (live[0..n_live]) |j| outcomes[j] = err;
                 return outcomes[0];
@@ -567,15 +537,12 @@ pub const Executor = struct {
         };
         for (live[0..n_live], solved[0..n_live]) |k, o| {
             const e = members[k];
-            outcomes[k] = blk: {
+            outcomes[k] = e.settle(blk: {
                 const r = o catch |err| break :blk err;
                 if (!r.converged) break :blk error.OpDidNotConverge;
-                e.circuit.setSimState(.{ .kind = if (e.job.op.tran_op) .ic else .dc });
+                e.circuit.setSimState(.{ .kind = simKind(e.job) });
                 break :blk e.finish();
-            };
-            e.refuseLatched() catch |err| {
-                outcomes[k] = err;
-            };
+            });
         }
         return outcomes[0];
     }
@@ -598,22 +565,15 @@ pub const Executor = struct {
     /// `executeBatch` for a transient, periodic or live LSTB GPU batch: `peers` may
     /// be thousands wide, so the per-member arrays come from the work arena.
     fn executeGpuBatch(self: *Executor) QueryError!types.Result {
-        const a = self.work.allocator();
-        const g = 1 + self.peers.len;
-        const members = try a.alloc(*Executor, g);
-        members[0] = self;
-        @memcpy(members[1..], self.peers);
-        const outcomes = try a.alloc(QueryError!types.Result, g);
-        @memset(outcomes, error.QueryCancelled);
-        defer for (members[1..], outcomes[1..]) |p, o| {
-            if (o) |r| p.published = r else |err| p.peer_failure = err;
-        };
+        const members, const outcomes = try self.gpuMembers();
+        defer publishPeers(members, outcomes);
+        const g = members.len;
         // Waves bound the host: each member's circuit, run and solver state
         // exist only for its wave, and one nothing reads afterwards is freed
         // with it. One wave unless the lanes would pass `gpu_wave_bytes`.
         const per_lane = gpuLaneBytes(self.topology);
         const wave = @max(gpu_wave_min, @min(g, gpu_wave_bytes / per_lane));
-        const live = try a.alloc(usize, @min(g, wave));
+        const live = try self.work.allocator().alloc(usize, @min(g, wave));
         var first: usize = 0;
         while (first < g) : (first += wave) {
             const end = @min(g, first + wave);
@@ -650,10 +610,7 @@ pub const Executor = struct {
         if (self.config.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: materialize {d} lanes {d:.1} ms\n", .{ members.len, @as(f64, @floatFromInt(@import("gpu/lanes.zig").Prof.now() - t0)) / 1e6 });
         if (self.job == .op) return self.runGpuOps(members, live[0..n_live], outcomes);
         const ctxs = try a.alloc(types.RunCtx, n_live);
-        for (live[0..n_live], ctxs) |k, *c| {
-            members[k].circuit.setSimState(.{ .kind = simKind(members[k].job) });
-            c.* = members[k].runCtx();
-        }
+        laneCtxs(members, live[0..n_live], ctxs);
         switch (self.job) {
             inline .tran, .pss, .hb, .lstb, .dc => |opts, tag| {
                 const M = module(tag);
@@ -667,12 +624,8 @@ pub const Executor = struct {
                     else
                         M.runGpuLanes(ctxs, opts, ran);
                 }
-                for (live[0..n_live], ran) |k, o| {
-                    outcomes[k] = if (o) |r| members[k].label(r) else |err| err;
-                    members[k].refuseLatched() catch |err| {
-                        outcomes[k] = err;
-                    };
-                }
+                for (live[0..n_live], ran) |k, o|
+                    outcomes[k] = members[k].settleLabeled(o);
             },
             else => unreachable,
         }
@@ -688,7 +641,7 @@ pub const Executor = struct {
         var options: op.Options = undefined;
         for (live, ckts, xs) |k, *c, *x| {
             const e = members[k];
-            e.circuit.setSimState(.{ .kind = if (e.job.op.tran_op) .ic else .dc });
+            e.circuit.setSimState(.{ .kind = simKind(e.job) });
             options = e.opStart() catch |err| {
                 for (live) |j| outcomes[j] = err;
                 return;
@@ -703,14 +656,11 @@ pub const Executor = struct {
         };
         for (live, solved) |k, o| {
             const e = members[k];
-            outcomes[k] = blk: {
+            outcomes[k] = e.settle(blk: {
                 const r = o catch |err| break :blk err;
                 if (!r.converged) break :blk error.OpDidNotConverge;
                 break :blk e.finish();
-            };
-            e.refuseLatched() catch |err| {
-                outcomes[k] = err;
-            };
+            });
         }
     }
 
@@ -723,15 +673,9 @@ pub const Executor = struct {
         const provider = @import("gpu/freq.zig");
         const FS = @import("solver").freq_solve.FreqSolver;
         const a = self.work.allocator();
-        const g = 1 + self.peers.len;
-        const members = try a.alloc(*Executor, g);
-        members[0] = self;
-        @memcpy(members[1..], self.peers);
-        const outcomes = try a.alloc(QueryError!types.Result, g);
-        @memset(outcomes, error.QueryCancelled);
-        defer for (members[1..], outcomes[1..]) |p, o| {
-            if (o) |r| p.published = r else |err| p.peer_failure = err;
-        };
+        const members, const outcomes = try self.gpuMembers();
+        defer publishPeers(members, outcomes);
+        const g = members.len;
         const ctxs = try a.alloc(?types.RunCtx, g);
         @memset(ctxs, null);
         const plans = try a.alloc(?frequency.Plan, g);
@@ -800,10 +744,7 @@ pub const Executor = struct {
                     outcomes[k] = e.finishAlone();
                     continue;
                 }
-                outcomes[k] = if (run(c, e.job)) |r| e.label(r) else |err| err;
-                e.refuseLatched() catch |err| {
-                    outcomes[k] = err;
-                };
+                outcomes[k] = e.settleLabeled(run(c, e.job));
             }
         }
         return outcomes[0];
@@ -820,18 +761,11 @@ pub const Executor = struct {
     // chunk the precompute if a long sweep on a large n needs it.
     fn runFreqLanes(members: []const *Executor, live: []const usize, outcomes: []QueryError!types.Result) void {
         var ctxs: [lane_width]types.RunCtx = undefined;
+        laneCtxs(members, live, &ctxs);
+        for (live, ctxs[0..live.len]) |k, *c| c.freq_pre = members[k].precompute(c) catch &.{};
         for (live, 0..) |k, l| {
             const e = members[k];
-            e.circuit.setSimState(.{ .kind = simKind(e.job) });
-            ctxs[l] = e.runCtx();
-            ctxs[l].freq_pre = e.precompute(&ctxs[l]) catch &.{};
-        }
-        for (live, 0..) |k, l| {
-            const e = members[k];
-            outcomes[k] = if (run(&ctxs[l], e.job)) |r| e.label(r) else |err| err;
-            e.refuseLatched() catch |err| {
-                outcomes[k] = err;
-            };
+            outcomes[k] = e.settleLabeled(run(&ctxs[l], e.job));
         }
     }
 
@@ -863,14 +797,34 @@ pub const Executor = struct {
         };
     }
 
+    /// This query and its `peers` in the work arena, this one first, each
+    /// outcome a cancel until its lane settles it; `publishPeers` hands the
+    /// peers theirs. A GPU batch may be thousands wide.
+    fn gpuMembers(self: *Executor) !struct { []*Executor, []QueryError!types.Result } {
+        const a = self.work.allocator();
+        const members = try a.alloc(*Executor, 1 + self.peers.len);
+        members[0] = self;
+        @memcpy(members[1..], self.peers);
+        const outcomes = try a.alloc(QueryError!types.Result, members.len);
+        @memset(outcomes, error.QueryCancelled);
+        return .{ members, outcomes };
+    }
+
+    /// `settle` of a lane's analysis outcome, its result labelled as alone.
+    fn settleLabeled(self: *Executor, outcome: anytype) QueryError!types.Result {
+        return self.settle(if (outcome) |r| self.label(r) else |err| err);
+    }
+
     /// `execute` past `materialize`, for a batch lane that runs alone.
     fn finishAlone(self: *Executor) QueryError!types.Result {
-        const res = self.runQuery() catch |err| {
-            try self.refuseLatched();
-            return err;
-        };
+        return self.settle(self.runQuery());
+    }
+
+    /// `outcome`, unless a device latched a refusal (`refuseLatched`),
+    /// which wins whether the run failed or not.
+    fn settle(self: *const Executor, outcome: QueryError!types.Result) QueryError!types.Result {
         try self.refuseLatched();
-        return res;
+        return outcome;
     }
 
     /// `error.DeviceRefused` after logging `<instance>: <file>:<line>:
@@ -948,7 +902,6 @@ pub const Executor = struct {
         defer self.circuit.display = null;
         if (self.config.timing_in_depth) (try self.circuit.workspace()).prof.io = self.io;
         defer if (self.config.timing_in_depth) printNewtonSplit(&self.circuit.ws.?, self.job);
-        const transient = if (self.job == .op) self.job.op.tran_op else @as(requests.Kind, self.job).transient();
         // It is what gives a host-integrated idt its 1/(jw) instead of its
         // DC form (`simKind`).
         self.circuit.setSimState(.{ .kind = simKind(self.job) });
@@ -959,7 +912,7 @@ pub const Executor = struct {
             if (gpu_context) |g| try g.syncHostState();
             // The OP ladder publishes its own sim state (`initial_step`);
             // restore the plain one that dependents inherit.
-            self.circuit.setSimState(.{ .kind = if (transient) .ic else .dc });
+            self.circuit.setSimState(.{ .kind = simKind(self.job) });
         } else if (self.job.uic()) try self.seedUic();
         return self.finish();
     }
@@ -1150,6 +1103,22 @@ fn expectedEvals(job: requests.Query) f64 {
         .ac, .noise, .sp, .stb, .tf, .pz, .disto, .four, .dcmatch, .sens, .lstb, .acxf, .dcxf, .dcinc, .acmatch, .dcsens => 1,
         else => 200,
     };
+}
+
+/// Each live member's `RunCtx`, into `ctxs[0..live.len]`, its sim state set
+/// as `runQuery` sets it (`simKind`).
+fn laneCtxs(members: []const *Executor, live: []const usize, ctxs: []types.RunCtx) void {
+    for (live, ctxs[0..live.len]) |k, *c| {
+        members[k].circuit.setSimState(.{ .kind = simKind(members[k].job) });
+        c.* = members[k].runCtx();
+    }
+}
+
+/// Hands each peer, `members[1..]`, its lane's outcome.
+fn publishPeers(members: []const *Executor, outcomes: []const QueryError!types.Result) void {
+    for (members[1..], outcomes[1..]) |p, o| {
+        if (o) |r| p.published = r else |err| p.peer_failure = err;
+    }
 }
 
 fn module(comptime kind: requests.Kind) type {

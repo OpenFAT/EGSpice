@@ -11,6 +11,10 @@ const std = @import("std");
 /// field is an error, naming an unknown field is not.
 pub const Param = struct { key: []const u8, value: ?f64 };
 
+/// Why a pair failed to bind: no number (`Param.value` null), NaN or
+/// infinity, or a value the field's type cannot hold (`castField`).
+pub const Error = error{ UnresolvedParameter, NonFiniteParameter, ParameterOutOfRange };
+
 /// Binding outcome, as a plain enum so it can cross the object boundary.
 pub const BindStatus = enum(u8) {
     ok,
@@ -18,8 +22,19 @@ pub const BindStatus = enum(u8) {
     non_finite_parameter,
     parameter_out_of_range,
 
+    /// Encodes this compilation's error for the trip across the object
+    /// boundary.
+    pub fn fromLocal(result: Error!void) BindStatus {
+        result catch |err| return switch (err) {
+            error.UnresolvedParameter => .unresolved_parameter,
+            error.NonFiniteParameter => .non_finite_parameter,
+            error.ParameterOutOfRange => .parameter_out_of_range,
+        };
+        return .ok;
+    }
+
     /// Converts back to the caller's own error values.
-    pub fn unwrap(self: BindStatus) error{ UnresolvedParameter, NonFiniteParameter, ParameterOutOfRange }!void {
+    pub fn unwrap(self: BindStatus) Error!void {
         return switch (self) {
             .ok => {},
             .unresolved_parameter => error.UnresolvedParameter,
@@ -35,15 +50,10 @@ pub const BindStatus = enum(u8) {
 /// winning. Keys matching no field are ignored. On error, fields bound before
 /// the failing one keep their new values.
 pub fn apply(target: anytype, params: []const Param) BindStatus {
-    applyKv(target, params) catch |err| return switch (err) {
-        error.UnresolvedParameter => .unresolved_parameter,
-        error.NonFiniteParameter => .non_finite_parameter,
-        error.ParameterOutOfRange => .parameter_out_of_range,
-    };
-    return .ok;
+    return .fromLocal(applyKv(target, params));
 }
 
-fn applyKv(target: anytype, params: []const Param) !void {
+fn applyKv(target: anytype, params: []const Param) Error!void {
     const T = @TypeOf(target.*);
     // BSIMSOI's Model has ~1600 fields, each lowered and alias-resolved at
     // comptime.
@@ -97,7 +107,7 @@ fn firstPairs(comptime keys: []const []const u8, params: []const Param) [keys.le
 
 /// The value of `params[index]`, or null when `index` is `absent`. Errors
 /// rather than letting a recognized field fall back to its default.
-fn number(params: []const Param, index: u32) !?f64 {
+fn number(params: []const Param, index: u32) Error!?f64 {
     if (index == absent) return null;
     const value = params[index].value orelse return error.UnresolvedParameter;
     if (!std.math.isFinite(value)) return error.NonFiniteParameter;
@@ -213,7 +223,7 @@ fn isScalar(comptime T: type) bool {
 /// land in range, floats must stay finite after narrowing, and bools are
 /// `value != 0`. Fails with `NonFiniteParameter` on NaN or infinity and
 /// `ParameterOutOfRange` when the value does not fit `T`.
-pub fn castField(comptime T: type, value: f64) !T {
+pub fn castField(comptime T: type, value: f64) error{ NonFiniteParameter, ParameterOutOfRange }!T {
     if (!std.math.isFinite(value)) return error.NonFiniteParameter;
     return switch (@typeInfo(T)) {
         .float => blk: {
@@ -388,6 +398,7 @@ test markKnown {
 test BindStatus {
     inline for (@typeInfo(BindStatus).@"enum".field_names) |name| {
         const status = @field(BindStatus, name);
+        try std.testing.expectEqual(status, BindStatus.fromLocal(status.unwrap()));
         if (status.unwrap()) |_| {
             try std.testing.expectEqual(BindStatus.ok, status);
         } else |err| {
@@ -405,15 +416,10 @@ test BindStatus {
 /// oracle the differential test checks `apply` and `markKnown` against.
 const linear = struct {
     fn apply(target: anytype, params: []const Param) BindStatus {
-        bindAll(target, params) catch |err| return switch (err) {
-            error.UnresolvedParameter => .unresolved_parameter,
-            error.NonFiniteParameter => .non_finite_parameter,
-            error.ParameterOutOfRange => .parameter_out_of_range,
-        };
-        return .ok;
+        return .fromLocal(bindAll(target, params));
     }
 
-    fn bindAll(target: anytype, params: []const Param) !void {
+    fn bindAll(target: anytype, params: []const Param) Error!void {
         const info = @typeInfo(@TypeOf(target.*)).@"struct";
         inline for (info.field_names, info.field_types) |field_name, field_type| {
             if (comptime isScalar(field_type)) {
@@ -448,7 +454,7 @@ const linear = struct {
         };
     }
 
-    fn firstNumber(params: []const Param, key: []const u8) !?f64 {
+    fn firstNumber(params: []const Param, key: []const u8) Error!?f64 {
         for (params) |p| if (std.mem.eql(u8, p.key, key)) {
             const value = p.value orelse return error.UnresolvedParameter;
             if (!std.math.isFinite(value)) return error.NonFiniteParameter;

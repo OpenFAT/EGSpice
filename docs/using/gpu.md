@@ -85,7 +85,7 @@ for HIP lanes.
 The execution configuration's `gpu_lane_cap` defaults to 16,384 device
 lanes. It has no environment-variable override.
 
-`zig build test-gpu` runs the fixture corpus under `--backend cuda`, one
+`zig build test -- --backend cuda --jobs 1` runs the fixture corpus under `--backend cuda`, one
 deck at a time; GPU results are compared within each fixture's tolerance.
 
 ## What fails, and when

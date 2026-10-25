@@ -79,7 +79,7 @@
             cp -r "$TMPDIR/zgc/p" "$out"
           '';
           outputHashMode = "recursive";
-          outputHash = "sha256-FxNNSbdKPSyj9kJwD6HzPcCN6MHFR/MRNRMb4U7xY20=";
+          outputHash = "sha256-AXyfU9Mm5OMrR8ZLq3NAYv2uvQTmhzMXUlbJiW3TxgY=";
         };
 
         gpuPkgs = lib.optionals pkgs.stdenv.isLinux (
@@ -149,7 +149,7 @@
           }:
           pkgs.stdenv.mkDerivation {
             pname = name;
-            version = "1.2.0";
+            version = "0.3.0";
             inherit src;
             nativeBuildInputs = [
               zig

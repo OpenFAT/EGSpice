@@ -7,6 +7,10 @@
 //   ***********************************************************************
 
 // Empty macros defining namespaces
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 `define INSTANCE
 `define NOISE
 `define ATTR(txt)

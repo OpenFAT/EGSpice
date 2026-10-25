@@ -137,6 +137,8 @@ pub const Refs = struct {
     vars: Variations,
     owned: bool,
 
+    /// Without a variation block `refs` borrows `Circuit.collectParams`'
+    /// cached list; with one both slices are allocated with `a`.
     pub fn init(a: std.mem.Allocator, ckt: *root.Circuit, vars: Variations) !Refs {
         if (vars.starts.len == 0) return .{ .refs = try ckt.collectParams(), .vars = vars, .owned = false };
         const refs = try ckt.isolatedParams(a, vars.params);
@@ -148,6 +150,7 @@ pub const Refs = struct {
         return .{ .refs = refs, .vars = v, .owned = true };
     }
 
+    /// Frees what `init` allocated; `a` must be the allocator `init` took.
     pub fn deinit(self: Refs, a: std.mem.Allocator) void {
         if (!self.owned) return;
         a.free(self.refs);

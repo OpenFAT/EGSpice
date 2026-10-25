@@ -1,5 +1,8 @@
 // r3_cmc version 1.1.2
 
+`include "constants.vams"
+`include "disciplines.vams"
+
 /*
 Copyright (c) 2023 Silicon Integration Initiative, Inc.
 

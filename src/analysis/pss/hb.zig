@@ -9,9 +9,7 @@
 //! enters the residual, and they are linear in it, so that column is the
 //! charge terms themselves.
 //!
-//! Cites: dev/analysis/pss-shooting-harmonic-balance.md (the method),
-//! dev/analysis/multitone-hb.md (the dense/GMRES crossover in `useGmres`),
-//! Verilog-A LRM §4.6.1 (sources follow their waveform only in the
+//! Cites: Verilog-A LRM §4.6.1 (sources follow their waveform only in the
 //! transient phase), #14 (the projection lane kernel).
 const std = @import("std");
 const root = @import("../types.zig");
@@ -24,6 +22,7 @@ const mhb = @import("mhb.zig");
 
 /// The `.hb` query; `extra_tones` or `phasors` route it to `mhb.zig`.
 pub const Options = @import("core").query.Hb;
+/// One lane's `run` outcome.
 pub const LaneOutcome = root.ErrorOf(run)!root.Result;
 
 /// Wide scheduler entry for driven sparse periodic systems. Dense and
@@ -57,13 +56,10 @@ pub const Spectrum = struct { status: SolveResult, f0: f64 };
 /// onto harmonics 0..K exactly, a Galerkin rather than collocation fit.
 const oversample: usize = 2;
 
-/// The shortest step the line search takes before it stops shortening.
-const min_step: f64 = 1.0 / 1024.0;
-
 /// True when a driven solve of n unknowns and nf = 2K+1 coefficients each
 /// takes `mhb.zig`'s preconditioned GMRES instead of the dense Jacobian.
 /// The dense LU is O((n·nf)^3) a step and GMRES O(iterations·n·nf^2), so
-/// n decides. Callgrind (dev/analysis/multitone-hb.md): a 4-node diode
+/// n decides. Callgrind: a 4-node diode
 /// clipper at K = 32 is 1.23x cheaper dense, a 6-node rectifier at K = 32
 /// 1.31x; the diode-RC ladders are cheaper on GMRES by 2.2x at 14 nodes and
 /// K = 8, 3.6x at 9 nodes and K = 32, and 16x at 44 nodes and K = 8.
@@ -180,14 +176,8 @@ pub fn solveSpectrum(
     // sample evals in one launch and factor the spectral Jacobian with
     // cuSOLVER; the IDFT/DFT are parallel per (node, harmonic).
 
-    // Backtracking line search on the loop's own residual evaluation: a step
-    // that made the residual worse (or non-finite, hence the negated
-    // comparison) is undone from `x_prev` and retaken at half length, and a
-    // step that helped earns the length back. A full Newton step can hand a
-    // diode the whole source swing at once.
-    var step: f64 = 1.0;
-    var prev_residual: f64 = std.math.inf(f64);
-    var retrying = false;
+    // A rewound step restarts from `x_prev`.
+    var ls: mhb.LineSearch = .{};
 
     var iter: u16 = 0;
     while (iter < options.max_iter) : (iter += 1) {
@@ -244,25 +234,20 @@ pub fn solveSpectrum(
         num.axpy(f_hat, 1.0, q_term);
 
         const max_residual = num.normInf(f_hat);
-        if (ckt.knobs.hb_trace) std.debug.print("HB iter={d} res={e} step={e} normx={e}\n", .{ iter, max_residual, step, num.normInf(x_hat) });
+        if (ckt.knobs.hb_trace) std.debug.print("HB iter={d} res={e} step={e} normx={e}\n", .{ iter, max_residual, ls.step, num.normInf(x_hat) });
         if (max_residual < options.hb_tol) {
             solved = .{ .status = .{ .converged = true, .iterations = iter + 1, .residual_norm = max_residual }, .f0 = if (osc == root.GROUND) options.f0 else omega0 / (2.0 * std.math.pi) };
             if (ppv.len == 0) return solved.?;
         }
 
-        if (solved == null and iter != 0 and !(max_residual <= prev_residual) and step > min_step) {
-            // Rewind and retake the last step at half length along the same
-            // `dx_hat`; no Jacobian rebuild.
-            step *= 0.5;
+        if (ls.backtrack(solved != null or iter == 0, max_residual)) {
+            // Retake the last step at half length along the same `dx_hat`;
+            // no Jacobian rebuild.
             num.copySimd(x_hat, x_prev);
-            num.axpy(x_hat, step, dx_hat);
-            if (osc != root.GROUND) setOmega(&omega0, &period, omega_prev * (1 + step * d_ln_omega));
-            retrying = true;
+            num.axpy(x_hat, ls.step, dx_hat);
+            if (osc != root.GROUND) setOmega(&omega0, &period, omega_prev * (1 + ls.step * d_ln_omega));
             continue;
         }
-        prev_residual = max_residual;
-        if (!retrying) step = @min(step * 2.0, 1.0);
-        retrying = false;
 
         // The harmonic-convolution Jacobian: dF/dX is the spectrum of G(t)
         // convolved with the basis, and product-to-sum gives
@@ -399,9 +384,9 @@ pub fn solveSpectrum(
             d_ln_omega = dx_hat[omega_col];
             dx_hat[omega_col] = 0;
             omega_prev = omega0;
-            setOmega(&omega0, &period, omega0 * (1 + step * d_ln_omega));
+            setOmega(&omega0, &period, omega0 * (1 + ls.step * d_ln_omega));
         }
-        num.axpy(x_hat, step, dx_hat);
+        num.axpy(x_hat, ls.step, dx_hat);
     }
 
     return .{
@@ -508,7 +493,7 @@ fn setOmega(omega0: *f64, period: *f64, omega: f64) void {
 /// the phase condition `solveSpectrum` holds). Exact while the orbit
 /// samples more than 2K points per period; asserts x_hat.len is n * (2K+1)
 /// with K >= 1.
-pub fn seed(x_hat: []f64, orb: pac.Orbit, n: usize, osc: u32) void {
+fn seed(x_hat: []f64, orb: pac.Orbit, n: usize, osc: u32) void {
     const nf = x_hat.len / n;
     const nh = (nf - 1) / 2;
     std.debug.assert(nf * n == x_hat.len and nh > 0);

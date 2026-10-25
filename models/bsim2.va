@@ -19,6 +19,10 @@
 // inversion, an exponential in weak inversion, and a C1 cubic between the
 // VGLOW/VGHIGH knots. Subthreshold current therefore enters the same Ids
 // expression rather than as a separate factor.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module bsim2(d, g, s, b);
     inout d, g, s, b;
     electrical d, g, s, b;

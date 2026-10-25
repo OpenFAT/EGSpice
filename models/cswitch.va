@@ -9,6 +9,10 @@
 // only the control quantity differs. A W card names a voltage source
 // (`W1 p n vnam csw1`), so the control is the current in the (cp,cn) branch,
 // a 0 V ammeter the builder puts in series with that source (see cccs.va).
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module cswitch(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;
