@@ -1,6 +1,6 @@
-# .deb, .rpm and Arch packages from one release tree, built by release.yml:
-#   TREE=espice-<version>-<variant> ZIG_DIR=<pinned Zig> VERSION=... ARCH=amd64|arm64 \
-#     nfpm package -f packaging/nfpm.yaml -p deb|rpm|archlinux -t <file>
+# .deb, .rpm and Arch packages from one release tree, built by release.yml,
+# which first expands TREE (espice-<version>-<variant>), ZIG_DIR (the pinned
+# Zig), VERSION and ARCH (amd64|arm64) here: nfpm leaves contents paths as written.
 # The release tree keeps its layout under /usr/lib/espice (espice finds
 # share/espice beside its executable); the pinned Zig rides along for .hdl.
 name: espice

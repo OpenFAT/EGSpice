@@ -129,9 +129,12 @@ jobs:
           # shellcheck disable=SC2016 # the dev shell's sh expands it
           ZIG_DIR=$(nix develop .#ci -c sh -c 'dirname "$(dirname "$(readlink -f "$(command -v zig)")")"')
           export TREE="espice-${VERSION}-${VARIANT}" ZIG_DIR
+          # nfpm expands no variables in contents paths.
+          python3 -c 'import os, sys; sys.stdout.write(os.path.expandvars(open(sys.argv[1]).read()))' \
+            packaging/nfpm.yaml > nfpm.yaml
           for format in deb rpm archlinux; do
             ext=$format; [ "$format" = archlinux ] && ext=pkg.tar.zst
-            nix shell --inputs-from . nixpkgs#nfpm -c nfpm package -f packaging/nfpm.yaml \
+            nix shell --inputs-from . nixpkgs#nfpm -c nfpm package -f nfpm.yaml \
               -p "$format" -t "dist/espice-${VERSION}-linux-${ARCH}.$ext"
           done
 
