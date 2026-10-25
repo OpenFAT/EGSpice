@@ -1,7 +1,38 @@
 # Install
 
 ESPice is one binary, `espice`, plus a static library and C header for
-embedding. There are four ways to get it.
+embedding. Every route below except building from source installs a
+published release, and no release exists yet: until one does, use Nix from
+source (`nix run github:OmarSiwy/ESPice`) or build from source.
+
+## Install script
+
+On Linux or macOS, without root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh -s -- 0.3.0
+```
+
+It reads `sources.json` (each release's tarballs and checksums), downloads
+the CPU build for your machine, checks its sha256, and unpacks it into
+`~/.local/share/espice/<version>`, linking `~/.local/bin/espice` to the
+version installed last. Tarballs stay in `~/.cache/espice/releases`, so
+reinstalling or switching back to a version downloads nothing.
+`ESPICE_INSTALL_HOME`, `ESPICE_INSTALL_BIN`, `ESPICE_INSTALL_CACHE` and
+`ESPICE_INSTALL_SOURCES` override the locations. Runtime `.hdl` needs the Zig
+it prints at the end, on `PATH` or in `ZIG`.
+
+## Homebrew
+
+```sh
+brew install OmarSiwy/espice/espice
+```
+
+Each release attaches `espice.rb`, which the release workflow installs and
+`brew test`s on macOS, then pushes to the `OmarSiwy/homebrew-espice` tap once
+that repository and its token are set up. Runtime `.hdl` needs the Zig named
+in `brew info espice`, on `PATH` or in `ZIG`.
 
 ## Linux packages
 

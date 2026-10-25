@@ -64,7 +64,8 @@ class ReleaseTests(unittest.TestCase):
             info.size = len(payload)
             tar.addfile(info, io.BytesIO(payload))
         bundle = directory / (stem + '.run')
-        bundle.write_bytes(b'example bundle')
+        if row['bundle']:
+            bundle.write_bytes(b'example bundle')
         for name in release.distro_assets(release.version(), row):
             (directory / name).write_bytes(b'example ' + name.encode())
         return bundle
@@ -109,13 +110,31 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn(f"pkgver={version}\n", text)
             self.assertIn(f"sha256sums_x86_64=('{release.digest(directory / deb)}')", text)
             self.assertIn("sha256sums_aarch64=('SKIP')", text)
-            self.assertNotIn('@', text.replace('ok.elsawy@', ''))
+            self.assertNotRegex(text, r'@[A-Z0-9_]+@')
             sums = dict(reversed(line.split('  ')) for line in (directory / 'SHA256SUMS').read_text().splitlines())
             self.assertEqual(sums['PKGBUILD'], release.digest(directory / 'PKGBUILD'))
             (directory / deb).unlink()
             with self.assertRaises(ValueError):
                 release.verify(directory, version)
         self.assertFalse(any(row['distro'] for row in release.catalogue() if row['gpu'] or row['system'].endswith('-darwin')))
+
+    def test_homebrew_formula_pins_every_platform_tarball(self):
+        version = release.version()
+        rows = [row for row in release.catalogue() if row['name'] in release.HOMEBREW.values()]
+        self.assertEqual(len(rows), 4)
+        with tempfile.TemporaryDirectory() as temp, patch.object(release, 'catalogue', return_value=rows):
+            directory = Path(temp)
+            for row in rows:
+                self.make_assets(directory, row)
+            release.verify(directory, version)
+            text = (directory / 'espice.rb').read_text()
+            self.assertNotRegex(text, r'@[A-Z0-9_]+@')
+            for variant in release.HOMEBREW.values():
+                tarball = f'espice-{version}-{variant}.tar.gz'
+                self.assertIn(f'/v{version}/{tarball}"\n      sha256 "{release.digest(directory / tarball)}"', text)
+            self.assertIn('Zig 0.18.0-dev.349+d924f83bf', text)
+            sums = dict(reversed(line.split('  ')) for line in (directory / 'SHA256SUMS').read_text().splitlines())
+            self.assertEqual(sums['espice.rb'], release.digest(directory / 'espice.rb'))
 
 
 if __name__ == '__main__':

@@ -123,20 +123,7 @@ jobs:
       # The tree just archived, plus the Zig it was built with, for runtime .hdl.
       - name: Distro packages (.deb, .rpm, Arch)
         if: matrix.distro
-        env:
-          ARCH: ${{ matrix.deb_arch }}
-        run: |
-          # shellcheck disable=SC2016 # the dev shell's sh expands it
-          ZIG_DIR=$(nix develop .#ci -c sh -c 'dirname "$(dirname "$(readlink -f "$(command -v zig)")")"')
-          export TREE="espice-${VERSION}-${VARIANT}" ZIG_DIR
-          # nfpm expands no variables in contents paths.
-          python3 -c 'import os, sys; sys.stdout.write(os.path.expandvars(open(sys.argv[1]).read()))' \
-            packaging/nfpm.yaml > nfpm.yaml
-          for format in deb rpm archlinux; do
-            ext=$format; [ "$format" = archlinux ] && ext=pkg.tar.zst
-            nix shell --inputs-from . nixpkgs#nfpm -c nfpm package -f nfpm.yaml \
-              -p "$format" -t "dist/espice-${VERSION}-linux-${ARCH}.$ext"
-          done
+        run: bash tools/package.sh "espice-${VERSION}-${VARIANT}" "$VERSION" "${{ matrix.deb_arch }}" dist
 
       - name: Smoke distro packages in clean Ubuntu, Debian, Fedora, openSUSE and Arch
         if: matrix.distro && steps.cpu.outputs.runnable == 'true'
@@ -200,6 +187,7 @@ jobs:
             dist/*.rpm
             dist/*.pkg.tar.zst
             dist/PKGBUILD
+            dist/espice.rb
             dist/SHA256SUMS
             dist/BUILD-MATRIX.json
 
@@ -248,35 +236,75 @@ jobs:
           done
           gh pr merge "$branch" --auto --squash
 
-  # Pushes the release's PKGBUILD to the AUR as espice-bin. Needs the
-  # AUR_SSH_PRIVATE_KEY secret (the key registered on the AUR account that
-  # owns espice-bin); without it the job only notes that it skipped.
+  # The formula the release attached, installed through a local tap on macOS
+  # and checked by `brew test` (a divider solved to its analytic value). With a
+  # HOMEBREW_TAP_TOKEN secret (a token that can push to OmarSiwy/homebrew-espice)
+  # it is pushed to the tap. After VerA's publish.yaml.
+  homebrew:
+    needs: [plan, publish]
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Install and test the formula
+        run: |
+          set -euo pipefail
+          gh release download "v$VERSION" -R "$GITHUB_REPOSITORY" -p espice.rb
+          brew tap-new --no-git espice/local
+          cp espice.rb "$(brew --repository espice/local)/Formula/espice.rb"
+          brew install espice/local/espice
+          brew test espice/local/espice
+          espice --version
+      - name: Push to OmarSiwy/homebrew-espice
+        if: env.TAP_TOKEN != ''
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/OmarSiwy/homebrew-espice.git" tap
+          mkdir -p tap/Formula && cp espice.rb tap/Formula/espice.rb
+          cd tap
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/espice.rb
+          git diff --cached --quiet || { git commit -m "espice v$VERSION"; git push; }
+
+  # The AUR package the release attached: makepkg in Arch downloads the
+  # uploaded .deb, checks it against the PKGBUILD's sha256, and the package it
+  # builds must install and run. With an AUR_SSH_PRIVATE_KEY secret (an AUR
+  # account's key) the PKGBUILD and its .SRCINFO are pushed to espice-bin.
   aur:
     needs: [plan, publish]
     runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.plan.outputs.version }}
-      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
     steps:
-      - name: Push espice-bin
+      - name: Build, install and run espice-bin
         run: |
-          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
-            echo "No AUR_SSH_PRIVATE_KEY secret: espice-bin was not pushed; the release's PKGBUILD is the manual route." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          set -euo pipefail
+          mkdir aur && cd aur
           gh release download "v$VERSION" -R "$GITHUB_REPOSITORY" -p PKGBUILD
-          docker run --rm -v "$PWD:/p:ro" docker.io/library/archlinux:latest bash -ec \
-            'useradd -m b; cp /p/PKGBUILD /home/b/; su b -c "cd /home/b && makepkg --printsrcinfo"' > .SRCINFO
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          docker run --rm -v "$PWD:/aur" docker.io/library/archlinux:latest sh -c '
+            set -e
+            pacman -Sy --noconfirm --needed base-devel >/dev/null
+            useradd -m builder && chown -R builder /aur
+            su builder -c "cd /aur && makepkg --noconfirm && makepkg --printsrcinfo > .SRCINFO"
+            pacman -U --noconfirm /aur/espice-bin-*.pkg.tar.zst >/dev/null
+            espice --version'
+      - name: Push to the AUR
+        if: env.AUR_KEY != ''
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && printf '%s\n' "$AUR_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
           # ponytail: trust on first use from a fresh runner; pin AUR's host key here if that matters.
-          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur"
-          git clone ssh://aur@aur.archlinux.org/espice-bin.git aur
-          cp PKGBUILD .SRCINFO aur/
-          cd aur
+          git clone ssh://aur@aur.archlinux.org/espice-bin.git espice-bin
+          cp aur/PKGBUILD aur/.SRCINFO espice-bin/
+          cd espice-bin
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add PKGBUILD .SRCINFO
-          git diff --cached --quiet || { git commit -m "espice-bin $VERSION"; git push origin HEAD:master; }
+          git diff --cached --quiet || { git commit -m "espice-bin $VERSION"; git push; }

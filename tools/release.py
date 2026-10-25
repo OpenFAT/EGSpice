@@ -74,6 +74,21 @@ def pkgbuild(directory, release_version):
     return text
 
 
+# Formula placeholder -> the CPU variant whose tarball it installs.
+HOMEBREW = {'MACOS_ARM64': 'macos-arm64-cpu', 'MACOS_X86_64': 'macos-x86_64-cpu',
+            'LINUX_AARCH64': 'linux-aarch64-cpu', 'LINUX_X86_64': 'linux-x86_64-v1-cpu'}
+
+
+def homebrew(directory, release_version):
+    """packaging/homebrew/espice.rb.in with each tarball's checksum and the pinned Zig."""
+    zig = re.search(r'minimum_zig_version\s*=\s*"([^"]+)"', (ROOT / 'build.zig.zon').read_text())[1]
+    text = (ROOT / 'packaging/homebrew/espice.rb.in').read_text()
+    text = text.replace('@VERSION@', release_version).replace('@ZIG@', zig)
+    for key, variant in HOMEBREW.items():
+        text = text.replace(f'@SHA256_{key}@', digest(directory / f'espice-{release_version}-{variant}.tar.gz'))
+    return text
+
+
 def verify(directory, release_version):
     if release_version != version():
         raise ValueError('release version differs from checkout')
@@ -113,6 +128,9 @@ def verify(directory, release_version):
     if any(row['distro'] for row in catalogue()):
         (directory / 'PKGBUILD').write_text(pkgbuild(directory, release_version))
         checksums.append(f'{digest(directory / "PKGBUILD")}  PKGBUILD\n')
+    if {row['name'] for row in catalogue()} >= set(HOMEBREW.values()):
+        (directory / 'espice.rb').write_text(homebrew(directory, release_version))
+        checksums.append(f'{digest(directory / "espice.rb")}  espice.rb\n')
     (directory / 'SHA256SUMS').write_text(''.join(checksums))
     print(f'Validated {len(builds)} variants and {len(assets)} assets')
 
