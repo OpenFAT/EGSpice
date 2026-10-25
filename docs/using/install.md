@@ -15,8 +15,9 @@ sudo zypper install ./espice-0.3.0-linux-amd64.rpm         # openSUSE
 sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst      # Arch
 ```
 
-On Arch, the AUR package `espice-bin` installs the same files; the release
-also attaches its `PKGBUILD`. Each package installs the release tree under
+On Arch, the release's `PKGBUILD` builds `espice-bin`, the same files, with
+`makepkg`; the release workflow pushes it to the AUR once the maintainer's
+AUR key is configured. No release carries packages yet. Each package installs the release tree under
 `/usr/lib/espice/` with the Zig compiler that runtime `.hdl` builds need,
 and `/usr/bin/espice` points `ZIG` at that Zig unless you set `ZIG`
 yourself. Embedders use `/usr/lib/espice/include` and `/usr/lib/espice/lib`.

@@ -15,9 +15,28 @@ Docs: <https://omarsiwy.github.io/ESPice/> · Changes: [CHANGELOGS.md](CHANGELOG
 
 ## Install
 
+Linux packages, attached to each [release](https://github.com/OmarSiwy/ESPice/releases) for x86-64
+and ARM64 (CPU build, glibc 2.28+):
+
 ```sh
-nix run github:OmarSiwy/ESPice -- deck.sp
-nix profile install github:OmarSiwy/ESPice      # .#espice-cuda adds CUDA
+sudo apt install ./espice-0.3.0-linux-amd64.deb             # Debian, Ubuntu, Mint
+sudo dnf install ./espice-0.3.0-linux-amd64.rpm             # Fedora; zypper on openSUSE
+sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst       # Arch
+```
+
+They carry the Zig that `.hdl` models compile with, so nothing else is needed. On Arch the release's
+`PKGBUILD` also builds `espice-bin` with `makepkg`. Tarballs for every platform and CPU level, and
+self-extracting `.run` bundles for the GPU builds, are on the same page
+([install guide](https://omarsiwy.github.io/ESPice/using/install/)). No release carries packages yet;
+until one does, use Nix or build from source.
+
+With Nix:
+
+```sh
+nix run github:OmarSiwy/ESPice#latest -- deck.sp            # newest release binary
+nix run 'github:OmarSiwy/ESPice#"0.3.0"' -- deck.sp         # a given release
+nix run github:OmarSiwy/ESPice -- deck.sp                   # built from main
+nix profile install github:OmarSiwy/ESPice                  # .#espice-cuda adds CUDA
 ```
 
 From source (Zig 0.18.0-dev.349, provided by the devshell; VerA and Gompute are pinned in
@@ -40,7 +59,7 @@ so running ESPice on the CPU needs nothing beyond the base system.
 | Run on the CPU | nothing |
 | Run on an NVIDIA GPU | the proprietary driver, which provides `libcuda.so.1`: `sudo ubuntu-drivers autoinstall` (or Mint's Driver Manager). The CUDA toolkit is not needed at run time. |
 | Run on an AMD GPU | the ROCm HIP runtime from AMD's repository (`amdgpu-install --usecase=hip`), which provides `libamdhip64.so`. |
-| Load `.hdl` models at run time | Zig `0.18.0-dev.349+d924f83bf` on `PATH`, or its path in `$ZIG` |
+| Load `.hdl` models at run time | nothing with the Linux packages or Nix; otherwise Zig `0.18.0-dev.349+d924f83bf` on `PATH`, or its path in `$ZIG` |
 | Build from source with Nix (recommended) | `sudo apt install curl git xz-utils`, then Nix: `sh <(curl -L https://nixos.org/nix/install) --daemon`; `nix develop` then provides Zig, Python and the GPU toolkits |
 | Build from source without Nix | `sudo apt install git curl xz-utils python3`, and Zig `0.18.0-dev.349+d924f83bf` from <https://ziglang.org/download/> |
 | Embed precompiled CUDA kernels (optional) | `ptxas` and `fatbinary` on `PATH`, from NVIDIA's CUDA 12 toolkit repository (`cuda-toolkit-12-x`; Ubuntu's own `nvidia-cuda-toolkit` is too old for recent GPUs). Without them the driver compiles the kernels on first use. |
@@ -54,7 +73,8 @@ so running ESPice on the CPU needs nothing beyond the base system.
   VBIC, HICUM, JFET/MESFET/HFET, passives, controlled and behavioural sources, switches,
   transmission lines.
 - **Your own models:** `.hdl "model.va"` plus an `N` card compiles a Verilog-A module at run time
-  (needs that Zig on `PATH` or in `$ZIG`; cached under `~/.cache/espice/hdl`). OSDI is not loaded.
+  (the Linux packages and Nix carry that Zig; otherwise it must be on `PATH` or in `$ZIG`; cached under
+  `~/.cache/espice/hdl`). OSDI is not loaded.
 - **Output:** binary/ASCII raw, CSV, Touchstone, PSF, FSDB, SST2, CITIfile, print.
 - **Parallel by default:** analyses form a DAG and run on every core (`--jobs`). `--plan` prints the
   DAG without solving.
