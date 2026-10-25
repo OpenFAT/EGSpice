@@ -53,7 +53,7 @@ AUR key is configured. No release carries packages yet. Each package installs th
 and `/usr/bin/espice` points `ZIG` at that Zig unless you set `ZIG`
 yourself. Embedders use `/usr/lib/espice/include` and `/usr/lib/espice/lib`.
 Before a release ships, every package is installed in a clean Ubuntu 24.04,
-Debian 12, Fedora 42, openSUSE Tumbleweed and Arch container and runs a
+Debian 12, Fedora 42, openSUSE Leap 15.6 and Arch container and runs a
 built-in model and a runtime Verilog-A deck.
 
 ## Nix

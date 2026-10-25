@@ -23,7 +23,7 @@ run() {
 run docker.io/library/ubuntu:24.04 "dpkg -i $stem.deb; $smoke"
 run docker.io/library/debian:12 "dpkg -i $stem.deb; $smoke"
 run docker.io/library/fedora:42 "rpm -i $stem.rpm; $smoke"
-run docker.io/opensuse/tumbleweed "command -v awk >/dev/null || zypper -nq install gawk; rpm -i $stem.rpm; $smoke"
+run docker.io/opensuse/leap:15.6 "rpm -i $stem.rpm; $smoke" # ships awk: no network needed
 # Arch Linux publishes x86_64 images only.
 if [ "$arch" = amd64 ]; then
   run docker.io/library/archlinux:latest "pacman -U --noconfirm $stem.pkg.tar.zst; $smoke"
