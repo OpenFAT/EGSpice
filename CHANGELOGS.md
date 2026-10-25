@@ -13,6 +13,7 @@ Newest first.
 - The compact models ship in the source tree; building no longer downloads them.
 - Cached `.hdl` builds rebuild once (new device ABI).
 - VerA v0.20.0 and Gompute 1.5.0.
+- Releases attach `.deb`, `.rpm` and Arch packages and an AUR `PKGBUILD` (`espice-bin`); `nix run .#latest` and `.#"<version>"` install release binaries.
 - Removed: the `ESPICE_LINEAR_CACHE` variable, the `-Dbsim4-narrow` build option and the `test-gpu-*` build steps (`test-gpu` runs the corpus on CUDA).
 
 ## 0.3.0 (2026-10-20)

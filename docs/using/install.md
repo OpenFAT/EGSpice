@@ -1,7 +1,28 @@
 # Install
 
 ESPice is one binary, `espice`, plus a static library and C header for
-embedding. There are three ways to get it.
+embedding. There are four ways to get it.
+
+## Linux packages
+
+Each release attaches a `.deb`, an `.rpm` and an Arch package for x86-64
+and ARM64 (CPU builds at the baseline instruction set):
+
+```sh
+sudo apt install ./espice-0.3.0-linux-amd64.deb            # Debian, Ubuntu
+sudo dnf install ./espice-0.3.0-linux-amd64.rpm            # Fedora
+sudo zypper install ./espice-0.3.0-linux-amd64.rpm         # openSUSE
+sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst      # Arch
+```
+
+On Arch, the AUR package `espice-bin` installs the same files; the release
+also attaches its `PKGBUILD`. Each package installs the release tree under
+`/usr/lib/espice/` with the Zig compiler that runtime `.hdl` builds need,
+and `/usr/bin/espice` points `ZIG` at that Zig unless you set `ZIG`
+yourself. Embedders use `/usr/lib/espice/include` and `/usr/lib/espice/lib`.
+Before a release ships, every package is installed in a clean Ubuntu 24.04,
+Debian 12, Fedora 42, openSUSE Tumbleweed and Arch container and runs a
+built-in model and a runtime Verilog-A deck.
 
 ## Nix
 
@@ -32,6 +53,17 @@ Or use it as an input of your own flake:
   };
 }
 ```
+
+A released version installs from its release binary instead of building
+from source (CPU build, baseline instruction set):
+
+```sh
+nix run github:OmarSiwy/ESPice#latest -- my_circuit.sp
+nix run 'github:OmarSiwy/ESPice#"0.3.0"' -- my_circuit.sp
+```
+
+`sources.json` lists each release's tarballs and checksums; the release
+workflow adds a new release to it through a pull request.
 
 The flake package is a CPU-only build (`-Dgpu=false`). Its `espice` wrapper
 sets `ZIG` to the Zig it was built with, so decks that load Verilog-A

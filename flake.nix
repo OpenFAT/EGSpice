@@ -34,8 +34,16 @@
       ...
     }:
     {
+      # Source builds only; the release binaries stay flake packages.
       overlays.default =
-        _: prev: removeAttrs self.packages.${prev.stdenv.hostPlatform.system} [ "default" ];
+        _: prev:
+        removeAttrs self.packages.${prev.stdenv.hostPlatform.system} (
+          [
+            "default"
+            "latest"
+          ]
+          ++ builtins.attrNames (builtins.fromJSON (builtins.readFile ./sources.json))
+        );
     }
     // flake-utils.lib.eachDefaultSystem (
       system:
@@ -46,6 +54,40 @@
         };
         lib = pkgs.lib;
         zig = zig-overlay.packages.${system}.master;
+
+        # Release binaries by version, written by tools/update-sources.py.
+        sources = lib.importJSON ./sources.json;
+        # The Zig a release's runtime .hdl builds with; a dev Zig is keyed by date in zig-overlay.
+        zigOf =
+          version:
+          zig-overlay.packages.${system}.${version} or (lib.findFirst (
+            z: lib.isDerivation z && z.version == version
+          ) (throw "zig-overlay has no Zig ${version}") (lib.attrValues zig-overlay.packages.${system}));
+        fromRelease =
+          version: s:
+          pkgs.stdenv.mkDerivation {
+            pname = "espice";
+            inherit version;
+            src = pkgs.fetchurl { inherit (s.${system}) url sha256; };
+            nativeBuildInputs = [ pkgs.makeWrapper ] ++ lib.optional pkgs.stdenv.isLinux pkgs.autoPatchelfHook;
+            dontConfigure = true;
+            dontBuild = true;
+            # Zig's ad-hoc Mach-O signature does not survive strip.
+            dontStrip = true;
+            installPhase = ''
+              cp -r . $out
+              wrapProgram $out/bin/espice --set-default ZIG ${zigOf s.zig}/bin/zig
+            '';
+            meta = {
+              description = "SPICE circuit simulator (release ${version} binary, CPU)";
+              mainProgram = "espice";
+              license = lib.licenses.asl20;
+              sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
+            };
+          };
+        releases = lib.mapAttrs fromRelease (lib.filterAttrs (_: s: s ? ${system}) sources);
+        latest =
+          if releases == { } then null else releases.${lib.last (lib.sort lib.versionOlder (lib.attrNames releases))};
 
         # Explicit glibc target: in the sandbox Zig falls back to a dynamic musl binary that cannot run.
         zigTarget = "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-${
@@ -183,6 +225,24 @@
           cuda = "sm_75";
         };
         baselineName = if pkgs.stdenv.hostPlatform.isx86_64 then "linux-x86_64-v1" else "linux-aarch64";
+        smoke =
+          name: espice:
+          pkgs.runCommand name { } ''
+          export HOME=$TMPDIR ESPICE_CACHE=$TMPDIR/cache
+          check() {
+            awk -F, -v col="$2" -v want="$3" '
+              NR == 1 { for (i = 1; i <= NF; i++) if ($i == col) c = i }
+              NR == 2 { d = $c - want; ok = c && d * d <= 1e-12 * want * want }
+              END { exit !ok }' "$1" || { echo "$1: $2 != $3"; cat "$1"; exit 1; }
+          }
+          cp -r ${conformance}/tests/netlist/hdl/veriloga_res_divider.{sp,assets} .
+          ${lib.getExe espice} --format=csv --rawfile=op.csv ${conformance}/tests/netlist/op/balanced_bridge.sp
+          check op.csv 'v(a)' 5
+          ${lib.getExe espice} --format=csv --rawfile=hdl.csv veriloga_res_divider.sp
+          check hdl.csv 'v(out)' 0.35
+          ls cache/hdl > /dev/null
+          touch $out
+        '';
       in
       {
         inherit devShells;
@@ -191,6 +251,8 @@
           default = espice;
           inherit espice;
         }
+        // releases
+        // lib.optionalAttrs (latest != null) { inherit latest; }
         // builtins.listToAttrs (
           map (variant: {
             name = "espice-${variant.name}";
@@ -216,22 +278,11 @@
           default = nix-bundle.bundlers.${system}.default;
         };
 
-        checks.smoke = pkgs.runCommand "espice-smoke" { } ''
-          export HOME=$TMPDIR ESPICE_CACHE=$TMPDIR/cache
-          check() {
-            awk -F, -v col="$2" -v want="$3" '
-              NR == 1 { for (i = 1; i <= NF; i++) if ($i == col) c = i }
-              NR == 2 { d = $c - want; ok = c && d * d <= 1e-12 * want * want }
-              END { exit !ok }' "$1" || { echo "$1: $2 != $3"; cat "$1"; exit 1; }
-          }
-          cp -r ${conformance}/tests/netlist/hdl/veriloga_res_divider.{sp,assets} .
-          ${lib.getExe espice} --format=csv --rawfile=op.csv ${conformance}/tests/netlist/op/balanced_bridge.sp
-          check op.csv 'v(a)' 5
-          ${lib.getExe espice} --format=csv --rawfile=hdl.csv veriloga_res_divider.sp
-          check hdl.csv 'v(out)' 0.35
-          ls cache/hdl > /dev/null
-          touch $out
-        '';
+        checks = {
+          smoke = smoke "espice-smoke" espice;
+        }
+        # The newest release binary, as `nix run .#latest` installs it.
+        // lib.optionalAttrs (latest != null) { release = smoke "espice-release-smoke" latest; };
       }
     );
 }

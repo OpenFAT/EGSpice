@@ -1,0 +1,47 @@
+# .deb, .rpm and Arch packages from one release tree, built by release.yml:
+#   TREE=espice-<version>-<variant> ZIG_DIR=<pinned Zig> VERSION=... ARCH=amd64|arm64 \
+#     nfpm package -f packaging/nfpm.yaml -p deb|rpm|archlinux -t <file>
+# The release tree keeps its layout under /usr/lib/espice (espice finds
+# share/espice beside its executable); the pinned Zig rides along for .hdl.
+name: espice
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+release: 1
+section: science
+priority: optional
+maintainer: omare <ok.elsawy@gmail.com>
+description: |
+  SPICE circuit simulator with a built-in Verilog-A compiler.
+  CPU build; carries the Zig compiler that runtime .hdl models build with.
+vendor: ESPice
+homepage: https://github.com/OmarSiwy/ESPice
+license: Apache-2.0
+disable_globbing: true
+contents:
+  - src: ${TREE}/
+    dst: /usr/lib/espice/
+    type: tree
+  - src: ${ZIG_DIR}/bin/zig
+    dst: /usr/lib/espice/zig/zig
+    file_info:
+      mode: 0755
+  - src: ${ZIG_DIR}/lib/
+    dst: /usr/lib/espice/zig/lib/
+    type: tree
+  - src: packaging/espice.sh
+    dst: /usr/bin/espice
+    file_info:
+      mode: 0755
+  - src: ${TREE}/LICENSE
+    dst: /usr/share/licenses/espice/LICENSE
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.28)
+  rpm:
+    depends:
+      - glibc >= 2.28
+  archlinux:
+    depends:
+      - glibc

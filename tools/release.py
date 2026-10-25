@@ -57,6 +57,23 @@ def metadata(name, release_version, runnable):
             'gpu_runtime_tested': False}
 
 
+def distro_assets(release_version, row):
+    """The .deb, .rpm and Arch package release.yml builds for a `distro` row."""
+    if not row['distro']:
+        return []
+    stem = f'espice-{release_version}-linux-{row["deb_arch"]}'
+    return [stem + '.deb', stem + '.rpm', stem + '.pkg.tar.zst']
+
+
+def pkgbuild(directory, release_version):
+    """packaging/PKGBUILD.in with each .deb's checksum; SKIP where the .deb is absent."""
+    text = (ROOT / 'packaging/PKGBUILD.in').read_text().replace('@VERSION@', release_version)
+    for arch in ('amd64', 'arm64'):
+        deb = directory / f'espice-{release_version}-linux-{arch}.deb'
+        text = text.replace(f'@SHA256_{arch.upper()}@', digest(deb) if deb.exists() else 'SKIP')
+    return text
+
+
 def verify(directory, release_version):
     if release_version != version():
         raise ValueError('release version differs from checkout')
@@ -68,6 +85,7 @@ def verify(directory, release_version):
         expected.append(archive)
         if row['bundle']:
             expected.append(directory / (stem + '.run'))
+        expected += [directory / name for name in distro_assets(release_version, row)]
         with tarfile.open(archive, 'r:gz') as tar:
             stream = tar.extractfile(stem + '/BUILD.json')
             if stream is None:
@@ -77,7 +95,8 @@ def verify(directory, release_version):
         if build != want:
             raise ValueError(f'{archive.name}: build metadata differs from the release plan')
         builds.append(build)
-    actual = set(directory.glob('*.run')) | set(directory.glob('*.tar.gz'))
+    actual = {path for pattern in ('*.run', '*.tar.gz', '*.deb', '*.rpm', '*.pkg.tar.zst')
+              for path in directory.glob(pattern)}
     if actual != set(expected):
         raise ValueError('release assets do not exactly match the complete matrix')
     assets = []
@@ -91,6 +110,9 @@ def verify(directory, release_version):
     manifest.write_text(json.dumps(matrix, indent=2) + '\n')
     checksums = [f'{asset["sha256"]}  {asset["name"]}\n' for asset in assets]
     checksums.append(f'{digest(manifest)}  {manifest.name}\n')
+    if any(row['distro'] for row in catalogue()):
+        (directory / 'PKGBUILD').write_text(pkgbuild(directory, release_version))
+        checksums.append(f'{digest(directory / "PKGBUILD")}  PKGBUILD\n')
     (directory / 'SHA256SUMS').write_text(''.join(checksums))
     print(f'Validated {len(builds)} variants and {len(assets)} assets')
 
@@ -106,6 +128,9 @@ def main():
     check = commands.add_parser('verify')
     check.add_argument('directory', type=Path)
     check.add_argument('version')
+    arch = commands.add_parser('pkgbuild')
+    arch.add_argument('directory', type=Path)
+    arch.add_argument('version')
     args = parser.parse_args()
     if args.command == 'plan':
         release_version, rows = plan(os.environ.get('VARIANT', 'all'), os.environ.get('RELEASE_TAG', ''))
@@ -113,6 +138,8 @@ def main():
         print('matrix=' + json.dumps({'include': rows}, separators=(',', ':')))
     elif args.command == 'metadata':
         print(json.dumps(metadata(args.variant, args.version, args.runnable == 'true'), indent=2))
+    elif args.command == 'pkgbuild':
+        print(pkgbuild(args.directory, args.version), end='')
     else:
         verify(args.directory, args.version)
 

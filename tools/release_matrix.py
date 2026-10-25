@@ -22,7 +22,10 @@ def variants(catalogue):
             row = {**host, "name": name, "cuda": cuda, "hip": hip,
                    "gpu": cuda != "none" or hip != "none",
                    "bundle": host["system"].endswith("-linux"),
-                   "package": "espice-" + name}
+                   "package": "espice-" + name,
+                   # .deb/.rpm/Arch packages: one CPU build per Linux architecture.
+                   "distro": host.get("distro", False) and not (cuda != "none" or hip != "none"),
+                   "deb_arch": {"x86_64-linux": "amd64", "aarch64-linux": "arm64"}.get(host["system"], "")}
             if not re.fullmatch(r"[a-z0-9_-]+", name):
                 raise ValueError(f"invalid artifact name: {name}")
             rows.append(row)
