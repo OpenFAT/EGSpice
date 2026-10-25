@@ -8,11 +8,20 @@ const std = @import("std");
 /// `.expected.json` or on an empty fixture tree.
 pub fn create(b: *std.Build) *std.Build.Module {
     const io = b.graph.io;
+    // A tree without the submodule (a git flake's source, a release checkout)
+    // still configures and installs; only a runner that imports the catalog fails.
+    // ponytail: the stub is cached with the configuration; a later
+    // `git submodule update --init` may need `rm -rf .zig-cache` to re-walk.
+    var dir = b.root.openDir(io, "tests/conformance/tests/netlist", .{ .iterate = true }) catch
+        return b.createModule(.{ .root_source_file = b.addWriteFiles().add("fixture_catalog.zig",
+            \\comptime {
+            \\    @compileError("tests/conformance/tests/netlist is missing: git submodule update --init tests/conformance");
+            \\}
+            \\
+        ) });
     // 0.17 caches the configuration: every walked directory is declared so a
     // deck added or removed anywhere under tests/conformance/tests/netlist re-runs it.
     b.dependOnDirectoryContents(b.path("tests/conformance/tests/netlist"));
-    var dir = b.root.openDir(io, "tests/conformance/tests/netlist", .{ .iterate = true }) catch
-        @panic("cannot open tests/conformance/tests/netlist");
     defer dir.close(io);
     var walker = dir.walk(b.allocator) catch @panic("cannot walk tests/conformance/tests/netlist");
     defer walker.deinit();
