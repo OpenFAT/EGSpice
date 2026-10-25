@@ -1,9 +1,9 @@
-//! The KCL certificate (analysis/certify.zig, #53) on a real generated device:
+//! The KCL certificate (`Circuit.kcl_cert`, #53) on a real generated device:
 //! a converged point passes the converger's own gate, a moved one fails it,
 //! and measuring leaves the circuit as it found it.
 const std = @import("std");
 const analysis = @import("../types.zig");
-const certify = @import("../certify.zig");
+const certify = @import("../Circuit.zig").kcl_cert;
 const Builder = @import("builder").Builder;
 const Library = @import("device").Library;
 const eval = @import("device_eval");

@@ -10,19 +10,16 @@
 //   ngspice: Copyright Regents of the University of California and others,
 //   modified BSD license.
 // Transcribed from the retired native device (coupled_ltra.zig), which it
-// matches on the CPL decks to 6e-8 relative
-// (dev/native-transmission-line-migration.md). Bug-compatible with
+// matches on the CPL decks to 6e-8 relative. Bug-compatible with
 // cplsetup/cplload: the reference's scaled pole units, diag()'s ordering queue
 // with integer-truncated comparisons, the R entry floor MAX(R, 1e-4),
 // integer-ps history, update_cnv's slope accumulated across terms. One
 // divergence: cplload's 0.1*gmin port stamp is not modelled.
 //
-// The conductor count is structural (port vector width), so it is a macro:
-// a 3- or 4-line build is a wrapper (coupled_ltra3.va, coupled_ltra4.va):
-//   `define CPL_N 3
-//   `define CPL_MODULE coupled_ltra3
-//   `include "coupled_ltra.va" The card matrices are packed upper triangles
-// of up to 10 entries (N <= 4), as the builder passes them.
+// The conductor count is structural (port vector width), so it is a macro,
+// CPL_N; build.zig compiles the 3- and 4-line devices from this file. The
+// card matrices are packed upper triangles of up to 10 entries (N <= 4), as
+// the builder passes them.
 //
 // State model: every variable a later evaluation reads is held (§5.10): each
 // evaluation starts from the values the last ACCEPTED evaluation left behind.
@@ -34,6 +31,9 @@
 //
 // Nodes: ngspice cplsetup binds each conductor to ground and ignores the
 // card's reference nodes, so r1/r2 are declared for the card shape and unused.
+
+`include "constants.vams"
+`include "disciplines.vams"
 
 `ifndef CPL_N
 `define CPL_N 2

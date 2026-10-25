@@ -27,14 +27,30 @@ pub fn freeAxis(scratch: std.mem.Allocator, freqs: []f64) void {
 /// by the analysis' `plan`; `deinit` returns the axis block and `rhs` to
 /// the scratch allocator that built them.
 pub const Plan = struct {
+    /// `value` added at G's diagonal entry (`row`, `row`): siemens on a node
+    /// row, ohms (−z0) on a branch row.
+    pub const Diagonal = struct { row: u32, value: f64 };
+
     freqs: []f64,
     omegas: []f64,
     rhs: []f64,
     adjoint: bool,
+    /// Analysis-local additions after linearization, such as SP port
+    /// terminations. The provider applies them only to its solver copy.
+    g_diagonal: []Diagonal = &.{},
 
+    /// Adds `g_diagonal` to `fs`'s copy of G; call it before `fs`'s first
+    /// solve (`FreqSolver.addDiagG`).
+    pub fn configure(p: Plan, fs: *FreqSolver) void {
+        for (p.g_diagonal) |d| fs.addDiagG(d.row, d.value);
+    }
+
+    /// Frees the axis block, `rhs` and `g_diagonal`; `scratch` must be the
+    /// allocator `plan` used.
     pub fn deinit(p: Plan, scratch: std.mem.Allocator) void {
         freeAxis(scratch, p.freqs);
         scratch.free(p.rhs);
+        scratch.free(p.g_diagonal);
     }
 };
 

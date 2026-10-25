@@ -23,6 +23,8 @@ const std = @import("std");
 const common = @import("job.zig");
 const compare = @import("compare.zig");
 const vacask = @import("vacask.zig");
+/// The flag whose output the report header quotes; the banner starts at
+/// `Version`, after a `Using:` line.
 pub const version_flag = "-v";
 
 /// Which simulator a deck is staged for.
@@ -62,19 +64,19 @@ pub fn stageFile(io: std.Io, a: std.mem.Allocator, netlist: []const u8, scratch:
 /// Cards whose meaning and output match in ngspice, HSPICE and Spectre's
 /// SPICE reader. An ngspice-dialect deck with any other card is refused.
 const checked_cards = std.StaticStringMap(void).initComptime(.{
-    .{"op"},      .{"dc"},    .{"ac"},     .{"tran"},  .{"end"},   .{"ends"},
-    .{"subckt"},  .{"model"}, .{"param"},  .{"option"}, .{"options"}, .{"opt"},
-    .{"ic"},      .{"nodeset"}, .{"global"}, .{"temp"}, .{"print"}, .{"plot"},
-    .{"probe"},   .{"meas"},  .{"measure"}, .{"four"}, .{"width"}, .{"title"},
+    .{"op"},     .{"dc"},      .{"ac"},      .{"tran"},   .{"end"},     .{"ends"},
+    .{"subckt"}, .{"model"},   .{"param"},   .{"option"}, .{"options"}, .{"opt"},
+    .{"ic"},     .{"nodeset"}, .{"global"},  .{"temp"},   .{"print"},   .{"plot"},
+    .{"probe"},  .{"meas"},    .{"measure"}, .{"four"},   .{"width"},   .{"title"},
     .{"save"},
 });
 
 /// HSPICE's own spellings and output-only cards, accepted in an HSPICE-dialect
 /// deck on top of `checked_cards`.
 const hspice_cards = std.StaticStringMap(void).initComptime(.{
-    .{"macro"},   .{"eom"},       .{"parameter"}, .{"parameters"}, .{"temperature"},
-    .{"connect"}, .{"protect"},   .{"unprotect"}, .{"prot"},       .{"unprot"},
-    .{"dcvolt"},  .{"check"},     .{"biaschk"},   .{"power"},
+    .{"macro"},   .{"eom"},     .{"parameter"}, .{"parameters"}, .{"temperature"},
+    .{"connect"}, .{"protect"}, .{"unprotect"}, .{"prot"},       .{"unprot"},
+    .{"dcvolt"},  .{"check"},   .{"biaschk"},   .{"power"},
 });
 
 /// ngspice device letters with the same card syntax and model in HSPICE and

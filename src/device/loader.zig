@@ -22,7 +22,7 @@ const DeviceVtable = ir.DeviceVtable;
 pub const BuildPaths = struct {
     /// Parent of the per-source build trees and compiler caches.
     work_dir: []const u8,
-    /// VerA's device contract, `<VerA>/tools/contract.zig`. A `.v` device
+    /// VerA's device contract, `<VerA>/lib/contract.zig`. A `.v` device
     /// also imports VerA's `sim` tree, found beside it.
     contract: []const u8,
     /// The evaluator root, src/device/eval.zig.
@@ -40,6 +40,9 @@ pub const BuildPaths = struct {
     /// 12.32.1): a call to one compiles as an integer, so they are part of
     /// the cache key too.
     int_systfs: []const []const u8 = &.{},
+    /// Searched for a `` `include`` after the source's own directory, in
+    /// order (VerA's `-I`).
+    include_dirs: []const []const u8 = &.{},
 };
 
 /// A compiled and opened device, not yet registered.
@@ -54,7 +57,21 @@ pub const Prepared = struct {
     pub fn name(self: *const Prepared) []const u8 {
         return self.name_buf[0..self.name_len];
     }
+
+    /// A device named `module_name` (lowercased), its vtable still unset;
+    /// null when the name is longer than `name_buf`.
+    fn named(module_name: []const u8, is_digital: bool) ?Prepared {
+        var out: Prepared = .{ .vtable = undefined, .name_buf = undefined, .name_len = undefined, .digital = is_digital };
+        if (module_name.len > out.name_buf.len) return null;
+        out.name_len = @intCast(std.ascii.lowerString(&out.name_buf, module_name).len);
+        std.debug.assert(out.name_len == module_name.len);
+        return out;
+    }
 };
+
+/// The library's generation suffix (`lib<name>.<generation>.so`), shared by
+/// a fresh build and the cached-load path that reopens it.
+const generation = 1;
 
 /// The source languages the loader compiles, by file extension, ignoring
 /// case: every Verilog-A and Verilog extension the frontend routes here
@@ -74,10 +91,12 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
 
     const source = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024));
     defer gpa.free(source);
+    const dirs = try std.mem.concat(gpa, []const u8, &.{ &.{std.fs.path.dirname(path) orelse "."}, paths.include_dirs });
+    defer gpa.free(dirs);
     // The cached build is found from the inputs alone (source and includes,
     // comments stripped), so a hit never runs VerA's frontend in this process.
-    const key: ?[32]u8 = try inputKey(io, gpa, hdl, path, source, paths);
-    if (key) |k| if (cachedLoad(loaded, gpa, io, paths.work_dir, k, hdl == .v)) |hit| return hit;
+    const key: ?[32]u8 = try inputKey(io, gpa, hdl, path, source, dirs, paths);
+    if (key) |k| if (cachedLoad(loaded, gpa, io, paths, k, hdl == .v)) |hit| return hit;
     var bag: fastvaf.diag.Bag = .init(gpa);
     defer bag.deinit(gpa);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -92,12 +111,11 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
     var v: DeviceZig = undefined;
     const module_name = switch (hdl) {
         .va => blk: {
-            const dir = std.fs.path.dirname(path) orelse ".";
             // VerA's default language, VAMS-2023, as the built-ins compile
             // except the three build.zig pins to VAMS-2.3 (`.std`). A 2.3 file
             // that names something 2023 reserves (BSIM-CMG 112's `expm1`)
             // narrows itself with `begin_keywords "VAMS-2.3"`.
-            va = fastvaf.compileSourceOpts(gpa, source, .build, .{ .file_name = path, .include_dirs = &.{dir}, .diags = &bag, .display = .record, .int_systfs = paths.int_systfs }) catch |err| {
+            va = fastvaf.compileSourceOpts(gpa, source, .build, .{ .file_name = path, .include_dirs = dirs, .diags = &bag, .display = .record, .int_systfs = paths.int_systfs }) catch |err| {
                 printDiags(&bag);
                 return err;
             };
@@ -109,10 +127,7 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
         },
     };
 
-    var out: Prepared = .{ .vtable = undefined, .name_buf = undefined, .name_len = undefined, .digital = hdl == .v };
-    if (module_name.len > out.name_buf.len) return error.NameTooLong;
-    out.name_len = @intCast(std.ascii.lowerString(&out.name_buf, module_name).len);
-    std.debug.assert(out.name_len == module_name.len);
+    var out = Prepared.named(module_name, hdl == .v) orelse return error.NameTooLong;
     // Only the compiled MIR knows a `.va` module's name, so `compileSource`
     // must run before this check; codegen and the build are skipped.
     if (isLoaded(loaded, out.name())) return null;
@@ -124,6 +139,12 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
     printDiags(&bag);
     if (va != null and va.?.device_has_compile_error) return error.HdlCodegenRefused;
 
+    // A wrong Zig fails mid-build with its own confusing message (0.16:
+    // "unrecognized optimization mode"), so ask it first.
+    checkZig(gpa, io, paths.zig) catch |err| {
+        zigHint(err, paths.zig);
+        return err;
+    };
     std.debug.print("loader: compiling '{s}' ({s}) — first load, cached afterwards\n", .{ module_name, path });
     // The orchestrator hashes this list into its cache key. `sim` and its
     // imports are VerA's build.zig `module_specs` rows, which a `.v` device
@@ -135,25 +156,11 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
         .{ .name = "core", .root = paths.core },
         .{ .name = "device_abi", .root = paths.device_abi, .deps = &.{ "contract", "core" } },
         .{ .name = "dyn", .root = paths.dyn, .deps = &.{ "contract", "gompute", "device_abi" } },
-        .{ .name = "sim", .root = try std.fs.path.join(arena, &.{ vera_root, "src/sim/root.zig" }), .deps = &.{ "contract", "base", "diag", "frontend", "kernels" } },
+        .{ .name = "sim", .root = try std.fs.path.join(arena, &.{ vera_root, "lib/sim/root.zig" }), .deps = &.{ "contract", "base", "diag", "frontend", "kernels" } },
         .{ .name = "base", .root = try std.fs.path.join(arena, &.{ vera_root, "lib/base/root.zig" }) },
-        .{ .name = "diag", .root = try std.fs.path.join(arena, &.{ vera_root, "lib/diag.zig" }) },
+        .{ .name = "diag", .root = try std.fs.path.join(arena, &.{ vera_root, "lib/diag/root.zig" }) },
         .{ .name = "frontend", .root = try std.fs.path.join(arena, &.{ vera_root, "lib/frontend/root.zig" }), .deps = &.{ "base", "diag", "kernels" } },
         .{ .name = "kernels", .root = try std.fs.path.join(arena, &.{ vera_root, "lib/kernels/root.zig" }), .deps = &.{"contract"} },
-    };
-    // The vtable crosses the dlopen boundary with Zig calling convention and
-    // auto layout, so the library must match the host's backend and mode
-    // (`layoutHash` checks both).
-    var options: fastvaf.orchestrator.Options = .{
-        .work_dir = paths.work_dir,
-        .name = module_name,
-        .optimize = builtin.mode,
-        .backend = if (builtin.zig_backend == .stage2_llvm) .llvm else .self_hosted,
-        .modules = &modules,
-        .zig_exe = paths.zig,
-        // The host's libc, not what the compiler detects: a Nix sandbox
-        // detects musl, whose libc.so a glibc espice cannot load.
-        .target = "native-native-" ++ @tagName(builtin.target.abi),
     };
     // One build tree per (source, host ABI, module set): VerA's writer prunes
     // its tree, so unrelated sources must not share one, and a stable path
@@ -173,7 +180,20 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
     const digest = hash.finalResult();
     const work_dir = try std.fs.path.join(gpa, &.{ paths.work_dir, &std.fmt.bytesToHex(digest, .lower) });
     defer gpa.free(work_dir);
-    options.work_dir = work_dir;
+    // The vtable crosses the dlopen boundary with Zig calling convention and
+    // auto layout, so the library must match the host's backend and mode
+    // (`layoutHash` checks both).
+    const options: fastvaf.orchestrator.Options = .{
+        .work_dir = work_dir,
+        .name = module_name,
+        .optimize = builtin.mode,
+        .backend = if (builtin.zig_backend == .stage2_llvm) .llvm else .self_hosted,
+        .modules = &modules,
+        .zig_exe = paths.zig,
+        // The host's libc, not what the compiler detects: a Nix sandbox
+        // detects musl, whose libc.so a glibc espice cannot load.
+        .target = "native-native-" ++ @tagName(builtin.target.abi),
+    };
     try std.Io.Dir.cwd().createDirPath(io, work_dir);
     const dir = try std.Io.Dir.cwd().openDir(io, work_dir, .{});
     defer dir.close(io);
@@ -186,7 +206,6 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
     // inode: truncating a library another loader has mapped would corrupt its
     // live vtable. Platforms that refuse the unlink fail here rather than
     // overwrite a mapped file.
-    const generation = 1;
     const target = builtin.target;
     const library = try gpa.print("{s}{s}.{d}{s}", .{
         target.libPrefix(), module_name, generation, target.dynamicLibSuffix(),
@@ -197,11 +216,7 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
         else => return err, // else: any other unlink failure aborts the build (see above)
     };
     var built = fastvaf.orchestrator.compileRelease(gpa, io, options, device, generation) catch |err| {
-        switch (err) {
-            error.CompilerGone => std.debug.print("loader: the Zig compiler '{s}' did not start or exited mid-build; runtime .hdl needs zig {s} on PATH, or its path in $ZIG\n", .{ paths.zig, builtin.zig_version_string }),
-            error.ProtocolMismatch => std.debug.print("loader: '{s}' is not zig {s}, the compiler this espice was built with; put that version on PATH or in $ZIG\n", .{ paths.zig, builtin.zig_version_string }),
-            else => {}, // else: the remaining errors name themselves; the caller reports them
-        }
+        zigHint(err, paths.zig);
         return err;
     };
     defer built.deinit(gpa);
@@ -216,9 +231,36 @@ fn prepareOne(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, pa
         },
     };
     out.vtable = try loadDevice(art.so_path);
+    @import("hdl_gpu.zig").register(io, art.so_path, work_dir, paths);
     std.debug.assert(out.vtable.n_u >= out.vtable.num_ports);
     if (key) |k| recordInputs(io, paths.work_dir, k, module_name, &std.fmt.bytesToHex(digest, .lower));
     return out;
+}
+
+/// Prints what to fix for the two errors a wrong or missing compiler gives.
+fn zigHint(err: anyerror, zig: []const u8) void {
+    switch (err) {
+        error.CompilerGone => std.debug.print("loader: the Zig compiler '{s}' did not start or exited mid-build; runtime .hdl needs zig {s} on PATH, or its path in $ZIG\n", .{ zig, builtin.zig_version_string }),
+        error.ProtocolMismatch => std.debug.print("loader: '{s}' is not zig {s}, the compiler this espice was built with; put that version on PATH or in $ZIG\n", .{ zig, builtin.zig_version_string }),
+        else => {}, // else: the remaining errors name themselves; the caller reports them
+    }
+}
+
+/// Hash of the compiler path `checkZig` last accepted; 0 before any.
+var zig_accepted: std.atomic.Value(u64) = .init(0);
+
+/// Fails with `ProtocolMismatch` unless `zig version` prints the version this
+/// espice was built with, and with `CompilerGone` when `zig` does not run.
+/// An accepted path is not asked again in this process.
+fn checkZig(gpa: std.mem.Allocator, io: std.Io, zig: []const u8) error{ ProtocolMismatch, CompilerGone }!void {
+    const id = std.hash.Wyhash.hash(0, zig) | 1; // never the 0 of "none yet"
+    if (zig_accepted.load(.acquire) == id) return;
+    const r = std.process.run(gpa, io, .{ .argv = &.{ zig, "version" }, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch
+        return error.CompilerGone;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    if (!std.mem.eql(u8, std.mem.trim(u8, r.stdout, " \t\r\n"), builtin.zig_version_string)) return error.ProtocolMismatch;
+    zig_accepted.store(id, .release);
 }
 
 /// Longest include chain the key follows; VerA refuses deeper ones anyway.
@@ -230,13 +272,19 @@ const max_include_depth = 32;
 /// builds against and this binary's size and mtime, which any rebuild (a VerA
 /// re-pin included) changes. Null when an include cannot be resolved
 /// statically (a macro-named one, or one in a `.v` design, which VerA gives
-/// no include dirs): the full path then compiles and reports it.
-fn inputKey(io: std.Io, gpa: std.mem.Allocator, hdl: Hdl, path: []const u8, source: []const u8, paths: BuildPaths) !?[32]u8 {
+/// no include dirs): the full path then compiles and reports it. `dirs` are
+/// the include dirs VerA gets, the source's own first.
+fn inputKey(io: std.Io, gpa: std.mem.Allocator, hdl: Hdl, path: []const u8, source: []const u8, dirs: []const []const u8, paths: BuildPaths) !?[32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update(@tagName(hdl));
     h.update(&.{0}); // 'va' ++ 'ssign' is not 'v' ++ 'assign'
-    const dir = std.fs.path.dirname(path) orelse ".";
-    if (!try hashCode(io, gpa, &h, hdl, dir, path, source, 0)) return null;
+    if (!try hashCode(io, gpa, &h, hdl, dirs, path, source, 0)) return null;
+    // Which file an include resolves to depends on the dirs, not only on
+    // the contents the walk hashed.
+    for (dirs) |d| {
+        h.update(&.{2});
+        h.update(d);
+    }
     inline for (.{ "contract", "dyn", "gompute", "device_abi", "core", "zig" }) |f| {
         h.update(&.{0});
         h.update(@field(paths, f));
@@ -259,12 +307,12 @@ fn inputKey(io: std.Io, gpa: std.mem.Allocator, hdl: Hdl, path: []const u8, sour
 }
 
 /// Hashes `text` without comments, then each file it `` `include``s, as
-/// VerA's `readInclude` finds it: absolute as written, else under `dir` (the
-/// loader's one include dir), else a built-in annex file by basename, which
-/// the binary identity already covers. Text that reads `` `__FILE__`` also
-/// hashes `file`, its own path, which the macro expands to. False on anything
-/// it cannot follow.
-fn hashCode(io: std.Io, gpa: std.mem.Allocator, h: *std.crypto.hash.sha2.Sha256, hdl: Hdl, dir: []const u8, file: []const u8, text: []const u8, depth: u8) !bool {
+/// VerA's `readInclude` finds it: absolute as written, else beside `file`,
+/// else under each of `dirs` in order, else a built-in annex file by
+/// basename, which the binary identity already covers. Text that reads
+/// `` `__FILE__`` also hashes `file`, its own path, which the macro expands
+/// to. False on anything it cannot follow.
+fn hashCode(io: std.Io, gpa: std.mem.Allocator, h: *std.crypto.hash.sha2.Sha256, hdl: Hdl, dirs: []const []const u8, file: []const u8, text: []const u8, depth: u8) !bool {
     // Each level recurses only from depth <= max, so one past it is the deepest call.
     std.debug.assert(depth <= max_include_depth + 1);
     if (depth > max_include_depth) return false;
@@ -284,9 +332,7 @@ fn hashCode(io: std.Io, gpa: std.mem.Allocator, h: *std.crypto.hash.sha2.Sha256,
         const close = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse return false;
         const name = rest[1..close];
         rest = rest[close + 1 ..];
-        const full = if (std.fs.path.isAbsolute(name)) try gpa.dupe(u8, name) else try std.fs.path.join(gpa, &.{ dir, name });
-        defer gpa.free(full);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, full, gpa, .limited(64 * 1024 * 1024)) catch {
+        const inc = try findInclude(io, gpa, dirs, file, name) orelse {
             if (fastvaf_builtin_includes.has(std.fs.path.basename(name))) {
                 h.update(name);
                 h.update(&.{0});
@@ -294,10 +340,28 @@ fn hashCode(io: std.Io, gpa: std.mem.Allocator, h: *std.crypto.hash.sha2.Sha256,
             }
             return false;
         };
-        defer gpa.free(bytes);
-        if (!try hashCode(io, gpa, h, hdl, dir, full, bytes, depth + 1)) return false;
+        defer gpa.free(inc.path);
+        defer gpa.free(inc.bytes);
+        if (!try hashCode(io, gpa, h, hdl, dirs, inc.path, inc.bytes, depth + 1)) return false;
     }
     return true;
+}
+
+/// The first file `name` resolves to, VerA's `readInclude` order without its
+/// annex fallback: as written when absolute, else beside `includer`, else
+/// under each of `dirs`. Null when none can be read. Caller frees both.
+fn findInclude(io: std.Io, gpa: std.mem.Allocator, dirs: []const []const u8, includer: []const u8, name: []const u8) !?struct { path: []u8, bytes: []u8 } {
+    const absolute = std.fs.path.isAbsolute(name);
+    for (0..if (absolute) 1 else 1 + dirs.len) |i| {
+        const base = if (absolute) "" else if (i == 0) std.fs.path.dirname(includer) orelse "." else dirs[i - 1];
+        const full = try std.fs.path.join(gpa, &.{ base, name });
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, full, gpa, .limited(64 * 1024 * 1024)) catch {
+            gpa.free(full);
+            continue;
+        };
+        return .{ .path = full, .bytes = bytes };
+    }
+    return null;
 }
 
 /// VerA's built-in annex headers (`preprocessor.builtin_includes`).
@@ -381,7 +445,8 @@ fn normalizeCode(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
 
 /// The device a previous run built for `key`, opened under its build lock;
 /// `.{null}` when that module is already in `loaded`, null on any miss.
-fn cachedLoad(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, work_root: []const u8, key: [32]u8, digital_dev: bool) ??Prepared {
+fn cachedLoad(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, paths: BuildPaths, key: [32]u8, digital_dev: bool) ??Prepared {
+    const work_root = paths.work_dir;
     var buf: [512]u8 = undefined;
     const index = std.fmt.bufPrint(&buf, "{s}/inputs/{s}", .{ work_root, &std.fmt.bytesToHex(key, .lower) }) catch return null;
     var text_buf: [256]u8 = undefined;
@@ -391,10 +456,7 @@ fn cachedLoad(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, wo
     const digest = lines.next() orelse return null;
     if (module_name.len == 0 or digest.len != 64) return null;
 
-    var out: Prepared = .{ .vtable = undefined, .name_buf = undefined, .name_len = undefined, .digital = digital_dev };
-    if (module_name.len > out.name_buf.len) return null;
-    out.name_len = @intCast(std.ascii.lowerString(&out.name_buf, module_name).len);
-    std.debug.assert(out.name_len == module_name.len);
+    var out = Prepared.named(module_name, digital_dev) orelse return null;
     if (isLoaded(loaded, out.name())) return @as(?Prepared, null);
 
     const work_dir = std.fs.path.join(gpa, &.{ work_root, digest }) catch return null;
@@ -404,9 +466,10 @@ fn cachedLoad(loaded: []const []const u8, gpa: std.mem.Allocator, io: std.Io, wo
     const lock = dir.createFile(io, "build.lock", .{ .truncate = false, .lock = .exclusive }) catch return null;
     defer lock.close(io);
     const target = builtin.target;
-    const so = gpa.print("{s}/{s}{s}.1{s}", .{ work_dir, target.libPrefix(), module_name, target.dynamicLibSuffix() }) catch return null;
+    const so = gpa.print("{s}/{s}{s}.{d}{s}", .{ work_dir, target.libPrefix(), module_name, generation, target.dynamicLibSuffix() }) catch return null;
     defer gpa.free(so);
     out.vtable = loadDevice(so) catch return null;
+    @import("hdl_gpu.zig").register(io, so, work_dir, paths);
     return out;
 }
 
@@ -638,13 +701,28 @@ test "the loader takes every Verilog-A and Verilog extension the frontend routes
     try std.testing.expect(hdl_extensions.get(".sv") == null);
 }
 
+test "checkZig refuses another Zig version and a missing compiler" {
+    const g = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "zig", .data = "#!/bin/sh\necho 0.16.0\n", .flags = .{ .permissions = .executable_file } });
+    const fake = try std.fs.path.join(g, &.{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path, "zig" });
+    defer g.free(fake);
+    try std.testing.expectError(error.ProtocolMismatch, checkZig(g, io, fake));
+    try std.testing.expectError(error.CompilerGone, checkZig(g, io, "/nonexistent-espice-test-dir/zig"));
+}
+
 test "inputKey keys a .va and a .v source apart" {
     const g = std.testing.allocator;
     const io = std.testing.io;
     const paths: BuildPaths = .{ .work_dir = ".", .contract = "c", .dyn = "d", .gompute = "g", .device_abi = "a", .core = "k" };
-    const va = (try inputKey(io, g, .va, "m.va", "ssign y;\n", paths)).?;
-    const v = (try inputKey(io, g, .v, "m.v", "assign y;\n", paths)).?;
+    const va = (try inputKey(io, g, .va, "m.va", "ssign y;\n", &.{"."}, paths)).?;
+    const v = (try inputKey(io, g, .v, "m.v", "assign y;\n", &.{"."}, paths)).?;
     try std.testing.expect(!std.mem.eql(u8, &va, &v));
+    // An include dir is part of the key: it can change what an include reads.
+    const with_dir = (try inputKey(io, g, .va, "m.va", "ssign y;\n", &.{ ".", "inc" }, paths)).?;
+    try std.testing.expect(!std.mem.eql(u8, &va, &with_dir));
 }
 
 test "hashCode: includes it cannot follow, and __FILE__" {
@@ -652,24 +730,31 @@ test "hashCode: includes it cannot follow, and __FILE__" {
     const io = std.testing.io;
     const Sha = std.crypto.hash.sha2.Sha256;
     var h = Sha.init(.{});
-    try std.testing.expect(try hashCode(io, g, &h, .va, ".", "m.va", "module m; endmodule\n", 0));
-    try std.testing.expect(!try hashCode(io, g, &h, .va, ".", "m.va", "`include `HDR\n", 0));
-    try std.testing.expect(!try hashCode(io, g, &h, .va, ".", "m.va", "`include \"x", 0));
-    try std.testing.expect(!try hashCode(io, g, &h, .v, ".", "m.v", "`include \"a.vh\"\n", 0));
-    try std.testing.expect(!try hashCode(io, g, &h, .va, ".", "m.va", "", max_include_depth + 1));
+    try std.testing.expect(try hashCode(io, g, &h, .va, &.{"."}, "m.va", "module m; endmodule\n", 0));
+    try std.testing.expect(!try hashCode(io, g, &h, .va, &.{"."}, "m.va", "`include `HDR\n", 0));
+    try std.testing.expect(!try hashCode(io, g, &h, .va, &.{"."}, "m.va", "`include \"x", 0));
+    try std.testing.expect(!try hashCode(io, g, &h, .v, &.{"."}, "m.v", "`include \"a.vh\"\n", 0));
+    try std.testing.expect(!try hashCode(io, g, &h, .va, &.{"."}, "m.va", "", max_include_depth + 1));
     // Missing on disk: an annex header falls back to its name, anything else
     // gives up.
     const nowhere = "/nonexistent-espice-test-dir";
-    try std.testing.expect(try hashCode(io, g, &h, .va, nowhere, "m.va", "`include \"disciplines.vams\"\n", 0));
-    try std.testing.expect(!try hashCode(io, g, &h, .va, nowhere, "m.va", "`include \"nope.vh\"\n", 0));
+    try std.testing.expect(try hashCode(io, g, &h, .va, &.{nowhere}, "m.va", "`include \"disciplines.vams\"\n", 0));
+    try std.testing.expect(!try hashCode(io, g, &h, .va, &.{nowhere}, "m.va", "`include \"nope.vh\"\n", 0));
+    // Found in an include dir after the source's own.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "inc.vh", .data = "x = 1;\n" });
+    const inc_dir = try std.fs.path.join(g, &.{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path });
+    defer g.free(inc_dir);
+    try std.testing.expect(try hashCode(io, g, &h, .va, &.{ nowhere, inc_dir }, "m.va", "`include \"inc.vh\"\n", 0));
 
     // The same text keys apart under two names only when it reads `__FILE__`.
     const Pair = struct {
         fn differ(text: []const u8) !bool {
             var a = Sha.init(.{});
             var b = Sha.init(.{});
-            _ = try hashCode(std.testing.io, std.testing.allocator, &a, .va, ".", "a.va", text, 0);
-            _ = try hashCode(std.testing.io, std.testing.allocator, &b, .va, ".", "b.va", text, 0);
+            _ = try hashCode(std.testing.io, std.testing.allocator, &a, .va, &.{"."}, "a.va", text, 0);
+            _ = try hashCode(std.testing.io, std.testing.allocator, &b, .va, &.{"."}, "b.va", text, 0);
             const da = a.finalResult();
             const db = b.finalResult();
             return !std.mem.eql(u8, &da, &db);

@@ -313,19 +313,13 @@ fn francisStep(n: usize, a: []f64, lo: usize, nn: usize, iter: u32) void {
 
     for (lo..nn - 1) |k| {
         const nr = @sqrt(x * x + y * y + z * z);
-        if (nr == 0) {
-            if (k + 1 < nn - 1) {
-                x = a[(k + 1) * n + k];
-                y = a[(k + 2) * n + k];
-                z = if (k + 3 < nn) a[(k + 3) * n + k] else 0;
+        if (nr != 0) {
+            if (k + 2 < nn) {
+                applyReflector3(n, a, lo, nn, k, x, y, z, nr);
+            } else {
+                // z is 0 at the last row, so `nr` is already |(x, y)|.
+                applyReflector2(n, a, lo, nn, k, x, y, nr);
             }
-            continue;
-        }
-
-        if (k + 2 < nn) {
-            applyReflector3(n, a, lo, nn, k, x, y, z, nr);
-        } else {
-            applyReflector2(n, a, lo, nn, k, x, y);
         }
 
         if (k + 1 < nn - 1) {
@@ -376,12 +370,10 @@ fn applyReflector3(n: usize, a: []f64, lo: usize, nn: usize, k: usize, x_in: f64
 
 /// The 2-element reflector at the bottom of the chase, rows and columns
 /// k..k+1.
-fn applyReflector2(n: usize, a: []f64, lo: usize, nn: usize, k: usize, x_in: f64, y_in: f64) void {
+fn applyReflector2(n: usize, a: []f64, lo: usize, nn: usize, k: usize, x_in: f64, y_in: f64, nr: f64) void {
     assert(k + 1 < nn);
     assert(nn <= n);
-    const nr = @sqrt(x_in * x_in + y_in * y_in);
-    if (nr == 0) return;
-
+    assert(nr != 0);
     const sign_x: f64 = if (x_in >= 0) 1.0 else -1.0;
     const v0 = x_in + sign_x * nr;
     const v1 = y_in;

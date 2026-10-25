@@ -36,7 +36,9 @@ Usage: espice [OPTION]... FILE...
       --tangent-step=S        Relative step of --tangents (default 1e-6)
       --tokenizer=FMT         ngspice|hspice|spectre (default: detected from the deck, else ngspice)
       --vpi=APP               Load a VPI application (.so) for Verilog-A $systf calls; repeatable
-  -v, --version               Version
+  -I, --include=DIR           Search DIR for a .hdl model's `include files, after the model's own
+                              directory; repeatable, in order
+  -v, --version               Version, the VerA version and commit it was built with, and its backends
 ```
 
 A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
@@ -81,6 +83,12 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
   Its analog system functions answer the models' `$name` calls. Repeat it
   for several applications; a deck adds its own with `.options vpi=`. See
   [VPI applications](devices.md#vpi-applications).
+
+`-I DIR`, `--include=DIR`
+: Search `DIR` for the files a `.hdl` model `` `include``s. A model's own
+  directory is searched first, then each `-I` in the order given, then
+  VerA's built-in headers (`disciplines.vams`, `constants.vams`). The
+  directories are part of the compiled model's cache key.
 
 `--backend=BE`
 : Where device models are evaluated: `cpu` (default), `auto`, `cuda` or
@@ -218,7 +226,9 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
 : Accepted for ngspice compatibility. ESPice always runs in batch mode.
 
 `-v`, `--version`
-: Print `espice 1.0.0`.
+: Print `espice 0.3.0 (VerA 0.12.1 <commit>; backends: cpu, cuda)`: the
+  VerA version and commit the binary was built with, and the backends
+  compiled in.
 
 `-h`, `--help`
 : Print the usage above.
@@ -249,7 +259,9 @@ failed points' values as NaN, then the error.
 
 A thread count that is unset, zero or not a number reads as 1. The `.hdl`
 cache is `$ESPICE_CACHE/hdl`, else `$XDG_CACHE_HOME/espice/hdl`, else
-`~/.cache/espice/hdl`, else `$TMPDIR/espice-cache/hdl`.
+`~/.cache/espice/hdl`, else `$TMPDIR/espice-cache/hdl`. Before compiling a
+model, ESPice checks that `zig version` matches the Zig it was built with
+and stops with a message naming the compiler if it does not.
 
 ## Examples
 

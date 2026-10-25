@@ -1,5 +1,7 @@
 // LTRA lossy transmission line (ngspice O card): recursive convolution of the
 // h1'/h2/h3' impulse responses over the accepted transient history.
+// Exact small-signal dispersion is supplied by models/ltra_ac.zig through
+// the device's frequency hook; the static rows below remain the DC limit.
 //
 // Verilog-A implementation: Omar El-Sawy, University of Waterloo.
 // Based on: ngspice LTRA (ltra/ltraload.c, ltramisc.c, ltratemp.c,
@@ -11,8 +13,7 @@
 // (ltra_native.zig): ngspice-compatible where the
 // reference cuts corners (the h2 interval mismatch at i == auxindex, the
 // duplicated straight-line check in the maxSafeStep bisection). On the LTRA
-// decks it reproduces that device to 1e-12 relative
-// (dev/native-transmission-line-migration.md).
+// decks it reproduces that device to 1e-12 relative.
 //
 // erfc is an analog function below (not a VAMS builtin), within 1.9e-13 of
 // libm, so the RC kernels are not bit-equal to ngspice's.
@@ -30,6 +31,10 @@
 //
 // Card keyword `abs` is a reserved word (LRM §4.3), so it is `brkabs` here and
 // needs a host alias, as in models/lossy_tline.va.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module ltra(p1, n1, p2, n2);
     inout p1, n1, p2, n2;
     electrical p1, n1, p2, n2;
@@ -154,7 +159,7 @@ module ltra(p1, n1, p2, n2);
     endfunction
 
     // erfc is not a VAMS-2023 builtin (Tables 4-14, 4-15): VerA's
-    // tests/fixtures/erfc.vh, series below |x| = 1.5, continued fraction
+    // tests/conformance/tests/netlist/erfc.vh, series below |x| = 1.5, continued fraction
     // above. Within 1.9e-13 relative of libm erfc on [-6, 6], not bit-equal.
     analog function real erfc;
         input x;

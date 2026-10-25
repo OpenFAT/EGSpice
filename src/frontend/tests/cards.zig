@@ -6,10 +6,6 @@ const netlist = @import("../netlist.zig");
 const Netlist = netlist.Netlist;
 const Dialect = netlist.Dialect;
 
-fn parseIn(arena: std.mem.Allocator, dialect: Dialect, src: []const u8) !Netlist {
-    return netlist.parse(arena, src, dialect);
-}
-
 fn device(nl: Netlist, name: []const u8) !Netlist.View {
     for (0..nl.deviceCount()) |e| {
         const d = nl.device(.from(e));
@@ -31,7 +27,7 @@ fn expectRefused(dialect: Dialect, err: anyerror, decks: []const []const u8) !vo
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     for (decks) |src| {
-        if (parseIn(arena.allocator(), dialect, src)) |_| {
+        if (netlist.parse(arena.allocator(), src, dialect)) |_| {
             std.debug.print("accepted: {s}\n", .{src});
             return error.TestUnexpectedResult;
         } else |got| if (got != err) {
@@ -44,7 +40,7 @@ fn expectRefused(dialect: Dialect, err: anyerror, decks: []const []const u8) !vo
 test ".four naming several outputs is one card per output, numbers kept" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const nl = try parseIn(arena.allocator(), .ngspice, "t\nr1 a b 1\nr2 b 0 1\n.four 1k v(a) v(b) 3\n.four 2k v(a)\n");
+    const nl = try netlist.parse(arena.allocator(), "t\nr1 a b 1\nr2 b 0 1\n.four 1k v(a) v(b) 3\n.four 2k v(a)\n", .ngspice);
     const as = nl.deck.analyses;
     try std.testing.expectEqual(@as(usize, 3), as.len);
     for (as[0..2], [_][]const u8{ "a", "b" }) |a, net| {
@@ -63,11 +59,11 @@ test "MONTE=list expands its a:b ranges; counts are positive integers [CR .DC]" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var nl = try parseIn(a, .hspice, "t\nr1 a 0 1\n.tran 1n 10n sweep monte=list(2 4:6)\n");
+    var nl = try netlist.parse(a, "t\nr1 a 0 1\n.tran 1n 10n sweep monte=list(2 4:6)\n", .hspice);
     const m = nl.deck.analyses[0].sweep.monte;
     try std.testing.expectEqual(@as(u32, 4), m.n);
     try std.testing.expectEqualSlices(u32, &.{ 2, 4, 5, 6 }, m.list);
-    nl = try parseIn(a, .hspice, "t\nr1 a 0 1\n.tran 1n 10n sweep monte=3 firstrun=2\n");
+    nl = try netlist.parse(a, "t\nr1 a 0 1\n.tran 1n 10n sweep monte=3 firstrun=2\n", .hspice);
     try std.testing.expectEqual(netlist.Monte{ .n = 3, .first = 2 }, nl.deck.analyses[0].sweep.monte);
     try expectRefused(.hspice, error.ParseError, &.{
         "t\nr1 a 0 1\n.tran 1n 10n sweep monte=list(0)\n",
@@ -80,7 +76,7 @@ test "MONTE=list expands its a:b ranges; counts are positive integers [CR .DC]" 
         "t\nr1 a 0 1\n.tran 1n 10n sweep monte=list(1:600000 1:600000)\n",
     });
     // A million trials in all is the limit.
-    nl = try parseIn(a, .hspice, "t\nr1 a 0 1\n.tran 1n 10n sweep monte=list(1:524288 1:524288)\n");
+    nl = try netlist.parse(a, "t\nr1 a 0 1\n.tran 1n 10n sweep monte=list(1:524288 1:524288)\n", .hspice);
     try std.testing.expectEqual(@as(u32, 1 << 20), nl.deck.analyses[0].sweep.monte.n);
 }
 
@@ -96,7 +92,7 @@ test ".step grids: dec and oct per decade or octave, lin by increment; poi refus
     };
     for (cases) |c| {
         const src = try a.print("t\n.param p=1\nr1 a 0 {{p}}\n{s}\n", .{c[0]});
-        const nl = try parseIn(a, .ngspice, src);
+        const nl = try netlist.parse(a, src, .ngspice);
         const values = nl.deck.steps[0].values;
         try std.testing.expectEqual(c[1].len, values.len);
         for (c[1], values) |want, got| try std.testing.expectApproxEqRel(want, got, 1e-12);
@@ -112,16 +108,16 @@ test "HSPICE sweep tails: lin by count, poi by list, .dc over a bare .param (#94
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var nl = try parseIn(a, .hspice, "t\n.param p=1\nr1 a 0 p\n.tran 1n 10n sweep p lin 3 1 2\n");
+    var nl = try netlist.parse(a, "t\n.param p=1\nr1 a 0 p\n.tran 1n 10n sweep p lin 3 1 2\n", .hspice);
     try std.testing.expectEqualSlices(f64, &.{ 1, 1.5, 2 }, nl.deck.analyses[0].sweep.step.values);
-    nl = try parseIn(a, .hspice, "t\n.param p=1\nr1 a 0 p\n.tran 1n 10n sweep p poi 2 1 5\n");
+    nl = try netlist.parse(a, "t\n.param p=1\nr1 a 0 p\n.tran 1n 10n sweep p poi 2 1 5\n", .hspice);
     try std.testing.expectEqualSlices(f64, &.{ 1, 5 }, nl.deck.analyses[0].sweep.step.values);
-    nl = try parseIn(a, .hspice, "t\n.param p=1\nr1 a 0 p\n.dc p 1 3 1\n");
+    nl = try netlist.parse(a, "t\n.param p=1\nr1 a 0 p\n.dc p 1 3 1\n", .hspice);
     const dc = nl.deck.analyses[0];
     try std.testing.expectEqual(@as(usize, 0), dc.args.len);
     try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, dc.sweep.step.values);
     try std.testing.expectEqualStrings("p", nl.live.names[dc.sweep.step.target.param]);
-    nl = try parseIn(a, .hspice, "t\nr1 a 0 1\n.data d\nx\n1\n.enddata\n.tran 1n 10n sweep data=d\n");
+    nl = try netlist.parse(a, "t\nr1 a 0 1\n.data d\nx\n1\n.enddata\n.tran 1n 10n sweep data=d\n", .hspice);
     try std.testing.expectEqualStrings("d", nl.deck.analyses[0].sweep.data);
     try expectRefused(.hspice, error.ParseError, &.{
         "t\n.param p=1\nr1 a 0 p\n.tran 1n 10n sweep p poi 3 1 5\n",
@@ -135,7 +131,7 @@ test "HSPICE sweep tails: lin by count, poi by list, .dc over a bare .param (#94
 test ".mosra reads its keys; SimMode 1 and unknown keys are refused [SA Ch.29]" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const nl = try parseIn(arena.allocator(), .hspice, "t\nr1 a 0 1\n.mosra reltotaltime=10 relstep=1 simmode=0 relmode=2 degf=0.1\n");
+    const nl = try netlist.parse(arena.allocator(), "t\nr1 a 0 1\n.mosra reltotaltime=10 relstep=1 simmode=0 relmode=2 degf=0.1\n", .hspice);
     const m = nl.deck.mosra.?;
     try std.testing.expectEqual(@as(f64, 10), m.rel_total_time);
     try std.testing.expectEqual(@as(f64, 1), m.rel_step);
@@ -157,7 +153,7 @@ test ".mosra reads its keys; SimMode 1 and unknown keys are refused [SA Ch.29]" 
 test ".sample: FS positive, MAXFLD at least 1, BETA in [0, 1] [CR .SAMPLE]" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const nl = try parseIn(arena.allocator(), .hspice, "t\nr1 a 0 1\n.sample fs=1g maxfld=4 beta=0.5 tol=1m\n");
+    const nl = try netlist.parse(arena.allocator(), "t\nr1 a 0 1\n.sample fs=1g maxfld=4 beta=0.5 tol=1m\n", .hspice);
     try std.testing.expectEqual(@import("core").query.NoiseSample{ .fs = 1e9, .max_fold = 4, .beta = 0.5 }, nl.deck.sample.?);
     try expectRefused(.hspice, error.ParseError, &.{
         "t\nr1 a 0 1\n.sample fs=0\n",
@@ -172,18 +168,18 @@ test "HSPICE .save is the operating-point save; ngspice .save lists outputs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var nl = try parseIn(a, .hspice, "t\nr1 a 0 1\n.save type=ic level=top time=1n file='Op.ic'\n");
+    var nl = try netlist.parse(a, "t\nr1 a 0 1\n.save type=ic level=top time=1n file='Op.ic'\n", .hspice);
     const s = nl.deck.save_op.?;
     try std.testing.expect(s.ic and s.top_only);
     try std.testing.expectEqual(@as(f64, 1e-9), s.time);
     try std.testing.expectEqualStrings("Op.ic", s.file.?); // the path keeps its case
-    nl = try parseIn(a, .hspice, "t\nr1 a 0 1\n.save type=ic\n.save level=none\n");
+    nl = try netlist.parse(a, "t\nr1 a 0 1\n.save type=ic\n.save level=none\n", .hspice);
     try std.testing.expectEqual(@as(?@import("core").SaveOp, null), nl.deck.save_op);
-    nl = try parseIn(a, .ngspice, "t\nr1 a 0 1\n.save v(A) i(R1) x\n");
+    nl = try netlist.parse(a, "t\nr1 a 0 1\n.save v(A) i(R1) x\n", .ngspice);
     try std.testing.expectEqual(@as(usize, 2), nl.deck.saves.len);
     try std.testing.expectEqualStrings("v(a)", nl.deck.saves[0]);
     try std.testing.expectEqualStrings("i(r1)", nl.deck.saves[1]);
-    nl = try parseIn(a, .ngspice, "t\nr1 a 0 1\n.save v(a)\n.save all\n");
+    nl = try netlist.parse(a, "t\nr1 a 0 1\n.save v(a)\n.save all\n", .ngspice);
     try std.testing.expectEqual(@as(usize, 0), nl.deck.saves.len);
     try expectRefused(.hspice, error.ParseError, &.{
         "t\nr1 a 0 1\n.save time=-1\n",
@@ -197,7 +193,7 @@ test "HSPICE .save is the operating-point save; ngspice .save lists outputs" {
 test "shunt options add one R or C per net to ground [CR Ch.3]" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const nl = try parseIn(arena.allocator(), .ngspice, "t\nr1 a b 1\nr2 b 0 1\n.options gshunt=1e-12 cshunt=1p rshunt=1e9\n");
+    const nl = try netlist.parse(arena.allocator(), "t\nr1 a b 1\nr2 b 0 1\n.options gshunt=1e-12 cshunt=1p rshunt=1e9\n", .ngspice);
     // Nets a and b, three shunts each, after the two cards.
     try std.testing.expectEqual(@as(u32, 2 + 2 * 3), nl.deviceCount());
     const g = try device(nl, "r.gshunt.a");
@@ -206,14 +202,14 @@ test "shunt options add one R or C per net to ground [CR Ch.3]" {
     try std.testing.expectEqual(@as(f64, 1e-12), (try device(nl, "c.cshunt.b")).positional[0].num);
     try std.testing.expectEqual(@as(f64, 1e9), (try device(nl, "r.rshunt.b")).positional[0].num);
     // A zero shunt adds nothing.
-    const none_added = try parseIn(arena.allocator(), .ngspice, "t\nr1 a 0 1\n.options gshunt=0\n");
+    const none_added = try netlist.parse(arena.allocator(), "t\nr1 a 0 1\n.options gshunt=0\n", .ngspice);
     try std.testing.expectEqual(@as(u32, 1), none_added.deviceCount());
 }
 
 test ".ic and .dcvolt keep nets some card names, never ground" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const nl = try parseIn(arena.allocator(), .ngspice, "t\nr1 a b 1\n.ic v(a)=1 v(0)=2 v(nosuch)=3 v(b)=x\n.dcvolt b 2\n.nodeset v(a)=0.5\n");
+    const nl = try netlist.parse(arena.allocator(), "t\nr1 a b 1\n.ic v(a)=1 v(0)=2 v(nosuch)=3 v(b)=x\n.dcvolt b 2\n.nodeset v(a)=0.5\n", .ngspice);
     try std.testing.expectEqual(@as(usize, 2), nl.deck.ic.len);
     try std.testing.expectEqualStrings("a", nl.netName(nl.deck.ic[0].net));
     try std.testing.expectEqual(@as(f64, 1), nl.deck.ic[0].value);
@@ -226,7 +222,7 @@ test ".ic and .dcvolt keep nets some card names, never ground" {
 test "ngspice reads `10%3` as the number 10 and refuses an operator-led field (#200)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const nl = try parseIn(arena.allocator(), .ngspice, "t\nr1 a 0 r=10%3\nr2 a 0 r=2k\\3\n");
+    const nl = try netlist.parse(arena.allocator(), "t\nr1 a 0 r=10%3\nr2 a 0 r=2k\\3\n", .ngspice);
     try std.testing.expectEqual(@as(f64, 10), try kvNum((try device(nl, "r1")).kv, "r"));
     try std.testing.expectEqual(@as(f64, 2000), try kvNum((try device(nl, "r2")).kv, "r"));
     try expectRefused(.ngspice, error.UnsupportedCard, &.{
@@ -241,11 +237,11 @@ test "a lone POLY(1) coefficient is p1 in HSPICE and p0 in ngspice [SA G-element
     defer arena.deinit();
     const a = arena.allocator();
     // ngspice: the constant term alone, `(2)`, folds to a number.
-    const ng = try device(try parseIn(a, .ngspice, "t\ne1 o 0 poly(1) a 0 2\nr1 a 0 1\n"), "e1");
+    const ng = try device(try netlist.parse(a, "t\ne1 o 0 poly(1) a 0 2\nr1 a 0 1\n", .ngspice), "e1");
     try std.testing.expectEqual('b', ng.kind);
     try std.testing.expectEqual(@as(f64, 2), try kvNum(ng.kv, "v"));
     // HSPICE: `0 + 2*v(a)` reads the circuit and stays postfix.
-    const hs = try device(try parseIn(a, .hspice, "t\ne1 o 0 poly(1) a 0 2\nr1 a 0 1\n"), "e1");
+    const hs = try device(try netlist.parse(a, "t\ne1 o 0 poly(1) a 0 2\nr1 a 0 1\n", .hspice), "e1");
     try std.testing.expect(hs.kv[0].value == .expr);
     try expectRefused(.ngspice, error.ParseError, &.{
         "t\ne1 o 0 poly(0) a 0 2\n",
@@ -259,14 +255,14 @@ test "LAPLACE, POLE and DELAY keep their letter and count their terms" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const lap = try device(try parseIn(a, .ngspice, "t\ne1 o 0 laplace a 0 1 / 1 1e-3\n"), "e1");
+    const lap = try device(try netlist.parse(a, "t\ne1 o 0 laplace a 0 1 / 1 1e-3\n", .ngspice), "e1");
     try std.testing.expectEqual('e', lap.kind);
     try std.testing.expectEqual(@as(usize, 4), lap.pins.len);
     try std.testing.expectEqual(@as(usize, 3), lap.positional.len);
     try std.testing.expectEqual(@as(f64, 1), try kvNum(lap.kv, "laplace"));
-    const pole = try device(try parseIn(a, .ngspice, "t\ng1 o 0 pole a 0 1 / 1 2 3\n"), "g1");
+    const pole = try device(try netlist.parse(a, "t\ng1 o 0 pole a 0 1 / 1 2 3\n", .ngspice), "g1");
     try std.testing.expectEqual(@as(f64, 1), try kvNum(pole.kv, "pole"));
-    const delay = try device(try parseIn(a, .ngspice, "t\ne1 o 0 delay a 0 td=1n\n"), "e1");
+    const delay = try device(try netlist.parse(a, "t\ne1 o 0 delay a 0 td=1n\n", .ngspice), "e1");
     try std.testing.expectEqual(@as(f64, 1e-9), try kvNum(delay.kv, "td"));
     try expectRefused(.ngspice, error.ParseError, &.{
         "t\ne1 o 0 laplace a 0 1\n", // no denominator
@@ -281,7 +277,7 @@ test "LAPLACE, POLE and DELAY keep their letter and count their terms" {
 test "an HSPICE P card is a V port; its hblin band splits into two keys" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const nl = try parseIn(arena.allocator(), .hspice, "t\np1 a 0 port=1 z0=50 hblin=[1, 2]\nr1 a 0 50\n");
+    const nl = try netlist.parse(arena.allocator(), "t\np1 a 0 port=1 z0=50 hblin=[1, 2]\nr1 a 0 50\n", .hspice);
     const p = try device(nl, "p1");
     try std.testing.expectEqual('v', p.kind);
     try std.testing.expectEqual(@as(f64, 1), try kvNum(p.kv, "hblin_h"));
@@ -297,7 +293,7 @@ test "an HSPICE P card is a V port; its hblin band splits into two keys" {
 test ".options vpi= names VPI applications in their own case (#197)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const nl = try parseIn(arena.allocator(), .ngspice, "t\nr1 a 0 1\n.options reltol=1e-4 vpi=\"Lib/App.so\" vpi='b.so'\n");
+    const nl = try netlist.parse(arena.allocator(), "t\nr1 a 0 1\n.options reltol=1e-4 vpi=\"Lib/App.so\" vpi='b.so'\n", .ngspice);
     try std.testing.expectEqual(@as(usize, 2), nl.deck.vpi_apps.len);
     try std.testing.expectEqualStrings("Lib/App.so", nl.deck.vpi_apps[0]);
     try std.testing.expectEqualStrings("b.so", nl.deck.vpi_apps[1]);
@@ -321,9 +317,9 @@ test ".connect is top-level only; nested .subckt definitions stop at 16" {
         for (0..depth) |_| try src.appendSlice(a, ".ends\n");
         try src.appendSlice(a, "x1 n s0\n");
         if (depth == 16)
-            _ = try parseIn(a, .ngspice, src.items)
+            _ = try netlist.parse(a, src.items, .ngspice)
         else
-            try std.testing.expectError(error.ParseError, parseIn(a, .ngspice, src.items));
+            try std.testing.expectError(error.ParseError, netlist.parse(a, src.items, .ngspice));
     }
 }
 
@@ -339,11 +335,11 @@ test "groups nest 32 deep; the 33rd level is refused" {
         for (0..depth) |_| try src.append(a, ')');
         try src.append(a, '\n');
         if (depth == 32) {
-            const nl = try parseIn(a, .ngspice, src.items);
+            const nl = try netlist.parse(a, src.items, .ngspice);
             var v = (try device(nl, "v1")).positional[0];
             for (0..depth) |_| v = v.group.args()[0];
             try std.testing.expectEqual(@as(f64, 1), v.num);
-        } else try std.testing.expectError(error.ParseError, parseIn(a, .ngspice, src.items));
+        } else try std.testing.expectError(error.ParseError, netlist.parse(a, src.items, .ngspice));
     }
 }
 

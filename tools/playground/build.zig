@@ -1,6 +1,6 @@
-//! cktimg.wasm for the docs playground: netlist text in, schematic SVG out.
-//! ESPice's `zig build wasm` runs this build into its own prefix; run alone,
-//! it installs zig-out/wasm/cktimg.wasm here.
+//! The docs playground: espice.wasm (the C API, simulating in the browser)
+//! and cktimg.wasm (netlist text in, schematic SVG out). `pages.yml` runs
+//! `zig build` here and copies zig-out/wasm/ into docs/wasm/.
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -30,4 +30,25 @@ pub fn build(b: *std.Build) void {
     exe.entry = .disabled;
     exe.rdynamic = true;
     b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "wasm" } } }).step);
+
+    const wasi = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi, .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}) });
+    const espice = b.dependency("espice", .{ .target = wasi, .optimize = optimize, .gpu = false, .@"cuda-arch" = "none", .@"hip-arch" = "none" });
+    const c_api = espice.module("c_api");
+    const root = b.createModule(.{
+        .root_source_file = b.path("espice.zig"),
+        .target = wasi,
+        .optimize = optimize,
+        .strip = true,
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "c_api", .module = c_api },
+            .{ .name = "espice_h", .module = c_api.import_table.get("espice_h").? },
+        },
+    });
+    const wexe = b.addExecutable(.{ .name = "espice", .root_module = root });
+    wexe.entry = .disabled;
+    wexe.rdynamic = true;
+    wexe.wasi_exec_model = .reactor;
+    wexe.stack_size = 16 << 20; // the corpus peaks at 541 KiB (dc/device_b3soipd_output.sp)
+    b.getInstallStep().dependOn(&b.addInstallArtifact(wexe, .{ .dest_dir = .{ .override = .{ .custom = "wasm" } } }).step);
 }

@@ -127,6 +127,37 @@ pub const Groups = struct {
     }
 };
 
+/// The refs a mismatch or sensitivity solves over, and `vars` numbered
+/// into them: with a variation block only its parameters, in block order
+/// (`Circuit.isolatedParams`, so the circuit's other instances keep sharing
+/// their Model rows), else every parameter (`Circuit.collectParams`).
+/// Free with `deinit` and the allocator `init` took.
+pub const Refs = struct {
+    refs: []const root.ParamRef,
+    vars: Variations,
+    owned: bool,
+
+    /// Without a variation block `refs` borrows `Circuit.collectParams`'
+    /// cached list; with one both slices are allocated with `a`.
+    pub fn init(a: std.mem.Allocator, ckt: *root.Circuit, vars: Variations) !Refs {
+        if (vars.starts.len == 0) return .{ .refs = try ckt.collectParams(), .vars = vars, .owned = false };
+        const refs = try ckt.isolatedParams(a, vars.params);
+        errdefer a.free(refs);
+        const params = try a.alloc(u32, vars.params.len);
+        for (params, 0..) |*p, k| p.* = @intCast(k);
+        var v = vars;
+        v.params = params;
+        return .{ .refs = refs, .vars = v, .owned = true };
+    }
+
+    /// Frees what `init` allocated; `a` must be the allocator `init` took.
+    pub fn deinit(self: Refs, a: std.mem.Allocator) void {
+        if (!self.owned) return;
+        a.free(self.refs);
+        a.free(self.vars.params);
+    }
+};
+
 /// The parameter's mismatch sigma (not sigma^2): A_P / sqrt(W·L).
 fn pelgromSigma(ref: root.ParamRef) f64 {
     if (ref.pelgrom_ap > 0 and ref.area_wl > 0) return ref.pelgrom_ap / @sqrt(ref.area_wl);
@@ -219,8 +250,10 @@ fn publish(ctx: *const root.RunCtx, output_node: u32, output_neg: u32, vars: Var
     const a = ctx.allocator;
     const ckt = ctx.circuit;
     const scratch = ctx.scratch_allocator;
-    const refs = try ckt.collectParams();
-    const groups = try Groups.init(scratch, refs, vars);
+    const sel = try Refs.init(scratch, ckt, vars);
+    defer sel.deinit(scratch);
+    const refs = sel.refs;
+    const groups = try Groups.init(scratch, refs, sel.vars);
     defer groups.deinit(scratch);
     const res = try solve(ckt, ctx.x_op, output_node, output_neg, refs, groups, scratch);
     defer scratch.free(res.contributions);

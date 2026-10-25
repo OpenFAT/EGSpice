@@ -14,8 +14,9 @@ allocator: std.mem.Allocator,
 n: u32,
 /// Structural nonzeros; also the trash slot ground stamps land in.
 nnz: u32,
-/// CSC column starts, n + 1 entries; rows ascend within a column.
+/// CSC column starts, n + 1 entries.
 col_ptr: []u32,
+/// CSC row of each slot, nnz entries, ascending within a column.
 row_idx: []u32,
 /// CSC slot of each diagonal entry.
 diag_slots: []u32,
@@ -52,6 +53,39 @@ vpi: ?*const Library.Vpi = null,
 /// until `countParams`. A variant row then reaches the batches it writes
 /// without collecting the others.
 param_starts: []u32 = &.{},
+/// The sparse LU's BTF + AMD column order of this pattern, filled by the
+/// first query that factors and copied by the rest (`ColumnOrder`), so a
+/// sweep orders its pattern once instead of per point. Heap-held, so it
+/// survives the Circuit value moving; null for a hand-made circuit.
+column_order: ?*ColumnOrder = null,
+
+/// A once-filled, lock-free slot for a pattern's column order.
+pub const ColumnOrder = struct {
+    /// Owns `q`: the template's allocator, whatever allocator the query
+    /// that fills it runs on.
+    gpa: std.mem.Allocator,
+    q: std.atomic.Value(?[*]u32) = .init(null),
+
+    /// The order, n entries, once some query has shared one.
+    pub fn get(c: *const ColumnOrder, n: u32) ?[]const u32 {
+        const p = c.q.load(.acquire) orelse return null;
+        return p[0..n];
+    }
+
+    /// Keeps a copy of `q` unless another query got there first.
+    pub fn share(c: *ColumnOrder, q: []const u32) error{OutOfMemory}!void {
+        if (c.q.load(.acquire) != null) return;
+        const copy = try c.gpa.dupe(u32, q);
+        if (c.q.cmpxchgStrong(null, copy.ptr, .acq_rel, .acquire) != null) c.gpa.free(copy);
+    }
+
+    /// Frees the shared order and the slot.
+    pub fn destroy(c: *ColumnOrder, n: u32) void {
+        const gpa = c.gpa;
+        if (c.q.load(.acquire)) |p| gpa.free(p[0..n]);
+        gpa.destroy(c);
+    }
+};
 
 /// Topology facts `freeze` records on the Circuit.
 pub const Facts = struct {
@@ -61,6 +95,7 @@ pub const Facts = struct {
     /// Per `DeviceType`, whether the type runs a digital engine
     /// (`Library.digital`); types past its end are analog.
     digital: []const bool = &.{},
+    /// Becomes `Circuit.vpi`.
     vpi: ?*const Library.Vpi = null,
 };
 
@@ -102,12 +137,7 @@ pub fn freeze(
     // Every diagonal is in the pattern, so it holds at least n entries.
     std.debug.assert(nnz >= n);
     std.debug.assert(row_idx.len == nnz);
-    const view: abi.PatternView = .{
-        .col_ptr = col_ptr,
-        .row_idx = row_idx,
-        .n = n,
-        .trash_slot = nnz,
-    };
+    const view: abi.PatternView = .{ .col_ptr = col_ptr, .row_idx = row_idx, .n = n, .trash_slot = nnz };
     const diagonal = try allocator.alloc(u32, n);
     errdefer allocator.free(diagonal);
     // Every diagonal was added above.
@@ -128,6 +158,9 @@ pub fn freeze(
     }
     const batch_types = try allocator.dupe(abi.DeviceType, types);
     errdefer allocator.free(batch_types);
+    const column_order = try allocator.create(ColumnOrder);
+    errdefer allocator.destroy(column_order);
+    column_order.* = .{ .gpa = allocator };
     const current_row = try allocator.alloc(bool, n);
     @memset(current_row, false);
     errdefer allocator.free(current_row);
@@ -163,6 +196,7 @@ pub fn freeze(
         .ac_dyn_slots = ac_dyn_slots,
         .has_charge = has_charge,
         .has_state_q = has_state_q,
+        .column_order = column_order,
     };
 }
 
@@ -183,11 +217,12 @@ pub fn deinit(self: *Circuit) void {
     allocator.free(self.intern_offs);
     if (self.bbd) |bbd| allocator.free(bbd.blocks);
     allocator.free(self.param_starts);
+    if (self.column_order) |o| o.destroy(self.n);
     self.* = undefined;
 }
 
-/// Fills `param_starts` once. Collecting gives each batch per-instance
-/// model rows, as every caller that numbers parameters already has.
+/// Fills `param_starts` once. A batch with `param_layout` keeps its Model
+/// rows shared; the others are collected, which unshares theirs.
 pub fn countParams(self: *Circuit) !void {
     if (self.param_starts.len != 0) return;
     const starts = try self.allocator.alloc(u32, self.batches.len + 1);
@@ -196,6 +231,11 @@ pub fn countParams(self: *Circuit) !void {
     defer list.deinit(self.allocator);
     starts[0] = 0;
     for (self.batches, 0..) |b, i| {
+        if (b.hooks.param_layout) |layout| {
+            const l = try layout(b.ctx).unwrap();
+            starts[i + 1] = starts[i] + @as(u32, @intCast(l.count * l.fields.len));
+            continue;
+        }
         list.clearRetainingCapacity();
         try b.hooks.collect_params(b.ctx, self.allocator, &list).unwrap();
         starts[i + 1] = starts[i] + @as(u32, @intCast(list.items.len));
@@ -215,12 +255,8 @@ pub fn nodeName(self: Circuit, node: u32) []const u8 {
 /// pattern.
 pub fn findSlot(self: Circuit, row: u32, col: u32) ?u32 {
     if (row >= self.n or col >= self.n) return null;
-    return (abi.PatternView{
-        .col_ptr = self.col_ptr,
-        .row_idx = self.row_idx,
-        .n = self.n,
-        .trash_slot = self.nnz,
-    }).findSlot(row, col);
+    const view: abi.PatternView = .{ .col_ptr = self.col_ptr, .row_idx = self.row_idx, .n = self.n, .trash_slot = self.nnz };
+    return view.findSlot(row, col);
 }
 
 /// A one-instance device that stamps (row, col) and owns one heap word, so

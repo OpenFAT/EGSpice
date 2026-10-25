@@ -3,7 +3,7 @@
 //! a `{...}` or quoted field keeps its delimiters (its kind is its first
 //! byte), and anything else is a word.
 //!
-//! Cites tests/grammar/{ngspice,hspice,spectre}_lines.peg (the line rules),
+//! Cites tests/frontend/grammar/{ngspice,hspice,spectre}_lines.peg (the line rules),
 //! dev/research/{ngspice,hspice,spectre}-syntax.md (§ and rule ids), ngspice
 //! inpeval.c INPevaluate and the HSPICE User Guide B-2008.09 for number
 //! literals, and glibc's pow(10, e) for the scale (#36).
@@ -53,7 +53,7 @@ pub fn Fields(comptime quotes: []const u8, comptime braces: bool) type {
         /// True unless `f` is a punctuation, quoted or braced field.
         /// Asserts `f` is non-empty, as every field `next` returns is.
         pub fn isWord(f: []const u8) bool {
-            return !isBreak(f[0]);
+            return !breaks[f[0]];
         }
 
         const breaks: [256]bool = blk: {
@@ -63,10 +63,6 @@ pub fn Fields(comptime quotes: []const u8, comptime braces: bool) type {
             if (braces) t['{'] = true;
             break :blk t;
         };
-
-        fn isBreak(c: u8) bool {
-            return breaks[c];
-        }
 
         /// True for this dialect's quote bytes.
         pub fn isQuote(c: u8) bool {
@@ -114,7 +110,7 @@ pub fn Fields(comptime quotes: []const u8, comptime braces: bool) type {
                 self.pos = @min(i + 1, line.len);
                 return line[start..self.pos];
             }
-            while (self.pos < line.len and !isBreak(line[self.pos])) self.pos += 1;
+            while (self.pos < line.len and !breaks[line[self.pos]]) self.pos += 1;
             return line[start..self.pos];
         }
     };
@@ -288,13 +284,14 @@ pub fn normalize(dst: []u8, src: []const u8) usize {
     return lines + std.mem.countScalar(u8, src[i..], '\n');
 }
 
-/// Appends a continuation piece to a logical line, copying `head` on first use.
-fn join(arena: std.mem.Allocator, joined: *?std.ArrayList(u8), head: []const u8, piece: []const u8) !void {
+/// Appends `sep` and a continuation piece to a logical line, copying
+/// `head` on first use.
+fn join(arena: std.mem.Allocator, joined: *?std.ArrayList(u8), head: []const u8, sep: []const u8, piece: []const u8) !void {
     if (joined.* == null) {
         joined.* = .empty;
         try joined.*.?.appendSlice(arena, head);
     }
-    try joined.*.?.append(arena, ' ');
+    try joined.*.?.appendSlice(arena, sep);
     try joined.*.?.appendSlice(arena, piece);
 }
 
@@ -338,7 +335,7 @@ pub const ngspice = struct {
     pub const Split = Fields("'", true);
 
     /// Logical-line iterator; a joined line is allocated in `arena`.
-    /// tests/grammar/ngspice_lines.peg is the spec; section numbers cite
+    /// tests/frontend/grammar/ngspice_lines.peg is the spec; section numbers cite
     /// dev/research/ngspice-syntax.md.
     pub const Lines = struct {
         rest: []const u8,
@@ -445,7 +442,7 @@ pub const ngspice = struct {
                     break;
                 }
                 glued = endsGlued(u);
-                try join(self.arena, &joined, head, stripComment(if (glued) unglued(u) else u));
+                try join(self.arena, &joined, head, " ", stripComment(if (glued) unglued(u) else u));
             }
             return if (joined) |j| j.items else head;
         }
@@ -459,7 +456,7 @@ pub const ngspice = struct {
 
 /// HSPICE: like ngspice, but `"` also quotes, `$` starts a comment only after
 /// a separator or a number, and a trailing `\` or `\\` continues the line
-/// (tests/grammar/hspice_lines.peg is the spec; rule ids L2-L6 cite
+/// (tests/frontend/grammar/hspice_lines.peg is the spec; rule ids L2-L6 cite
 /// dev/research/hspice-syntax.md).
 pub const hspice = struct {
     /// The first line is the deck title, not a card.
@@ -581,13 +578,7 @@ pub const hspice = struct {
                     const raw = nextPhysicalLine(&self.rest) orelse break;
                     const brk = part.brk;
                     part = read(std.mem.trim(u8, raw, " \t"), &quote);
-                    if (brk == .glue) {
-                        if (joined == null) {
-                            joined = .empty;
-                            try joined.?.appendSlice(self.arena, head);
-                        }
-                        try joined.?.appendSlice(self.arena, part.text);
-                    } else try join(self.arena, &joined, head, part.text);
+                    try join(self.arena, &joined, head, if (brk == .glue) "" else " ", part.text);
                     continue;
                 }
                 // L5: a `+` line continues the statement, past comment and blank lines.
@@ -598,7 +589,7 @@ pub const hspice = struct {
                 if (t.len > 0 and t[0] == '+') {
                     quote = 0;
                     part = read(t[1..], &quote);
-                    try join(self.arena, &joined, head, part.text);
+                    try join(self.arena, &joined, head, " ", part.text);
                 } else if (t.len == 0 or t[0] == '*' or t[0] == '$') {
                     continue;
                 } else {
@@ -619,7 +610,7 @@ pub const hspice = struct {
     /// factor (`1e-6u`), which HSPICE forbids (hspice-syntax.md T3, UG08
     /// p. 49): a deck that writes one is refused (#203). A number starts
     /// after a byte that cannot continue a name, so `n1e3k` is a name.
-    /// tests/grammar/lower.zig refuses the same lines.
+    /// tests/frontend/lower.zig refuses the same lines.
     pub fn exponentWithScale(line: []const u8) bool {
         for (0..line.len) |i| {
             if (i > 0 and (std.ascii.isAlphanumeric(line[i - 1]) or line[i - 1] == '_' or line[i - 1] == '.')) continue;
@@ -691,15 +682,15 @@ test "hspice.exponentWithScale finds a number with an exponent and a scale (#203
 
 /// Spectre: the title line, case kept, `*` comment lines, `//` comments, `\`
 /// or `+` continuation, and HSPICE's rules in a `simulator lang=spice`
-/// region (tests/grammar/spectre_lines.peg is the spec; § cite
+/// region (tests/frontend/grammar/spectre_lines.peg is the spec; § cite
 /// dev/research/spectre-syntax.md).
 pub const spectre = struct {
     /// §1.2: line 1 of the top-level netlist is the title (UG p.29, p.50).
     pub const title_line = true;
     /// Operator bytes beyond `* /` at their level: `%`, which ESPice reads
-    /// (tests/grammar/spectre.peg MulOp); `\` is no Spectre operator (#203).
+    /// (tests/frontend/grammar/spectre.peg MulOp); `\` is no Spectre operator (#203).
     pub const remainder_ops = "%";
-    /// Unary `!`, which ESPice reads (tests/grammar/spectre.peg SignOp).
+    /// Unary `!`, which ESPice reads (tests/frontend/grammar/spectre.peg SignOp).
     pub const unary_not = true;
     /// Cards are case-sensitive: the text is parsed as written.
     pub const fold_case = false;
@@ -760,9 +751,9 @@ pub const spectre = struct {
             return .{ text, false };
         }
 
-        /// True for `simulator lang=<lang>`, case-blind as a SPICE region
-        /// writes it.
-        fn switchesTo(line: []const u8, lang: []const u8) bool {
+        /// True for `simulator lang=<lang> ...`, compared case-insensitively
+        /// as a SPICE region writes it; fields after the language are ignored.
+        pub fn switchesTo(line: []const u8, lang: []const u8) bool {
             var f = Fields("\"", false).init(line);
             const words = [_][]const u8{ "simulator", "lang", "=" };
             for (words) |w| if (!std.ascii.eqlIgnoreCase(f.next() orelse return false, w)) return false;
@@ -813,7 +804,7 @@ pub const spectre = struct {
                         break;
                     }
                 }
-                try join(self.arena, &joined, head, text);
+                try join(self.arena, &joined, head, " ", text);
             }
             const line = if (joined) |j| j.items else head;
             if (switchesTo(line, "spice")) self.spice = true;
@@ -932,25 +923,4 @@ test "number literals read as ngspice's INPevaluate" {
     try std.testing.expectEqual(1e-3, spectre.parseNum("1meg").?);
     try std.testing.expectEqual(0.5, spectre.parseNum("50%").?);
     try std.testing.expectEqual(1e5, spectre.parseNum("1E5").?);
-}
-
-fn expectLines(comptime S: type, src: []const u8, want: []const []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var it: S.Lines = .{ .rest = src, .arena = arena.allocator() };
-    for (want) |w| try std.testing.expectEqualStrings(w, (try it.next()).?);
-    try std.testing.expectEqual(null, try it.next());
-}
-
-test "logical lines per dialect" {
-    try expectLines(ngspice, "", &.{});
-    try expectLines(ngspice, "* c\nr1 a b 1k $ tail\n+ 2 ; more\n\n* mid\n+ 3\n$ only\nc1 x y 1p\r\n", &.{ "r1 a b 1k 2 3", "c1 x y 1p" });
-    // `\\` squeezes the blanks out of the join, ` \` keeps one (HSPICE User
-    // Guide B-2008.09 p. 40); `$` after a number or a comma is a comment (p. 56).
-    try expectLines(hspice, "r1 a b$c 1k $ tail\nr2 a \\\\\nb 2\n+ 3\n", &.{ "r1 a b$c 1k", "r2 ab 2 3" });
-    try expectLines(hspice, "$ note\nr3 a b \\\n  2k$c\nr4 a b 1,$c\n", &.{ "r3 a b 2k", "r4 a b 1," });
-    // No `/* */` in Spectre (spectre-syntax.md §1.3); `*` comments only in
-    // the first column; a SPICE region reads as HSPICE does.
-    try expectLines(spectre, "r1 (a b) resistor r=1k // c\nr2 \"x//y\" b \\\n  r=2\n// note\n+ m=1\n* gone\n", &.{ "r1 (a b) resistor r=1k", "r2 \"x//y\" b r=2 m=1" });
-    try expectLines(spectre, "simulator lang=spice\nR1 a b 1k $ c\n+ tc1=1\nsimulator lang=spectre\nr2 (a b) resistor r=1 $x\n", &.{ "simulator lang=spice", "R1 a b 1k tc1=1", "simulator lang=spectre", "r2 (a b) resistor r=1 $x" });
 }

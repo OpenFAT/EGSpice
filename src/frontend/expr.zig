@@ -73,6 +73,12 @@ pub const Code = enum(u8) {
 /// B-source tape (models/bsource.va opcode 37).
 pub const Fn = enum(u8) { sqrt, abs, min, max, pow, pwr, exp, ln, log, log10, sin, cos, tan, atan, floor, ceil, ternary, tanh, sqr, int, nint, sgn, sinh, cosh, asin, acos, asinh, acosh, atanh, agauss, gauss, unif, aunif, limit, table, other, hsqrt, hlog, hlog10, hpow };
 
+/// True when `name` (lower case) calls a function a Monte Carlo trial draws.
+pub fn isDistributionName(name: []const u8) bool {
+    const f = fns.get(name) orelse return false;
+    return isDistribution(f);
+}
+
 /// True for the functions a Monte Carlo trial draws.
 pub fn isDistribution(f: Fn) bool {
     return switch (f) {
@@ -122,7 +128,10 @@ comptime {
 /// Compile output before parameters are spliced in.
 pub const Scratch = struct {
     ops: std.ArrayList(Op) = .empty,
+    /// The constant pool `.num` operands index.
     consts: std.ArrayList(f64) = .empty,
+    /// Slices of the compiled text that `.ident`, probe and `.ucall`
+    /// operands index.
     names: std.ArrayList([]const u8) = .empty,
 
     /// Table lengths to roll back to.
@@ -507,9 +516,8 @@ fn call(f: Fn, args: []const Val) Val {
         .abs => @abs(a),
         .min => @min(a, b),
         .max => @max(a, b),
-        .pow => std.math.pow(f64, @abs(a), b),
         // numparam's pwr is |a|^b (xpressn.c XFU_PWR), so pwr(-0, 0) is 1.
-        .pwr => std.math.pow(f64, @abs(a), b),
+        .pow, .pwr => std.math.pow(f64, @abs(a), b),
         .hsqrt => std.math.copysign(@sqrt(@abs(a)), a),
         .hlog => if (a < 0) -@log(-a) else @log(a),
         .hlog10 => if (a < 0) -@log10(-a) else @log10(a),
@@ -574,22 +582,6 @@ pub fn subtreeStart(ops: []const Op, end: usize) usize {
         need = need - 1 + arity(ops[i]);
         if (need == 0) return i;
     }
-}
-
-/// Last op of each operand of `ops[end]`, left to right, written into
-/// `out`. An op with more operands than `out` holds returns only the
-/// leftmost `out.len`. O(size of the subtree at `end`).
-pub fn operands(ops: []const Op, end: usize, out: []usize) []usize {
-    const n = arity(ops[end]);
-    var i: usize = n;
-    var last = end;
-    while (i > 0) {
-        i -= 1;
-        last -= 1;
-        if (i < out.len) out[i] = last;
-        last = subtreeStart(ops, last);
-    }
-    return out[0..@min(n, out.len)];
 }
 
 /// Evaluates ops that fold to a number: constants, `.live` operands and
@@ -771,10 +763,6 @@ test "postfix subtrees" {
     try std.testing.expectEqual(0, subtreeStart(ops, 4));
     try std.testing.expectEqual(1, subtreeStart(ops, 3));
     try std.testing.expectEqual(2, subtreeStart(ops, 2));
-    var buf: [4]usize = undefined;
-    try std.testing.expectEqualSlices(usize, &.{ 0, 3 }, operands(ops, 4, &buf));
-    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, operands(ops, 3, &buf));
-    try std.testing.expectEqualSlices(usize, &.{0}, operands(ops, 4, buf[0..1]));
     // Probes keep their arguments as names; `1n` stays a node, not 1e-9.
     s = .{};
     try compileAll(test_num, arena.allocator(), &s, "v(1n,2)+i(vdd)");

@@ -3,8 +3,7 @@
 //! lane (`lanes.solveLanes`) sharing one Newton workspace. Each draw is
 //! keyed by (Options.seed, trial, variable), so a run is reproducible and
 //! any trial can be computed alone. With `Options.variants` the lanes are
-//! deck variants instead, each warm from the nominal OP.
-//! Cites dev/analysis/ensemble-sweeps.md and dev/analysis/variants.md.
+//! deck variants instead, each warm from the nominal OP. No outside source.
 const std = @import("std");
 const root = @import("../types.zig");
 const lanes = @import("lanes.zig");
@@ -25,11 +24,11 @@ const LaneCtx = struct {
     variation: f64,
     seed: u64,
 
-    pub fn apply(self: *LaneCtx, k: usize) void {
+    pub fn apply(self: *LaneCtx, k: usize) !void {
         for (self.param_vars, 0..) |pv, v| pv.ref.set(pv.nominal + pv.nominal * self.variation * draw(self.seed, k, v));
     }
 
-    pub fn restore(self: *LaneCtx) void {
+    pub fn restore(self: *LaneCtx) !void {
         for (self.param_vars) |pv| pv.ref.set(pv.nominal);
     }
 };
@@ -37,39 +36,36 @@ const LaneCtx = struct {
 /// N(0,1) for variable `variable` of trial `trial`: a counter-based draw,
 /// a fresh generator seeded by the hash of the three, so it depends on no
 /// other draw.
-pub fn draw(seed: u64, trial: usize, variable: usize) f64 {
+fn draw(seed: u64, trial: usize, variable: usize) f64 {
     const key = [2]u64{ trial, variable };
     var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(seed, std.mem.asBytes(&key)));
     return prng.random().floatNorm(f64);
 }
 
 /// Lane k installs deck variant `first + k`, after putting back the
-/// parameters the previous lane wrote.
+/// parameters the previous lane wrote. The writes go through
+/// `Circuit.setParams`, as a `.step` point's do, so instances keep sharing
+/// their Model rows where the variant writes them alike.
 const VariantCtx = struct {
-    params: []const root.ParamRef,
+    ckt: *root.Circuit,
     variants: @import("core").Variants,
     first: u32,
     /// The refs the installed lane wrote and their values before it.
     written: []const u32 = &.{},
     saved: []f64,
 
-    pub fn apply(self: *VariantCtx, k: usize) void {
-        self.restore();
+    pub fn apply(self: *VariantCtx, k: usize) !void {
+        try self.restore();
         const refs, const values = self.variants.writes(self.first + @as(u32, @intCast(k)));
-        for (refs, values, self.saved[0..refs.len]) |r, v, *old| {
-            old.* = self.params[r].get();
-            self.params[r].set(v);
-        }
+        // All read before any is written, so a ref written twice saves its
+        // nominal both times.
+        for (refs, self.saved[0..refs.len]) |r, *old| old.* = (try self.ckt.paramAt(r)).value;
+        try self.ckt.setParams(refs, values, false);
         self.written = refs;
     }
 
-    pub fn restore(self: *VariantCtx) void {
-        // Newest first, so a ref written twice ends at its nominal.
-        var i = self.written.len;
-        while (i > 0) {
-            i -= 1;
-            self.params[self.written[i]].set(self.saved[i]);
-        }
+    pub fn restore(self: *VariantCtx) !void {
+        try self.ckt.setParams(self.written, self.saved[0..self.written.len], false);
         self.written = &.{};
     }
 };
@@ -79,15 +75,15 @@ pub const Setup = union(enum) {
     trials: LaneCtx,
     variants: VariantCtx,
 
-    pub fn apply(self: *Setup, k: usize) void {
+    pub fn apply(self: *Setup, k: usize) !void {
         switch (self.*) {
-            inline else => |*s| s.apply(k),
+            inline else => |*s| try s.apply(k),
         }
     }
 
-    pub fn restore(self: *Setup) void {
+    pub fn restore(self: *Setup) !void {
         switch (self.*) {
-            inline else => |*s| s.restore(),
+            inline else => |*s| try s.restore(),
         }
     }
 
@@ -103,13 +99,13 @@ pub const Setup = union(enum) {
 /// parameter at its nominal, or the variants' widest write's save slots.
 pub fn setup(ctx: *const root.RunCtx, opts: Options) !Setup {
     const scratch = ctx.scratch_allocator;
-    const refs = try ctx.circuit.collectParams();
     if (opts.variants.count != 0) {
         const rows = opts.variants;
         var widest: usize = 0;
         for (rows.first..rows.first + rows.count) |v| widest = @max(widest, ctx.variants.writes(@intCast(v))[0].len);
-        return .{ .variants = .{ .params = refs, .variants = ctx.variants, .first = rows.first, .saved = try scratch.alloc(f64, widest) } };
+        return .{ .variants = .{ .ckt = ctx.circuit, .variants = ctx.variants, .first = rows.first, .saved = try scratch.alloc(f64, widest) } };
     }
+    const refs = try ctx.circuit.collectParams();
     var n_vars: usize = 0;
     for (refs) |ref| n_vars += @intFromBool(ref.primary and ref.get() != 0);
     const param_vars = try scratch.alloc(ParamVar, n_vars);

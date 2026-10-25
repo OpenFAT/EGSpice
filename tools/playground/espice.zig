@@ -16,8 +16,10 @@ comptime {
     _ = c_api; // its `export fn`s are the API
 }
 
-/// The C API's root-level options, as the native library sets them.
+/// The C API's root-level options, as the native library sets them. Both are
+/// read from `@import("root")`, which is this file in the wasm build.
 pub const std_options = c_api.std_options;
+/// VerA's device/host contract checks, re-exported for the same reason.
 pub const vera_validate_contract = c_api.vera_validate_contract;
 
 const gpa = std.heap.wasm_allocator;

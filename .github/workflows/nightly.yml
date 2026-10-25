@@ -1,0 +1,87 @@
+name: nightly
+
+# The slow tier (TESTING.md, Gates): evidence the merge gate cannot afford.
+#
+#   certify      every converged Newton point against an independent KCL residual
+#   perturb      every expected value moved 0.1%: a LOOSE deck's tolerance
+#                cannot see an error that size (reports, never gates)
+#   fuzz         every std.testing.fuzz target, bounded
+#   determinism  every deck at 1 thread and 8, byte-compared
+#   adversarial  depths and counts no human writes: exit 0 or a diagnostic
+#   reference    every deck against ngspice, VACASK and Xyce
+#
+# One job, so the checks share one compile. Every step runs even when an
+# earlier one fails, so one red check does not hide the others.
+# GitHub disables a schedule after 60 days without repository activity:
+# run it by hand before then, or accept that it stops.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      FLAGS: -Doptimize=ReleaseSafe -Dgpu=false -Dcuda-arch=none -Dhip-arch=none -j2 --summary failures
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # tests/conformance: the SPICE decks
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+        with:
+          name: omarsiwy
+          skipPush: true
+
+      # Certificate: every converged Newton point re-checked against an
+      # independent KCL residual, over every suite and the whole corpus.
+      - name: Corpus with KCL certificates
+        run: nix develop .#ci -c zig build test -Dcertify=true $FLAGS
+
+      - name: Perturbed corpus
+        if: ${{ !cancelled() }}
+        run: |
+          nix develop .#ci -c zig build test -Dtest-filter=__no_unit_test__ $FLAGS -- --perturb 2>&1 | tee perturb.txt
+          status="${PIPESTATUS[0]}"
+          grep '^LOOSE ' perturb.txt | sort > loose.txt || true
+          { echo '## LOOSE decks (every expected value moved 0.1%, still pass)'; echo '```'; wc -l < loose.txt; head -100 loose.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      # Coverage-guided fuzzing of every std.testing.fuzz target (parsers,
+      # expressions, the C ABI), bounded by iterations.
+      - name: Fuzz
+        if: ${{ !cancelled() }}
+        run: nix develop .#ci -c zig build test --fuzz=20M $FLAGS
+
+      - name: Determinism, 1 thread against 8
+        if: ${{ !cancelled() }}
+        run: |
+          nix develop .#ci -c zig build $FLAGS --prefix out
+          nix develop .#ci -c bash tools/determinism.sh out/bin/espice tests/conformance/tests/netlist 8
+
+      - name: Adversarial sizes
+        if: ${{ !cancelled() }}
+        run: nix develop .#ci -c python3 tools/adversarial.py out/bin/espice
+
+      # Reference differential: every deck against ngspice, VACASK and Xyce.
+      - name: Reference simulators
+        if: ${{ !cancelled() }}
+        run: nix develop .#benchmarking -c zig build bench $FLAGS -- --iters 1
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: nightly-reports
+          path: |
+            zig-out/benchmark-results.md
+            loose.txt
+          if-no-files-found: warn

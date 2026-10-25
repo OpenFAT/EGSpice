@@ -1,5 +1,28 @@
 {
   "nodes": {
+    "conformance": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792789931,
+        "narHash": "sha256-Z0sV0m/lB2VwchU/PPL0zwJjyzEe93GTBXR9amLEZCE=",
+        "owner": "OmarSiwy",
+        "repo": "VAMS-Conformance-Suite",
+        "rev": "2fddbea5917fa6f8e50739feedf74ca0b5e1fbcf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "OmarSiwy",
+        "repo": "VAMS-Conformance-Suite",
+        "type": "github"
+      }
+    },
     "flake-compat": {
       "flake": false,
       "locked": {
@@ -34,6 +57,30 @@
         "type": "github"
       }
     },
+    "nix-bundle": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "utils": [
+          "flake-utils"
+        ]
+      },
+      "locked": {
+        "lastModified": 1756736056,
+        "narHash": "sha256-8YFhvulVX3iS4TYnKisA9zSImJeFN21G75HOUUFjzuE=",
+        "owner": "nix-community",
+        "repo": "nix-bundle",
+        "rev": "eff01593f62794d458ec714090091419194ab64d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "nix-bundle",
+        "rev": "eff01593f62794d458ec714090091419194ab64d",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1782948114,
@@ -52,7 +99,9 @@
     },
     "root": {
       "inputs": {
+        "conformance": "conformance",
         "flake-utils": "flake-utils",
+        "nix-bundle": "nix-bundle",
         "nixpkgs": "nixpkgs",
         "zig-overlay": "zig-overlay"
       }

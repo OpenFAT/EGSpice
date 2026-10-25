@@ -12,7 +12,7 @@
 const std = @import("std");
 const core = @import("core");
 const requests = core.query;
-const numerics = @import("core").numerics;
+const numerics = core.numerics;
 const devices = @import("spice.zig");
 const sparam = @import("sparam.zig");
 const wfit = @import("wfit.zig");
@@ -32,7 +32,7 @@ const DeviceType = batch.DeviceType;
 const castField = batch.bind.castField;
 const markGiven = batch.bind.markGiven;
 
-const GROUND = @as(u32, 0);
+const GROUND = core.GROUND;
 const Circuit = device.Circuit;
 const Proto = batch.Proto;
 
@@ -129,12 +129,8 @@ pub const Builder = struct {
             const grow = node + 1 - self.node_instance.items.len;
             try self.node_instance.appendNTimes(staging, 0, grow);
         }
-        const cur = self.node_instance.items[node];
-        if (cur == 0 and subckt_instance != 0) {
-            self.node_instance.items[node] = subckt_instance;
-        } else if (cur != 0 and subckt_instance != 0 and cur != subckt_instance) {
-            self.node_instance.items[node] = MULTI_INSTANCE;
-        }
+        const cur = &self.node_instance.items[node];
+        if (subckt_instance != 0 and cur.* != subckt_instance) cur.* = if (cur.* == 0) subckt_instance else MULTI_INSTANCE;
     }
 
     /// The BBD permutation (old row to new row) and its blocks, both in `gpa`.
@@ -235,10 +231,10 @@ pub const Builder = struct {
     }
 
     /// Adds one instance of built-in `D` on `nodes` (one row per port),
-    /// reading `model` and `instance` through pointers: a delay line's
-    /// Instance carries its history inline (wline_4: 2 MB).
     /// attributed to netlist card `card` in `cards`; "" records no card.
-    /// `card` is borrowed like the card table. Instances of one type share a
+    /// `card` is borrowed like the card table. `model` and `instance` are
+    /// read through pointers: a delay line's Instance carries its history
+    /// inline (wline_4: 2 MB). Instances of one type share a
     /// batch whatever the call order. Internal unknowns get fresh rows here,
     /// in `D.U` order, unless `collapse` maps them onto a port.
     pub fn addDevice(
@@ -268,6 +264,31 @@ pub const Builder = struct {
         }
         const proto = try self.protoOf(t);
         try vt.proto_add(proto.ctx, self.gpa, @ptrCast(model), @ptrCast(instance), &all).unwrap();
+    }
+
+    /// `addDevice` of an instance whose Model is row `row` of its type's
+    /// store and whose collapse map is `col`, both what an earlier
+    /// `addDevice` with the same card inputs gave (`NetBuilder.memo`).
+    fn addDeviceRow(
+        self: *Builder,
+        comptime D: type,
+        card: []const u8,
+        row: u32,
+        instance: *const D.Instance,
+        col: []const i32,
+        nodes: anytype,
+    ) !void {
+        const n_u = comptime @typeInfo(D.U).@"enum".field_names.len;
+        std.debug.assert(col.len == n_u);
+        var all: [n_u]u32 = undefined;
+        inline for (0..D.num_ports) |p| all[p] = nodes[p];
+        const t = comptime Library.builtin(device.modelName(D).?);
+        const vt = self.lib.vtable(t);
+        try self.countCard(t, card);
+        for (D.num_ports..n_u) |u|
+            all[u] = if (col[u] >= 0) all[@intCast(col[u])] else try self.addNode();
+        const proto = try self.protoOf(t);
+        try vt.proto_add_row.?(proto.ctx, row, @ptrCast(instance), &all).unwrap();
     }
 
     /// Counts one instance of `t` and records its card name, if any.
@@ -381,6 +402,10 @@ fn setParam(comptime D: type, model: *D.Model, instance: *D.Instance, comptime f
 /// A model card bound once for device type `type`; `model` points at its `D.Model`.
 const BoundCard = struct { type: DeviceType, model: *const anyopaque };
 
+/// `NetBuilder.memo`'s value: Model row `row`, a `D.Instance` and the
+/// `n_u` entries of its collapse map, for the type the key names.
+const Memo = struct { row: u32, instance: *const anyopaque, col: []const i32 };
+
 /// Netlist to Builder: one pass over the cards, recording the source,
 /// branch and port tables the deck's queries resolve against. Rows it
 /// records are pre-permutation; `prepare.build` maps them after the freeze.
@@ -388,6 +413,8 @@ pub const NetBuilder = struct {
     /// Scratch for everything recorded here; dies after `prepare.build`.
     arena: std.mem.Allocator,
     /// The circuit under construction; every row recorded here is one of its.
+    /// Dangles once `Builder.compile` consumes it: `publish` and `frozenRow`
+    /// never read it.
     b: *Builder,
     /// The parsed deck. Names recorded here borrow its arena.
     nl: Netlist,
@@ -439,6 +466,12 @@ pub const NetBuilder = struct {
     /// card's pairs, its polarity), bound on first use and copied per
     /// instance: a BSIM4 bin card is ~270 pairs against ~1000 fields.
     bound_cards: []?BoundCard,
+    /// A device card's bound result by its inputs (`memoKey`): the Model
+    /// row its type's store holds, its Instance and collapse map. A later
+    /// card with the same inputs skips binding, `derive`, `collapse` and
+    /// the store's row hash and compare (7.5).
+    memo: std.StringHashMapUnmanaged(Memo) = .empty,
+    memo_key: std.ArrayList(u8) = .empty,
 
     /// The first `.tran` card's TSTEP and TSTOP, ngspice's TRANinit values
     /// for `resolvePulseDefaults`; 1 ns and 1e30 s without one.
@@ -715,7 +748,7 @@ pub const NetBuilder = struct {
         for ([_][]const []const u8{ self.v.items(.name), self.l.items(.name), self.br.items(.name) }, [_][]const u32{ self.v.items(.branch), self.l.items(.branch), self.br.items(.row) }) |names, rows| {
             for (names, rows) |name, br| {
                 probe_buf[n_probes] = br;
-                label_buf[n_probes] = try std.fmt.allocPrint(arena, "i({s})", .{name});
+                label_buf[n_probes] = try std.mem.concat(arena, u8, &.{ "i(", name, ")" });
                 n_probes += 1;
             }
         }
@@ -723,7 +756,7 @@ pub const NetBuilder = struct {
             const label = circuit.nodeName(@intCast(i));
             if (label.len != 0) {
                 probe_buf[n_probes] = @intCast(i);
-                label_buf[n_probes] = try std.fmt.allocPrint(arena, "v({s})", .{label});
+                label_buf[n_probes] = try std.mem.concat(arena, u8, &.{ "v(", label, ")" });
                 n_probes += 1;
             }
         }
@@ -1732,7 +1765,8 @@ pub const NetBuilder = struct {
     /// models/wline_N.va: the modal rational fit of wfit.zig run by the
     /// method of characteristics. Refused: other model forms and N > 4.
     fn addWline(self: *NetBuilder, dev: Device) !void {
-        var m: WMatrices = .{};
+        // L, C, R, G, Rs, Gd lower triangles, in RLGC-file order.
+        var tri: [6][10]f64 = @splat(@splat(0));
         var n: usize = 0;
         if (kvName(dev.kv, "rlgcmodel")) |name| {
             const card = self.nl.findModel(name) orelse return refuse(dev, 'W', "no .model named by RLGCMODEL");
@@ -1741,12 +1775,12 @@ pub const NetBuilder = struct {
             // Clamped first: @intFromFloat of N=1e30 is illegal behaviour.
             n = @intFromFloat(std.math.clamp((try numericParameter(card.kv, "n")) orelse 0, 0, wfit.max_n + 1));
             if (n == 0 or n > wfit.max_n) return refuse(dev, 'W', "N must be 1 to 4");
-            const tri = n * (n + 1) / 2;
+            const n_tri = n * (n + 1) / 2;
             const keys = [_][2][]const u8{ .{ "lo", "l" }, .{ "co", "c" }, .{ "ro", "r" }, .{ "go", "g" }, .{ "rs", "" }, .{ "gd", "" } };
             for (keys, 0..) |k, which| {
-                var got = try cplVector(card.kv, k[0], m.tri[which][0..tri]);
-                if (got == 0 and k[1].len != 0) got = try cplVector(card.kv, k[1], m.tri[which][0..tri]);
-                if (got != 0 and got != tri) return refuse(dev, 'W', "a matrix does not hold N(N+1)/2 lower-triangle entries");
+                var got = try cplVector(card.kv, k[0], tri[which][0..n_tri]);
+                if (got == 0 and k[1].len != 0) got = try cplVector(card.kv, k[1], tri[which][0..n_tri]);
+                if (got != 0 and got != n_tri) return refuse(dev, 'W', "a matrix does not hold N(N+1)/2 lower-triangle entries");
                 if (got == 0 and which < 2) return refuse(dev, 'W', "Lo and Co are required");
             }
         } else if (kvName(dev.kv, "rlgcfile")) |path| {
@@ -1756,7 +1790,7 @@ pub const NetBuilder = struct {
                 error.InvalidRlgcFile => "malformed RLGC file",
             });
             n = file.n;
-            for (file.tri[0..file.mats], m.tri[0..file.mats]) |src, *dst| @memcpy(dst[0..src.len], &src);
+            for (file.tri[0..file.mats], tri[0..file.mats]) |src, *dst| @memcpy(dst[0..src.len], &src);
         } else return refuse(dev, 'W', "only RLGCMODEL= and RLGCFILE= are supported (TABLEMODEL, UMODEL, FSMODEL and SMODEL are not)");
         if (try numericParameter(dev.kv, "n")) |nn| if (nn != @as(f64, @floatFromInt(n))) return refuse(dev, 'W', "N differs from the model's");
         if (dev.pins.len != 2 * n + 2) return refuse(dev, 'W', "the node count is not 2N+2");
@@ -1768,11 +1802,11 @@ pub const NetBuilder = struct {
             .fgd = (try numericParameter(dev.kv, "fgd")) orelse 0,
             .rs_imag = if (kvName(dev.kv, "includersimag")) |v| !std.mem.eql(u8, v, "no") else (kvNumber(dev.kv, "includersimag") orelse 1) != 0,
         };
-        for ([_]*[wfit.max_n][wfit.max_n]f64{ &p.l, &p.c, &p.r, &p.g, &p.rs, &p.gd }, m.tri) |dst, tri| {
+        for ([_]*[wfit.max_n][wfit.max_n]f64{ &p.l, &p.c, &p.r, &p.g, &p.rs, &p.gd }, tri) |dst, packed_tri| {
             var idx: usize = 0;
             for (0..n) |i| for (0..i + 1) |j| {
-                dst[i][j] = tri[idx];
-                dst[j][i] = tri[idx];
+                dst[i][j] = packed_tri[idx];
+                dst[j][i] = packed_tri[idx];
                 idx += 1;
             };
         }
@@ -2140,6 +2174,8 @@ fn addSingleDevice(self: *NetBuilder, comptime D: type, dev: Device) !void {
     if (comptime @hasField(D.Model, "sw_et")) {
         if (dev.pins.len < 5) model.sw_et = 0;
     }
+    const key = try memoKey(self, D, dev);
+    if (key) |k| if (self.memo.get(k)) |hit| return b.addDeviceRow(D, dev.name, hit.row, @ptrCast(@alignCast(hit.instance)), hit.col, try deviceNodes(self, D, dev));
     if (dev.model) |m| model = try boundCard(self, D, model, m, dev.model_row);
     _ = try setParam(D, &model, &instance, "gain", Value.numberAt(dev.positional, 0) orelse 0);
     // INP2Q/D/J/Z: a bare number after the model name is the area; area=
@@ -2178,6 +2214,47 @@ fn addSingleDevice(self: *NetBuilder, comptime D: type, dev: Device) !void {
     // values win through `__given`.
     deriveModel(D, &model, b, dev.pins.len);
     try b.addDevice(D, dev.name, &model, &instance, try deviceNodes(self, D, dev));
+    const k = key orelse return;
+    const t = comptime Library.builtin(device.modelName(D).?);
+    const vt = b.lib.vtable(t);
+    const last = vt.proto_last_row orelse return;
+    const n_u = comptime @typeInfo(D.U).@"enum".field_names.len;
+    const col = try self.arena.alloc(i32, n_u);
+    @memset(col, -1);
+    if (comptime n_u > D.num_ports) if (vt.collapse) |collapse| collapse(@ptrCast(&model), @ptrCast(&instance), col.ptr);
+    const kept = try self.arena.create(D.Instance);
+    kept.* = instance;
+    try self.memo.put(self.arena, try self.arena.dupe(u8, k), .{ .row = last((try b.protoOf(t)).ctx), .instance = kept, .col = col });
+}
+
+/// The bytes that decide what `addSingleDevice` binds for `dev`: its type,
+/// letter, pin count, model card row, the two positional numbers it reads
+/// and every pair (all numbers). Null, so nothing is memoized, for a card
+/// without a model row, a pair that is not a number, or a device that
+/// calls VPI applications or keeps a row per instance. Borrows
+/// `memo_key` until the next call.
+fn memoKey(self: *NetBuilder, comptime D: type, dev: Device) !?[]const u8 {
+    if (comptime device.modelName(D) == null) return null;
+    const t = comptime Library.builtin(device.modelName(D).?);
+    const vt = self.b.lib.vtable(t);
+    if (vt.proto_add_row == null or vt.systf_calls.len != 0) return null;
+    if (dev.model != null and dev.model_row == netlist.none) return null;
+    for (dev.kv) |item| if (item.value != .num) return null;
+    const k = &self.memo_key;
+    k.clearRetainingCapacity();
+    const head = [_]u64{
+        @backingInt(t),                                                       dev.kind,
+        dev.pins.len,                                                         if (dev.model == null) netlist.none else dev.model_row,
+        @bitCast(Value.numberAt(dev.positional, 0) orelse std.math.nan(f64)), @bitCast(Value.numberAt(dev.positional, 1) orelse std.math.nan(f64)),
+        dev.kv.len,
+    };
+    try k.appendSlice(self.arena, std.mem.asBytes(&head));
+    for (dev.kv) |item| {
+        const v: u64 = @bitCast(item.value.num);
+        try k.appendSlice(self.arena, std.mem.asBytes(&[_]u64{ item.key.len, v }));
+        try k.appendSlice(self.arena, item.key);
+    }
+    return k.items;
 }
 
 /// Refuses a card pair that neither `D.Model` nor `D.Instance` binds, as
@@ -2604,11 +2681,11 @@ fn compileTape(self: *NetBuilder, ops: []const Op, consts: []const f64, model: *
             n -= 1;
             if (e >= 0 and e <= 255 and e == @round(e)) {
                 n_consts -= 1;
-                // ngspice's pow() function is |x|^y whatever y is (ptfuncs.c
-                // PTpower); only the `^`/`**` operator keeps the sign of x
-                // for an integer exponent (PTpowerH). sky130's poly
-                // resistors cube a negative min(...) with pow().
-                if (op.code == .call and self.nl.deck.dialect == .ngspice) {
+                // ngspice 45's default PTpower AND PTpowerH use |x|^y.
+                // Keep constant-integer folding consistent with the general
+                // power and the frontend's constant evaluator. HSPICE keeps
+                // its signed integer power.
+                if (self.nl.deck.dialect == .ngspice) {
                     if (n + 1 == tape.max_ops) return error.TooManyOps;
                     model.op_code[n] = .abs;
                     n += 1;
@@ -3126,9 +3203,6 @@ fn cplVector(kv: []const Kv, key: []const u8, out: []f64) !usize {
     }
     return 0;
 }
-
-/// A W element's lower-triangle matrices in RLGC-file order: L, C, R, G, Rs, Gd.
-const WMatrices = struct { tri: [6][10]f64 = @splat(@splat(0)) };
 
 /// Logs why HSPICE element `dev` (`letter` W or S) is refused.
 fn refuse(dev: Device, letter: u8, why: []const u8) error{UnsupportedCard} {

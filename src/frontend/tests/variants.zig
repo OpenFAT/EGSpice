@@ -266,7 +266,8 @@ fn rebuilt(gpa: std.mem.Allocator, prepared: input.Prepared, name: []const u8) !
     const out = try gpa.alloc(f64, prepared.runs.len);
     for (prepared.runs, out) |run, *r| {
         const refs = try variants.collect(gpa, &run.circuit);
-        r.* = for (refs) |ref| {
+        r.* = for (0..refs.len) |i| {
+            const ref = refs.at(i);
             if (std.mem.eql(u8, ref.param_name, name)) break ref.get();
         } else return error.TestUnexpectedResult;
     }

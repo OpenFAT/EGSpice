@@ -20,8 +20,11 @@ const ParamRef = device.abi.ParamRef;
 /// A run's variants: the table, how each card fans out over it, and the
 /// runs that need their own circuit, for the caller to build in order.
 pub const Plan = struct {
+    /// One row per point the nominal circuit can hold, in the session arena.
     variants: core.Variants = .{},
+    /// Which cards run over which rows (`analyses.queries`).
     fanout: analyses.Fanout = .{},
+    /// Points and `.alter` runs that need a circuit of their own.
     rebuilds: []const Rebuild = &.{},
 };
 
@@ -42,8 +45,12 @@ pub const Rebuild = struct { nl: *Netlist, run: Run };
 
 /// What one point sets, before it becomes a row.
 pub const Point = struct {
+    /// The row's label, `name=value, ...`.
     label: []const u8,
+    /// The row's sweep-axis value: the first swept value or the trial
+    /// number; 0 when nothing is swept.
     axis: f64,
+    /// Circuit temperature in degC; null keeps the deck's.
     temp: ?f64 = null,
     /// Every live name's value (`Live.names`).
     live: []const f64,
@@ -158,17 +165,21 @@ pub fn plan(p: *Planner) !Plan {
 /// rows and rebuilds so far.
 pub const Planner = struct {
     lib: *const device.Library,
+    /// The session arena: `table` copies the rows into it.
     sim: std.mem.Allocator,
+    /// The parse arena: every planning table, which dies after the build.
     scratch: std.mem.Allocator,
     /// The netlist each point is set on in turn; nominal again when
     /// `plan` returns.
     nl: *Netlist,
+    /// The circuit every row writes into; its parameters are `refs`.
     nominal: *const device.Circuit,
     cards: []const core.query.CardRef,
+    /// Label prefix of an `.alter` run's rows; "" for the main run.
     prefix: []const u8 = "",
     /// Set while a card's own sweep is planned: rebuilt points keep only it.
     card: ?u32 = null,
-    refs: []const ParamRef = &.{},
+    refs: Params = .{},
     stack: std.ArrayList(expr.Val) = .empty,
     labels: std.ArrayList([]const u8) = .empty,
     temps: std.ArrayList(?f64) = .empty,
@@ -304,34 +315,31 @@ pub const Planner = struct {
 
     /// The point setting `steps[i]`'s target to `values[i]`.
     fn stepPoint(p: *Planner, steps: []const netlist.Step, values: []const f64) !Point {
-        const live = try p.scratch.dupe(f64, p.nl.live.nominal);
-        var pt: Point = .{ .label = "", .axis = values[0], .live = live };
-        var label: std.ArrayList(u8) = .empty;
-        var cards: std.ArrayList(CardValue) = .empty;
-        for (steps, values) |st, v| {
-            if (label.items.len != 0) try label.appendSlice(p.scratch, ", ");
-            try label.print(p.scratch, "{s}={d}", .{ targetName(p.nl, st.target), v });
-            switch (st.target) {
-                .param => |k| live[k] = v,
-                .temp => pt.temp = v,
-                .card => |name| try cards.append(p.scratch, .{ .name = name, .value = v }),
-            }
+        const targets = try p.scratch.alloc(netlist.StepTarget, steps.len);
+        const names = try p.scratch.alloc([]const u8, steps.len);
+        for (steps, targets, names) |st, *t, *name| {
+            t.* = st.target;
+            name.* = targetName(p.nl, st.target);
         }
-        pt.label = label.items;
-        pt.cards = cards.items;
-        return pt;
+        return p.pointOf(targets, names, values);
     }
 
     /// One `.data` row.
     fn addRow(p: *Planner, data: netlist.Data, row: []const f64) !void {
+        try p.add(try p.pointOf(data.columns, data.labels, row));
+    }
+
+    /// The point setting `targets[i]` to `values[i]`, labelled
+    /// `names[i]=values[i], ...`; the first value is its axis.
+    fn pointOf(p: *Planner, targets: []const netlist.StepTarget, names: []const []const u8, values: []const f64) !Point {
         const live = try p.scratch.dupe(f64, p.nl.live.nominal);
-        var pt: Point = .{ .label = "", .axis = row[0], .live = live };
+        var pt: Point = .{ .label = "", .axis = values[0], .live = live };
         var label: std.ArrayList(u8) = .empty;
         var cards: std.ArrayList(CardValue) = .empty;
-        for (data.columns, data.labels, row) |col, name, v| {
+        for (targets, names, values) |target, name, v| {
             if (label.items.len != 0) try label.appendSlice(p.scratch, ", ");
             try label.print(p.scratch, "{s}={d}", .{ name, v });
-            switch (col) {
+            switch (target) {
                 .param => |k| live[k] = v,
                 .temp => pt.temp = v,
                 .card => |card| try cards.append(p.scratch, .{ .name = card, .value = v }),
@@ -339,7 +347,7 @@ pub const Planner = struct {
         }
         pt.label = label.items;
         pt.cards = cards.items;
-        try p.add(pt);
+        return pt;
     }
 
     fn addTrial(p: *Planner, sampler: *Sampler, trial: u32, index: u32) !void {
@@ -364,7 +372,7 @@ pub const Planner = struct {
             var c = try circuitOf(p.lib, arena.allocator(), arena.allocator(), alt);
             defer c.deinit();
             if (sameTopology(p.nominal, &c)) {
-                try p.diff(arena.allocator(), &c);
+                try p.diff(try collect(arena.allocator(), &c));
                 return p.closeRow(label, @floatFromInt(k), null);
             }
         }
@@ -409,7 +417,11 @@ pub const Planner = struct {
         }
         if (!p.kept.holds(p.nl)) return .circuit;
         if (!moved) return .row;
-        if (p.fast == .untested) p.fast = try p.probe(pt);
+        if (p.fast == .untested) {
+            p.fast = try p.probeIdentity();
+            // The probe left the live slots perturbed.
+            if (!p.force_rebuild) try setPoint(p.scratch, &p.stack, p.nl, pt);
+        }
         if (p.fast == .identity and !crossed) {
             for (p.fast_slots, p.fast_refs) |k, r| try p.setMoved(r, p.nl.slot(k).num);
             return .row;
@@ -434,7 +446,7 @@ pub const Planner = struct {
         defer c.deinit();
         if (!sameTopology(p.nominal, &c)) return .circuit;
         const at = try collect(arena.allocator(), &c);
-        try p.diffAt(at);
+        try p.diff(at);
         if (p.fast == .identity and !seen) {
             const base = try p.scratch.alloc(f64, p.nominal_slots.len);
             for (base, 0..) |*x, k| x.* = p.nl.slot(k).num;
@@ -453,22 +465,16 @@ pub const Planner = struct {
 
     /// `set`, unless parameter `ord` holds `x` in the nominal circuit.
     fn setMoved(p: *Planner, ord: u32, x: f64) !void {
-        if (@as(u64, @bitCast(x)) != @as(u64, @bitCast(p.refs[ord].get()))) try p.set(ord, x);
+        if (@as(u64, @bitCast(x)) != @as(u64, @bitCast(p.refs.get(ord)))) try p.set(ord, x);
     }
 
     /// Finds, with one rebuild at perturbed live values, whether every
     /// parameter the live values reach holds one of them unchanged. Then a
     /// point writes its values straight to those parameters (the C2 fast
-    /// path); otherwise each point rebinds the netlist and diffs. `pt` is
-    /// the point being added; its values are restored.
-    fn probe(p: *Planner, pt: Point) !Fast {
-        if (p.force_rebuild) return .rebuild;
-        const fast = try p.probeIdentity();
-        try setPoint(p.scratch, &p.stack, p.nl, pt);
-        return fast;
-    }
-
+    /// path); otherwise each point rebinds the netlist and diffs. Unless
+    /// `force_rebuild`, may leave the live slots perturbed.
     fn probeIdentity(p: *Planner) !Fast {
+        if (p.force_rebuild) return .rebuild;
         const m = try p.probeAt(p.nominal_slots, p.refs) orelse return .rebuild;
         std.debug.assert(std.mem.indexOfScalar(u32, m.slots, netlist.none) == null);
         p.fast_slots = m.slots;
@@ -480,7 +486,7 @@ pub const Planner = struct {
     /// are `at`, from one rebuild at values perturbed from `base`; null
     /// when some parameter neither holds a slot's value unchanged nor
     /// stays put. Leaves the live slots at the perturbed values.
-    fn probeAt(p: *Planner, base: []const f64, at: []const ParamRef) !?Map {
+    fn probeAt(p: *Planner, base: []const f64, at: Params) !?Map {
         std.debug.assert(at.len == p.refs.len);
         const probe_at = try p.scratch.alloc(f64, base.len);
         var by_bits: std.AutoHashMapUnmanaged(u64, u32) = .empty;
@@ -509,14 +515,18 @@ pub const Planner = struct {
         var refs: std.ArrayList(u32) = .empty;
         var slots: std.ArrayList(u32) = .empty;
         var values: std.ArrayList(f64) = .empty;
-        for (at, moved, p.refs, 0..) |a, b, nominal, i| {
-            const before = a.get();
-            const after = b.get();
+        var it_at = at.iterator();
+        var it_moved = moved.iterator();
+        var it_nominal = p.refs.iterator();
+        for (0..at.len) |i| {
+            const before = it_at.next().?.*;
+            const after = it_moved.next().?.*;
+            const nominal = it_nominal.next().?.*;
             var k: u32 = netlist.none;
             if (@as(u64, @bitCast(before)) != @as(u64, @bitCast(after))) {
                 k = by_bits.get(@bitCast(after)) orelse return null;
                 if (@as(u64, @bitCast(before)) != @as(u64, @bitCast(base[k]))) return null;
-            } else if (@as(u64, @bitCast(before)) == @as(u64, @bitCast(nominal.get()))) continue;
+            } else if (@as(u64, @bitCast(before)) == @as(u64, @bitCast(nominal))) continue;
             try refs.append(p.scratch, @intCast(i));
             try slots.append(p.scratch, k);
             try values.append(p.scratch, before);
@@ -537,17 +547,15 @@ pub const Planner = struct {
         try p.rebuilds.append(p.scratch, .{ .nl = p.nl, .run = .{ .prefix = label, .point = pt, .card = p.card } });
     }
 
-    /// Appends a write for every parameter `c` holds at another value;
-    /// `scratch` holds `c`'s parameter table.
-    fn diff(p: *Planner, scratch: std.mem.Allocator, c: *const device.Circuit) !void {
-        try p.diffAt(try collect(scratch, c));
-    }
-
-    /// `diff` against parameters `moved`, collected in `p.refs` order.
-    fn diffAt(p: *Planner, moved: []const ParamRef) !void {
-        for (p.refs, moved, 0..) |a, b, i| {
-            const x = b.get();
-            if (@as(u64, @bitCast(a.get())) == @as(u64, @bitCast(x))) continue;
+    /// Appends a write for every parameter whose value in `moved`, collected
+    /// in `p.refs` order, differs from the nominal circuit's.
+    fn diff(p: *Planner, moved: Params) !void {
+        std.debug.assert(moved.len == p.refs.len);
+        var it_moved = moved.iterator();
+        var it_ref = p.refs.iterator();
+        for (0..p.refs.len) |i| {
+            const x = it_moved.next().?.*;
+            if (@as(u64, @bitCast(it_ref.next().?.*)) == @as(u64, @bitCast(x))) continue;
             try p.set(@intCast(i), x);
         }
     }
@@ -617,7 +625,7 @@ pub const Planner = struct {
             const ords = targets.ords[targets.starts[i]..targets.starts[i + 1]];
             if (ords.len == 0) continue;
             for (ords) |ord| {
-                const r = p.refs[ord];
+                const r = p.refs.at(ord);
                 const spread = try p.spreadOf(v, ord, r.get());
                 try params.append(p.sim, ord);
                 try sigmas.append(p.sim, if (v.dist == .unif) spread / @sqrt(3.0) else spread);
@@ -652,7 +660,7 @@ pub const Planner = struct {
         var params: std.ArrayList(u32) = .empty;
         var steps: std.ArrayList(f64) = .empty;
         try starts.append(p.sim, 0);
-        if (p.fast == .untested) p.fast = if (p.force_rebuild) .rebuild else try p.probeIdentity();
+        if (p.fast == .untested) p.fast = try p.probeIdentity();
         // The steps are taken from every draw at its nominal, which under
         // `.option seed` is not the circuit's own state.
         _ = try p.nl.setLive(p.scratch, &p.stack, live.nominal, null);
@@ -688,15 +696,18 @@ pub const Planner = struct {
                 var c = try circuitOf(p.lib, arena.allocator(), arena.allocator(), p.nl);
                 defer c.deinit();
                 if (!sameTopology(p.nominal, &c)) return p.refuse("", "a one-sigma mismatch draw that changes the topology");
-                for (base_refs, try collect(arena.allocator(), &c), 0..) |x, y, ord| {
-                    const step = y.get() - x.get();
+                const moved = try collect(arena.allocator(), &c);
+                var it_moved = moved.iterator();
+                var it_base = base_refs.iterator();
+                for (0..base_refs.len) |ord| {
+                    const step = it_moved.next().?.* - it_base.next().?.*;
                     if (step == 0) continue;
                     try params.append(p.sim, @intCast(ord));
                     try steps.append(p.sim, step);
                 }
             }
             if (params.items.len == first) continue;
-            const r = p.refs[params.items[first]];
+            const r = p.refs.at(params.items[first]);
             const card = names.get(r.type, r.index) orelse "?";
             try labels.append(p.sim, try std.fmt.allocPrint(p.sim, "{s}@{s}", .{ card, r.param_name }));
             try starts.append(p.sim, @intCast(params.items.len));
@@ -713,7 +724,7 @@ pub const Planner = struct {
     fn spreadOf(p: *Planner, v: netlist.Variation, ord: u32, base: f64) !f64 {
         var spread = v.value;
         if (v.sigma.len != 0) {
-            const r = p.refs[ord];
+            const r = p.refs.at(ord);
             var at: [netlist.Variation.sigma_names.len]f64 = undefined;
             for (netlist.Variation.sigma_names, &at) |name, *x| x.* = p.instanceValue(r, name) orelse
                 if (name[0] == 'm') p.instanceValue(r, "mfactor") orelse 1 else std.math.nan(f64);
@@ -724,15 +735,15 @@ pub const Planner = struct {
     }
 
     /// Instance parameter `name` of the device that owns `r`, or null.
-    fn instanceValue(p: *Planner, r: ParamRef, name: []const u8) ?f64 {
+    fn instanceValue(p: *Planner, r: Params.Ref, name: []const u8) ?f64 {
         const ord = p.paramRef(r.type, r.index, name) catch return null;
-        return p.refs[ord].get();
+        return p.refs.get(ord);
     }
 
     /// The value parameter `ord` has in the open row.
     fn current(p: *Planner, ord: u32) f64 {
         const at = p.row_at[ord];
-        return if (at != netlist.none) p.write_values.items[at] else p.refs[ord].get();
+        return if (at != netlist.none) p.write_values.items[at] else p.refs.get(ord);
     }
 
     /// Writes `value` to `ord` in the open row, once per parameter.
@@ -757,13 +768,12 @@ pub const Planner = struct {
     }
 
     fn paramRef(p: *Planner, t: core.DeviceType, index: u32, name: []const u8) !u32 {
-        if (p.by_name.count() == 0) for (p.refs, 0..) |r, i| {
-            const gop = try p.by_name.getOrPut(p.scratch, try refKey(p.scratch, r.type, r.param_name));
-            if (!gop.found_existing) gop.value_ptr.* = @intCast(i - r.index);
-        };
+        if (p.by_name.count() == 0) try p.refs.indexNames(p.scratch, &p.by_name);
         const first = p.by_name.get(try refKey(p.scratch, t, name)) orelse return error.UnknownParameter;
         const ord = first + index;
-        if (ord >= p.refs.len or p.refs[ord].index != index or p.refs[ord].type != t) return error.UnknownParameter;
+        if (ord >= p.refs.len) return error.UnknownParameter;
+        const r = p.refs.at(ord);
+        if (r.index != index or r.type != t) return error.UnknownParameter;
         return ord;
     }
 };
@@ -1111,17 +1121,28 @@ pub const Tuning = struct {
     /// table: the row of a point `set` refused, so its queries stay its
     /// own (`Problem.append_points`). The values and templates are untouched.
     pub fn refusedRow(t: *Tuning, current: core.Variants) !core.Variants {
-        const p = &t.planner;
+        try t.reserveRow(current);
+        t.closeRow("refused");
+        return t.table();
+    }
+
+    /// Seeds the table and makes room for one more row, so `closeRow`
+    /// cannot fail.
+    fn reserveRow(t: *Tuning, current: core.Variants) !void {
+        const sim = t.planner.sim;
         try t.seed(current);
-        try t.labels.ensureUnusedCapacity(p.sim, 1);
-        try t.temps.ensureUnusedCapacity(p.sim, 1);
-        try t.axes.ensureUnusedCapacity(p.sim, 1);
-        try t.starts.ensureUnusedCapacity(p.sim, 1);
-        t.labels.appendAssumeCapacity("refused");
+        try t.labels.ensureUnusedCapacity(sim, 1);
+        try t.temps.ensureUnusedCapacity(sim, 1);
+        try t.axes.ensureUnusedCapacity(sim, 1);
+        try t.starts.ensureUnusedCapacity(sim, 1);
+    }
+
+    /// Ends the row over the writes appended so far. Asserts `reserveRow` ran.
+    fn closeRow(t: *Tuning, label: []const u8) void {
+        t.labels.appendAssumeCapacity(label);
         t.temps.appendAssumeCapacity(null);
         t.axes.appendAssumeCapacity(0);
         t.starts.appendAssumeCapacity(@intCast(t.refs.items.len));
-        return t.table();
     }
 
     /// Copies the deck's table on the first row appended.
@@ -1166,11 +1187,7 @@ pub const Tuning = struct {
         const pt: Point = .{ .label = label.items, .axis = 0, .live = t.next, .trial = t.trial };
         // Room for the row and a template first, so nothing fails after
         // the template list grows.
-        try t.seed(current);
-        try t.labels.ensureUnusedCapacity(p.sim, 1);
-        try t.temps.ensureUnusedCapacity(p.sim, 1);
-        try t.axes.ensureUnusedCapacity(p.sim, 1);
-        try t.starts.ensureUnusedCapacity(p.sim, 1);
+        try t.reserveRow(current);
         try t.templates.ensureUnusedCapacity(t.gpa, 1);
         var built: ?*device.Circuit = null;
         errdefer if (built != null) {
@@ -1207,10 +1224,7 @@ pub const Tuning = struct {
         try t.refs.appendSlice(p.sim, p.write_refs.items);
         try t.write_values.appendSlice(p.sim, p.write_values.items);
         t.template = t.planned;
-        t.labels.appendAssumeCapacity(label.items);
-        t.temps.appendAssumeCapacity(null);
-        t.axes.appendAssumeCapacity(0);
-        t.starts.appendAssumeCapacity(@intCast(t.refs.items.len));
+        t.closeRow(label.items);
         @memcpy(t.values, t.next);
         return .{ .template = t.template, .built = built, .variants = t.table() };
     }
@@ -1286,20 +1300,152 @@ fn targetName(nl: *const Netlist, t: netlist.StepTarget) []const u8 {
 /// Every parameter of `c`'s batches, typed, in `Circuit.collectParams`
 /// order. Caller owns the returned slice and must free it with `gpa`; the
 /// refs point into `c`'s storage and die with it.
-pub fn collect(gpa: std.mem.Allocator, c: *const device.Circuit) ![]const ParamRef {
-    var list: std.ArrayList(ParamRef) = .empty;
-    for (c.batches, c.batch_types) |b, t| {
-        const first = list.items.len;
+pub fn collect(gpa: std.mem.Allocator, c: *const device.Circuit) !Params {
+    const n = c.batches.len;
+    const starts = try gpa.alloc(u32, n + 1);
+    const layouts = try gpa.alloc(?device.abi.ParamLayout, n);
+    const fallback = try gpa.alloc([]const ParamRef, n);
+    starts[0] = 0;
+    for (c.batches, c.batch_types, 0..) |b, t, i| {
+        fallback[i] = &.{};
+        layouts[i] = null;
+        if (b.hooks.param_layout) |layout| {
+            const l = try layout(b.ctx).unwrap();
+            layouts[i] = l;
+            starts[i + 1] = starts[i] + @as(u32, @intCast(l.count * l.fields.len));
+            continue;
+        }
+        var list: std.ArrayList(ParamRef) = .empty;
         try b.hooks.collect_params(b.ctx, gpa, &list).unwrap();
-        for (list.items[first..]) |*r| r.type = t;
+        for (list.items) |*r| r.type = t;
+        fallback[i] = list.items;
+        starts[i + 1] = starts[i] + @as(u32, @intCast(list.items.len));
     }
-    return list.toOwnedSlice(gpa);
+    return .{ .batches = c.batches, .types = c.batch_types, .starts = starts, .layouts = layouts, .fallback = fallback, .len = starts[n] };
 }
+
+/// Every parameter of a circuit's batches in `Circuit.collectParams` order,
+/// addressed through each batch's `param_layout` instead of a `ParamRef`
+/// per parameter: a sweep over 10k BSIM4 devices held 8.7M refs (555 MB)
+/// per table, and the planner builds several. Batches without the hook
+/// keep their `collect_params` refs. Dies with the circuit.
+pub const Params = struct {
+    /// The circuit's batch and type slices: heap storage, which stays put
+    /// when the `Circuit` value itself moves (`prepare` returns it).
+    batches: []const device.abi.Batch = &.{},
+    types: []const device.abi.DeviceType = &.{},
+    /// Batch b's parameters are ordinals `starts[b]..starts[b + 1]`.
+    starts: []const u32 = &.{0},
+    /// Batch b's `param_layout`, null for a batch without the hook.
+    layouts: []const ?device.abi.ParamLayout = &.{},
+    /// Batch b's `collect_params` refs, empty when it has a layout.
+    fallback: []const []const ParamRef = &.{},
+    /// Total parameter count, `starts[batches.len]`.
+    len: usize = 0,
+
+    /// One parameter: where it lives and which device field it is.
+    pub const Ref = struct {
+        ptr: *f64,
+        type: core.DeviceType,
+        param_name: []const u8,
+        index: u32,
+        is_instance: bool,
+        primary: bool,
+
+        /// The parameter's current value.
+        pub fn get(r: Ref) f64 {
+            return r.ptr.*;
+        }
+    };
+
+    fn batchOf(ps: Params, ord: usize) usize {
+        return std.sort.upperBound(u32, ps.starts, @as(u32, @intCast(ord)), orderU32) - 1;
+    }
+
+    fn orderU32(a: u32, b: u32) std.math.Order {
+        return std.math.order(a, b);
+    }
+
+    /// Parameter `ord`. O(log batches). Asserts `ord < ps.len`.
+    pub fn at(ps: Params, ord: usize) Ref {
+        const b = ps.batchOf(ord);
+        const local: u32 = @intCast(ord - ps.starts[b]);
+        if (ps.layouts[b]) |l| {
+            const field = l.fields[local / l.count];
+            return .{
+                .ptr = l.ptr(local),
+                .type = ps.types[b],
+                .param_name = field.name,
+                .index = local % l.count,
+                .is_instance = field.is_instance,
+                .primary = field.primary,
+            };
+        }
+        const r = ps.fallback[b][local];
+        return .{ .ptr = r.ptr, .type = r.type, .param_name = r.param_name, .index = r.index, .is_instance = r.is_instance, .primary = r.primary };
+    }
+
+    /// Parameter `ord`'s current value; `at` without building the `Ref`.
+    pub fn get(ps: Params, ord: usize) f64 {
+        return ps.ptrOf(ord).*;
+    }
+
+    fn ptrOf(ps: Params, ord: usize) *f64 {
+        const b = ps.batchOf(ord);
+        return ps.ptrIn(b, @intCast(ord - ps.starts[b]));
+    }
+
+    /// Parameter `local` of batch `b`.
+    fn ptrIn(ps: Params, b: usize, local: u32) *f64 {
+        return if (ps.layouts[b]) |l| l.ptr(local) else ps.fallback[b][local].ptr;
+    }
+
+    /// Every parameter's address in order, without a search per call.
+    pub fn iterator(ps: *const Params) Iterator {
+        return .{ .ps = ps };
+    }
+
+    /// Walks the parameters in ordinal order; see `iterator`.
+    pub const Iterator = struct {
+        ps: *const Params,
+        b: usize = 0,
+        ord: usize = 0,
+
+        /// The next parameter's address; null past the last.
+        pub fn next(it: *Iterator) ?*f64 {
+            const ps = it.ps;
+            if (it.ord >= ps.len) return null;
+            while (it.ord >= ps.starts[it.b + 1]) it.b += 1;
+            const local: u32 = @intCast(it.ord - ps.starts[it.b]);
+            it.ord += 1;
+            return ps.ptrIn(it.b, local);
+        }
+    };
+
+    /// `refKey(type, name)` to the ordinal of that field's index-0
+    /// parameter, the first entry winning, as a scan of the refs gave.
+    fn indexNames(ps: Params, a: std.mem.Allocator, map: *std.StringHashMapUnmanaged(u32)) !void {
+        for (ps.layouts, ps.fallback, 0..) |layout, refs, b| {
+            if (layout) |l| {
+                if (l.count == 0) continue;
+                for (l.fields, 0..) |f, k| {
+                    const gop = try map.getOrPut(a, try refKey(a, ps.types[b], f.name));
+                    if (!gop.found_existing) gop.value_ptr.* = ps.starts[b] + @as(u32, @intCast(k)) * l.count;
+                }
+                continue;
+            }
+            for (refs, 0..) |r, i| {
+                const gop = try map.getOrPut(a, try refKey(a, r.type, r.param_name));
+                if (!gop.found_existing) gop.value_ptr.* = @intCast(ps.starts[b] + i - r.index);
+            }
+        }
+    }
+};
 
 /// The frozen circuit `nl` binds to, as `prepare.build` constructs it, with
 /// `nl`'s live values as they stand. Caller owns the circuit and releases
 /// it with `deinit`; `scratch` holds the construction tables.
-pub fn circuitOf(lib: *const device.Library, gpa: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netlist) !device.Circuit {
+fn circuitOf(lib: *const device.Library, gpa: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netlist) !device.Circuit {
     const deck_opts = try analyses.deckOptions(nl.deck.config, nl.deck.dialect);
     var b = try builder.Builder.init(gpa, lib);
     var compiled = false;
@@ -1493,7 +1639,7 @@ const TrialDraw = struct {
 /// The standard normal quantile Φ⁻¹(u), u in (0, 1): Acklam's rational
 /// approximation, relative error below 1.2e-9. At 0 or 1 it returns NaN,
 /// so callers draw from the open interval.
-pub fn normalQuantile(u: f64) f64 {
+fn normalQuantile(u: f64) f64 {
     const a = [_]f64{ -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00 };
     const b = [_]f64{ -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01 };
     const c = [_]f64{ -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00 };
@@ -1570,8 +1716,8 @@ test "normal quantile is monotone across the tail seam" {
 test crossesZero {
     // (from, to, crosses): reaching, leaving and crossing zero count; -0 is 0.
     for ([_]struct { f64, f64, bool }{
-        .{ 1, 2, false },  .{ -1, -2, false }, .{ 0, -0.0, false }, .{ 0, 0, false },
-        .{ 0, 1e-300, true }, .{ 1, 0, true },  .{ 1, -1, true },   .{ -1, 1, true },
+        .{ 1, 2, false },           .{ -1, -2, false }, .{ 0, -0.0, false }, .{ 0, 0, false },
+        .{ 0, 1e-300, true },       .{ 1, 0, true },    .{ 1, -1, true },    .{ -1, 1, true },
         .{ 5e-324, -5e-324, true },
     }) |c| try std.testing.expectEqual(c[2], crossesZero(c[0], c[1]));
 }

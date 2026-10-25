@@ -21,17 +21,6 @@ const EnvelopeTests = struct {
         try testing.expect(mp2 <= mp1);
     }
 
-    test "envelope: maxPoints leaves room for DC and one step" {
-        const opts: Options = .{
-            .t_carrier = 1e-6,
-            .t_stop = 1e-3,
-            .min_periods_per_step = 1,
-            .max_periods_per_step = 32,
-        };
-        const mp = maxPoints(opts);
-        try testing.expect(mp >= 3); // at least DC + one step + slack
-    }
-
     test "envelope: stepCount covers the window without a roundoff step" {
         const stepCount = impl.test_access.stepCount;
         // A fine window that came out of a subtraction is a carrier period
@@ -251,16 +240,70 @@ const TranTests = struct {
     const std = @import("std");
     const testing = std.testing;
 
-    test "almostEqualUlps counts representable doubles, as ngspice's does" {
+    test "floor retry: UIC forced capacitor completes at default and smaller minimum" {
+        const gpa = testing.allocator;
+        const Builder = @import("builder").Builder;
+        const Library = @import("device").Library;
+        const models = @import("models");
+        var lib = try Library.init(gpa);
+        defer lib.deinit();
+        var b = try Builder.init(gpa, &lib);
+        const out = try b.addNode();
+        try b.addDevice(models.vsource, "", &.{ .dc = 1 }, &.{}, .{ out, root.GROUND });
+        try b.addDevice(models.capacitor, "", &.{ .c = 1e-12 }, &.{}, .{ out, root.GROUND });
+        var prepared = try b.compile();
+        defer prepared.deinit();
+        for ([_]f64{ 1e-16, 1e-18, 1e-22 }) |minimum| {
+            var ckt = try root.Circuit.instantiate(&prepared, gpa);
+            defer ckt.deinit();
+            const x = try gpa.alloc(f64, ckt.n);
+            defer gpa.free(x);
+            @memset(x, 0);
+            var wf = try Waveform.init(gpa, 1, 256);
+            defer wf.deinit();
+            const complete = try simulate(&ckt, x, &.{out}, &wf, .{
+                .t_stop = 2e-12,
+                .dt_init = 2e-14,
+                .dt_max = 2e-14,
+                .dt_min = minimum,
+                .uic = true,
+                .tol = .{ .reltol = 1e-5, .abstol = 1e-14, .vntol = 1e-8, .chgtol = 1e-18 },
+            }, gpa);
+            const times = wf.column(0);
+            const volts = wf.column(1);
+            if (minimum == 1e-16) {
+                // Retrying the floor cannot bypass the unchanged LTE check.
+                try testing.expect(!complete);
+                try testing.expect(times.at(times.len - 1) < 2e-12);
+            } else {
+                try testing.expect(complete);
+                try testing.expectApproxEqAbs(@as(f64, 2e-12), times.at(times.len - 1), 1e-25);
+            }
+            // The ideal source fixes every solved voltage. The UIC t=0
+            // point is deliberately inconsistent and carries zero charge.
+            for (1..volts.len) |i| try testing.expectApproxEqAbs(@as(f64, 1), volts.at(i), 1e-12);
+        }
+    }
+
+    test "almostEqualUlps counts representable doubles, as ngspice's does, across zero" {
         const eq = impl.test_access.almostEqualUlps;
         const x: f64 = 1.0e-9;
-        try std.testing.expect(eq(x, std.math.nextAfter(f64, x, 1), 1));
+        try testing.expect(eq(x, std.math.nextAfter(f64, x, 1), 1));
         var y = x;
         for (0..3) |_| y = std.math.nextAfter(f64, y, 0);
-        try std.testing.expect(eq(x, y, 3));
-        try std.testing.expect(!eq(x, y, 2));
-        try std.testing.expect(eq(0.0, -0.0, 1));
-        try std.testing.expect(!eq(1.0, 1.0 + 1e-12, 100));
+        try testing.expect(eq(x, y, 3));
+        try testing.expect(!eq(x, y, 2));
+        try testing.expect(eq(0.0, -0.0, 1));
+        try testing.expect(!eq(1.0, 1.0 + 1e-12, 100));
+        // The ulp count runs straight across zero.
+        const tiny = std.math.floatTrueMin(f64);
+        try testing.expect(eq(-tiny, tiny, 2));
+        try testing.expect(!eq(-tiny, tiny, 1));
+        try testing.expect(eq(-0.0, tiny, 1));
+        // Opposite extremes are 2^64 - 2^53 - 2 apart: no i64 overflow.
+        try testing.expect(!eq(-std.math.floatMax(f64), std.math.floatMax(f64), std.math.maxInt(i64)));
+        // Identical NaN bits count as equal, as in ngspice: 0 ulps apart.
+        try testing.expect(eq(std.math.nan(f64), std.math.nan(f64), 0));
     }
 
     test "waveform: doubling fallback keeps the rows intact" {
@@ -385,18 +428,6 @@ const TranTests = struct {
         try testing.checkAllAllocationFailures(testing.allocator, runFamily, .{&ckt});
     }
 
-    test "almostEqualUlps: the ulp count runs straight across zero" {
-        const eq = impl.test_access.almostEqualUlps;
-        const tiny = std.math.floatTrueMin(f64);
-        try testing.expect(eq(-tiny, tiny, 2));
-        try testing.expect(!eq(-tiny, tiny, 1));
-        try testing.expect(eq(-0.0, tiny, 1));
-        // Opposite extremes are 2^64 - 2^53 - 2 apart: no i64 overflow.
-        try testing.expect(!eq(-std.math.floatMax(f64), std.math.floatMax(f64), std.math.maxInt(i64)));
-        // Identical NaN bits count as equal, as in ngspice: 0 ulps apart.
-        try testing.expect(eq(std.math.nan(f64), std.math.nan(f64), 0));
-    }
-
     test "column: lowerBound, from and strided reads" {
         const Column = impl.Column;
         // Rows (t, v): the t column has stride 2.
@@ -509,6 +540,11 @@ const TranTests = struct {
                 const vec = integrator.stepBound(W, m, cm, s, ip[0..len], c, lte);
                 const ora = integrator.stepBound(1, m, cm, s, ip[0..len], c, lte);
                 try testing.expectEqual(@as(u64, @bitCast(ora)), @as(u64, @bitCast(vec)));
+                const trace = integrator.diagnoseBound(m, cm, &s, ip[0..len], &.{}, c, lte, &.{ lte.dt, lte.dt1, lte.dt2 });
+                try testing.expectEqual(@as(u64, @bitCast(vec)), @as(u64, @bitCast(trace.bound)));
+                try testing.expectEqual(q[0][trace.index], trace.q[0]);
+                const rebuilt = if (m == .backward_euler) trace.unrooted_bound else @sqrt(trace.unrooted_bound);
+                try testing.expectEqual(@as(u64, @bitCast(vec)), @as(u64, @bitCast(rebuilt)));
             };
         }
     }
@@ -689,6 +725,9 @@ const TranTests = struct {
                 var q: [8][]const f64 = undefined;
                 for (&q, h[0..8]) |*v, *col| v.* = col;
                 try testing.expect(std.math.isNan(integrator.stepBoundGear(m, m, q[0 .. k + 2], &h[8], &g, c, lte, &dts)));
+                const diagnostic = integrator.diagnoseBound(m, m, q[0 .. k + 2], &h[8], &g, c, lte, &dts);
+                try testing.expect(std.math.isNan(diagnostic.bound));
+                try testing.expectEqual(@as(usize, L - 1), diagnostic.index);
             };
             // q = t^(k+1) on a unit grid: the (k+1)-th divided difference is
             // exactly 1 (in units of dt^-(k+1)), so del = (trtol*tol/(coeff*1))^(1/k).
@@ -698,6 +737,8 @@ const TranTests = struct {
             for (&q, &col) |*v, *cc| v.* = cc;
             const ip = [_]f64{0};
             const del = integrator.stepBoundGear(m, .backward_euler, q[0 .. k + 2], &ip, g[0..1], c, lte, &dts);
+            const diagnostic = integrator.diagnoseBound(m, .backward_euler, q[0 .. k + 2], &ip, g[0..1], c, lte, &dts);
+            try testing.expectEqual(@as(u64, @bitCast(del)), @as(u64, @bitCast(diagnostic.bound)));
             const i_new = c.ag0 * (col[0][0] - col[1][0]);
             const tol = @max(lte.abstol + lte.reltol * @abs(i_new), lte.reltol * @max(@max(@abs(col[0][0]), @abs(col[1][0])), lte.chgtol) / 1e-9);
             const want = std.math.pow(f64, lte.trtol * tol / @max(lte.abstol, integrator.lteCoeff(m)), 1 / @as(f64, @floatFromInt(k)));
@@ -740,6 +781,13 @@ const TranTests = struct {
         const abstol: f64 = 1e-12;
         const chgtol: f64 = 1e-14;
         const trtol: f64 = 7.0;
+        const lte: integrator.LteIn = .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol };
+        // Backward Euler at a uniform dt, history past prev and i_prev zero.
+        const beBound = struct {
+            fn f(cur: []const f64, prev: []const f64, zero: []const f64, l: integrator.LteIn) f64 {
+                return integrator.stepBound(W, .backward_euler, .backward_euler, .{ cur, prev, zero, zero }, zero, .{ .ag0 = 1.0 / l.dt, .ag2 = 0 }, l);
+            }
+        }.f;
 
         // 2*W+1: W cancelling pairs through the vector body, one dead slot so the
         // scalar tail runs too.
@@ -757,24 +805,8 @@ const TranTests = struct {
         // Row view: every pair sums to zero, and so does its whole history.
         const row: [W + 1]f64 = @splat(0);
 
-        const del_state = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &s_cur, &s_prev, &s_zero, &s_zero },
-            &s_zero,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
-        const del_row = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &row, &row, &row, &row },
-            &row,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
+        const del_state = beBound(&s_cur, &s_prev, &s_zero, lte);
+        const del_row = beBound(&row, &row, &row, lte);
 
         // Closed form, so the CKTterr formula is pinned and not just the inequality:
         //   i_new     = (1/dt)*(3e-12 - 1e-12)            = 2e-3
@@ -797,24 +829,8 @@ const TranTests = struct {
         const mirrored = [_]f64{ 3e-12, -3e-12 };
         const mirrored_p = [_]f64{ 1e-12, -1e-12 };
         const pair_zero = [_]f64{ 0, 0 };
-        const del_one = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &one_sided, &one_sided_p, &pair_zero, &pair_zero },
-            &pair_zero,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
-        const del_mirror = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &mirrored, &mirrored_p, &pair_zero, &pair_zero },
-            &pair_zero,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
+        const del_one = beBound(&one_sided, &one_sided_p, &pair_zero, lte);
+        const del_mirror = beBound(&mirrored, &mirrored_p, &pair_zero, lte);
         try testing.expectEqual(del_one, del_mirror);
 
         // CKTterr is homogeneous of degree zero in the charge: tol and |dd| both
@@ -826,15 +842,7 @@ const TranTests = struct {
         // inductor's single INDflux (indload.c:70-77; MUT has no MUTtrunc).
         const big: [2]f64 = .{ s_cur[0] * 1e3, 0 };
         const big_p: [2]f64 = .{ s_prev[0] * 1e3, 0 };
-        const del_big = integrator.stepBound(
-            W,
-            .backward_euler,
-            .backward_euler,
-            .{ &big, &big_p, &pair_zero, &pair_zero },
-            &pair_zero,
-            .{ .ag0 = 1.0 / dt, .ag2 = 0 },
-            .{ .dt = dt, .dt1 = dt, .dt2 = dt, .reltol = reltol, .abstol = abstol, .chgtol = chgtol, .trtol = trtol },
-        );
+        const del_big = beBound(&big, &big_p, &pair_zero, lte);
         try testing.expectApproxEqRel(del_one, del_big, 1e-9);
     }
 
@@ -1161,6 +1169,48 @@ const TranTests = struct {
             try testing.expectEqual(wf.time(i), try std.fmt.parseFloat(f64, line["n1 t=".len..]));
         }
         try testing.expectEqualStrings("", lines.rest());
+    }
+
+    // A display task reads the Model row's `setup` cache (VerA device ABI 6),
+    // so the row must be set up before the first accepted point prints.
+    test "transient: a display task sees the Model row after setup" {
+        const gpa = testing.allocator;
+        const D = struct {
+            pub const U = enum(u8) { p, n };
+            pub const num_ports: usize = 2;
+            pub const Model = struct { su: f64 = 0 };
+            pub const Instance = struct {};
+            pub fn setup(comptime _: type, m: *Model) void {
+                m.su = 42;
+            }
+            pub fn eval(comptime S: type, xv: *const [2]S.V, _: *const Model, _: *const Instance, _: contract.SimState) contract.Rows(@This(), S) {
+                const v = contract.probes(@This(), S, xv);
+                const current = v[0].sub(v[1]);
+                return contract.rows(@This(), S, .{ current, current.neg() });
+            }
+            pub const say_sites = [_]contract.SaySite{.{ .fmt = "%m su=%.17g\n", .file = "t.va", .line = 1, .nargs = 1 }};
+            pub fn say(comptime S: type, _: *const [2]S.V, m: *const Model, _: *const Instance, _: contract.SimState, out: *contract.Say) void {
+                out.put(0, &.{m.su});
+            }
+        };
+        var ckt = try oneDevice(D, gpa);
+        defer ckt.deinit();
+        var sink: std.Io.Writer.Allocating = .init(gpa);
+        defer sink.deinit();
+        var display: root.Display = .{ .names = &.{&.{"n1"}}, .staged = .init(gpa), .out = &sink.writer };
+        defer display.staged.deinit();
+        ckt.display = &display;
+        const x = try gpa.alloc(f64, 2);
+        defer gpa.free(x);
+        @memset(x, 0);
+        const probes = [_]u32{1};
+        var wf = try Waveform.init(gpa, 1, 64);
+        defer wf.deinit();
+        try testing.expect(try simulate(&ckt, x, &probes, &wf, .{ .t_stop = 0.3, .dt_init = 0.1, .uic = true }, gpa));
+        var lines = std.mem.splitScalar(u8, sink.written(), '\n');
+        const first = lines.next() orelse return error.TestMissingLine;
+        try testing.expect(std.mem.startsWith(u8, first, "n1 su="));
+        try testing.expectEqual(@as(f64, 42), try std.fmt.parseFloat(f64, first["n1 su=".len..]));
     }
 };
 
@@ -1565,7 +1615,7 @@ const LaneKernelTests = struct {
             const lin: lk.LteIn = .{ .dt = lte.dt, .dt1 = lte.dt1, .dt2 = lte.dt2, .reltol = lte.reltol, .abstol = lte.abstol, .chgtol = lte.chgtol, .trtol = lte.trtol, .ag0 = c.ag0, .ag1 = c.ag1, .ag2 = c.ag2 };
             for (methods) |m| for (methods) |cm| {
                 const want = integrator.stepBound(W, m, cm, q, ip, c, lte);
-                const got = lk.stepBound(code(m), code(cm), q[0], q[1], q[2], q[3], ip, len, lin);
+                const got = lk.stepBound(code(m), code(cm), q[0], q[1], q[2], q[3], ip, len, 1, lin);
                 if (std.math.isNan(want)) {
                     try testing.expect(std.math.isNan(got));
                 } else {

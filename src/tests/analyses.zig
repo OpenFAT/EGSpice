@@ -1,8 +1,15 @@
-//! Numerical regressions run end to end through the Problem API.
+//! Numerical regressions run end to end through the Problem API: deck text
+//! in, published results out. Oracles: closed forms (RC-ladder poles,
+//! bridge zeros, dividers, the `.ic`/uic start), ngspice's printed values
+//! (branch-current signs, bsource expressions), two solvers that must agree
+//! (hbnoise against shooting pnoise, multi-tone hb against qpss), the same
+//! run under an equivalent option (`tran_ceiling=duration` against TMAX,
+//! tnoimod 0 against 1), and the named refusal or failure a run must end in.
 const std = @import("std");
 const api = @import("espice");
 const Result = api.Result;
 
+/// Parses `source` and runs every query; the caller deinits the problem.
 fn runDeck(source: []const u8) !*api.Problem {
     const problem = try api.Problem.init(std.testing.allocator, std.testing.io, .{
         .source = .{ .bytes = .{ .data = source, .origin = "legacy.cir" } },
@@ -12,6 +19,8 @@ fn runDeck(source: []const u8) !*api.Problem {
     return problem;
 }
 
+/// The result of the `ordinal`-th query the deck itself requested, skipping
+/// implicit prerequisites such as the operating point.
 fn requestedResult(problem: *const api.Problem, ordinal: usize) !Result {
     var found: usize = 0;
     for (0..problem.query_count()) |i| {
@@ -364,6 +373,58 @@ test "uic: keyword is positional-independent and .ic on an unknown node is dropp
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), v2_first, 1e-9);
 }
 
+test "duration ceiling and equivalent TMAX produce identical transient samples" {
+    // The enlarged cap also sets breakpoint/minimum-step scales. Identical
+    // accepted grids exercise those couplings across corners and UIC.
+    const circuits = [_][]const u8{
+        "V1 in 0 PULSE(0 1 1n 1p 1p 2p 3n)\nR1 in out 1k\nC1 out 0 1p\n",
+        "V1 in 0 PWL(0 0 1n 0 1.01n 1 2n 1 2.01n 0)\nR1 in out 100\nL1 out cap 1n\nC1 cap 0 1p\n",
+        "R1 out 0 1k\nC1 out 0 1p\n.ic v(out)=1\n",
+    };
+    for (circuits, 0..) |circuit, ci| {
+        for ([_][]const u8{ "trap", "gear" }) |method| {
+            const uic = if (ci == 2) " uic" else "";
+            const policy = try std.fmt.allocPrint(std.testing.allocator, "ceiling\n{s}.options method={s} tran_ceiling=duration\n.tran 10p 10n 2n{s}\n.end\n", .{ circuit, method, uic });
+            defer std.testing.allocator.free(policy);
+            const explicit = try std.fmt.allocPrint(std.testing.allocator, "ceiling\n{s}.options method={s}\n.tran 10p 10n 2n 800p{s}\n.end\n", .{ circuit, method, uic });
+            defer std.testing.allocator.free(explicit);
+            const a = try runDeck(policy);
+            defer a.deinit();
+            const b = try runDeck(explicit);
+            defer b.deinit();
+            const ar = try requestedResult(a, 0);
+            const br = try requestedResult(b, 0);
+            try std.testing.expectEqualSlices(f64, ar.data, br.data);
+        }
+    }
+}
+
+test "nodesets select a bistable latch and release it before a transient write" {
+    const sim = try runDeck(
+        \\latch
+        \\.model nch nmos(level=1 vto=0.3 kp=200u lambda=0.01)
+        \\.model pch pmos(level=1 vto=-0.3 kp=100u lambda=0.01)
+        \\Vdd vdd 0 1
+        \\Mn1 q qb 0 0 nch w=1u l=1u
+        \\Mp1 q qb vdd vdd pch w=2u l=1u
+        \\Mn2 qb q 0 0 nch w=1u l=1u
+        \\Mp2 qb q vdd vdd pch w=2u l=1u
+        \\Cq q 0 1f
+        \\Cqb qb 0 1f
+        \\Iwrite 0 q PULSE(0 100u 100p 1p 1p 50p 1n)
+        \\.save v(q) v(qb)
+        \\.tran 0.1p 250p 0 0.1p
+        \\.nodeset v(q)=0 v(qb)=1
+        \\.end
+    );
+    defer sim.deinit();
+    const res = try requestedResult(sim, 0);
+    try std.testing.expect((probeFirst(res, "q") orelse return error.NoProbe) < 0.01);
+    try std.testing.expect((probeFirst(res, "qb") orelse return error.NoProbe) > 0.99);
+    try std.testing.expect((probeLast(res, "q") orelse return error.NoProbe) > 0.99);
+    try std.testing.expect((probeLast(res, "qb") orelse return error.NoProbe) < 0.01);
+}
+
 test "branch currents: op emits i(<card>) with ngspice's sign, last probe stays a node" {
     // ngspice 44.2 on this deck: i(v1) = -2e-3 (current into the + terminal),
     // i(l1) = +2e-3 (p->n through the inductor).
@@ -415,8 +476,8 @@ test "sensing: a Spectre cccs binds the first exact-case source of its probe nam
 }
 
 test "bsource: expressions of several probes match ngspice at the operating point" {
-    // ngspice 45 on this deck (numdgt=12), except v(c): ngspice's default
-    // `^` is |x|^3 = +0.421875; an integer power keeps the sign here.
+    // ngspice 45 on this deck (numdgt=12), including its default
+    // `^` semantics: |x|^3 = +0.421875.
     const sim = try runDeck(
         \\bsource multi-probe op
         \\va a 0 1.5
@@ -443,7 +504,7 @@ test "bsource: expressions of several probes match ngspice at the operating poin
     const res = try requestedResult(sim, 0);
     const want = [_]struct { []const u8, f64 }{
         .{ "v(m)", -1.125 },           .{ "v(s)", 0.5625 },
-        .{ "v(c)", -0.421875 },        .{ "v(d)", 4.259475254511 },
+        .{ "v(c)", 0.421875 },         .{ "v(d)", 4.259475254511 },
         .{ "v(t)", -0.635148952387 },  .{ "v(x)", 0.6158871668943 },
         .{ "v(ni)", -0.672603939956 }, .{ "i(bm)", 1.125e-3 },
     };
@@ -594,4 +655,95 @@ test "BSIM4 tnoimod1 retains DC conduction with zero source and drain squares" {
     // Noise mode must preserve DC conduction. The regression fixture checks
     // absolute ngspice accuracy separately; its existing model gap stays visible.
     for (currents[0], currents[1]) |direct, internal| try std.testing.expectApproxEqRel(direct, internal, 1e-5);
+}
+
+const CeilingEventRun = struct {
+    problem: *api.Problem,
+    result: Result,
+    attempts: u64,
+    accepted: u32,
+};
+
+/// Runs the deck's one requested `.tran` by checkpoint quanta, recording the
+/// attempted and accepted step counts the progress events report (real
+/// work, with no instrumentation and no guessing rejections from row
+/// counts); the caller deinits `problem`.
+fn runCeilingEventDeck(source: []const u8) !CeilingEventRun {
+    const p = try api.Problem.init(std.testing.allocator, std.testing.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "ceiling-event.cir" } },
+    });
+    errdefer p.deinit();
+    const id: api.QueryId = find: {
+        for (0..p.query_count()) |i| {
+            const q: api.QueryId = @fromBackingInt(@intCast(i));
+            const info = try p.query_info(q);
+            if (info.requested and info.kind == .tran) break :find q;
+        }
+        return error.MissingRequestedResult;
+    };
+    var attempts: u64 = 0;
+    var accepted: u32 = 0;
+    var ended = false;
+    for (0..100000) |_| {
+        const event = try p.advance(id);
+        if (event.progress) |progress| if (progress.phase == .transient) {
+            attempts = @max(attempts, progress.completed);
+            accepted = @max(accepted, progress.accepted orelse 0);
+        };
+        const info = try p.query_info(id);
+        if (info.status.terminal()) {
+            try std.testing.expectEqual(api.Status.complete, info.status);
+            ended = true;
+            break;
+        }
+    }
+    try std.testing.expect(ended);
+    try std.testing.expect(accepted > 0 and attempts >= accepted);
+    return .{ .problem = p, .result = try p.result(id), .attempts = attempts, .accepted = accepted };
+}
+
+test "duration ceiling event matrix: delay line, hysteretic switch, and rejected-step recovery equal TMAX" {
+    // Physical circuits/stimuli retained from bench_tline_terminated and
+    // device_switch_hysteresis; only the requested maximum changes. The
+    // forced capacitor is the reduced P5 rejection/recovery reproducer.
+    const Case = struct { circuit: []const u8, step: []const u8, stop: []const u8, cap: []const u8, tail: []const u8, end_time: f64 };
+    const cases = [_]Case{
+        .{ .circuit = "Vin in 0 DC 0 PULSE(0 3.3 0 100p 100p 4n 8n)\nRS in a 25\nT1 a 0 b 0 Z0=50 TD=1.5n\nRL b 0 200\n.save v(b)\n", .step = "25p", .stop = "16n", .cap = "1.6n", .tail = "", .end_time = 16e-9 },
+        .{ .circuit = "Vc ctl 0 PWL(0 0 5m 5 10m 0 15m 5 20m 0)\nVs in 0 DC 10\nS1 in out ctl 0 sw1\nRL out 0 1k\n.model sw1 SW(VT=2.5 VH=0.5 RON=1 ROFF=1meg)\n.save v(out)\n", .step = "0.05m", .stop = "20m", .cap = "2m", .tail = "", .end_time = 20e-3 },
+        .{ .circuit = "V1 p 0 1\nC1 p 0 1p\n.save v(p)\n.options reltol=1e-5 abstol=1e-14 vntol=1e-8 chgtol=1e-18\n", .step = "0.02p", .stop = "2p", .cap = "0.2p", .tail = " uic", .end_time = 2e-12 },
+    };
+    for (cases, 0..) |case, index| for ([_][]const u8{ "trap", "gear" }) |method| {
+        const policy = try std.fmt.allocPrint(std.testing.allocator, "ceiling events\n{s}.options method={s} tran_ceiling=duration\n.tran {s} {s} 0{s}\n.end\n", .{ case.circuit, method, case.step, case.stop, case.tail });
+        defer std.testing.allocator.free(policy);
+        const explicit = try std.fmt.allocPrint(std.testing.allocator, "ceiling events\n{s}.options method={s}\n.tran {s} {s} 0 {s}{s}\n.end\n", .{ case.circuit, method, case.step, case.stop, case.cap, case.tail });
+        defer std.testing.allocator.free(explicit);
+        const a = try runCeilingEventDeck(policy);
+        defer a.problem.deinit();
+        const b = try runCeilingEventDeck(explicit);
+        defer b.problem.deinit();
+        try std.testing.expectEqualSlices(f64, a.result.data, b.result.data);
+        try std.testing.expectEqual(a.attempts, b.attempts);
+        try std.testing.expectEqual(a.accepted, b.accepted);
+        try std.testing.expectEqual(@as(usize, 2), a.result.varnames.len);
+        try std.testing.expectApproxEqAbs(case.end_time, a.result.data[a.result.data.len - 2], case.end_time * 1e-13);
+        var low = std.math.inf(f64);
+        var high: f64 = -std.math.inf(f64);
+        for (0..a.result.npoints) |k| {
+            const time = a.result.data[k * 2];
+            const value = a.result.data[k * 2 + 1];
+            try std.testing.expect(std.math.isFinite(value));
+            low = @min(low, value);
+            high = @max(high, value);
+            // No signal can arrive before the line's physical delay.
+            if (index == 0 and time < 1.5e-9) try std.testing.expectApproxEqAbs(@as(f64, 0), value, 1e-10);
+        }
+        if (index == 0) try std.testing.expect(high > 1);
+        if (index == 1) try std.testing.expect(low < 0.1 and high > 9);
+        if (index == 2) {
+            // An actual rejected solve must occur in both executions; two
+            // identical always-accepted grids cannot satisfy this case.
+            try std.testing.expect(a.attempts > a.accepted);
+            for (1..a.result.npoints) |k| try std.testing.expectApproxEqAbs(@as(f64, 1), a.result.data[k * 2 + 1], 1e-12);
+        }
+    };
 }

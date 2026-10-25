@@ -25,6 +25,10 @@
 //     ponytail: the other ~300 l*/w*/p* params; add when a deck bins.
 //   * Newton limiting (B3SOIDDlimit, SmartVbs): shapes the path, not the
 //     solution.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module b3soidd(d, g, s, e);
     inout d, g, s, e;
     electrical d, g, s, e;

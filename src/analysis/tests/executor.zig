@@ -4,7 +4,7 @@
 //! promises.
 
 const Worker = @import("../worker.zig").Worker;
-const progress = @import("../progress.zig");
+const progress = @import("../worker.zig");
 const std = @import("std");
 
 test "worker resumes preserved stack state and runs only once" {
@@ -273,4 +273,38 @@ test "a completion quantum runs through every checkpoint" {
     try worker.start(.completion, null);
     try std.testing.expectEqual(@as(u32, 5), (try worker.wait()).complete);
     try std.testing.expect(worker.thread == null);
+}
+
+test "an interval quantum parks at most once per min_quantum_ns of work" {
+    const Context = struct {
+        callback: progress.Callback = undefined,
+        seen: u32 = 0,
+
+        fn run(ctx: *anyopaque) !u32 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (0..1000) |i| {
+                try self.callback.checkpoint(.{ .phase = .sweep, .completed = i, .total = 1000 });
+                self.seen += 1;
+            }
+            return self.seen;
+        }
+    };
+    var ctx: Context = .{};
+    var worker = Worker(anyerror, u32).init(std.testing.io, &ctx, Context.run, .{});
+    defer worker.deinit();
+    ctx.callback = worker.callback();
+    // 1000 empty checkpoints take microseconds; only a stalled machine parks.
+    var parks: u32 = 0;
+    while (true) {
+        try worker.start(.interval, null);
+        switch (try worker.wait()) {
+            .progress => parks += 1,
+            .complete => |n| {
+                try std.testing.expectEqual(@as(u32, 1000), n);
+                break;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect(parks < 1000);
 }

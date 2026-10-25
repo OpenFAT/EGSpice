@@ -6,13 +6,15 @@
 pub const abi = @import("device_abi");
 /// The frozen circuit `Circuit.freeze` builds from the protos.
 pub const Circuit = @import("Circuit.zig");
-/// Runtime HDL compilation and dlopen; `Library.load` is its entry.
-pub const loader = @import("loader.zig");
+/// Device kernels for runtime `.hdl` models (01 1.8).
+pub const hdl_gpu = @import("hdl_gpu.zig");
 /// The per-Problem table of device types under dense ids.
 pub const Library = @import("Library.zig");
 /// A dense device-type id into a `Library`.
 pub const DeviceType = abi.DeviceType;
 const cat = @import("catalog.zig");
+// Reached through `Library.load`; imported here only for its tests.
+const loader = @import("loader.zig");
 /// Every decl of `models`, in declaration order.
 pub const catalog = cat.catalog;
 /// The binding name of a device type, or null when it is not in the catalog.
@@ -31,4 +33,5 @@ test {
     _ = Circuit;
     _ = Library;
     _ = loader;
+    _ = hdl_gpu;
 }

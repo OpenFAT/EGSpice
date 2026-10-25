@@ -1,6 +1,6 @@
 /* A minimal ESPice host: simulate an RC low-pass from netlist text, run
  * every analysis, and print |v(out)| of the AC result.
- * `zig build c-example` compiles and runs this file against libespice.a. */
+ * `zig build test` compiles and runs this file against libespice.a. */
 #include <espice.h>
 #include <math.h>
 #include <stdio.h>

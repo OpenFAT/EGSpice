@@ -1,9 +1,9 @@
-//! Source to netlist to frozen circuit and queries: the frontend's entry
-//! points for the Problem facade. Cites no outside source; the run and
-//! variant plan follows dev/analysis/variants.md, the arenas AGENTS.md §2.12.
+//! The frontend module root: source to netlist to frozen circuit and
+//! queries, the entry points the Problem facade calls. Leaves never import
+//! this file. Cites no outside source.
 const std = @import("std");
 const core = @import("core");
-const requests = @import("core").query;
+const requests = core.query;
 const netlist = @import("netlist");
 const device = @import("device");
 const analyses = @import("analyses.zig");
@@ -12,13 +12,20 @@ const variants = @import("variants.zig");
 const mosra = @import("mosra.zig");
 const Builder = builder.Builder;
 const Job = requests.Query;
+/// The per-Problem device library the facade fills before `build`.
+pub const Library = device.Library;
+/// HSPICE `OPTIMIZE=`: the optimizer's point-to-rows adapter (variants.zig).
+pub const Tuner = variants.Tuner;
 const Ic = core.Ic;
 const GROUND = core.GROUND;
 
 /// Construction result: the frozen topology and what the deck says about it.
 /// The session arena owns every deck slice; `deinit` releases the circuits.
 pub const Prepared = struct {
+    /// The frozen topology; `deinit` releases it.
     circuit: device.Circuit,
+    /// Queries, probes, measures and variants; its slices live in the
+    /// session arena.
     deck: core.Deck,
     /// Variant runs whose topology differs from `circuit` (an `.alter`
     /// that swaps elements, a point that collapses a node), each with its
@@ -51,6 +58,7 @@ pub const Dialect = netlist.Dialect;
 pub const Source = union(enum) {
     /// Path of the deck file.
     file: []const u8,
+    /// Deck text already in memory.
     bytes: Bytes,
 
     /// In-memory deck; `origin` is a real or virtual filename whose
@@ -75,9 +83,9 @@ pub fn parseDialect(name: []const u8) ?Dialect {
 /// line nor the includes.
 pub fn detectDialect(text: []const u8) Dialect {
     const hspice_cards = [_][]const u8{
-        ".data",   ".enddata", ".alter", ".variation", ".mosra",   ".appendmodel", ".lin",   ".net",   ".fft",
-        ".stim",   ".vec",     ".pat",   ".check",     ".dout",    ".biaschk",     ".power", ".connect", ".dcvolt",
-        ".load",   ".sample",  ".sn",    ".snac",      ".snxf",    ".snnoise",     ".ptdnoise",
+        ".data", ".enddata", ".alter", ".variation", ".mosra", ".appendmodel", ".lin",      ".net",     ".fft",
+        ".stim", ".vec",     ".pat",   ".check",     ".dout",  ".biaschk",     ".power",    ".connect", ".dcvolt",
+        ".load", ".sample",  ".sn",    ".snac",      ".snxf",  ".snnoise",     ".ptdnoise",
     };
     var hspice = false;
     var card: []const u8 = "";
@@ -99,12 +107,19 @@ pub fn detectDialect(text: []const u8) Dialect {
                 const master = std.mem.trimStart(u8, after, " \t");
                 if (master.len != 0 and master.len < after.len and std.ascii.isAlphabetic(master[0])) return .spectre;
             };
-            for (hspice_cards) |c| hspice = hspice or std.ascii.eqlIgnoreCase(card, c);
+            // Past the first HSPICE marker only a Spectre one can change
+            // the answer.
+            if (hspice) continue;
+            if (std.mem.startsWith(u8, card, ".")) for (hspice_cards) |c| {
+                hspice = hspice or std.ascii.eqlIgnoreCase(card, c);
+            };
             // `.lib 'file' tt`: a quoted path and a section.
             if (std.ascii.eqlIgnoreCase(card, ".lib") and tail.len != 0 and tail[0] == '\'') if (std.mem.indexOfScalarPos(u8, tail, 1, '\'')) |close| {
                 hspice = hspice or std.mem.trim(u8, tail[close + 1 ..], " \t").len != 0;
             };
         }
+        // Every word test below needs an `=` or a `sweep` on the line.
+        if (hspice or (std.mem.indexOfScalar(u8, rest, '=') == null and std.ascii.findIgnoreCase(rest, "sweep") == null)) continue;
         var words = std.mem.tokenizeAny(u8, rest, " \t");
         var sweep = false;
         while (words.next()) |w| {
@@ -139,7 +154,7 @@ test detectDialect {
 test "detectDialect: no false positive over the corpus" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    var dir = std.Io.Dir.cwd().openDir(io, "tests/fixtures", .{ .iterate = true }) catch return error.SkipZigTest;
+    var dir = std.Io.Dir.cwd().openDir(io, "tests/conformance/tests/netlist", .{ .iterate = true }) catch return error.SkipZigTest;
     defer dir.close(io);
     var walker = try dir.walk(a);
     defer walker.deinit();
@@ -203,7 +218,7 @@ pub fn prepare(io: std.Io, session: std.mem.Allocator, input: Source, dialect: D
 fn loadData(io: std.Io, session: std.mem.Allocator, foreign: []const netlist.Foreign, origin: []const u8) ![]const netlist.DataFile {
     var files: std.ArrayList(netlist.DataFile) = .empty;
     for (foreign) |f| if (f.kind == .data) {
-        const path = if (std.fs.path.isAbsolute(f.path)) f.path else try std.fs.path.join(session, &.{ std.fs.path.dirname(origin) orelse ".", f.path });
+        const path = try deckRelative(session, origin, f.path);
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, session, .unlimited) catch |err| {
             std.log.err("netlist: cannot read data file {s}: {s}", .{ path, @errorName(err) });
             return err;
@@ -223,31 +238,27 @@ fn loadData(io: std.Io, session: std.mem.Allocator, foreign: []const netlist.For
 /// loader's error for a model that does not compile.
 pub fn loadModels(io: std.Io, lib: *device.Library, session: std.mem.Allocator, nl: netlist.Netlist, origin: []const u8, apps: []const []const u8) !void {
     for (apps) |app| try lib.loadVpiApp(app);
-    for (nl.deck.vpi_apps) |app| try lib.loadVpiApp(if (std.fs.path.isAbsolute(app))
-        app
-    else
-        try std.fs.path.join(session, &.{ std.fs.path.dirname(origin) orelse ".", app }));
-    const foreign = nl.deck.foreign;
+    for (nl.deck.vpi_apps) |app| try lib.loadVpiApp(try deckRelative(session, origin, app));
     var paths: std.ArrayList([]const u8) = .empty;
-    for (foreign) |f| {
-        const path = if (std.fs.path.isAbsolute(f.path))
-            f.path
-        else
-            try std.fs.path.join(session, &.{ std.fs.path.dirname(origin) orelse ".", f.path });
-        switch (f.kind) {
-            .data => {},
-            .verilog_a, .verilog => try paths.append(session, path),
-            // ESPice compiles Verilog-A through VerA and never loads OSDI, so an
-            // OSDI reference is an error rather than a guess at a substitute.
-            .osdi_include, .pre_osdi => {
-                if (!@import("builtin").is_test) std.log.err("netlist: {s} {s}: espice does not load OSDI binaries; load the Verilog-A source with .hdl \"model.va\"", .{ @tagName(f.kind), f.path });
-                return error.OsdiUnsupported;
-            },
-        }
-    }
+    for (nl.deck.foreign) |f| switch (f.kind) {
+        .data => {},
+        .verilog_a, .verilog => try paths.append(session, try deckRelative(session, origin, f.path)),
+        // ESPice compiles Verilog-A through VerA and never loads OSDI, so an
+        // OSDI reference is an error rather than a guess at a substitute.
+        .osdi_include, .pre_osdi => {
+            if (!@import("builtin").is_test) std.log.err("netlist: {s} {s}: espice does not load OSDI binaries; load the Verilog-A source with .hdl \"model.va\"", .{ @tagName(f.kind), f.path });
+            return error.OsdiUnsupported;
+        },
+    };
     if (paths.items.len == 0) return;
-
     try lib.load(io, paths.items);
+}
+
+/// `path` as written when absolute, else joined onto the directory of the
+/// deck at `origin`, allocated in `session`.
+fn deckRelative(session: std.mem.Allocator, origin: []const u8, path: []const u8) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) return path;
+    return std.fs.path.join(session, &.{ std.fs.path.dirname(origin) orelse ".", path });
 }
 
 /// Narrows the published outputs to the `.save` labels, in place. The
@@ -282,14 +293,11 @@ pub fn build(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_are
     return buildRun(lib, sim_arena, parse_arena, owned, .{});
 }
 
-/// Which run of a deck `buildRun` builds.
-pub const Run = variants.Run;
-
-/// What `buildRun` can fail with: the errors of the stages one run goes
-/// through (`buildOne`, and setting a point's live values), each raised and
-/// logged with its card by the stage that owns it. A failed build releases
-/// every circuit it froze; its slices stay in the arenas until they die.
-pub const BuildError = ErrorOf(buildOne) || ErrorOf(variants.setPoint);
+// What `buildRun` can fail with, spelled out because it recurses: the
+// errors of `buildOne` and of setting a point's live values, each logged
+// with its card by the stage that owns it. A failed build releases every
+// circuit it froze; its slices stay in the arenas until they die.
+const BuildError = ErrorOf(buildOne) || ErrorOf(variants.setPoint);
 
 fn ErrorOf(comptime f: anytype) type {
     return @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.error_set;
@@ -299,7 +307,7 @@ fn ErrorOf(comptime f: anytype) type {
 /// when the deck has an HSPICE optimization (`Prepared.tuner` borrows it).
 /// A `run.point` sets `nl`'s live values first; they are nominal again
 /// when a run with rebuilt points returns.
-pub fn buildRun(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: *netlist.Netlist, run: Run) BuildError!Prepared {
+fn buildRun(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: *netlist.Netlist, run: variants.Run) BuildError!Prepared {
     var stack: std.ArrayList(netlist.expr.Val) = .empty;
     if (run.point) |pt| try variants.setPoint(parse_arena, &stack, nl, pt);
     var one = try buildOne(lib, sim_arena, parse_arena, nl, run);
@@ -325,7 +333,7 @@ pub fn buildRun(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_
 /// One run without its rebuilt points: the prepared run and the runs its
 /// plan asks for. `CircuitTooLarge` when the deck has more analysis cards
 /// than a u32 job index can fan out.
-fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: *netlist.Netlist, run: Run) !struct { prepared: Prepared, rebuilds: []const variants.Rebuild } {
+fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: *netlist.Netlist, run: variants.Run) !struct { prepared: Prepared, rebuilds: []const variants.Rebuild } {
     if (nl.deck.analyses.len > (std.math.maxInt(u32) - 1) / 3) return error.CircuitTooLarge;
     const deck_opts = try analyses.deckOptions(nl.deck.config, nl.deck.dialect);
     var b = try Builder.init(sim_arena, lib);
@@ -400,9 +408,7 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
     } else if (run.prefix.len != 0 or variants.any(nl.deck)) blk: {
         var planner = try variants.Planner.init(lib, sim_arena, parse_arena, nl, &circuit, cards, run.prefix);
         const planned = try variants.plan(&planner);
-        if (nl.deck.optimize != null) {
-            tuner = try variants.Tuner.init(planner);
-        }
+        if (nl.deck.optimize != null) tuner = try variants.Tuner.init(planner);
         break :blk planned;
     } else .{};
     const tuning = if (nl.tunable.len != 0 and run.point == null and run.prefix.len == 0) try variants.Tuning.init(core.gpa, lib, sim_arena, parse_arena, nl, &circuit, cards) else null;
@@ -601,4 +607,14 @@ test namesNoOutput {
     try std.testing.expect(namesNoOutput(.{ .kind = .pxf, .args = &.{} }));
     try std.testing.expect(!namesNoOutput(.{ .kind = .pxf, .args = &.{}, .sn = true }));
     try std.testing.expect(!namesNoOutput(.{ .kind = .ac, .args = &.{} }));
+}
+
+test {
+    _ = @import("tests/builder.zig");
+    _ = @import("tests/prepared.zig");
+    _ = @import("tests/models.zig");
+    _ = @import("tests/variants.zig");
+    _ = variants;
+    _ = analyses;
+    _ = mosra;
 }

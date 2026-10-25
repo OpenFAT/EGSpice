@@ -17,6 +17,10 @@
 // unknown the module does not own. The builder (addKinduc) binds them to
 // L1/L2's branch-current unknowns, so V(brX) reads that current and I(brX)
 // writes that inductor's KVL row: `I(br1) <+ -k*ddt(V(br2))` is Q[br1] = -k*x.br2.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module kinduc(br1, br2);
     inout br1, br2;
     electrical br1, br2;

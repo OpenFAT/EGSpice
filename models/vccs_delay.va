@@ -6,6 +6,10 @@
 //   and Analysis, Sources and Stimuli].
 //
 // At DC the delay is transparent, as in vcvs_delay.va.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module vccs_delay(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;

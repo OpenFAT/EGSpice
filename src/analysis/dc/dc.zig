@@ -9,6 +9,7 @@ const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
 const op = @import("op.zig");
+const gpu_lanes = @import("../gpu/lanes.zig");
 
 /// Query options, defined in core/query.zig.
 pub const Options = @import("core").query.Dc;
@@ -56,8 +57,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
 pub fn runLanes(comptime W: usize, ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
     const g = ctxs.len;
     std.debug.assert(g >= 1 and g <= W and out.len == g);
-    const pin = ctxs[0].circuit.knobs.newton.pin;
-    if (W == 1 or g == 1 or !(pin == .auto or pin == .direct) or root.Circuit.certify) {
+    if (W == 1 or g == 1 or !op.lanesAllowed(ctxs[0].circuit)) {
         for (ctxs, out) |*c, *o| o.* = run(c, opts);
         return;
     }
@@ -149,6 +149,145 @@ pub fn runLanes(comptime W: usize, ctxs: []const root.RunCtx, opts: Options, out
     while (it.next()) |l| out[l] = sweeps[l].take();
 }
 
+/// `run` for any number of lanes with each point's warm Newton for every
+/// lane on the GPU (06 6.9, `gpu_lanes.GpuLanes.solveStatic`): the swept
+/// value, recompute, predictor, cold ladder, commit and rows stay on the
+/// host, as `run` does them, and each point moves the lanes' rows to the
+/// device and the accepted lanes' device state back. Within tolerance of
+/// `run`, not bitwise (one LU pivot order). A batch the device cannot take
+/// runs each lane's `run`; a device error part way runs the rest of the
+/// warm Newtons on the host.
+pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
+    const g = ctxs.len;
+    std.debug.assert(out.len == g);
+    if (g == 0) return;
+    const c0 = ctxs[0].circuit;
+    const why: ?[]const u8 = if (g < 2) "one lane" else if (!op.lanesAllowed(c0)) "a JFNK pin or certify" else gpu_lanes.staticRefusal(c0);
+    if (why) |w| {
+        if (c0.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: dc lanes on the CPU: {s}\n", .{w});
+        for (ctxs, out) |*c, *o| o.* = run(c, opts);
+        return;
+    }
+    const gpa = ctxs[0].scratch_allocator;
+    const fail = struct {
+        fn f(o: []LaneOutcome, e: LaneError) void {
+            @memset(o, e);
+        }
+    }.f;
+    // A lane's own error ends its sweep.
+    const drop = struct {
+        fn f(s: *Sweep, on: *bool, o: *LaneOutcome, e: LaneError) void {
+            o.* = e;
+            s.deinit();
+            on.* = false;
+        }
+    }.f;
+    const sweeps = gpa.alloc(Sweep, g) catch |e| return fail(out, e);
+    defer gpa.free(sweeps);
+    const ckts = gpa.alloc(*root.Circuit, g) catch |e| return fail(out, e);
+    defer gpa.free(ckts);
+    const xs = gpa.alloc([]f64, g) catch |e| return fail(out, e);
+    defer gpa.free(xs);
+    const res = gpa.alloc(gpu_lanes.LaneNewton, g) catch |e| return fail(out, e);
+    defer gpa.free(res);
+    // Per lane: still sweeping, and warm this point.
+    const live = gpa.alloc(bool, g) catch |e| return fail(out, e);
+    defer gpa.free(live);
+    const warm = gpa.alloc(bool, g) catch |e| return fail(out, e);
+    defer gpa.free(warm);
+    for (sweeps, ctxs, 0..) |*s, *c, l| {
+        s.init(c, opts) catch |e| {
+            // ponytail: a lane that fails its setup sends the batch to `run`.
+            for (sweeps[0..l]) |*d| d.deinit();
+            out[l] = e;
+            for (ctxs, out, 0..) |*cc, *o, k| if (k != l) {
+                o.* = run(cc, opts);
+            };
+            return;
+        };
+        ckts[l] = c.circuit;
+        xs[l] = s.sol();
+    }
+    @memset(live, true);
+    defer for (sweeps, live) |*s, on| if (on) s.deinit();
+    var dev: ?*gpu_lanes.GpuLanes = null;
+    // The host already holds every lane's state (`copyBack` each point).
+    defer if (dev) |d| {
+        @memset(d.detached, true);
+        d.deinit();
+    };
+    var on_device = true;
+    for (0..sweeps[0].n_outer) |po| {
+        for (sweeps, live, out) |*s, *on, *o| if (on.*) s.beginBlock(po) catch |e| drop(s, on, o, e);
+        for (0..sweeps[0].n_inner) |pt| {
+            var any = false;
+            for (sweeps, live, warm, out) |*s, *on, *w, *o| {
+                w.* = false;
+                if (!on.*) continue;
+                w.* = s.beginPoint(pt) catch |e| {
+                    drop(s, on, o, e);
+                    continue;
+                };
+                if (!w.*) continue;
+                s.prepareWarm();
+                any = true;
+            }
+            if (any and on_device) devicePoint(gpa, &dev, ckts, xs, warm, sweeps, res) catch |e| {
+                if (c0.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: dc lanes leave the device ({s})\n", .{@errorName(e)});
+                on_device = false;
+            };
+            for (sweeps, live, warm, res, out) |*s, *on, w, *r, *o| {
+                if (!on.*) continue;
+                var converged = false;
+                if (w and on_device) {
+                    converged = r.result.converged and !r.singular and !r.reject;
+                    // As `converger.run` ends each lane's solve.
+                    s.ckt.clearLimits();
+                } else if (w) {
+                    if (converger.run(s.ckt, s.ws, s.sol(), 0, s.warmOptions(), root.EvalHook{})) |rr| {
+                        converged = rr.converged;
+                    } else |e| switch (e) {
+                        error.SingularMatrix => {},
+                        else => {
+                            drop(s, on, o, e);
+                            continue;
+                        },
+                    }
+                }
+                s.endPoint(pt, converged) catch |e| drop(s, on, o, e);
+            }
+        }
+    }
+    for (sweeps, live, out) |*s, *on, *o| if (on.*) {
+        o.* = s.take();
+        s.deinit();
+        on.* = false;
+    };
+}
+
+/// One point's warm Newton on the device for the lanes of `warm`: the
+/// device batch built on the first call, every lane's rows and start
+/// uploaded, then each converged lane's x in `xs` and its device state
+/// copied back for `Sweep.endPoint` to commit. `res[l]` holds a warm
+/// lane's outcome.
+fn devicePoint(gpa: std.mem.Allocator, dev: *?*gpu_lanes.GpuLanes, ckts: []const *root.Circuit, xs: []const []f64, warm: []const bool, sweeps: []const Sweep, res: []gpu_lanes.LaneNewton) !void {
+    const d = dev.* orelse blk: {
+        const made = try gpu_lanes.GpuLanes.initStatic(gpa, ckts, xs);
+        made.prof.on = ckts[0].knobs.gpu_stats != .off;
+        dev.* = made;
+        break :blk made;
+    };
+    try d.reload(xs, true);
+    var first: usize = 0;
+    for (d.round, warm, 0..) |*r, w, l| {
+        r.* = @intFromBool(w);
+        if (w and !warm[first]) first = l;
+    }
+    try d.solveStatic(xs, sweeps[first].warmOptions(), res);
+    for (d.detached, warm, res) |*det, w, r| det.* = !(w and r.result.converged and !r.singular and !r.reject);
+    d.copyBack();
+}
+
 const LaneError = root.ErrorOf(run);
 /// One lane's `run` outcome.
 pub const LaneOutcome = LaneError!root.Result;
@@ -203,12 +342,7 @@ const Sweep = struct {
         // Matching the device type as well as the index lets a deck hold
         // both a V and an I card (their per-type indices overlap) and lets
         // the sweep name a resistor.
-        const refs = try ckt.collectParams();
-        // A null target is the temperature (`.dc TEMP ...`).
-        const t: ?root.ParamRef = switch (opts.target) {
-            .temp => null,
-            .device => |d| findTarget(refs, d) orelse return error.DcSweepSourceNotFound,
-        };
+        const t = try targetRef(ckt, opts.target);
         // A temperature sweep at either level writes every Model row's
         // temperature; `deinit` puts the netlist's back.
         s.* = .{
@@ -240,10 +374,7 @@ const Sweep = struct {
         // the blocks. The outer install is one ParamRef write or a circuit
         // temperature set.
         if (opts.hasOuter()) {
-            s.t2 = switch (opts.target2.?) {
-                .temp => null,
-                .device => |d| findTarget(refs, d) orelse return error.DcSweepSourceNotFound,
-            };
+            s.t2 = try targetRef(ckt, opts.target2.?);
             s.saved2 = if (s.t2) |r| r.get() else 0;
             // Accumulated, not start + k*step: ngspice steps both levels
             // with `+= TRCVvStep` (dctrcurv.c:469) and its axis carries that
@@ -346,6 +477,17 @@ const Sweep = struct {
         _ = s.ckt.applyLimits(s.sol(), x_prev);
     }
 
+    /// Point `pt` of the current block is the deck's operating point: the
+    /// first point of the first block, with every swept device value at its
+    /// netlist value. Its cold ladder is then the OP prerequisite's own
+    /// solve (same circuit, tolerances and nodesets), whose answer is
+    /// `ctx.x_op` (04 4.10).
+    fn isOpPoint(s: *const Sweep, pt: usize) bool {
+        if (pt != 0 or !s.first_block or s.t == null or s.v != s.saved) return false;
+        if (s.opts.hasOuter() and (s.t2 == null or s.v2 != s.saved2)) return false;
+        return s.ctx.x_op.len == s.ckt.n;
+    }
+
     /// Ends point `pt`: the cold ladder when the warm Newton did not
     /// converge (or did not run), then the point's row and tangent rows.
     fn endPoint(s: *Sweep, pt: usize, warm_converged: bool) !void {
@@ -358,6 +500,10 @@ const Sweep = struct {
         // Rows in one tangent block: every point of every outer level.
         const block = s.n_inner * s.n_outer;
         var converged = warm_converged;
+        if (!converged and s.isOpPoint(pt)) {
+            @memcpy(x, ctx.x_op);
+            converged = true;
+        }
         if (!converged) {
             op.coldStart(ckt, x);
             const lr = try op.nodesetLadder(ckt, s.ws, x, .{ .tol = opts.tol }, s.force, 0);
@@ -403,11 +549,32 @@ fn sweepColumn(target: Options.SweepTarget) []const u8 {
     return "v(v-sweep)";
 }
 
-fn findTarget(refs: []const root.ParamRef, want: Options.SweepTarget.Param) ?root.ParamRef {
-    for (refs) |ref| {
-        if (ref.index == want.index and
-            std.mem.eql(u8, ref.param_name, want.param_name) and
-            ref.type == want.type) return ref;
+/// The ref `target` sweeps, null for the temperature (`.dc TEMP ...`).
+/// error.DcSweepSourceNotFound when it names no parameter.
+fn targetRef(ckt: *root.Circuit, target: Options.SweepTarget) !?root.ParamRef {
+    return switch (target) {
+        .temp => null,
+        .device => |d| try findTarget(ckt, d) orelse return error.DcSweepSourceNotFound,
+    };
+}
+
+/// The parameter `want` names. Only the batches of its type are
+/// collected, so the other batches keep their Model rows shared; the ref
+/// stays valid as `collectParams`' do.
+fn findTarget(ckt: *root.Circuit, want: Options.SweepTarget.Param) !?root.ParamRef {
+    var refs: std.ArrayList(root.ParamRef) = .empty;
+    defer refs.deinit(ckt.gpa);
+    for (ckt.batches, ckt.batch_types) |b, t| {
+        if (t != want.type) continue;
+        refs.clearRetainingCapacity();
+        try b.hooks.collect_params(b.ctx, ckt.gpa, &refs).unwrap();
+        for (refs.items) |ref| {
+            if (ref.index == want.index and std.mem.eql(u8, ref.param_name, want.param_name)) {
+                var r = ref;
+                r.type = t;
+                return r;
+            }
+        }
     }
     return null;
 }
@@ -420,7 +587,6 @@ fn findTarget(refs: []const root.ParamRef, want: Options.SweepTarget.Param) ?roo
 /// writes. Leaves every parameter as it found it.
 fn tangentRows(ctx: *const root.RunCtx, ckt: *root.Circuit, ws: *converger.Workspace, x: []const f64, tangents: []const u32, buf: []f64, out: []f64, stride: usize, ncols: usize) !void {
     const n = ckt.n;
-    const params = try ckt.collectParams();
     const rhs = buf[0..n];
     const dx = buf[n..][0..n];
     // A full stamp: the baseline would hold the const-Jacobian devices
@@ -439,22 +605,27 @@ fn tangentRows(ctx: *const root.RunCtx, ckt: *root.Circuit, ws: *converger.Works
         }
         const refs, const values = ctx.variants.writes(row);
         const saved = buf[2 * n ..][0..refs.len];
-        for (refs, values, saved) |r, value, *old| {
-            old.* = params[r].get();
-            params[r].set(value);
-        }
+        // All read before any is written, so a ref written twice saves its
+        // nominal both times. `setParams` leaves instances sharing their
+        // Model rows where the row writes them alike.
+        for (refs, saved) |r, *old| old.* = (try ckt.paramAt(r)).value;
+        try ckt.setParams(refs, values, false);
         // The rows only move device parameters, so re-deriving their own
         // types is the whole recompute (Circuit.recomputeType). A row that
         // re-wires a device has no first-order answer on this pattern.
-        const rewired = if (recomputeTypes(ckt, params, refs)) false else |e| switch (e) {
+        const rewired = if (recomputeTypes(ckt, refs)) false else |e| switch (e) {
             error.TopologyChanged => true,
+            else => |other| return other,
         };
         if (!rewired) {
             ckt.eval(x, 0);
             for (dx, ckt.rhs[0..n], rhs) |*d, f, f0| d.* = f - f0;
         }
-        for (refs, saved) |r, old| params[r].set(old);
-        recomputeTypes(ckt, params, refs) catch unreachable; // restores the values it was built at
+        try ckt.setParams(refs, saved, false);
+        recomputeTypes(ckt, refs) catch |e| switch (e) {
+            error.TopologyChanged => unreachable, // restores the values it was built at
+            else => |other| return other,
+        };
         if (rewired) {
             @memset(probes, std.math.nan(f64));
             continue;
@@ -465,11 +636,11 @@ fn tangentRows(ctx: *const root.RunCtx, ckt: *root.Circuit, ws: *converger.Works
 }
 
 /// `Circuit.recomputeType` once for each device type `refs` writes.
-fn recomputeTypes(ckt: *root.Circuit, params: []const root.ParamRef, refs: []const u32) error{TopologyChanged}!void {
+fn recomputeTypes(ckt: *root.Circuit, refs: []const u32) !void {
     for (refs, 0..) |r, i| {
-        const t = params[r].type;
+        const t = (try ckt.paramAt(r)).type;
         for (refs[0..i]) |earlier| {
-            if (params[earlier].type == t) break;
+            if ((try ckt.paramAt(earlier)).type == t) break;
         } else try ckt.recomputeType(t);
     }
 }

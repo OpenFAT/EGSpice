@@ -11,7 +11,7 @@
 //! the model is passive. `sections` turns the result into the second-order
 //! sections models/sparam_1.va runs through `laplace_nd`. HSPICE's option for this is
 //! RATIONAL_FUNC=1; its default is IFFT convolution. The W element's fitter
-//! (wfit.zig) reuses `fit`, `enforcePassivity` and `sections`.
+//! (wfit.zig) reuses `fit`, `enforcePassivity`, `sections` and `symEig`.
 //!
 //! Data (DOD): samples are SoA over (entry, frequency), entry-major, entry
 //! e = i·P + j; the fit is one pole list and per-entry residues and direct
@@ -51,7 +51,7 @@ pub const Network = struct {
 pub const Error = error{ OutOfMemory, InvalidTouchstone, SingularSParameters };
 
 /// A Touchstone 1.0 file as written: the option line's settings and the
-/// network records, before any conversion. tests/grammar/touchstone.peg is
+/// network records, before any conversion. tests/frontend/grammar/touchstone.peg is
 /// the syntax; the rules cite dev/research/data-file-syntax.md §1 (TS1.1 =
 /// Touchstone 1.1, TS2.0 = 2.0).
 pub const Raw = struct {
@@ -67,6 +67,7 @@ pub const Raw = struct {
     /// Network records, each a frequency then N² value pairs: `nf` rows of
     /// 1 + 2N² numbers, frequencies strictly ascending.
     values: []const f64,
+    /// Network records in `values`, at least 1.
     nf: usize,
 
     /// The data format the option line names.
@@ -370,7 +371,7 @@ pub fn fit(arena: Allocator, net: Network, opt: FitOptions) Error!Fit {
     var n: usize = 4;
     // Order K's σ block is rows K+1..2K of a 2·nf-row QR, so K < nf.
     while (best.rel_err > opt.tol and n <= opt.max_order and n < net.freq.len) : (n += 4) {
-        const f = try fitOrder(arena, net, n / 2, opt.iterations, w_max, weight);
+        const f = try fitOrder(arena, net, n / 2, opt.iterations, s, w_max, weight);
         if (f.rel_err < best.rel_err) best = f;
     }
     return best;
@@ -392,9 +393,10 @@ fn weights(arena: Allocator, net: Network, relative: bool) Error![]f64 {
     return w;
 }
 
-/// Vector fitting with `pairs` starting complex pairs, in s scaled by
-/// `w0` so the basis is O(1); `weight` as `weights` returns it.
-fn fitOrder(arena: Allocator, net: Network, pairs: usize, iterations: usize, w0: f64, weight: []const f64) Error!Fit {
+/// Vector fitting with `pairs` starting complex pairs, at `s`, the data
+/// frequencies in rad/s scaled by `w0` so the basis is O(1); `weight` as
+/// `weights` returns it.
+fn fitOrder(arena: Allocator, net: Network, pairs: usize, iterations: usize, s: []const f64, w0: f64, weight: []const f64) Error!Fit {
     const nf = net.freq.len;
     const ne = net.ports * net.ports;
     var poles = try arena.alloc(Cx, pairs);
@@ -409,8 +411,6 @@ fn fitOrder(arena: Allocator, net: Network, pairs: usize, iterations: usize, w0:
         const b = lo * std.math.pow(f64, 1 / lo, t);
         p.* = .{ .re = -b / 100, .im = b };
     }
-    const s = try arena.alloc(f64, nf);
-    for (s, net.freq) |*o, f| o.* = 2 * std.math.pi * f / w0;
     var n_used: usize = 0;
     for (0..ne) |e| n_used += @intFromBool(!std.mem.allEqual(f64, weight[e * nf ..][0..nf], 0));
     if (n_used == 0) return error.InvalidTouchstone;
@@ -475,7 +475,7 @@ fn fitOrder(arena: Allocator, net: Network, pairs: usize, iterations: usize, w0:
                 at += 1;
             }
         }
-        const ev = try arena.alloc(core.numerics.Complex, kk);
+        const ev = try arena.alloc(numerics.Complex, kk);
         const got = eigen.eigenvalues(kk, h, ev, 1e-14, 60 * @as(u32, @intCast(kk)));
         if (!got.converged or got.count != kk) break;
         poles = try arena.alloc(Cx, kk);

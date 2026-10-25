@@ -22,6 +22,11 @@
 //! as genuine ones; the QZ sees each of its roots as a vanishing diagonal of
 //! C's triangular factor instead.
 //!
+//! Above `dense_max_n` unknowns the dense pencil is out of reach (O(n³)
+//! time, 4n² f64), and `.pz` reports only the `sparse_k` roots of each kind
+//! nearest a shift, by shift-invert Arnoldi on the sparse LU (`sparseRoots`);
+//! the plot name says so.
+//!
 //! Cites ngspice cktpzstr.c (where the iteration limit diverges) and
 //! dev/analysis/pole-zero.md.
 const std = @import("std");
@@ -30,28 +35,46 @@ const dense_lu = @import("solver").dense_lu;
 const freq_solve = @import("solver").freq_solve;
 const qr = @import("core").eigen;
 const qz = @import("qz.zig");
+const arnoldi = @import("arnoldi.zig");
+const direct = @import("solver").direct;
+const numerics = @import("core").numerics;
+const combinePlanes = @import("../Circuit.zig").combinePlanes;
 
-const Complex = @import("core").numerics.Complex;
+const Complex = numerics.Complex;
 const GROUND = root.GROUND;
 
 /// Query options, defined in core/query.zig.
 pub const Options = @import("core").query.Pz;
+
+/// Unknowns above which `.pz` takes the sparse path. The dense one costs
+/// 0.26 s on a 500-stage RC ladder and 2.1 s on a 1000-stage one
+/// (ReleaseFast), growing as n³.
+const dense_max_n = 1000;
+/// Roots of each kind the sparse path wants: the dominant ones, which an
+/// engineer reads off a large circuit, and few enough that the Krylov basis
+/// (2k + 20 columns of n) stays small.
+const sparse_k = 20;
 
 /// Poles and zeros in rad/s, each owned by `allocator`.
 pub const Roots = struct {
     poles: []Complex,
     zeros: []Complex,
     allocator: std.mem.Allocator,
+    /// 0 when the lists hold every finite root (the dense path); else how
+    /// many of each kind the sparse path wanted, nearest `shift` first.
+    requested: u32 = 0,
+    /// rad/s, the sparse path's shift.
+    shift: f64 = 0,
 
     /// Frees both root lists.
-    pub fn deinit(self: *Roots) void {
+    fn deinit(self: *Roots) void {
         self.allocator.free(self.poles);
         self.allocator.free(self.zeros);
     }
 };
 
-/// One pencil solve's working set, sliced from one allocation. `g` and `c` are
-/// the pencil; the zeros pass rewrites both in place as the numerator.
+/// One dense pencil solve's working set. `g` and `c` are the pencil; the
+/// zeros pass rewrites both in place as the numerator.
 const Work = struct {
     n: usize,
     g: []f64,
@@ -71,11 +94,13 @@ const Work = struct {
 /// operating point `x_op`. Returns error.Singular when poles are wanted and G
 /// itself is singular (a node reached only through capacitors), and
 /// error.PzDidNotConverge when the QR or QZ runs out of `qr_max_iter` with
-/// roots still missing: a partial root set is never returned.
+/// roots still missing: the dense path never returns a partial root set.
+/// Above `dense_max_n` unknowns the sparse path returns the roots nearest
+/// its shift and says how many it wanted (`Roots.requested`).
 ///
 /// Diverges from ngspice, which warns at its iteration limit and publishes
 /// the roots it found (cktpzstr.c:225).
-pub fn solve(
+fn solve(
     ckt: *root.Circuit,
     x_op: []const f64,
     options: Options,
@@ -85,7 +110,53 @@ pub fn solve(
 
     try ckt.linearizeAc(x_op);
 
-    const arena = try allocator.alloc(f64, 4 * n * n + 2 * n);
+    // The frequency-dependent entries at their DC gain, acDyn(0).re (absdelay
+    // 1, a laplace H(0)): what a .dc eval stamps in G, bit for bit. e^(-sτ)
+    // has no finite pole-zero form, so a delay stays transparent.
+    const dyn = try allocator.alloc(f64, 2 * ckt.ac_dyn_slots.len);
+    defer allocator.free(dyn);
+    const dyn_re = dyn[0..ckt.ac_dyn_slots.len];
+    if (ckt.ac_dyn_slots.len != 0) ckt.acDyn(x_op, &.{0}, dyn_re, dyn[dyn_re.len..]);
+
+    if (n > dense_max_n) {
+        const nnz: usize = ckt.nnz;
+        const planes = try allocator.alloc(f64, 2 * (nnz + 1));
+        defer allocator.free(planes);
+        const g = planes[0 .. nnz + 1];
+        const c = planes[nnz + 1 ..];
+        @memcpy(g[0..nnz], ckt.g_vals[0..nnz]);
+        @memcpy(c[0..nnz], ckt.c_vals[0..nnz]);
+        g[nnz] = 0;
+        c[nnz] = 0;
+        for (ckt.ac_dyn_slots, dyn_re) |slot, v| {
+            if (slot < nnz) g[slot] += v;
+        }
+        return sparseRoots(.{
+            .n = ckt.n,
+            .col_ptr = ckt.col_ptr,
+            .row_idx = ckt.row_idx,
+            .g = g,
+            .c = c,
+            .bbd = ckt.bbd,
+            .lu = ckt.knobs.lu,
+            .execution = ckt.solver_execution,
+        }, options, allocator);
+    }
+
+    const planes = try allocator.alloc(f64, 2 * n * n);
+    defer allocator.free(planes);
+    ckt.denseG(planes[0 .. n * n]);
+    ckt.denseC(planes[n * n ..]);
+    for (ckt.ac_dyn_slots, dyn_re) |slot, v| {
+        if (slot < ckt.nnz) planes[@as(usize, ckt.row_idx[slot]) * n + freq_solve.slotCol(ckt.col_ptr, slot)] += v;
+    }
+    return denseRoots(n, planes[0 .. n * n], planes[n * n ..], options, allocator);
+}
+
+/// Every finite root of the dense row-major pencil (`g`, `c`), both n×n and
+/// destroyed. Errors as `solve`.
+fn denseRoots(n: usize, g: []f64, c: []f64, options: Options, allocator: std.mem.Allocator) !Roots {
+    const arena = try allocator.alloc(f64, 2 * n * n + 2 * n);
     defer allocator.free(arena);
     const piv = try allocator.alloc(u32, n);
     defer allocator.free(piv);
@@ -95,29 +166,15 @@ pub fn solve(
 
     var w: Work = .{
         .n = n,
-        .g = arena[0 .. n * n],
-        .c = arena[n * n .. 2 * n * n],
-        .m = arena[2 * n * n .. 3 * n * n],
-        .a = arena[3 * n * n .. 4 * n * n],
-        .col = arena[4 * n * n ..][0..n],
-        .sol = arena[4 * n * n + n ..][0..n],
+        .g = g,
+        .c = c,
+        .m = arena[0 .. n * n],
+        .a = arena[n * n .. 2 * n * n],
+        .col = arena[2 * n * n ..][0..n],
+        .sol = arena[2 * n * n + n ..][0..n],
         .piv = piv,
         .eigs = eigs,
     };
-    ckt.denseG(w.g);
-    ckt.denseC(w.c);
-    // The frequency-dependent entries at their DC gain, acDyn(0).re (absdelay
-    // 1, a laplace H(0)): what a .dc eval stamps in G, bit for bit. e^(-sτ)
-    // has no finite pole-zero form, so a delay stays transparent.
-    if (ckt.ac_dyn_slots.len != 0) {
-        const dyn = try allocator.alloc(f64, 2 * ckt.ac_dyn_slots.len);
-        defer allocator.free(dyn);
-        const re = dyn[0..ckt.ac_dyn_slots.len];
-        ckt.acDyn(x_op, &.{0}, re, dyn[re.len..]);
-        for (ckt.ac_dyn_slots, re) |slot, v| {
-            if (slot < ckt.nnz) w.g[@as(usize, ckt.row_idx[slot]) * n + freq_solve.slotCol(ckt.col_ptr, slot)] += v;
-        }
-    }
 
     var poles: []Complex = &.{};
     errdefer allocator.free(poles);
@@ -209,6 +266,162 @@ fn numeratorPencil(w: *Work, o: Options) void {
     }
 }
 
+/// A pencil G + sC on the circuit's CSC pattern, for the sparse path. `g`
+/// and `c` hold nnz + 1 values, the trash slot last.
+const Pencil = struct {
+    n: u32,
+    col_ptr: []const u32,
+    row_idx: []const u32,
+    g: []const f64,
+    c: []const f64,
+    bbd: ?numerics.BbdInfo = null,
+    lu: direct.Knobs = .{},
+    execution: numerics.Execution = .{},
+};
+
+/// The `sparse_k` poles and zeros nearest the shift σ, each list sorted by
+/// |s|. Shift-invert: with G + σC regular, θ = 1/(s − σ) runs over the
+/// eigenvalues of −(G + σC)⁻¹C, and its largest are the poles nearest σ;
+/// the zeros solve the numerator pencil through the same factor (`Op`).
+/// σ = 0 unless the zeros need another: G singular with only zeros wanted,
+/// or a transfer zero at the origin, where `Op`'s bordering would divide by
+/// H(σ) = 0. error.Singular as `solve` (G singular with poles wanted), or
+/// when the transfer vanishes at the fallback shift too.
+fn sparseRoots(p: Pencil, options: Options, allocator: std.mem.Allocator) !Roots {
+    const n: usize = p.n;
+    const nnz: usize = p.col_ptr[n];
+    var slv = try direct.Solver.init(allocator, p.n, p.col_ptr, p.row_idx, p.bbd, p.lu);
+    defer slv.deinit();
+    const work = try allocator.alloc(f64, nnz + 1 + 4 * n);
+    defer allocator.free(work);
+    const y = work[0 .. nnz + 1];
+    const d = work[nnz + 1 ..][0..n];
+    const w = work[nnz + 1 + n ..][0..n];
+    const t = work[nnz + 1 + 2 * n ..][0..n];
+    const ex = work[nnz + 1 + 3 * n ..][0..n];
+
+    // The drive column of `numeratorPencil`.
+    @memset(d, 0);
+    if (options.drive_branch != GROUND) {
+        d[options.drive_branch] = 1;
+    } else {
+        if (options.in_pos != GROUND) d[options.in_pos] = 1;
+        if (options.in_neg != GROUND) d[options.in_neg] = -1;
+    }
+
+    var shift: f64 = 0;
+    var h: f64 = 0;
+    for (0..2) |attempt| {
+        combinePlanes(y, p.g, p.c, shift);
+        slv.factor(y, p.execution) catch |err| switch (err) {
+            error.SingularMatrix => {
+                if (options.want != .zeros or attempt == 1) return error.Singular;
+                shift = fallbackShift(p);
+                continue;
+            },
+            else => return err,
+        };
+        if (options.want == .poles) break;
+        // w = (G + σC)⁻¹d, and h = H(σ).
+        slv.solve(d, w);
+        h = w[options.out_pos] - if (options.out_neg != GROUND) w[options.out_neg] else 0;
+        if (h != 0 and std.math.isFinite(h)) break;
+        if (attempt == 1) return error.Singular;
+        shift = fallbackShift(p);
+    }
+
+    var op: Op = .{ .p = &p, .slv = &slv, .t = t, .ex = ex };
+    var poles: []Complex = &.{};
+    errdefer allocator.free(poles);
+    if (options.want != .zeros) poles = try nearest(allocator, n, &op, shift);
+    var zeros: []Complex = &.{};
+    if (options.want != .poles) {
+        op.numerator = .{ .pos = options.out_pos, .neg = options.out_neg, .w = w, .h = h };
+        zeros = try nearest(allocator, n, &op, shift);
+    }
+    return .{ .poles = poles, .zeros = zeros, .allocator = allocator, .requested = sparse_k, .shift = shift };
+}
+
+/// A shift off the origin when the pencil is singular there: 1e-6 of the
+/// slowest rate |g/c| over the slots that hold both, so it sits well below
+/// every root but one at the origin.
+/// ponytail: a guess from single entries; a root closer to the origin than
+/// it can rank out of order against ones near σ. Estimate the nearest pole
+/// by a few power steps if that ever matters.
+fn fallbackShift(p: Pencil) f64 {
+    var rate = std.math.inf(f64);
+    for (p.g, p.c) |g, c| {
+        if (g != 0 and c != 0) rate = @min(rate, @abs(g / c));
+    }
+    return if (std.math.isFinite(rate)) 1e-6 * rate else 1;
+}
+
+/// The roots s = σ + 1/θ of `op`'s `sparse_k` largest θ, sorted by |s|, in a
+/// list owned by `allocator`. Fewer when Arnoldi ran out of restarts or the
+/// pencil has fewer finite roots.
+fn nearest(allocator: std.mem.Allocator, n: usize, op: *const Op, shift: f64) ![]Complex {
+    var theta: [sparse_k + 1]Complex = undefined;
+    const e = try arnoldi.dominant(allocator, n, sparse_k, op, &theta, op.numerator != null);
+    const roots = try allocator.alloc(Complex, e.count);
+    for (roots, theta[0..e.count]) |*r, l| {
+        const m2 = l.magSq();
+        r.* = .{ .re = shift + l.re / m2, .im = -l.im / m2 };
+    }
+    std.mem.sort(Complex, roots, {}, struct {
+        fn before(_: void, l: Complex, r: Complex) bool {
+            if (l.magSq() != r.magSq()) return l.magSq() < r.magSq();
+            return l.im > r.im;
+        }
+    }.before);
+    return roots;
+}
+
+/// x ↦ −M⁻¹C'x at σ, for the poles' pencil (M = G + σC, C' = C) or, with
+/// `numerator`, the zeros' one of `numeratorPencil`: G' = G·E + d·e_pᵀ and
+/// C' = C·E, where E copies x with x_p replaced by x_{out−} (0 for a
+/// grounded out−). M x = b then needs only the factor of G + σC: with
+/// u = (G + σC)⁻¹b and w = (G + σC)⁻¹d, Ex = u − x_p·w, so
+/// x_p = (u_p − u_{out−}) / h for h = w_p − w_{out−} = H(σ), and
+/// x_j = u_j − x_p·w_j elsewhere.
+///
+/// The numerator pencil's infinite roots (the transfer's relative degree of
+/// them) form one defective block of high index, which Arnoldi sees as a
+/// ring of roundoff Ritz values; `arnoldi.dominant` drops those for the
+/// zeros (`stable_only`). The poles' infinite roots are of index 2 at most
+/// (MNA), a ring of radius eps^(1/2) at θ = 0 under the cutoff, so their
+/// genuine defective clusters (a cascade of identical stages) come back as
+/// the dense QR gives them.
+const Op = struct {
+    p: *const Pencil,
+    slv: *direct.Solver,
+    /// Scratch, n each.
+    t: []f64,
+    ex: []f64,
+    numerator: ?struct { pos: u32, neg: u32, w: []const f64, h: f64 } = null,
+
+    pub fn apply(self: *const Op, x: []const f64, y: []f64) void {
+        var src = x;
+        if (self.numerator) |z| {
+            @memcpy(self.ex, x);
+            self.ex[z.pos] = if (z.neg != GROUND) x[z.neg] else 0;
+            src = self.ex;
+        }
+        // t = C'x, by columns.
+        @memset(self.t, 0);
+        for (0..self.p.n) |j| {
+            if (src[j] == 0) continue;
+            for (self.p.col_ptr[j]..self.p.col_ptr[j + 1]) |k| self.t[self.p.row_idx[k]] += self.p.c[k] * src[j];
+        }
+        self.slv.solve(self.t, y);
+        if (self.numerator) |z| {
+            const xp = (y[z.pos] - if (z.neg != GROUND) y[z.neg] else 0) / z.h;
+            numerics.axpy(y, -xp, z.w);
+            y[z.pos] = xp;
+        }
+        for (y) |*v| v.* = -v.*;
+    }
+};
+
 /// Contract entry: the roots at ctx.x_op, complex, in one of two layouts.
 /// Poles only: a list, one row per pole under (index, pole), which is what
 /// decks written against bare `.pz` read. With zeros the two counts need not
@@ -219,6 +432,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     var res = try solve(ctx.circuit, ctx.x_op, opts, ctx.scratch_allocator);
 
     defer res.deinit();
+    const plotname = try plotName(a, res, opts.want);
 
     if (opts.want == .poles) {
         const n = res.poles.len;
@@ -230,7 +444,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
             data[i * 4 + 2] = pole.re;
             data[i * 4 + 3] = pole.im;
         }
-        return .{ .plotname = "Pole-Zero Analysis", .varnames = names, .is_complex = true, .npoints = n, .data = data };
+        return .{ .plotname = plotname, .varnames = names, .is_complex = true, .npoints = n, .data = data };
     }
 
     const nvars = 1 + res.poles.len + res.zeros.len;
@@ -248,7 +462,21 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
             col += 1;
         }
     }
-    return .{ .plotname = "Pole-Zero Analysis", .varnames = names, .is_complex = true, .npoints = 1, .data = data };
+    return .{ .plotname = plotname, .varnames = names, .is_complex = true, .npoints = 1, .data = data };
+}
+
+/// "Pole-Zero Analysis", plus, for the sparse path's partial lists, how
+/// many roots of each kind it wanted, the shift they are nearest, and how
+/// many it found.
+fn plotName(a: std.mem.Allocator, res: Roots, want: Options.Want) ![]const u8 {
+    const base = "Pole-Zero Analysis";
+    if (res.requested == 0) return base;
+    const head = "{s} (partial: the {d} roots of each kind nearest s = {d} rad/s; found ";
+    return switch (want) {
+        .poles => std.fmt.allocPrint(a, head ++ "{d} poles)", .{ base, res.requested, res.shift, res.poles.len }),
+        .zeros => std.fmt.allocPrint(a, head ++ "{d} zeros)", .{ base, res.requested, res.shift, res.zeros.len }),
+        .both => std.fmt.allocPrint(a, head ++ "{d} poles, {d} zeros)", .{ base, res.requested, res.shift, res.poles.len, res.zeros.len }),
+    };
 }
 
 /// det of a dense row-major n×n copy, by elimination with partial pivoting.
@@ -306,4 +534,146 @@ test numeratorPencil {
             try std.testing.expectEqual(@as(f64, 0), c[r * n + 2]);
         }
     }
+}
+
+/// A bridged RC ladder of `stages` nodes, a gyrator every 40th node (an
+/// inductor out of the next node's capacitor, so complex poles), loaded at
+/// the far end and driven by a voltage source: row-major dense G and C plus
+/// the same pencil on a CSC pattern. Unknowns: GROUND, the nodes 1..stages,
+/// the source node, its branch row. `ac_coupled` feeds node 1 through a
+/// series capacitor, a transfer zero at the origin.
+const TestLadder = struct {
+    n: usize,
+    g: []f64,
+    c: []f64,
+    col_ptr: []u32,
+    row_idx: []u32,
+    gv: []f64,
+    cv: []f64,
+
+    fn init(gpa: std.mem.Allocator, stages: usize, ac_coupled: bool) !TestLadder {
+        const n = stages + 3;
+        const src = stages + 1;
+        const br = stages + 2;
+        const g = try gpa.alloc(f64, n * n);
+        const c = try gpa.alloc(f64, n * n);
+        @memset(g, 0);
+        @memset(c, 0);
+        const two = struct {
+            fn add(m: []f64, nn: usize, a: usize, b: usize, v: f64) void {
+                m[a * nn + a] += v;
+                m[b * nn + b] += v;
+                m[a * nn + b] -= v;
+                m[b * nn + a] -= v;
+            }
+        };
+        g[0] = 1;
+        g[src * n + br] = 1;
+        g[br * n + src] = 1;
+        if (ac_coupled) two.add(c, n, src, 1, 2) else two.add(g, n, src, 1, 1);
+        g[stages * n + stages] += 0.5;
+        for (1..stages + 1) |k| {
+            const kf: f64 = @floatFromInt(k);
+            c[k * n + k] += 1 + @mod(kf * 37, 11) / 10;
+            if (k < stages) two.add(g, n, k, k + 1, 1 + @mod(kf * 13, 7) / 5);
+            if (k % 7 == 0 and k + 3 <= stages) two.add(c, n, k, k + 3, 0.05 + @mod(kf * 29, 13) / 50);
+            if (k % 40 == 0 and k < stages) {
+                g[k * n + k + 1] += 0.7;
+                g[(k + 1) * n + k] -= 0.7;
+            }
+        }
+        var nnz: usize = 0;
+        for (0..n) |j| for (0..n) |i| {
+            if (g[i * n + j] != 0 or c[i * n + j] != 0) nnz += 1;
+        };
+        const col_ptr = try gpa.alloc(u32, n + 1);
+        const row_idx = try gpa.alloc(u32, nnz);
+        const gv = try gpa.alloc(f64, nnz + 1);
+        const cv = try gpa.alloc(f64, nnz + 1);
+        var k: usize = 0;
+        for (0..n) |j| {
+            col_ptr[j] = @intCast(k);
+            for (0..n) |i| if (g[i * n + j] != 0 or c[i * n + j] != 0) {
+                row_idx[k] = @intCast(i);
+                gv[k] = g[i * n + j];
+                cv[k] = c[i * n + j];
+                k += 1;
+            };
+        }
+        col_ptr[n] = @intCast(k);
+        gv[nnz] = 0;
+        cv[nnz] = 0;
+        return .{ .n = n, .g = g, .c = c, .col_ptr = col_ptr, .row_idx = row_idx, .gv = gv, .cv = cv };
+    }
+
+    fn deinit(self: TestLadder, gpa: std.mem.Allocator) void {
+        gpa.free(self.g);
+        gpa.free(self.c);
+        gpa.free(self.col_ptr);
+        gpa.free(self.row_idx);
+        gpa.free(self.gv);
+        gpa.free(self.cv);
+    }
+};
+
+/// Asserts that `part` is the |s|-nearest prefix of `all`: each root within
+/// 1e-8 relative of one in `all` (plus 1e-12 absolute, for a root at the
+/// origin of these unit-scale circuits), and none in `all` nearer the
+/// origin left out.
+fn expectNearest(all: []const Complex, part: []const Complex, want: usize) !void {
+    const gpa = std.testing.allocator;
+    const sorted = try gpa.dupe(Complex, all);
+    defer gpa.free(sorted);
+    std.mem.sort(Complex, sorted, {}, struct {
+        fn before(_: void, l: Complex, r: Complex) bool {
+            return l.magSq() < r.magSq();
+        }
+    }.before);
+    try std.testing.expect(part.len >= @min(want, sorted.len));
+    try std.testing.expect(part.len <= sorted.len);
+    if (part.len == 0) return;
+    const big = part[part.len - 1].mag();
+    const abs_tol = 1e-12 * @max(big, 1);
+    for (part) |r| {
+        var best = std.math.inf(f64);
+        for (sorted) |d| best = @min(best, d.sub(r).mag());
+        try std.testing.expect(best <= 1e-8 * r.mag() + abs_tol);
+    }
+    try std.testing.expect(big <= sorted[part.len - 1].mag() * (1 + 1e-8) + abs_tol);
+}
+
+test "sparse pz: the roots nearest the shift are the dense path's nearest" {
+    const gpa = std.testing.allocator;
+    for ([_]usize{ 5, 300, 600 }) |stages| for ([_]bool{ false, true }) |ac_coupled| {
+        const lad = try TestLadder.init(gpa, stages, ac_coupled);
+        defer lad.deinit(gpa);
+        const pencil: Pencil = .{
+            .n = @intCast(lad.n),
+            .col_ptr = lad.col_ptr,
+            .row_idx = lad.row_idx,
+            .g = lad.gv,
+            .c = lad.cv,
+        };
+        // The output a dozen stages in: the zeros are then the natural
+        // frequencies of the ladder beyond it, well conditioned. At the far
+        // end of a long ladder they are a cluster no method resolves (the
+        // dense QZ's own are a ring of radius eps^(1/r)).
+        const transfer: Options = .{ .in_pos = @intCast(stages + 1), .out_pos = @intCast(@min(stages, 12)), .drive_branch = @intCast(stages + 2), .want = .both };
+        for ([_]Options{ .{}, transfer }) |o| {
+            const g = try gpa.dupe(f64, lad.g);
+            defer gpa.free(g);
+            const c = try gpa.dupe(f64, lad.c);
+            defer gpa.free(c);
+            var dense = try denseRoots(lad.n, g, c, o, gpa);
+            defer dense.deinit();
+            var sparse = try sparseRoots(pencil, o, gpa);
+            defer sparse.deinit();
+            try std.testing.expectEqual(@as(u32, sparse_k), sparse.requested);
+            try std.testing.expect(sparse.poles.len + sparse.zeros.len > 0);
+            if (o.want != .zeros) try expectNearest(dense.poles, sparse.poles, sparse_k);
+            if (o.want != .poles) try expectNearest(dense.zeros, sparse.zeros, sparse_k);
+            // A zero at the origin moves the shift off it.
+            try std.testing.expectEqual(ac_coupled and o.want == .both, sparse.shift != 0);
+        }
+    };
 }

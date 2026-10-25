@@ -20,7 +20,7 @@
 
 const std = @import("std");
 /// The S-element reader and fitter this file builds on, re-exported for
-/// the grammar oracle (tests/grammar), which imports this module alone.
+/// its own module, which imports this file alone.
 pub const sparam = @import("sparam.zig");
 const plainNumber = @import("netlist").lines.plainNumber;
 const Cx = std.math.Complex(f64);
@@ -51,7 +51,7 @@ pub const RlgcError = error{ InvalidRlgcFile, TooManyConductors };
 /// Reads an RLGC file. `*` comments out the rest of a line; blanks, tabs,
 /// newlines, `,`, `;` and brackets separate numbers, which are plain or
 /// scientific with no scale suffix [SI p.107, p.109].
-/// tests/grammar/rlgc.peg is the syntax.
+/// tests/frontend/grammar/rlgc.peg is the syntax.
 pub fn readRlgcFile(bytes: []const u8) RlgcError!RlgcFile {
     var nums: [1 + 6 * 10]f64 = undefined;
     var count: usize = 0;
@@ -235,21 +235,31 @@ pub fn fitLine(arena: Allocator, p: Rlgc, sections: usize) Error!Line {
         }
     }
     // Band: every mode's loss and delay corner, two decades past each side.
+    // Each mode's diagonal of L0, C0, R0, G0, Rs and Gd, read once.
+    var lm: [max_n]f64 = undefined;
+    var cm: [max_n]f64 = undefined;
+    var rm: [max_n]f64 = undefined;
+    var gm: [max_n]f64 = undefined;
+    var rsm: [max_n]f64 = undefined;
+    var gdm: [max_n]f64 = undefined;
     var lo: f64 = std.math.inf(f64);
     var hi: f64 = 0;
-    var corners: [max_n][5]f64 = undefined;
     for (0..n) |mi| {
-        const lm = modal(p.l, tv.*, line.ti, mi, .series);
-        const cm = modal(p.c, tv.*, line.ti, mi, .shunt);
-        const tau = p.length * @sqrt(lm * cm);
-        corners[mi] = .{
+        lm[mi] = modal(p.l, tv.*, line.ti, mi, .series);
+        cm[mi] = modal(p.c, tv.*, line.ti, mi, .shunt);
+        rm[mi] = modal(p.r, tv.*, line.ti, mi, .series);
+        gm[mi] = modal(p.g, tv.*, line.ti, mi, .shunt);
+        rsm[mi] = modal(p.rs, tv.*, line.ti, mi, .series);
+        gdm[mi] = modal(p.gd, tv.*, line.ti, mi, .shunt);
+        const tau = p.length * @sqrt(lm[mi] * cm[mi]);
+        const corners = [5]f64{
             1 / tau,
-            modal(p.r, tv.*, line.ti, mi, .series) / (2 * std.math.pi * lm),
-            modal(p.g, tv.*, line.ti, mi, .shunt) / (2 * std.math.pi * cm),
-            std.math.pow(f64, modal(p.rs, tv.*, line.ti, mi, .series) / (2 * std.math.pi * lm), 2),
-            if (modal(p.gd, tv.*, line.ti, mi, .shunt) != 0) (if (p.fgd > 0) p.fgd else 1 / tau) else 0,
+            rm[mi] / (2 * std.math.pi * lm[mi]),
+            gm[mi] / (2 * std.math.pi * cm[mi]),
+            std.math.pow(f64, rsm[mi] / (2 * std.math.pi * lm[mi]), 2),
+            if (gdm[mi] != 0) (if (p.fgd > 0) p.fgd else 1 / tau) else 0,
         };
-        for (corners[mi]) |c| if (c > 0 and std.math.isFinite(c)) {
+        for (corners) |c| if (c > 0 and std.math.isFinite(c)) {
             lo = @min(lo, c);
             hi = @max(hi, c);
         };
@@ -267,21 +277,24 @@ pub fn fitLine(arena: Allocator, p: Rlgc, sections: usize) Error!Line {
     for (freq[1..], 0..) |*o, k| o.* = lo * std.math.pow(f64, hi / lo, @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(nf - 1)));
 
     for (0..n) |mi| {
-        const lm = modal(p.l, tv.*, line.ti, mi, .series);
-        const cm = modal(p.c, tv.*, line.ti, mi, .shunt);
-        const z0 = @sqrt(lm / cm);
-        const tau = p.length * @sqrt(lm * cm);
+        const z0 = @sqrt(lm[mi] / cm[mi]);
+        const tau = p.length * @sqrt(lm[mi] * cm[mi]);
         // A lossy mode with no R0 or no G0 has Yc ~ √s (or 1/√s) toward
         // DC, which no rational function follows. It gets the R0 or G0 that
         // puts that corner at `lo`, so Yc and P level off to finite DC
         // values whose ratio still gives the series resistance. ponytail:
         // this costs ~1e-5 of P in band (G·Z0·l/2 of extra loss); a corner
         // further down needs a wider band and more sections.
-        const r0 = modal(p.r, tv.*, line.ti, mi, .series);
-        const g0 = modal(p.g, tv.*, line.ti, mi, .shunt);
-        const lossy = r0 != 0 or g0 != 0 or modal(p.rs, tv.*, line.ti, mi, .series) != 0 or modal(p.gd, tv.*, line.ti, mi, .shunt) != 0;
-        const r_floor = if (lossy) @max(0, 2 * std.math.pi * lo * lm - r0) else 0;
-        const g_floor = if (lossy) @max(0, 2 * std.math.pi * lo * cm - g0) else 0;
+        const lossy = rm[mi] != 0 or gm[mi] != 0 or rsm[mi] != 0 or gdm[mi] != 0;
+        // Lossless: Yc = 1/Z0 and P = 1 exactly. Fitting 1 − P would fit its
+        // roundoff, which differs with each platform's libm.
+        if (!lossy) {
+            const exact: Rational = .{ .d = 1, .num = &.{}, .den = &.{}, .rel_err = 0 };
+            line.modes[mi] = .{ .z0 = z0, .tau = tau, .yc = exact, .h = exact };
+            continue;
+        }
+        const r_floor = if (lossy) @max(0, 2 * std.math.pi * lo * lm[mi] - rm[mi]) else 0;
+        const g_floor = if (lossy) @max(0, 2 * std.math.pi * lo * cm[mi] - gm[mi]) else 0;
         const yc_re = try arena.alloc(f64, freq.len);
         const yc_im = try arena.alloc(f64, freq.len);
         const h_re = try arena.alloc(f64, freq.len);

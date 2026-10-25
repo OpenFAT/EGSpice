@@ -5,8 +5,7 @@
 //! In: a linear circuit at its operating point. Out: the probes at every
 //! step, as `Waveform` rows.
 //! Cites the MATEX paper's eq. 5 (the piecewise-linear source update),
-//! expokit's breakdown tolerance, Verilog-AMS LRM §4.6.1, #51, #125 and
-//! dev/analysis/matex-exponential-integrators.md.
+//! expokit's breakdown tolerance, Verilog-AMS LRM §4.6.1, #51 and #125.
 //! ponytail: no nonlinear (EPIRK) path; add one when a const-Jacobian check
 //! says a circuit needs linearization.
 const std = @import("std");
@@ -120,8 +119,7 @@ fn expmSmall(m: usize, H: []f64, out: []f64, scratch: []f64, piv_buf: []u32) boo
     }
 
     // Undo the scaling: out = out^(2^s).
-    var si: u32 = 0;
-    while (si < s) : (si += 1) {
+    for (0..s) |_| {
         num.copySimd(H2[0..mm], out[0..mm]);
         denseMatMul(m, H2, H2, out);
     }

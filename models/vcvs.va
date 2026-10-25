@@ -12,6 +12,10 @@
 // ponytail: no POLY ladder. The polynomial subset belongs to bsource.va and the
 // builder fills only `gain` for letter E. Route E POLY(n) through bsource if it
 // is ever needed.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module vcvs(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;

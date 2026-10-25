@@ -9,8 +9,7 @@
 //
 // O-card RLC/RC devices use the recursive-convolution model
 // (models/ltra.va); LC uses tline.va. This file is kept for
-// comparison and the static RG path. Migration requirements:
-// dev/native-transmission-line-migration.md.
+// comparison and the static RG path.
 //
 // Each port has one branch-current unknown (ngspice rows brEq1/brEq2), i1 and
 // i2 both flowing INTO the line:
@@ -55,6 +54,10 @@
 //
 // The `.model ltra` keywords are declared for card compatibility; only the
 // step-limit flags act. Noise: none (ngspice has no ltranoise.c).
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module lossy_tline(p1, n1, p2, n2);
     inout p1, n1, p2, n2;
     electrical p1, n1, p2, n2;

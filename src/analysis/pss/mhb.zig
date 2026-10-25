@@ -21,7 +21,7 @@
 //! (the APFT; VACASK `lib/corehbcoloc.cpp`, after Kundert, White and
 //! Sangiovanni-Vincentelli, 1990, App. B).
 //!
-//! Cites: dev/analysis/multitone-hb.md, VACASK `lib/spurs.cpp` (line
+//! Cites: VACASK `lib/spurs.cpp` (line
 //! merging in `spectrum`), Verilog-A LRM §4.6.1 (sources follow their
 //! waveform only in the transient phase), #83 (NaN residuals).
 const std = @import("std");
@@ -34,6 +34,7 @@ const converger = solvers.converger;
 const dense_lu = solvers.dense_lu;
 const FreqSolver = solvers.freq_solve.FreqSolver;
 const Gmres = solvers.gmres.Gmres;
+const Gcrodr = solvers.gcrodr.Gcrodr;
 
 /// The `.hb` query, read for its tone list (`f0` then `extra_tones`).
 pub const Options = @import("core").query.Hb;
@@ -169,6 +170,144 @@ const Transform = struct {
     times: []f64,
     inv: []f64,
     fwd: []f64,
+    /// One tone: the same pair folded by symmetry (`Fold`), which `idft`
+    /// and `dft` take instead of `inv` and `fwd`. Owned by the `Newton`
+    /// that set it; the device operator keeps the dense pair.
+    fold: ?*const Fold = null,
+};
+
+/// The one-tone transform pair at a quarter of its multiply-adds. On the
+/// uniform grid nt = 2·nf, so H = nt/2 is an integer and harmonic h obeys
+///   x(s + H) = Σ_even - Σ_odd       (a half-period shift flips odd h)
+///   x(H - s): cos even, sin odd for even h; cos odd, sin even for odd h
+/// so every sample comes from the m bases s = 0..m-1 (H = 2m - 1), each
+/// split into four partial sums: even/odd lines times cos/sin. `dft` folds
+/// the samples the same way before m-long dots. Values match the dense pair
+/// up to summation order (the angles are the same table entries).
+const Fold = struct {
+    /// Base samples: 0..m-1.
+    m: usize,
+    /// Coefficient indices in gather order: even-line cos (DC first),
+    /// even-line sin, odd-line cos, odd-line sin; group ends in `ends`.
+    perm: []u32,
+    ends: [4]usize,
+    /// m rows of nf: row s holds the gathered basis values at sample s.
+    inv: []f64,
+    /// nf rows of m, natural coefficient order: the projection weights
+    /// over the folded samples of group `group[c]`.
+    fwd: []f64,
+    group: []u8,
+    /// Scratch: the gathered coefficients (nf), the half-period sums and
+    /// differences (2·H) and the four folded sample arrays (4·m).
+    work: []f64,
+
+    /// Folds the dense one-tone pair `tr` of `spec`. Asserts one tone on the
+    /// uniform nt = 2·nf grid. Free with `deinit` on `gpa`.
+    pub fn init(gpa: std.mem.Allocator, spec: Spectrum, tr: Transform) !*Fold {
+        const m = spec.freqs.len;
+        const nf = 2 * m - 1;
+        const nt = tr.nt;
+        std.debug.assert(spec.tones == 1 and nt == 2 * nf);
+        const h_half = nt / 2;
+        const self = try gpa.create(Fold);
+        errdefer gpa.destroy(self);
+        const perm = try gpa.alloc(u32, nf);
+        errdefer gpa.free(perm);
+        const group = try gpa.alloc(u8, nf);
+        errdefer gpa.free(group);
+        const vals = try gpa.alloc(f64, 2 * m * nf + nf + 2 * h_half + 4 * m);
+        // Group of coefficient c: 0 even cos, 1 even sin, 2 odd cos, 3 odd sin.
+        group[0] = 0;
+        for (1..m) |j| {
+            const odd: u8 = @intCast(spec.mix[j] & 1);
+            group[2 * j - 1] = 2 * odd;
+            group[2 * j] = 2 * odd + 1;
+        }
+        var at: usize = 0;
+        var ends: [4]usize = undefined;
+        for (0..4) |g| {
+            for (group, 0..) |gc, c| if (gc == g) {
+                perm[at] = @intCast(c);
+                at += 1;
+            };
+            ends[g] = at;
+        }
+        const inv = vals[0 .. m * nf];
+        const fwd = vals[m * nf ..][0 .. nf * m];
+        // The dense pair's own entries at the base samples.
+        for (0..m) |sb| for (perm, 0..) |c, k| {
+            inv[sb * nf + k] = tr.inv[sb * nf + c];
+        };
+        for (0..nf) |c| for (0..m) |sb| {
+            fwd[c * m + sb] = tr.fwd[c * nt + sb];
+        };
+        self.* = .{ .m = m, .perm = perm, .ends = ends, .inv = inv, .fwd = fwd, .group = group, .work = vals[2 * m * nf ..] };
+        return self;
+    }
+
+    /// Frees the fold and every table `init` allocated on `gpa`.
+    pub fn deinit(self: *const Fold, gpa: std.mem.Allocator) void {
+        const nf = self.perm.len;
+        gpa.free(self.inv.ptr[0 .. 2 * self.m * nf + self.work.len]);
+        gpa.free(self.perm);
+        gpa.free(self.group);
+        gpa.destroy(self);
+    }
+
+    /// `idft` of one node: x (nt) from its coefficient block (nf).
+    fn inverse(f: *const Fold, coef: []const f64, x: []f64) void {
+        const nf = f.perm.len;
+        const m = f.m;
+        const hh = 2 * m - 1;
+        const g = f.work[0..nf];
+        for (g, f.perm) |*v, c| v.* = coef[c];
+        const e = f.ends;
+        for (0..m) |sb| {
+            const row = f.inv[sb * nf ..][0..nf];
+            const pc = num.dot(g[0..e[0]], row[0..e[0]]);
+            const ps = num.dot(g[e[0]..e[1]], row[e[0]..e[1]]);
+            const qc = num.dot(g[e[1]..e[2]], row[e[1]..e[2]]);
+            const qs = num.dot(g[e[2]..e[3]], row[e[2]..e[3]]);
+            const p = pc + ps;
+            const q = qc + qs;
+            x[sb] = p + q;
+            x[sb + hh] = p - q;
+            if (sb == 0) continue;
+            const p2 = pc - ps;
+            const q2 = qs - qc;
+            x[hh - sb] = p2 + q2;
+            x[2 * hh - sb] = p2 - q2;
+        }
+    }
+
+    /// `dft` of one node: its coefficient block (nf) from x (nt).
+    fn forward(f: *const Fold, x: []const f64, coef: []f64) void {
+        const nf = f.perm.len;
+        const m = f.m;
+        const hh = 2 * m - 1;
+        const u = f.work[nf..][0..hh];
+        const v = f.work[nf + hh ..][0..hh];
+        const folded = f.work[nf + 2 * hh ..][0 .. 4 * m];
+        for (u, v, x[0..hh], x[hh..][0..hh]) |*a, *b, lo, hi| {
+            a.* = lo + hi;
+            b.* = lo - hi;
+        }
+        const ec = folded[0..m];
+        const es = folded[m..][0..m];
+        const oc = folded[2 * m ..][0..m];
+        const os = folded[3 * m ..][0..m];
+        ec[0] = u[0];
+        es[0] = 0;
+        oc[0] = v[0];
+        os[0] = 0;
+        for (1..m) |sb| {
+            ec[sb] = u[sb] + u[hh - sb];
+            es[sb] = u[sb] - u[hh - sb];
+            oc[sb] = v[sb] - v[hh - sb];
+            os[sb] = v[sb] + v[hh - sb];
+        }
+        for (coef, f.group, 0..) |*out, g, c| out.* = num.dot(folded[@as(usize, g) * m ..][0..m], f.fwd[c * m ..][0..m]);
+    }
 };
 
 /// Pool size per collocation point (VACASK's default `samplefac`).
@@ -290,6 +429,10 @@ fn basisRow(spec: Spectrum, tones: []const f64, t: f64, row: []f64) void {
 /// x_td[node*nt + s] = Σ_c inv[s, c]·x_hat[node*nf + c].
 fn idft(tr: Transform, nf: usize, x_hat: []const f64, x_td: []f64) void {
     const n = x_hat.len / nf;
+    if (tr.fold) |f| {
+        for (0..n) |node| f.inverse(x_hat[node * nf ..][0..nf], x_td[node * tr.nt ..][0..tr.nt]);
+        return;
+    }
     for (0..n) |node| {
         const x = x_hat[node * nf ..][0..nf];
         for (x_td[node * tr.nt ..][0..tr.nt], 0..) |*out, s| out.* = num.dot(x, tr.inv[s * nf ..][0..nf]);
@@ -299,6 +442,10 @@ fn idft(tr: Transform, nf: usize, x_hat: []const f64, x_td: []f64) void {
 /// x_hat[node*nf + c] = Σ_s fwd[c, s]·x_td[node*nt + s].
 fn dft(tr: Transform, nf: usize, x_td: []const f64, x_hat: []f64) void {
     const n = x_hat.len / nf;
+    if (tr.fold) |f| {
+        for (0..n) |node| f.forward(x_td[node * tr.nt ..][0..tr.nt], x_hat[node * nf ..][0..nf]);
+        return;
+    }
     for (0..n) |node| {
         const x = x_td[node * tr.nt ..][0..tr.nt];
         for (x_hat[node * nf ..][0..nf], 0..) |*out, c| out.* = num.dot(x, tr.fwd[c * tr.nt ..][0..tr.nt]);
@@ -363,12 +510,15 @@ const Operator = struct {
     w_td: []f64,
     u_hat: []f64,
     fs: *FreqSolver,
+    gpu_held: ?*@import("../gpu/freq.zig").Held = null,
+    gpu_operator: ?*@import("../gpu/periodic.zig").Operator = null,
     /// Preconditioner right-hand sides and solutions, m stacked 2n blocks.
     p_rhs: []f64,
     p_x: []f64,
 
     /// w = J v: IDFT, G(t)·v and C(t)·v per sample, DFT, plus Ω on the charge.
     pub fn matvec(self: *Operator, v: []const f64, w: []f64) void {
+        if (self.gpu_operator) |device| if (device.matvec(v, w)) return;
         const nf = self.nf;
         const ckt = self.ckt;
         idft(self.tr, nf, v, self.v_td);
@@ -383,6 +533,7 @@ const Operator = struct {
     /// r := M^-1 r. Line j's (c, s) rows are the phasor X = c - js of
     /// (G0 + jω_j C0)·X = r_c - j·r_s.
     pub fn precond(self: *Operator, r: []f64) void {
+        if (self.gpu_operator) |device| if (device.precond(r, r)) return;
         const nf = self.nf;
         const n = r.len / nf;
         const nn = 2 * n;
@@ -393,7 +544,8 @@ const Operator = struct {
                 b[n + node] = if (j == 0) 0 else -r[node * nf + 2 * j];
             }
         }
-        self.fs.solveEach(self.p_rhs, self.p_x, false);
+        const device_solved = if (self.gpu_held) |held| held.solve(self.p_rhs, self.p_x, false) else false;
+        if (!device_solved) self.fs.solveEach(self.p_rhs, self.p_x, false);
         for (0..self.omegas.len) |j| {
             const x = self.p_x[j * nn ..][0..nn];
             for (0..n) |node| {
@@ -412,6 +564,24 @@ const Operator = struct {
 /// slot-major, `nt` samples contiguous in each.
 const Planes = struct { x: []f64, f: []f64, q: []f64, g: []f64, c: []f64 };
 
+/// Carves `Planes` out of `slab` at `off`: x, f and q `node_len` each, then
+/// g and c `slot_len` each.
+fn takePlanes(slab: []f64, off: *usize, node_len: usize, slot_len: usize) Planes {
+    return .{
+        .x = take(slab, off, node_len),
+        .f = take(slab, off, node_len),
+        .q = take(slab, off, node_len),
+        .g = take(slab, off, slot_len),
+        .c = take(slab, off, slot_len),
+    };
+}
+
+/// The step `sample` declares to the devices, 1/(nt·f_1) with f_1 the
+/// lowest line.
+fn sampleDt(spec: Spectrum) f64 {
+    return 1 / (spec.freqs[1] * @as(f64, @floatFromInt(transformSamples(spec))));
+}
+
 /// Evaluates the circuit at every instant of `tr` on `x_hat`'s waveform
 /// into `p`; `p.c` is left alone without charge. `x_sample` (n) is scratch.
 fn sample(ckt: *root.Circuit, tr: Transform, nf: usize, dt: f64, x_hat: []const f64, x_sample: []f64, p: Planes) void {
@@ -421,8 +591,8 @@ fn sample(ckt: *root.Circuit, tr: Transform, nf: usize, dt: f64, x_hat: []const 
     idft(tr, nf, x_hat, p.x);
     // Sample s is the circuit at t_s in the transient phase, the only
     // phase in which a source follows its waveform (§4.6.1).
-    // ponytail: the nt evals are independent; batch them on the GPU
-    // when HB profiles eval-bound.
+    // The grouped driver evaluates these instants through gpu_lanes.Samples
+    // when every model supports independent sampled evaluation.
     for (0..nt) |s| {
         const t = tr.times[s];
         for (0..n) |node| x_sample[node] = p.x[node * nt + s];
@@ -437,14 +607,44 @@ fn sample(ckt: *root.Circuit, tr: Transform, nf: usize, dt: f64, x_hat: []const 
     }
 }
 
-/// The shortest step the line search takes before it stops shortening.
-const min_step: f64 = 1.0 / 1024.0;
+/// The backtracking line search both HB Newtons take on their own residual
+/// evaluation: a step that made the residual worse (or non-finite, hence
+/// the negated comparison) is undone and retaken at half length, and a step
+/// that helped earns the length back. A full Newton step can hand a diode
+/// the whole source swing at once.
+pub const LineSearch = struct {
+    step: f64 = 1,
+    prev_residual: f64 = std.math.inf(f64),
+    retrying: bool = false,
+
+    /// The shortest step before the search stops shortening.
+    const min_step: f64 = 1.0 / 1024.0;
+
+    /// Judges the step that produced `residual`. True: rewind it and retake
+    /// it at the halved `step`. False: the step stands and `step` is the
+    /// next one's length. `first` (the starting point, or a judgement that
+    /// must not rewind) never backtracks.
+    pub fn backtrack(ls: *LineSearch, first: bool, residual: f64) bool {
+        if (!first and !(residual <= ls.prev_residual) and ls.step > min_step) {
+            ls.step *= 0.5;
+            ls.retrying = true;
+            return true;
+        }
+        ls.prev_residual = residual;
+        if (!ls.retrying) ls.step = @min(ls.step * 2, 1);
+        ls.retrying = false;
+        return false;
+    }
+};
 
 /// GMRES stopping tolerance relative to the Newton residual.
 const gmres_tol: f64 = 1e-7;
 /// GMRES restart depth and restarts per Newton step.
 const gmres_restart: u32 = 40;
 const gmres_max_restarts: u32 = 20;
+/// Harmonic Ritz vectors the host solve recycles across restarts and
+/// Newton steps (`Gcrodr`), out of `gmres_restart`.
+const gmres_recycle: u32 = 10;
 
 /// Zeroes `x_hat` (node-major, `nf` coefficients per node) and seeds each
 /// node's DC coefficient with the DC operating point, solved into
@@ -469,7 +669,7 @@ pub fn dcSeed(ckt: *root.Circuit, x_hat: []f64, x_sample: []f64, nf: usize, tol:
 /// Driven harmonic balance on `spec` (tones `tones` Hz) from the DC
 /// operating point. `x_hat` (n·(2m-1), caller-owned) receives node-major
 /// blocks [dc, c_1, s_1, ...], the last iterate when Newton does not
-/// converge. Newton takes `hb.zig`'s backtracking line search; each step
+/// converge. Newton takes the `LineSearch`; each step
 /// is GMRES on the matrix-free Jacobian with the block-diagonal
 /// preconditioner. Memory is O(nnz·nt + m·LU) for the sampled planes and
 /// the held factors. Asserts `spec` has two or more lines and x_hat.len is
@@ -478,135 +678,505 @@ pub fn dcSeed(ckt: *root.Circuit, x_hat: []f64, x_sample: []f64, nf: usize, tol:
 /// QueryCancelled, error.HbDidNotConverge when the collocation transform
 /// of several tones is singular, and `FreqSolver.factorEach`'s.
 pub fn solve(ckt: *root.Circuit, x_hat: []f64, spec: Spectrum, tones: []const f64, options: Options, allocator: std.mem.Allocator) !SolveResult {
-    const n: usize = ckt.n;
-    const nnz: usize = ckt.nnz;
-    const m = spec.freqs.len;
-    const nf = 2 * m - 1;
-    const nt = transformSamples(spec);
-    const total = n * nf;
-    std.debug.assert(x_hat.len == total and m >= 2);
-
-    const sizes = [_]usize{
-        nt + 2 * nt * nf, // transform
-        total, // f_hat
-        total, // q_hat, also the matvec's u_hat
-        total, // dx
-        total, // x_prev
-        3 * n * nt, // x_td/v_td, f_td/w_td, q_td
-        2 * nnz * nt, // g_td, c_td
-        2 * nnz, // g0, c0
-        2 * m * 2 * n, // p_rhs, p_x
-        m, // omegas
-        n, // x_sample
+    var state = try Newton.init(ckt, x_hat, spec, tones, options, allocator, true);
+    defer state.deinit();
+    while (state.phase != .done) switch (state.phase) {
+        .sample => {
+            try state.sampleHost();
+            try state.sampled();
+        },
+        .linear => state.solveAlone(),
+        .done => unreachable,
     };
-    var len: usize = 0;
-    for (sizes) |s| len += s;
-    const arena = try allocator.alloc(f64, len);
-    defer allocator.free(arena);
-    var off: usize = 0;
-    const tr = try transform(spec, tones, take(arena, &off, sizes[0]), allocator);
-    const f_hat = take(arena, &off, total);
-    const q_hat = take(arena, &off, total);
-    const dx = take(arena, &off, total);
-    const x_prev = take(arena, &off, total);
-    const x_td = take(arena, &off, n * nt);
-    const f_td = take(arena, &off, n * nt);
-    const q_td = take(arena, &off, n * nt);
-    const g_td = take(arena, &off, nnz * nt);
-    const c_td = take(arena, &off, nnz * nt);
-    const g0 = take(arena, &off, nnz);
-    const c0 = take(arena, &off, nnz);
-    const p_rhs = take(arena, &off, 2 * m * n);
-    const p_x = take(arena, &off, 2 * m * n);
-    const omegas = take(arena, &off, m);
-    const x_sample = take(arena, &off, n);
-    std.debug.assert(off == len);
-    for (omegas, spec.freqs) |*w, f| w.* = 2 * std.math.pi * f;
-    if (!ckt.has_charge) @memset(c_td, 0);
-
-    try dcSeed(ckt, x_hat, x_sample, nf, options.tol);
-
-    var fs = try FreqSolver.fromCircuit(allocator, ckt, x_sample);
-    defer fs.deinit();
-    var gmres = try Gmres.init(allocator, @intCast(total), @intCast(@min(total, gmres_restart)));
-    defer gmres.deinit(allocator);
-    var op: Operator = .{
-        .ckt = ckt,
-        .tr = tr,
-        .omegas = omegas,
-        .nf = nf,
-        .g_td = g_td,
-        .c_td = c_td,
-        .v_td = x_td,
-        .w_td = f_td,
-        .u_hat = q_hat,
-        .fs = &fs,
-        .p_rhs = p_rhs,
-        .p_x = p_x,
-    };
-
-    // Sample spacing for the transient state; an idt only needs dt > 0.
-    const dt = 1 / (spec.freqs[1] * @as(f64, @floatFromInt(nt)));
-    var step: f64 = 1.0;
-    var prev_residual: f64 = std.math.inf(f64);
-    var retrying = false;
-    var iter: u16 = 0;
-    while (iter < options.max_iter) : (iter += 1) {
-        if (iter != 0) try ckt.checkpoint(.{ .phase = .harmonic, .completed = iter });
-        sample(ckt, tr, nf, dt, x_hat, x_sample, .{ .x = x_td, .f = f_td, .q = q_td, .g = g_td, .c = c_td });
-        dft(tr, nf, f_td, f_hat);
-        if (ckt.has_charge) {
-            dft(tr, nf, q_td, q_hat);
-            addOmega(omegas, q_hat, f_hat);
-        }
-
-        const residual = num.normInf(f_hat);
-        if (ckt.knobs.hb_trace) std.debug.print("MHB iter={d} res={e} step={e}\n", .{ iter, residual, step });
-        if (residual < options.hb_tol) return .{ .converged = true, .iterations = iter + 1, .residual_norm = residual };
-
-        if (iter != 0 and !(residual <= prev_residual) and step > min_step) {
-            step *= 0.5;
-            num.copySimd(x_hat, x_prev);
-            num.axpy(x_hat, step, dx);
-            retrying = true;
-            continue;
-        }
-        prev_residual = residual;
-        if (!retrying) step = @min(step * 2.0, 1.0);
-        retrying = false;
-
-        // G0, C0: the sample means. Not the DC line through `fwd`: a
-        // collocation fit aliases G(t)'s harmonics past the kept band into
-        // it, and an exponential's can drive it negative. A mean keeps
-        // every conductance's sign.
-        const inv_nt = 1 / @as(f64, @floatFromInt(nt));
-        for (0..nnz) |slot| {
-            g0[slot] = num.sum(g_td[slot * nt ..][0..nt]) * inv_nt;
-            c0[slot] = num.sum(c_td[slot * nt ..][0..nt]) * inv_nt;
-        }
-        fs.setPlanes(g0, c0);
-        try fs.factorEach(omegas);
-
-        num.scale(f_hat, -1, f_hat);
-        @memset(dx, 0);
-        const gr = gmres.solve(&op, f_hat, dx, gmres_tol, gmres_max_restarts);
-        if (ckt.knobs.hb_trace) std.debug.print("  gmres it={d} res={e} conv={}\n", .{ gr.iterations, gr.residual, gr.converged });
-        num.copySimd(x_prev, x_hat);
-        num.axpy(x_hat, step, dx);
-    }
-    // f_hat was negated for the last solve; its norm is the same.
-    return .{ .converged = false, .iterations = options.max_iter, .residual_norm = num.normInf(f_hat) };
+    return state.result;
 }
 
-/// The tones and harmonic counts of `opts`, f0 first.
-fn toneList(opts: Options, tones: *[max_tones]f64, nharms: *[max_tones]u16) !usize {
+/// One point's Newton and backtracking continuation. Sampling and linear
+/// solves are separate requests so independent points can share device
+/// work without sharing a convergence or damping decision.
+const Newton = struct {
+    const Phase = enum { sample, linear, done };
+    allocator: std.mem.Allocator,
+    ckt: *root.Circuit,
+    options: Options,
+    phase: Phase = .sample,
+    result: SolveResult = undefined,
+    slab: []f64,
+    x_hat: []f64,
+    tr: Transform,
+    nf: usize,
+    dt: f64,
+    f_hat: []f64,
+    q_hat: []f64,
+    dx: []f64,
+    x_prev: []f64,
+    planes: Planes,
+    g0: []f64,
+    c0: []f64,
+    p_rhs: []f64,
+    p_x: []f64,
+    omegas: []f64,
+    x_sample: []f64,
+    fs: FreqSolver,
+    factor_on_host: bool,
+    factors_ready: bool = false,
+    gmres: Gcrodr,
+    gpu_held: ?@import("../gpu/freq.zig").Held = null,
+    gpu_held_disabled: bool = false,
+    gpu_operator: ?@import("../gpu/periodic.zig").Operator = null,
+    ls: LineSearch = .{},
+    iter: u16 = 0,
+    backtracks: usize = 0,
+
+    fn init(ckt: *root.Circuit, x_hat: []f64, spec: Spectrum, tones: []const f64, options: Options, allocator: std.mem.Allocator, single_gpu: bool) !Newton {
+        const n: usize = ckt.n;
+        const nnz: usize = ckt.nnz;
+        const m = spec.freqs.len;
+        const nf = 2 * m - 1;
+        const nt = transformSamples(spec);
+        const total = n * nf;
+        std.debug.assert(x_hat.len == total and m >= 2);
+        const len = nt + 2 * nt * nf + 4 * total + 3 * n * nt + 2 * nnz * nt + 2 * nnz + 4 * m * n + m + n;
+        const slab = try allocator.alloc(f64, len);
+        errdefer allocator.free(slab);
+        var off: usize = 0;
+        var tr = try transform(spec, tones, take(slab, &off, nt + 2 * nt * nf), allocator);
+        if (spec.tones == 1) tr.fold = try Fold.init(allocator, spec, tr);
+        errdefer if (tr.fold) |f| f.deinit(allocator);
+        const f_hat = take(slab, &off, total);
+        const q_hat = take(slab, &off, total);
+        const dx = take(slab, &off, total);
+        const x_prev = take(slab, &off, total);
+        const planes = takePlanes(slab, &off, n * nt, nnz * nt);
+        const g0 = take(slab, &off, nnz);
+        const c0 = take(slab, &off, nnz);
+        const p_rhs = take(slab, &off, 2 * m * n);
+        const p_x = take(slab, &off, 2 * m * n);
+        const omegas = take(slab, &off, m);
+        const x_sample = take(slab, &off, n);
+        std.debug.assert(off == len);
+        for (omegas, spec.freqs) |*w, f| w.* = 2 * std.math.pi * f;
+        if (!ckt.has_charge) @memset(planes.c, 0);
+        try dcSeed(ckt, x_hat, x_sample, nf, options.tol);
+        var fs = try FreqSolver.fromCircuit(allocator, ckt, x_sample);
+        errdefer fs.deinit();
+        // Complex held factors on the host solve; the grouped and device
+        // drivers read stacked tapes.
+        fs.complex_held = fs.complex_lanes and single_gpu and ckt.gpu == null;
+        const restart: u32 = @intCast(@min(total, gmres_restart));
+        var gmres = try Gcrodr.init(allocator, @intCast(total), restart, @min(gmres_recycle, restart / 4));
+        errdefer gmres.deinit(allocator);
+        const device: ?@import("../gpu/periodic.zig").Operator = if (single_gpu and ckt.gpu != null)
+            @import("../gpu/periodic.zig").Operator.init(allocator, .{
+                .points = 1,
+                .n = @intCast(n),
+                .nf = @intCast(nf),
+                .nt = @intCast(nt),
+                .charge = ckt.has_charge,
+                .col_ptr = ckt.col_ptr,
+                .row_idx = ckt.row_idx,
+                .inv = tr.inv,
+                .fwd = tr.fwd,
+                .omegas = omegas,
+            }, ckt.knobs.gpu_stats != .off) catch null
+        else
+            null;
+        return .{
+            .allocator = allocator,
+            .ckt = ckt,
+            .options = options,
+            .slab = slab,
+            .x_hat = x_hat,
+            .tr = tr,
+            .nf = nf,
+            .dt = sampleDt(spec),
+            .f_hat = f_hat,
+            .q_hat = q_hat,
+            .dx = dx,
+            .x_prev = x_prev,
+            .planes = planes,
+            .g0 = g0,
+            .c0 = c0,
+            .p_rhs = p_rhs,
+            .p_x = p_x,
+            .omegas = omegas,
+            .x_sample = x_sample,
+            .fs = fs,
+            .gmres = gmres,
+            .gpu_operator = device,
+            .factor_on_host = single_gpu,
+        };
+    }
+
+    fn deinit(self: *Newton) void {
+        if (self.tr.fold) |f| f.deinit(self.allocator);
+        if (self.gpu_operator) |*device| device.deinit();
+        if (self.gpu_held) |*held| held.deinit();
+        self.gmres.deinit(self.allocator);
+        self.fs.deinit();
+        self.allocator.free(self.slab);
+        self.* = undefined;
+    }
+
+    fn checkpoint(self: *Newton) !void {
+        if (self.iter != 0) try self.ckt.checkpoint(.{ .phase = .harmonic, .completed = self.iter });
+    }
+
+    fn sampleHost(self: *Newton) !void {
+        try self.checkpoint();
+        sample(self.ckt, self.tr, self.nf, self.dt, self.x_hat, self.x_sample, self.planes);
+    }
+
+    fn sampled(self: *Newton) !void {
+        std.debug.assert(self.phase == .sample);
+        dft(self.tr, self.nf, self.planes.f, self.f_hat);
+        if (self.ckt.has_charge) {
+            dft(self.tr, self.nf, self.planes.q, self.q_hat);
+            addOmega(self.omegas, self.q_hat, self.f_hat);
+        }
+        const residual = num.normInf(self.f_hat);
+        if (self.ckt.knobs.hb_trace) std.debug.print("MHB iter={d} res={e} step={e}\n", .{ self.iter, residual, self.ls.step });
+        if (residual < self.options.hb_tol) {
+            self.result = .{ .converged = true, .iterations = self.iter + 1, .residual_norm = residual };
+            self.phase = .done;
+            return;
+        }
+        if (self.ls.backtrack(self.iter == 0, residual)) {
+            self.backtracks += 1;
+            num.copySimd(self.x_hat, self.x_prev);
+            num.axpy(self.x_hat, self.ls.step, self.dx);
+            self.iterationComplete();
+            return;
+        }
+        const nt = self.tr.nt;
+        const inv_nt = 1 / @as(f64, @floatFromInt(nt));
+        for (0..self.ckt.nnz) |slot| {
+            self.g0[slot] = num.sum(self.planes.g[slot * nt ..][0..nt]) * inv_nt;
+            self.c0[slot] = num.sum(self.planes.c[slot * nt ..][0..nt]) * inv_nt;
+        }
+        self.fs.setPlanes(self.g0, self.c0);
+        self.factors_ready = false;
+        if (self.factor_on_host) try self.factorHost();
+        num.scale(self.f_hat, -1, self.f_hat);
+        @memset(self.dx, 0);
+        self.phase = .linear;
+    }
+
+    fn iterationComplete(self: *Newton) void {
+        self.iter += 1;
+        if (self.iter == self.options.max_iter) {
+            self.result = .{ .converged = false, .iterations = self.options.max_iter, .residual_norm = num.normInf(self.f_hat) };
+            self.phase = .done;
+        } else self.phase = .sample;
+    }
+
+    fn solved(self: *Newton, result: Gmres.SolveResult) void {
+        std.debug.assert(self.phase == .linear);
+        if (self.ckt.knobs.hb_trace) std.debug.print("  gmres it={d} res={e} conv={}\n", .{ result.iterations, result.residual, result.converged });
+        num.copySimd(self.x_prev, self.x_hat);
+        num.axpy(self.x_hat, self.ls.step, self.dx);
+        self.iterationComplete();
+    }
+
+    fn solveAlone(self: *Newton) void {
+        std.debug.assert(self.factors_ready);
+        if (self.gpu_operator) |*device| {
+            device.refresh(self.planes.g, self.planes.c, &self.fs) catch {
+                device.deinit();
+                self.gpu_operator = null;
+            };
+        }
+        if (self.gpu_operator == null)
+            @import("../gpu/freq.zig").prepareHeld(&self.gpu_held, &self.gpu_held_disabled, self.ckt, &self.fs, self.omegas.len, self.allocator);
+        var op: Operator = .{
+            .ckt = self.ckt,
+            .tr = self.tr,
+            .omegas = self.omegas,
+            .nf = self.nf,
+            .g_td = self.planes.g,
+            .c_td = self.planes.c,
+            .v_td = self.planes.x,
+            .w_td = self.planes.f,
+            .u_hat = self.q_hat,
+            .fs = &self.fs,
+            .p_rhs = self.p_rhs,
+            .p_x = self.p_x,
+            .gpu_operator = if (self.gpu_operator) |*device| device else null,
+            .gpu_held = if (self.gpu_held) |*held| held else null,
+        };
+        const total = self.f_hat.len;
+        const result = (if (self.gpu_operator) |*device|
+            device.solve(self.f_hat, self.dx, @intCast(@min(total, gmres_restart)), gmres_tol, gmres_max_restarts)
+        else
+            null) orelse self.gmres.solve(&op, self.f_hat, self.dx, gmres_tol, gmres_max_restarts);
+        self.solved(result);
+    }
+
+    fn factorHost(self: *Newton) !void {
+        if (self.factors_ready) return;
+        try self.fs.ensureHeldOnHost(self.omegas);
+        self.factors_ready = true;
+    }
+};
+
+/// One point's `.hb` outcome, as `hb.run` returns it.
+pub const LaneOutcome = @import("hb.zig").LaneOutcome;
+/// Test-only counters of points the device batch admitted and of their line
+/// search backtracks; empty outside tests.
+pub const gpu_test_access = if (@import("builtin").is_test) struct {
+    pub var admitted = std.atomic.Value(usize).init(0);
+    pub var backtracks = std.atomic.Value(usize).init(0);
+} else struct {};
+
+/// Driven sparse HB/MHB points share sampled evaluation and resident
+/// Krylov work. Every point keeps its own Newton iteration and line search.
+pub fn runGpuLanes(ctxs: []const root.RunCtx, options: Options, out: []LaneOutcome) void {
+    const artifacts = @import("gompute_kernels");
+    std.debug.assert(ctxs.len == out.len and ctxs.len != 0);
+    if (comptime artifacts.has_cuda) return dispatchGpuBatch(.cuda, ctxs, options, out);
+    if (comptime artifacts.has_hip) return dispatchGpuBatch(.hip, ctxs, options, out);
+    for (ctxs, out) |*ctx, *result| result.* = @import("hb.zig").run(ctx, options);
+}
+
+fn dispatchGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.RunCtx, options: Options, out: []LaneOutcome) void {
+    runGpuBatch(backend, ctxs, options, out) catch |err| {
+        for (out) |*o| o.* = err;
+    };
+}
+
+/// Writes `input` as point `point`'s column of the point-minor batch `out`:
+/// out[row * points + point] = input[row].
+fn interleave(out: []f64, input: []const f64, point: usize, points: usize) void {
+    std.debug.assert(out.len == input.len * points);
+    for (input, 0..) |value, row| out[row * points + point] = value;
+}
+
+/// `interleave`'s inverse: point `point`'s column of `input` into `out`.
+fn scatter(out: []f64, input: []const f64, point: usize, points: usize) void {
+    std.debug.assert(input.len == out.len * points);
+    for (out, 0..) |*value, row| value.* = input[row * points + point];
+}
+
+fn runGpuBatch(comptime backend: @import("gompute").Backend, ctxs: []const root.RunCtx, options: Options, out: []LaneOutcome) !void {
+    const Device = @import("../gpu/periodic.zig").Engine(backend);
+    const Samples = @import("../gpu/lanes.zig").Samples;
+    const a = ctxs[0].scratch_allocator;
+    const N = ctxs.len;
+    const n: usize = ctxs[0].circuit.n;
+    const nnz: usize = ctxs[0].circuit.nnz;
+    var tones: [max_tones]f64 = undefined;
+    const spec = try querySpectrum(a, options, &tones);
+    defer spec.deinit(a);
+    if (spec.freqs.len < 2) return error.InvalidQueryOptions;
+    const nf = 2 * spec.freqs.len - 1;
+    const nt = transformSamples(spec);
+    const states = try a.alloc(?Newton, N);
+    defer a.free(states);
+    @memset(states, null);
+    const spectra = try a.alloc([]f64, N);
+    defer a.free(spectra);
+    @memset(spectra, &.{});
+    defer for (states, spectra, ctxs) |*state, x, ctx| {
+        if (state.*) |*s| s.deinit();
+        ctx.scratch_allocator.free(x);
+    };
+    @memset(out, error.QueryCancelled);
+    var first: ?usize = null;
+    for (ctxs, 0..) |ctx, p| {
+        ctx.circuit.refuseDigital("hb") catch |err| {
+            out[p] = err;
+            continue;
+        };
+        if (ctx.circuit.n != n or ctx.circuit.nnz != nnz or ctx.circuit.has_charge != ctxs[0].circuit.has_charge or
+            !std.mem.eql(u32, ctx.circuit.col_ptr, ctxs[0].circuit.col_ptr) or
+            !std.mem.eql(u32, ctx.circuit.row_idx, ctxs[0].circuit.row_idx))
+        {
+            out[p] = @import("hb.zig").run(&ctx, options);
+            continue;
+        }
+        spectra[p] = ctx.scratch_allocator.alloc(f64, n * nf) catch |err| {
+            out[p] = err;
+            continue;
+        };
+        states[p] = Newton.init(ctx.circuit, spectra[p], spec, tones[0..spec.tones], options, ctx.scratch_allocator, false) catch |err| {
+            out[p] = err;
+            continue;
+        };
+        if (first == null) first = p;
+    }
+    const first_point = first orelse return;
+    const head = &states[first_point].?;
+    const values = std.math.mul(usize, n * nf, N) catch return error.OutOfMemory;
+    const sample_values = std.math.mul(usize, n * nt, N) catch return error.OutOfMemory;
+    const plane_values = std.math.mul(usize, nnz * nt, N) catch return error.OutOfMemory;
+    const sample_size = std.math.add(
+        usize,
+        std.math.mul(usize, sample_values, 3) catch return error.OutOfMemory,
+        std.math.mul(usize, plane_values, 2) catch return error.OutOfMemory,
+    ) catch return error.OutOfMemory;
+    const sample_slab = try a.alloc(f64, sample_size);
+    defer a.free(sample_slab);
+    var sample_offset: usize = 0;
+    const sampled = takePlanes(sample_slab, &sample_offset, sample_values, plane_values);
+    const rhs = try a.alloc(f64, values);
+    defer a.free(rhs);
+    const dx = try a.alloc(f64, values);
+    defer a.free(dx);
+    const omegas = try a.alloc(f64, head.omegas.len * N);
+    defer a.free(omegas);
+    for (0..N) |p| interleave(omegas, head.omegas, p, N);
+    const frequencies = try a.dupe(f64, head.omegas);
+    defer a.free(frequencies);
+    const factors = try a.alloc(*FreqSolver, N);
+    defer a.free(factors);
+    const results = try a.alloc(Gmres.SolveResult, N);
+    defer a.free(results);
+    const active = try a.alloc(u8, N);
+    defer a.free(active);
+    const ckts = try a.alloc(*root.Circuit, N);
+    defer a.free(ckts);
+    for (states, ckts) |*state, *ckt| ckt.* = if (state.*) |*s| s.ckt else head.ckt;
+    var sampler: ?*Samples = Samples.init(a, ckts, head.tr.times, head.dt) catch |err| blk: {
+        if (head.ckt.knobs.gpu_stats != .off) std.debug.print("gpu-hb: sample provider declined ({s})\n", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (sampler) |s| s.deinit();
+    var device: ?Device = Device.init(a, .{
+        .points = N,
+        .n = @intCast(n),
+        .nf = @intCast(nf),
+        .nt = @intCast(nt),
+        .charge = head.ckt.has_charge,
+        .col_ptr = head.ckt.col_ptr,
+        .row_idx = head.ckt.row_idx,
+        .inv = head.tr.inv,
+        .fwd = head.tr.fwd,
+        .omegas = omegas,
+    }, head.ckt.knobs.gpu_stats != .off) catch null;
+    defer if (device) |*d| d.deinit();
+    var device_samples: usize = 0;
+    var device_solves: usize = 0;
+    while (true) {
+        @memset(active, 0);
+        var any = false;
+        for (states, 0..) |*state, p| if (state.*) |*s| {
+            if (s.phase == .sample) {
+                s.checkpoint() catch |err| {
+                    out[p] = err;
+                    s.deinit();
+                    state.* = null;
+                    continue;
+                };
+                active[p] = 1;
+                any = true;
+            }
+            idft(s.tr, s.nf, s.x_hat, s.planes.x);
+            interleave(sampled.x, s.planes.x, p, N);
+        } else {
+            for (0..n * nt) |row| sampled.x[row * N + p] = 0;
+        };
+        if (!any) break;
+        const used_device = if (sampler) |s| blk: {
+            s.evaluate(sampled.x, sampled.f, sampled.q, sampled.g, sampled.c, active) catch {
+                s.deinit();
+                sampler = null;
+                break :blk false;
+            };
+            device_samples += 1;
+            break :blk true;
+        } else false;
+        for (active, states, 0..) |enabled, *state, p| {
+            if (enabled == 0) continue;
+            const s = &state.*.?;
+            if (used_device) {
+                scatter(s.planes.f, sampled.f, p, N);
+                scatter(s.planes.q, sampled.q, p, N);
+                scatter(s.planes.g, sampled.g, p, N);
+                scatter(s.planes.c, sampled.c, p, N);
+            } else {
+                // The checkpoint already ran for this iteration.
+                sample(s.ckt, s.tr, s.nf, s.dt, s.x_hat, s.x_sample, s.planes);
+            }
+            s.sampled() catch |err| {
+                out[p] = err;
+                s.deinit();
+                state.* = null;
+            };
+        }
+        const leader = for (states) |*state| {
+            if (state.*) |*s| if (s.phase == .linear) break s;
+        } else continue;
+        for (states, 0..) |*state, p| {
+            const s = if (state.*) |*live| if (live.phase == .linear) live else leader else leader;
+            interleave(sampled.g, s.planes.g, p, N);
+            interleave(sampled.c, s.planes.c, p, N);
+            factors[p] = &s.fs;
+            const solving = if (state.*) |*live| live.phase == .linear else false;
+            active[p] = @intFromBool(solving);
+            if (solving) {
+                interleave(rhs, s.f_hat, p, N);
+            } else {
+                for (0..n * nf) |row| rhs[row * N + p] = 0;
+            }
+        }
+        @memset(dx, 0);
+        const solved_device = if (device) |*d| blk: {
+            d.factor(sampled.g, sampled.c, factors, frequencies, active) catch {
+                d.deinit();
+                device = null;
+                break :blk false;
+            };
+            d.solveHost(rhs, dx, @intCast(@min(n * nf, gmres_restart)), gmres_tol, gmres_max_restarts, results) catch {
+                d.deinit();
+                device = null;
+                break :blk false;
+            };
+            device_solves += 1;
+            break :blk true;
+        } else false;
+        for (states, 0..) |*state, p| if (state.*) |*s| {
+            if (s.phase != .linear) continue;
+            if (solved_device) {
+                scatter(s.dx, dx, p, N);
+                s.solved(results[p]);
+            } else {
+                s.factorHost() catch |err| {
+                    out[p] = err;
+                    s.deinit();
+                    state.* = null;
+                    continue;
+                };
+                s.solveAlone();
+            }
+        };
+    }
+    for (states, 0..) |state, p| if (state) |s| {
+        out[p] = if (s.result.converged) publish(&ctxs[p], options, spec, s.x_hat) else error.HbDidNotConverge;
+        if (ctxs[p].circuit.knobs.gpu_stats != .off and device_solves != 0)
+            std.debug.print("gpu-hb-point: {d}, {d} iterations, {d} backtracks, converged={}\n", .{ p, s.result.iterations, s.backtracks, s.result.converged });
+    };
+    if (ctxs[0].circuit.knobs.gpu_stats != .off and device_solves != 0)
+        std.debug.print("gpu-hb: {d} points, {d} sampled device rounds, {d} Krylov rounds\n", .{ N, device_samples, device_solves });
+    if (@import("builtin").is_test and device_samples != 0 and device_solves != 0) {
+        _ = gpu_test_access.admitted.fetchAdd(N, .monotonic);
+        for (states) |state| if (state) |s| {
+            _ = gpu_test_access.backtracks.fetchAdd(s.backtracks, .monotonic);
+        };
+    }
+}
+
+/// `spectrum` of `opts`' tones, f0 first, which land in `tones[0..spec.tones]`.
+/// error.InvalidQueryOptions for more than `max_tones` tones or a harmonic
+/// list that does not match them, and as `spectrum` otherwise.
+fn querySpectrum(gpa: std.mem.Allocator, opts: Options, tones: *[max_tones]f64) !Spectrum {
     const count = 1 + opts.extra_tones.len;
     if (count > max_tones or opts.extra_harmonics.len != opts.extra_tones.len) return error.InvalidQueryOptions;
+    var nharms: [max_tones]u16 = undefined;
     tones[0] = opts.f0;
     nharms[0] = opts.n_harmonics;
     @memcpy(tones[1..count], opts.extra_tones);
     @memcpy(nharms[1..count], opts.extra_harmonics);
-    return count;
+    return spectrum(gpa, tones[0..count], nharms[0..count], opts.intmodmax, opts.subharms);
 }
 
 /// Contract entry for `.hb TONES=` (any tone count) and the positional
@@ -616,20 +1186,24 @@ fn toneList(opts: Options, tones: *[max_tones]f64, nharms: *[max_tones]u16) !usi
 /// (frequency, each probe's amplitude sqrt(c² + s²)) with a signed DC.
 /// Non-convergence is error.HbDidNotConverge.
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
-    const a = ctx.allocator;
     const scratch = ctx.scratch_allocator;
     var tones: [max_tones]f64 = undefined;
-    var nharms: [max_tones]u16 = undefined;
-    const count = try toneList(opts, &tones, &nharms);
-    const spec = try spectrum(scratch, tones[0..count], nharms[0..count], opts.intmodmax, opts.subharms);
+    const spec = try querySpectrum(scratch, opts, &tones);
     defer spec.deinit(scratch);
     if (spec.freqs.len < 2) return error.InvalidQueryOptions;
     const nf = 2 * spec.freqs.len - 1;
     const x_hat = try scratch.alloc(f64, @as(usize, ctx.circuit.n) * nf);
     defer scratch.free(x_hat);
-    const st = try solve(ctx.circuit, x_hat, spec, tones[0..count], opts, scratch);
+    const st = try solve(ctx.circuit, x_hat, spec, tones[0..spec.tones], opts, scratch);
     if (!st.converged) return error.HbDidNotConverge;
 
+    return publish(ctx, opts, spec, x_hat);
+}
+
+/// `run`'s published rows from the converged `x_hat`, in `ctx.allocator`.
+fn publish(ctx: *const root.RunCtx, opts: Options, spec: Spectrum, x_hat: []const f64) !root.Result {
+    const a = ctx.allocator;
+    const nf = 2 * spec.freqs.len - 1;
     const names = try root.probeNames(ctx, "frequency");
     const width: usize = if (opts.phasors) 2 else 1;
     const ncols = names.len * width;
@@ -684,41 +1258,35 @@ pub const Orbit = struct {
 /// `allocator`.
 pub fn orbit(ckt: *root.Circuit, opts: Options, allocator: std.mem.Allocator) !Orbit {
     var tones: [max_tones]f64 = undefined;
-    var nharms: [max_tones]u16 = undefined;
-    const count = try toneList(opts, &tones, &nharms);
-    const spec = try spectrum(allocator, tones[0..count], nharms[0..count], opts.intmodmax, opts.subharms);
+    const spec = try querySpectrum(allocator, opts, &tones);
     errdefer spec.deinit(allocator);
+    const tone_list = tones[0..spec.tones];
     if (spec.freqs.len < 2) return error.InvalidQueryOptions;
     const n: usize = ckt.n;
     const nnz: usize = ckt.nnz;
     const nf = 2 * spec.freqs.len - 1;
     const nt = transformSamples(spec);
-    const buf = try allocator.alloc(f64, n * nf + nt + 2 * nt * nf + 3 * n * nt + 2 * nnz * nt + n);
+    const len = n * nf + nt + 2 * nt * nf + 3 * n * nt + 2 * nnz * nt + n;
+    const buf = try allocator.alloc(f64, len);
     errdefer allocator.free(buf);
-    const x_hat = buf[0 .. n * nf];
-    const tr_buf = buf[n * nf ..][0 .. nt + 2 * nt * nf];
-    const td = buf[n * nf + tr_buf.len ..];
-    const p: Planes = .{
-        .x = td[0 .. n * nt],
-        .f = td[n * nt ..][0 .. n * nt],
-        .q = td[2 * n * nt ..][0 .. n * nt],
-        .g = td[3 * n * nt ..][0 .. nnz * nt],
-        .c = td[3 * n * nt + nnz * nt ..][0 .. nnz * nt],
-    };
-    const st = try solve(ckt, x_hat, spec, tones[0..count], opts, allocator);
+    var off: usize = 0;
+    const x_hat = take(buf, &off, n * nf);
+    const tr_buf = take(buf, &off, nt + 2 * nt * nf);
+    const p = takePlanes(buf, &off, n * nt, nnz * nt);
+    const x_sample = take(buf, &off, n);
+    std.debug.assert(off == len);
+    const st = try solve(ckt, x_hat, spec, tone_list, opts, allocator);
     if (!st.converged) return error.HbDidNotConverge;
-    const tr = try transform(spec, tones[0..count], tr_buf, allocator);
+    const tr = try transform(spec, tone_list, tr_buf, allocator);
     @memset(p.c, 0);
-    sample(ckt, tr, nf, 1 / (spec.freqs[1] * @as(f64, @floatFromInt(nt))), x_hat, td[3 * n * nt + 2 * nnz * nt ..], p);
+    sample(ckt, tr, nf, sampleDt(spec), x_hat, x_sample, p);
     return .{ .spec = spec, .tr = tr, .x_td = p.x, .g_td = p.g, .c_td = p.c, .buf = buf };
 }
 
-/// Spectral lines of `opts`' spectrum, DC included. As `spectrum` fails.
+/// Spectral lines of `opts`' spectrum, DC included. Fails as `querySpectrum`.
 pub fn lineCount(gpa: std.mem.Allocator, opts: Options) !usize {
     var tones: [max_tones]f64 = undefined;
-    var nharms: [max_tones]u16 = undefined;
-    const count = try toneList(opts, &tones, &nharms);
-    const spec = try spectrum(gpa, tones[0..count], nharms[0..count], opts.intmodmax, opts.subharms);
+    const spec = try querySpectrum(gpa, opts, &tones);
     defer spec.deinit(gpa);
     return spec.freqs.len;
 }
@@ -736,4 +1304,7 @@ pub fn solveOneTone(ckt: *root.Circuit, x_hat: []f64, options: Options, allocato
 pub const test_access = if (@import("builtin").is_test) .{
     .transform = transform,
     .transformSamples = transformSamples,
+    .Fold = Fold,
+    .idft = idft,
+    .dft = dft,
 } else {};

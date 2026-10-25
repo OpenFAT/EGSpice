@@ -2,6 +2,7 @@
 //! com_measure2.c: the same event counting, linear interpolation and
 //! quadrature, printed in the same lines. A card whose event never happens
 //! reports on the error writer, as ngspice does, and prints no value.
+//! `Stream` measures the same cards row by row while a transient runs.
 const std = @import("std");
 const core = @import("core");
 const Writer = std.Io.Writer;
@@ -9,6 +10,35 @@ const Clause = core.MeasureClause;
 const Kind = core.query.Kind;
 const nan = std.math.nan(f64);
 const assert = std.debug.assert;
+/// The one-sample-at-a-time passes, shared with the GPU lanes.
+pub const passes = @import("scan.zig");
+const Cross = passes.Cross;
+const At = passes.At;
+const Extremum = passes.Extremum;
+const Integ = passes.Integ;
+const line = passes.line;
+const Stat = passes.Stat;
+const Integral = passes.Integral;
+const almostEqualUlps = passes.almostEqualUlps;
+
+comptime {
+    assert(passes.unset == core.measure_unset and passes.last == core.measure_last);
+}
+
+/// The numbers of clause `c` a shared pass reads.
+fn bounds(c: Clause) passes.Bounds {
+    return .{ .from = c.from, .to = c.to, .val = c.val, .td = c.td, .rise = c.rise, .fall = c.fall, .cross = c.cross, .has_y2 = c.vec2.len > 0 };
+}
+
+/// `analysis` as the shared passes tell scales apart.
+fn modeOf(analysis: Kind) passes.Mode {
+    return switch (analysis) {
+        .tran, .tran_noise => .tran,
+        .dc => .dc,
+        .ac, .sp => .ac,
+        else => .other, // else: no other scale has a pass-specific rule
+    };
+}
 
 /// A sweep point's row in the variant table and its label (`rv=1k, ...`),
 /// which names its `.meas` block.
@@ -25,19 +55,41 @@ pub fn print(out: *Writer, err: *Writer, measures: []const core.Measure, analysi
     // so those are evaluated first; each card still prints in deck order.
     // ponytail: a fixed table; cards past the 256th read as NaN to a PARAM.
     var values: [256]f64 = @splat(nan);
-    var discard_buf: [64]u8 = undefined;
-    var discard: Writer.Discarding = .init(&discard_buf);
     var done: Done = undefined;
+    // The first pass keeps each card's printed text (and error), so the
+    // second prints it instead of evaluating the card again: a sweep prints
+    // a block per point, and each number goes through `%e`'s exact decimal
+    // conversion. A card whose text overflows the buffer is evaluated again.
+    var text_buf: [16 * 1024]u8 = undefined;
+    var used: usize = 0;
+    var kept: [256]?Kept = @splat(null);
     for (measures, 0..) |m, i| {
         if (!targets(m, analysis, result) or m.func == .param or i >= values.len) continue;
-        values[i] = evaluate(&discard.writer, m, cardWave(result, analysis, &values, i, &done)) catch nan;
+        var w: Writer = .fixed(text_buf[used..]);
+        const r = evaluate(&w, m, cardWave(result, analysis, &values, i, &done));
+        if (r == error.WriteFailed) {
+            // Out of buffer: the value as before, through a discarding writer.
+            var discard_buf: [64]u8 = undefined;
+            var discard = quiet(&discard_buf);
+            values[i] = evaluate(&discard.writer, m, cardWave(result, analysis, &values, i, &done)) catch nan;
+            continue;
+        }
+        values[i] = r catch nan;
+        kept[i] = .{ .text = text_buf[used..][0..w.end], .err = if (r) |_| null else |e| e };
+        used += w.end;
     }
     var headed = false;
     for (measures, 0..) |m, i| {
         if (!targets(m, analysis, result)) continue;
         if (!headed) try writeHeading(out, analysis, point);
         headed = true;
-        const value = evaluate(out, m, cardWave(result, analysis, &values, i, &done)) catch |e| switch (e) {
+        const fresh = if (i < kept.len) kept[i] == null else true;
+        const replay: EvalError!f64 = if (fresh) evaluate(out, m, cardWave(result, analysis, &values, i, &done)) else blk: {
+            const k = kept[i].?;
+            try out.writeAll(k.text);
+            break :blk if (k.err) |e| e else values[i];
+        };
+        const value = replay catch |e| switch (e) {
             error.WriteFailed => return error.WriteFailed,
             error.NoSuchVector => blk: {
                 try err.print("\nError: measure  {s} : no such vector\n", .{m.name});
@@ -52,6 +104,9 @@ pub fn print(out: *Writer, err: *Writer, measures: []const core.Measure, analysi
         if (m.func == .param and i < values.len) values[i] = value;
     }
 }
+
+/// A card's text and error from `print`'s first pass.
+const Kept = struct { text: []const u8, err: ?EvalError };
 
 /// `print` for a sweep point whose `analysis` failed: its heading and
 /// `name = NaN` for every card of that analysis.
@@ -102,7 +157,7 @@ pub fn evaluateOutcomes(measures: []const core.Measure, analysis: Kind, result: 
     @memset(out, nan);
     if (missing) |ms| @memset(ms, false);
     var discard_buf: [64]u8 = undefined;
-    var discard: Writer.Discarding = .init(&discard_buf);
+    var discard = quiet(&discard_buf);
     var done: Done = undefined;
     for ([_]bool{ false, true }) |param| for (measures, out, 0..) |m, *v, i| {
         if (!targets(m, analysis, result) or (m.func == .param) != param) continue;
@@ -135,7 +190,8 @@ pub fn sample(c: Clause, result: core.Result, at: []const f64, out: []f64) error
             const mid = (lo + hi) / 2;
             if (x.get(mid) < t) lo = mid + 1 else hi = mid;
         }
-        v.* = if (lo == 0) y.get(0) else if (lo == n) y.get(n - 1) else interpolate(x, y, lo - 1, lo, t);
+        // ngspice measure_interpolate, 'y' mode, between the samples around t.
+        v.* = if (lo == 0) y.get(0) else if (lo == n) y.get(n - 1) else line(x.get(lo - 1), y.get(lo - 1), x.get(lo), y.get(lo), t);
     }
 }
 
@@ -232,6 +288,8 @@ pub const Stream = struct {
 
     /// `names` and `nodes` are a transient's columns (the scale first,
     /// then each probe's unknown); `recorded` names the ones it records.
+    /// Borrows `measures` and the name strings, which must outlive it; free
+    /// with `deinit`. Asserts one node per name after the scale.
     pub fn init(gpa: std.mem.Allocator, measures: []const core.Measure, names: []const []const u8, nodes: []const u32, recorded: []const []const u8) !Stream {
         assert(names.len == nodes.len + 1);
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -277,6 +335,8 @@ pub const Stream = struct {
         return s;
     }
 
+    /// Frees everything `init` allocated; slices from `measured` and
+    /// `deviceScans` are the caller's and survive it.
     pub fn deinit(s: *Stream) void {
         s.arena.deinit();
         s.* = undefined;
@@ -313,8 +373,141 @@ pub const Stream = struct {
         return if (s.abort_card) |k| !s.cards[k].done else s.open > 0;
     }
 
+    /// Every pass of the open `.tran` cards as a device pass and what it
+    /// reads (`passes.Dev`, `passes.DevColumns`), in card then pass order,
+    /// so a GPU lane can measure without the host seeing a row (performance
+    /// TODO 06 6.8); a FIND/DERIV ... WHEN card still at its WHEN adds a
+    /// `.find` pass after it. Null when a card needs more than one row at a
+    /// time: one that is not `.scan`, an ERR/EM_AVG pass, or a `par()`
+    /// waveform past `passes.Program.max` ops. Caller owns both slices.
+    pub fn deviceScans(s: *const Stream, gpa: std.mem.Allocator) !?struct { scans: []passes.Dev, cols: []passes.DevColumns } {
+        var n: usize = 0;
+        for (s.cards) |*c| {
+            if (c.done) continue;
+            if (c.rule != .scan or !c.started or c.stage == .targ) return null;
+            if (c.stage == .find) if (c.ring_y == null or s.devSource(c.ring_y.?) == null) return null;
+            for (c.scans[0..c.n]) |*sc| {
+                if (sc.missing or s.devSource(sc.y) == null) return null;
+                if (sc.y2) |y2| if (s.devSource(y2) == null) return null;
+                switch (sc.pass) {
+                    .cross, .at, .extremum, .integ => {},
+                    else => return null,
+                }
+            }
+            n += c.n + @intFromBool(c.stage == .find);
+        }
+        const scans = try gpa.alloc(passes.Dev, n);
+        errdefer gpa.free(scans);
+        const cols = try gpa.alloc(passes.DevColumns, n);
+        var k: usize = 0;
+        for (s.cards) |*c| if (!c.done) for (c.scans[0..c.n], 0..) |*sc, j| {
+            scans[k] = switch (sc.pass) {
+                inline .cross, .at, .extremum, .integ => |v, tag| .{
+                    .kind = @field(passes.Dev.Kind, @tagName(tag)),
+                    .over = sc.over,
+                    .time = sc.time[0],
+                    .pass = @unionInit(@FieldType(passes.Dev, "pass"), @tagName(tag), v),
+                },
+                else => unreachable, // else: refused above
+            };
+            cols[k] = s.devColumns(sc.y, sc.y2);
+            k += 1;
+            if (c.stage == .find and j + 1 == c.n) {
+                scans[k] = .{ .kind = .find, .pass = .{ .find = .{
+                    .at = .{ .at = nan, .slope = c.slope },
+                    .ring = c.ring,
+                    .ring_len = c.ring_len,
+                    .rows = s.rows,
+                } } };
+                cols[k] = s.devColumns(c.ring_y.?, null);
+                k += 1;
+            }
+        };
+        return .{ .scans = scans, .cols = cols };
+    }
+
+    /// Takes back the passes `deviceScans` handed out, as the device left
+    /// them, and resolves each card they finish, as `feed` would have at
+    /// the row that finished it.
+    pub fn adoptScans(s: *Stream, scans: []const passes.Dev) void {
+        var k: usize = 0;
+        for (s.measures, s.cards, 0..) |m, *c, i| if (!c.done) {
+            for (c.scans[0..c.n]) |*sc| {
+                const d = scans[k];
+                k += 1;
+                sc.over = d.over;
+                sc.time[0] = d.time;
+                sc.pass = switch (d.kind) {
+                    inline .cross, .at, .extremum, .integ => |tag| @unionInit(Scan.Pass, @tagName(tag), @field(d.pass, @tagName(tag))),
+                    .find => unreachable, // a card's `.find` pass comes after its own
+                };
+            }
+            if (c.stage == .find) {
+                const d = scans[k];
+                k += 1;
+                const f = d.pass.find;
+                c.ring = f.ring;
+                c.ring_len = f.ring_len;
+                switch (f.state) {
+                    .waiting => {},
+                    .none => c.stage = .none,
+                    .armed => {
+                        c.stage = .none;
+                        c.n = 2;
+                        c.scans[1] = .{ .y = c.ring_y.?, .over = d.over, .pass = .{ .at = f.at } };
+                    },
+                }
+            }
+            if (!c.resolved()) continue;
+            c.done = true;
+            s.values[i] = s.value(m, c);
+            s.open -= 1;
+        };
+        assert(k == scans.len);
+    }
+
+    /// `col` as the device reads it: the unknown behind a real column of
+    /// the stream's row, or a program (`passes.Program`) for the scale or a
+    /// `par()` waveform; null for anything else.
+    fn devSource(s: *const Stream, col: Column) ?struct { u32, passes.Program } {
+        if (col.complex) return null;
+        var p: passes.Program = .{};
+        if (col.ops.len == 0) {
+            if (col.offset != 0) return .{ s.nodes[col.offset - 1], p };
+            p.ops[0] = .{ .code = .scale };
+            p.len = 1;
+            return .{ passes.DevColumns.none, p };
+        }
+        if (col.ops.len > passes.Program.max) return null;
+        for (col.ops, p.ops[0..col.ops.len]) |op, *o| o.* = switch (op) {
+            .num => |x| .{ .code = .num, .num = x },
+            .measure => .{ .code = .nan },
+            .vector => |name| blk: {
+                // `Sample.leaf`'s column: every name resolved when the
+                // waveform was made.
+                const k = columnIndex(col.names, name) orelse return null;
+                break :blk if (k == 0) .{ .code = .scale } else .{ .code = .unknown, .unknown = s.nodes[k - 1] };
+            },
+            .neg => .{ .code = .neg },
+            .add => .{ .code = .add },
+            .sub => .{ .code = .sub },
+            .mul => .{ .code = .mul },
+            .div => .{ .code = .div },
+            .pow => return null, // `passes.Program`
+        };
+        p.len = @intCast(col.ops.len);
+        return .{ passes.DevColumns.none, p };
+    }
+
+    /// `devSource` of a pass's two columns, which it has checked.
+    fn devColumns(s: *const Stream, y: Column, y2: ?Column) passes.DevColumns {
+        const a = s.devSource(y).?;
+        const b = if (y2) |c| s.devSource(c).? else .{ passes.DevColumns.none, passes.Program{} };
+        return .{ .y = a[0], .y2 = b[0], .prog = a[1], .prog2 = b[1] };
+    }
+
     /// Each card's passes for `core.Result.measured`: what a `.scan` card
-    /// found, nothing for the others.
+    /// found, nothing for the others. Caller owns the slice.
     pub fn measured(s: *Stream, gpa: std.mem.Allocator) ![]core.Measured {
         const out = try gpa.alloc(core.Measured, s.cards.len);
         for (s.cards, out) |*c, *o| {
@@ -353,11 +546,10 @@ pub const Stream = struct {
         const a = resolve(m.first, s.values) catch return;
         const b = resolve(m.second, s.values) catch return;
         const w = s.wave();
-        const tran = Kind.tran;
         switch (m.func) {
-            .when => c.scans[0] = .init(w, a, .{ .cross = .init(a, tran) }, .waveform),
+            .when => c.scans[0] = .init(w, a, .{ .cross = .init(bounds(a), .tran) }, .waveform),
             .trig_targ => {
-                if (a.at == core.measure_no_at) c.scans[0] = .init(w, a, .{ .cross = .init(a, tran) }, .waveform);
+                if (a.at == core.measure_no_at) c.scans[0] = .init(w, a, .{ .cross = .init(bounds(a), .tran) }, .waveform);
                 c.n = @intFromBool(a.at == core.measure_no_at);
                 if (b.at == core.measure_no_at) {
                     var targ = b;
@@ -366,7 +558,7 @@ pub const Stream = struct {
                         c.clause = b;
                     } else {
                         if (b.td_trig) targ.td = a.at;
-                        c.scans[c.n] = .init(w, targ, .{ .cross = .init(targ, tran) }, .waveform);
+                        c.scans[c.n] = .init(w, targ, .{ .cross = .init(bounds(targ), .tran) }, .waveform);
                         c.n += 1;
                     }
                 }
@@ -375,7 +567,7 @@ pub const Stream = struct {
             .find, .deriv => if (a.at != core.measure_no_at) {
                 c.scans[0] = .init(w, a, .{ .at = .{ .at = a.at, .slope = m.func == .deriv } }, .none);
             } else {
-                c.scans[0] = .init(w, b, .{ .cross = .init(b, tran) }, .waveform);
+                c.scans[0] = .init(w, b, .{ .cross = .init(bounds(b), .tran) }, .waveform);
                 c.stage = .find;
                 c.clause = a;
                 c.slope = m.func == .deriv;
@@ -383,7 +575,7 @@ pub const Stream = struct {
             },
             .avg, .min, .max, .min_at, .max_at => c.scans[0] = .init(w, a, .{
                 .extremum = .{
-                    .c = a,
+                    .c = bounds(a),
                     .dc = false,
                     .op = switch (m.func) {
                         .avg => .avg,
@@ -394,13 +586,13 @@ pub const Stream = struct {
             }, .none),
             .pp => {
                 c.scans = .{
-                    .init(w, a, .{ .extremum = .{ .c = a, .dc = false, .op = .min } }, .none),
-                    .init(w, a, .{ .extremum = .{ .c = a, .dc = false, .op = .max } }, .none),
+                    .init(w, a, .{ .extremum = .{ .c = bounds(a), .dc = false, .op = .min } }, .none),
+                    .init(w, a, .{ .extremum = .{ .c = bounds(a), .dc = false, .op = .max } }, .none),
                 };
                 c.n = 2;
                 return s.catchUp(c, data);
             },
-            .rms, .integ => c.scans[0] = .init(w, a, .{ .integ = .{ .c = a, .rms = m.func == .rms } }, .none),
+            .rms, .integ => c.scans[0] = .init(w, a, .{ .integ = .{ .c = bounds(a), .rms = m.func == .rms } }, .none),
             .em_avg => c.scans[0] = .init(w, a, .{ .em_avg = .{ .c = a } }, .none),
             .err, .err1, .err2, .err3 => c.scans[0] = .init(w, a, .{ .rel_error = .{ .c = a, .dc = false, .func = m.func } }, .column),
             else => unreachable, // else: `ruleOf` gives every other function `.end`
@@ -422,11 +614,7 @@ pub const Stream = struct {
     /// ring, and starts scan 1 at scan 0's event.
     fn next(s: *Stream, c: *Card, data: []const f64) void {
         if (c.stage == .none) return;
-        if (c.ring_y) |y| {
-            if (c.ring_len == c.ring.len) std.mem.copyForwards([2]f64, c.ring[0..2], c.ring[1..3]);
-            c.ring_len = @min(c.ring_len + 1, c.ring.len);
-            c.ring[c.ring_len - 1] = .{ s.row[0], y.get(0) };
-        }
+        if (c.ring_y) |y| passes.Find.push(&c.ring, &c.ring_len, .{ s.row[0], y.get(0) });
         if (!c.scans[0].over) return;
         const event = c.scans[0].found();
         const stage = c.stage;
@@ -438,7 +626,7 @@ pub const Stream = struct {
         c.n = 2;
         if (stage == .targ) {
             cl.td = event.v[0];
-            c.scans[1] = .init(w, cl, .{ .cross = .init(cl, .tran) }, .waveform);
+            c.scans[1] = .init(w, cl, .{ .cross = .init(bounds(cl), .tran) }, .waveform);
         } else c.scans[1] = .init(w, cl, .{ .at = .{ .at = event.v[0], .slope = c.slope } }, .none);
         if (c.rule == .replay) return s.replay(&c.scans[1], data);
         // `.scan`: from the ring. Rows before it hold the event only where
@@ -471,7 +659,7 @@ pub const Stream = struct {
         for (c.scans[0..c.n], found[0..c.n]) |*scan, *f| f.* = scan.found();
         var done: Done = .{ .found = &found };
         var discard_buf: [64]u8 = undefined;
-        var discard: Writer.Discarding = .init(&discard_buf);
+        var discard = quiet(&discard_buf);
         const empty: core.Result = .{ .plotname = "", .varnames = &.{}, .is_complex = false, .npoints = 0, .data = &.{} };
         return evaluate(&discard.writer, m, .{ .result = empty, .analysis = .tran, .values = s.values, .done = &done }) catch nan;
     }
@@ -533,7 +721,7 @@ fn targets(m: core.Measure, analysis: Kind, result: core.Result) bool {
 /// O(cards * trials * samples).
 pub fn printStatistics(out: *Writer, measures: []const core.Measure, analysis: Kind, trials: []const core.Result) Writer.Error!void {
     var discard_buf: [64]u8 = undefined;
-    var discard: Writer.Discarding = .init(&discard_buf);
+    var discard = quiet(&discard_buf);
     // Welford accumulators, one per card; every field moves together.
     const Acc = struct { n: f64 = 0, mean: f64 = 0, m2: f64 = 0, lo: f64 = std.math.inf(f64), hi: f64 = -std.math.inf(f64) };
     var acc: [256]Acc = @splat(.{});
@@ -967,8 +1155,6 @@ fn columnIndex(names: []const []const u8, name: []const u8) ?usize {
     return null;
 }
 
-const Stat = struct { value: f64, at: f64 };
-
 /// The result a card reads; column 0 is the scale (time, frequency, sweep).
 const Wave = struct {
     result: core.Result,
@@ -1032,7 +1218,7 @@ const Wave = struct {
         const x = w.scale();
         const y = try w.waveform(c.vec, c.ops, c.vectype);
         const y2: ?Column = if (c.vec2.len > 0) try w.waveform(c.vec2, c.ops2, c.vectype) else null;
-        var s: Cross = .init(c, w.analysis);
+        var s: Cross = .init(bounds(c), modeOf(w.analysis));
         for (0..w.len()) |i| {
             if (s.feed(times, x.get(i), y.get(i), if (y2) |c2| c2.get(i) else nan)) break;
         }
@@ -1155,12 +1341,10 @@ const Wave = struct {
         }
         const x = w.scale();
         const y = try w.waveform(c.vec, c.ops, c.vectype);
-        var s: Extremum = .{ .c = c, .dc = w.analysis == .dc, .op = op };
+        var s: Extremum = .{ .c = bounds(c), .dc = w.analysis == .dc, .op = op };
         for (0..w.len()) |i| if (s.feed(x.get(i), y.get(i))) break;
         return s.stat();
     }
-
-    const Integral = struct { value: f64, from: f64, to: f64 };
 
     const Jitter = struct { rms: f64, pp: f64, period: f64, edges: u32 };
 
@@ -1232,7 +1416,7 @@ const Wave = struct {
         }
         const x = w.scale();
         const y = try w.waveform(c.vec, c.ops, c.vectype);
-        var s: Integ = .{ .c = c, .rms = rms };
+        var s: Integ = .{ .c = bounds(c), .rms = rms };
         for (0..w.len()) |i| if (s.feed(x.get(i), y.get(i))) break;
         return s.result();
     }
@@ -1246,212 +1430,10 @@ fn positiveArea(v0: f64, v1: f64, dx: f64) f64 {
     return 0.5 * hi * dx * hi / (hi - @min(v0, v1));
 }
 
-/// ngspice measure_interpolate, 'y' mode: the line through samples i and j
-/// at scale value `at`, in slope-intercept form for the same rounding.
-fn interpolate(x: Column, y: Column, i: usize, j: usize, at: f64) f64 {
-    assert(i < j);
-    return line(x.get(i), y.get(i), x.get(j), y.get(j), at);
-}
-
-/// The line through (x0, y0) and (x1, y1) at `at`, as `interpolate`.
-fn line(x0: f64, y0: f64, x1: f64, y1: f64, at: f64) f64 {
-    const slope = (y1 - y0) / (x1 - x0);
-    const intercept = y0 - slope * x0;
-    return slope * at + intercept;
-}
-
 // The passes below read a waveform one sample at a time, in order, and
 // `feed` returns true where the whole-waveform loop would stop. `Wave` runs
 // them over a recording and `Stream` over a run as it goes, so both give
 // the same values, to the bit.
-
-/// `Wave.crossings`' event count (ngspice com_measure_when).
-const Cross = struct {
-    c: Clause,
-    analysis: Kind,
-    td: f64,
-    /// The counts the next event needs.
-    want: Clause,
-    rise: i32 = 0,
-    fall: i32 = 0,
-    cross: i32 = 0,
-    above: bool = false,
-    pending: bool = false,
-    last: f64 = nan,
-    first: u32 = 0,
-    prev: f64 = 0,
-    prev2: f64 = 0,
-    prev_x: f64 = 0,
-    rows: usize = 0,
-    /// Events found, and whether the scan stopped on one (LAST is not added then).
-    n: usize = 0,
-    ended: bool = false,
-
-    fn init(c: Clause, analysis: Kind) Cross {
-        return .{ .c = c, .analysis = analysis, .td = c.td, .want = c };
-    }
-
-    /// Reads sample (`xv`, `v`), `v2` being the level vector's (NaN
-    /// without one), and adds the events it ends to `times`.
-    fn feed(s: *Cross, times: []f64, xv: f64, v: f64, v2: f64) bool {
-        const c = s.c;
-        const dc = s.analysis == .dc;
-        const has_y2 = c.vec2.len > 0;
-        const i = s.rows;
-        s.rows += 1;
-        // A DC sweep may start anywhere: ngspice keeps its origin in td.
-        if (dc and i == 0) s.td = xv;
-        if ((s.analysis == .tran or s.analysis == .tran_noise) and xv < s.td) return false;
-        if ((s.analysis == .ac or s.analysis == .sp) and xv < 0) return false;
-        if (dc) {
-            if (xv < c.from or xv > c.to) return false;
-        } else {
-            if (xv < c.from) return false;
-            if (c.to != 0 and xv > c.to) return true;
-        }
-        if (s.first > 1 and dc and s.td == xv) s.first = 1;
-        const level = if (has_y2) v2 else c.val;
-        const prev_level = if (has_y2) s.prev2 else c.val;
-        if (s.first == 1) {
-            s.cross = 0;
-            s.above = !(v < level);
-            if (!s.above and s.prev >= prev_level) {
-                s.fall = 1;
-                s.cross = 1;
-            } else if (s.above and s.prev < prev_level) {
-                s.rise = 1;
-                s.cross = 1;
-            }
-        }
-        if (s.first > 1) {
-            if (!s.above and v >= level) {
-                s.above = true;
-                s.cross += 1;
-                s.rise += 1;
-                if (c.fall != core.measure_last) s.pending = true;
-            } else if (s.above and v <= level) {
-                s.above = false;
-                s.cross += 1;
-                s.fall += 1;
-                if (c.rise != core.measure_last) s.pending = true;
-            }
-            const hit = s.prev_x + (prev_level - s.prev) * (xv - s.prev_x) / (v - s.prev - level + prev_level);
-            // Counters move by at most one per sample, so the event the
-            // raised count names comes on a later sample.
-            if (s.cross == s.want.cross or s.rise == s.want.rise or s.fall == s.want.fall) {
-                times[s.n] = hit;
-                s.n += 1;
-                if (s.n == times.len) {
-                    s.ended = true;
-                    return true;
-                }
-                if (s.cross == s.want.cross) s.want.cross += 1;
-                if (s.rise == s.want.rise) s.want.rise += 1;
-                if (s.fall == s.want.fall) s.want.fall += 1;
-            }
-            if (s.pending) {
-                if (c.cross == core.measure_unset and c.rise == core.measure_unset and c.fall == core.measure_unset) {
-                    times[s.n] = hit;
-                    s.n += 1;
-                    s.ended = true;
-                    return true;
-                }
-                if (c.cross == core.measure_last or c.rise == core.measure_last or c.fall == core.measure_last) s.last = hit;
-                s.pending = false;
-            }
-        }
-        s.first += 1;
-        s.prev = v;
-        if (has_y2) s.prev2 = v2;
-        s.prev_x = xv;
-        return false;
-    }
-
-    /// How many events `times` holds, a LAST count's appended; once the
-    /// scan has stopped or read every sample.
-    fn finish(s: Cross, times: []f64) usize {
-        if (s.ended or std.math.isNan(s.last)) return s.n;
-        times[s.n] = s.last;
-        return s.n + 1;
-    }
-};
-
-/// `Wave.valueAt` and `slopeAt`: the first segment holding `at`.
-const At = struct {
-    at: f64,
-    dc: bool = false,
-    slope: bool = false,
-    rows: usize = 0,
-    px: f64 = 0,
-    pv: f64 = 0,
-    value: f64 = nan,
-
-    fn feed(s: *At, xv: f64, v: f64) bool {
-        if (s.rows > 0 and ((s.px <= s.at and xv >= s.at) or (s.dc and s.px >= s.at and xv <= s.at))) {
-            s.value = if (s.slope) (v - s.pv) / (xv - s.px) else s.pv + (s.at - s.px) * (v - s.pv) / (xv - s.px);
-            return true;
-        }
-        s.rows += 1;
-        s.px = xv;
-        s.pv = v;
-        return false;
-    }
-};
-
-/// `Wave.extremum`.
-const Extremum = struct {
-    c: Clause,
-    dc: bool,
-    op: Op,
-    first: bool = false,
-    m: f64 = 0,
-    m_at: f64 = 0,
-    xv: f64 = 0,
-    pv: f64 = 0,
-    px: f64 = 0,
-    span: f64 = 0,
-
-    const Op = enum { min, max, avg };
-
-    fn feed(s: *Extremum, xv: f64, v: f64) bool {
-        s.xv = xv;
-        if (s.dc) {
-            if (xv < s.c.from or xv > s.c.to) return false;
-        } else {
-            if (xv < s.c.from) return false;
-            if (s.c.to != 0 and xv > s.c.to) return true;
-        }
-        if (!s.first) {
-            s.first = true;
-            s.m = if (s.op == .avg) 0 else v;
-            s.m_at = xv;
-            s.pv = v;
-            s.px = xv;
-            return false;
-        }
-        switch (s.op) {
-            .min => if (v <= s.m) {
-                s.m = v;
-                s.m_at = xv;
-            },
-            .max => if (v >= s.m) {
-                s.m = v;
-                s.m_at = xv;
-            },
-            .avg => {
-                s.m += 0.5 * (v + s.pv) * (xv - s.px);
-                s.span += xv - s.px;
-                s.pv = v;
-                s.px = xv;
-            },
-        }
-        return false;
-    }
-
-    fn stat(s: Extremum) Stat {
-        return if (s.op == .avg) .{ .value = s.m / (if (s.first) s.span else 1), .at = s.xv } else .{ .value = s.m, .at = s.m_at };
-    }
-};
 
 /// `Wave.emAvg`.
 const EmAvg = struct {
@@ -1474,7 +1456,7 @@ const EmAvg = struct {
         return false;
     }
 
-    fn result(s: EmAvg) Wave.Integral {
+    fn result(s: EmAvg) Integral {
         const span = s.to - s.from;
         if (!(span > 0)) return .{ .value = nan, .from = s.from, .to = s.to };
         return .{ .value = (@max(s.pos, s.neg) - s.c.val * @min(s.pos, s.neg)) / span, .from = s.from, .to = s.to };
@@ -1509,89 +1491,6 @@ const RelError = struct {
     fn value(s: RelError) f64 {
         if (s.count == 0) return nan;
         return if (s.func == .err2) s.sum / s.count else @sqrt(s.sum / s.count);
-    }
-};
-
-/// `Wave.rmsInteg`: the window's points, from the first sample at or past
-/// `from` (read as the value at a nonzero `from`) to the first past a
-/// nonzero `to` (read as the value at `to`), each panel taking the next
-/// four points' spacing; points past the window read zero, as in
-/// ngspice's zeroed buffers.
-const Integ = struct {
-    c: Clause,
-    rms: bool,
-    inside: bool = false,
-    /// Samples read, and the last one raw: an interpolated end's left side.
-    rows: usize = 0,
-    px: f64 = 0,
-    py: f64 = 0,
-    /// Window points not in a panel yet, oldest first, as (scale, value or
-    /// value squared).
-    p: [4][2]f64 = undefined,
-    np: usize = 0,
-    count: usize = 0,
-    first_x: f64 = nan,
-    cut: bool = false,
-    cut_x: f64 = nan,
-    sum: [3]f64 = .{ 0, 0, 0 },
-
-    fn feed(s: *Integ, xv: f64, v: f64) bool {
-        defer {
-            s.rows += 1;
-            s.px = xv;
-            s.py = v;
-        }
-        const c = s.c;
-        if (!s.inside) {
-            if (xv < c.from) return false;
-            s.inside = true;
-        }
-        s.cut = c.to != 0 and xv > c.to;
-        var pt: [2]f64 = .{ xv, v };
-        if (s.cut) {
-            if (s.rows > 0 and !almostEqualUlps(xv, c.to)) pt = .{ c.to, line(s.px, s.py, xv, v, c.to) };
-        } else if (s.count == 0 and c.from != 0 and s.rows > 0 and !almostEqualUlps(xv, c.from)) {
-            pt = .{ c.from, line(s.px, s.py, xv, v, c.from) };
-        }
-        if (s.rms) pt[1] = pt[1] * pt[1];
-        if (s.count == 0) s.first_x = pt[0];
-        if (s.cut) s.cut_x = pt[0];
-        s.count += 1;
-        s.p[s.np] = pt;
-        s.np += 1;
-        if (s.np == s.p.len) s.panel(s.np);
-        return s.cut;
-    }
-
-    /// Folds the oldest points into one panel; `avail` of `p` are points,
-    /// the rest read zero, and a spacing past them zero.
-    fn panel(s: *Integ, avail: usize) void {
-        assert(avail >= 2 and avail <= s.p.len);
-        var p = s.p;
-        for (p[avail..]) |*q| q.* = .{ 0, 0 };
-        var width: [3]f64 = undefined;
-        for (&width, 0..) |*d, j| d.* = if (j + 1 < avail) p[j + 1][0] - p[j][0] else 0;
-        const used: usize = if (almostEqualUlps(width[0], width[1]) and almostEqualUlps(width[0], width[2])) blk: {
-            s.sum[0] += 3 * width[0] * (p[0][1] + 3 * (p[1][1] + p[2][1]) + p[3][1]) / 8.0;
-            break :blk 3;
-        } else if (almostEqualUlps(width[0], width[1])) blk: {
-            s.sum[1] += width[0] * (p[0][1] + 4 * p[1][1] + p[2][1]) / 3.0;
-            break :blk 2;
-        } else blk: {
-            s.sum[2] += width[0] * (p[0][1] + p[1][1]) / 2;
-            break :blk 1;
-        };
-        s.np = avail -| used;
-        std.mem.copyForwards([2]f64, s.p[0..s.np], s.p[avail - s.np .. avail]);
-    }
-
-    fn result(s: *Integ) Wave.Integral {
-        if (s.rows == 0) return .{ .value = nan, .from = nan, .to = nan };
-        while (s.np > 1) s.panel(s.np);
-        const from = if (s.count > @intFromBool(s.cut)) s.first_x else nan;
-        const to = if (s.cut) s.cut_x else s.px;
-        const total = s.sum[0] + s.sum[1] + s.sum[2];
-        return .{ .value = if (s.rms) @sqrt(total / (to - from)) else total, .from = from, .to = to };
     }
 };
 
@@ -1695,17 +1594,17 @@ fn cardWave(result: core.Result, analysis: Kind, values: []const f64, i: usize, 
     return w;
 }
 
-/// ngspice AlmostEqualUlps(a, b, 100) (maths/misc/equality.c).
-fn almostEqualUlps(a: f64, b: f64) bool {
-    if (a == b) return true;
-    const ordered = struct {
-        fn f(d: f64) i64 {
-            const i: i64 = @bitCast(d);
-            return if (i < 0) std.math.minInt(i64) -% i else i;
-        }
-    }.f;
-    return @abs(ordered(a) -% ordered(b)) <= 100;
+/// A discarding writer for an `evaluate` whose text nobody reads, only its
+/// value: `Sci` prints nothing into it, which skips the exact big-integer
+/// decimal (most of a card's cost when `point_measures` or a `Stream`
+/// re-evaluates thousands of points).
+fn quiet(buffer: []u8) Writer.Discarding {
+    var d: Writer.Discarding = .init(buffer);
+    d.writer.vtable = &quiet_vtable;
+    return d;
 }
+
+const quiet_vtable: Writer.VTable = .{ .drain = Writer.Discarding.drain, .sendFile = Writer.Discarding.sendFile };
 
 /// C's `%.*e`, digit for digit: the exact binary value rounded half-to-even
 /// (glibc's default), at least two exponent digits and an explicit sign.
@@ -1718,6 +1617,7 @@ const Sci = struct {
     precision: u8,
 
     pub fn format(s: Sci, w: *Writer) Writer.Error!void {
+        if (w.vtable == &quiet_vtable) return;
         if (!std.math.isFinite(s.x)) {
             var buf: [64]u8 = undefined;
             return w.writeAll(std.fmt.float.render(&buf, s.x, .{ .mode = .scientific }) catch "?");
@@ -1775,6 +1675,16 @@ fn exactDecimal(a: std.mem.Allocator, x: f64) !struct { []const u8, i32 } {
         try d.mul(&d, &five);
     }
     return .{ try d.toString(a, 10, .lower), @min(e, 0) };
+}
+
+test "a quiet writer skips the decimal, a fixed one still gets it" {
+    var buf: [64]u8 = undefined;
+    var q = quiet(&buf);
+    try q.writer.print("{f}", .{sci(0.1, 6)});
+    try std.testing.expectEqual(@as(u64, 0), q.fullCount());
+    var w: Writer = .fixed(&buf);
+    try w.print("{f}", .{sci(0.1, 6)});
+    try std.testing.expectEqualStrings("1.000000e-01", w.buffered());
 }
 
 test "sci matches C %e digit for digit" {
@@ -2197,6 +2107,98 @@ fn expectStreamed(cards: []const core.Measure, early: bool) !usize {
     try std.testing.expectEqualSlices(u64, @ptrCast(want), @ptrCast(got));
     try std.testing.expectEqualStrings(want_text.written(), got_text.written());
     return n;
+}
+
+test "Stream's device passes, fed outside it, resolve and measure as feeding it does, to the bit" {
+    const gpa = std.testing.allocator;
+    const last = core.measure_last;
+    const sum: []const core.MeasureOp = &.{ .{ .vector = "v(a)" }, .{ .vector = "v(b)" }, .add };
+    const scaled: []const core.MeasureOp = &.{ .{ .vector = "v(b)" }, .{ .vector = "v(b)" }, .mul, .neg, .{ .num = 0.5 }, .mul };
+    const slope_t: []const core.MeasureOp = &.{ .{ .vector = "time" }, .{ .num = 0.1 }, .mul, .{ .vector = "v(a)" }, .sub, .{ .measure = 0 }, .{ .num = 3 }, .div, .add };
+    const cards = [_]core.Measure{
+        .{ .analysis = .tran, .name = "w", .func = .when, .first = .{ .vec = "v(a)", .val = 0.2, .rise = 2 } },
+        .{ .analysis = .tran, .name = "wv", .func = .when, .first = .{ .vec = "v(a)", .vec2 = "v(b)", .cross = 3, .td = 1 } },
+        .{ .analysis = .tran, .name = "wl", .func = .when, .first = .{ .vec = "v(a)", .val = 0.2, .fall = last, .to = 15 } },
+        .{ .analysis = .tran, .name = "wn", .func = .when, .first = .{ .vec = "v(a)", .val = 9, .to = 20 } },
+        .{ .analysis = .tran, .name = "tt", .func = .trig_targ, .first = .{ .vec = "v(a)", .val = 0.2, .rise = 1 }, .second = .{ .vec = "v(b)", .val = 0, .fall = 1 } },
+        .{ .analysis = .tran, .name = "fa", .func = .find, .first = .{ .vec = "v(b)", .at = 4.321 } },
+        .{ .analysis = .tran, .name = "da", .func = .deriv, .first = .{ .vec = "v(a)", .at = 7.5 } },
+        .{ .analysis = .tran, .name = "mx", .func = .max, .first = .{ .vec = "v(a)", .from = 1, .to = 6 } },
+        .{ .analysis = .tran, .name = "mn", .func = .min_at, .first = .{ .vec = "v(a)", .from = 1, .to = 6 } },
+        .{ .analysis = .tran, .name = "av", .func = .avg, .first = .{ .vec = "v(b)", .from = 2, .to = 9 } },
+        .{ .analysis = .tran, .name = "pp", .func = .pp, .first = .{ .vec = "v(b)", .to = 12 } },
+        .{ .analysis = .tran, .name = "ig", .func = .integ, .first = .{ .vec = "v(a)", .from = 0.7, .to = 8.3 } },
+        .{ .analysis = .tran, .name = "rm", .func = .rms, .first = .{ .vec = "v(a)", .to = 21 } },
+        // Stages and `par()` waveforms (the scale, an earlier card's NaN).
+        .{ .analysis = .tran, .name = "fw", .func = .find, .first = .{ .vec = "v(b)" }, .second = .{ .vec = "v(a)", .val = -0.3, .fall = 2 } },
+        .{ .analysis = .tran, .name = "dw", .func = .deriv, .first = .{ .ops = sum }, .second = .{ .vec = "v(a)", .val = 0.1, .cross = 4 } },
+        .{ .analysis = .tran, .name = "fp", .func = .find, .first = .{ .vec = "v(b)" }, .second = .{ .vec = "v(a)", .val = 0.05, .rise = 1 } },
+        .{ .analysis = .tran, .name = "fn", .func = .find, .first = .{ .vec = "v(b)" }, .second = .{ .vec = "v(a)", .val = 9, .rise = 1, .to = 5 } },
+        .{ .analysis = .tran, .name = "pa", .func = .avg, .first = .{ .ops = sum, .to = 9 } },
+        .{ .analysis = .tran, .name = "pw", .func = .when, .first = .{ .ops = sum, .ops2 = scaled, .vec2 = "v(b)", .cross = 2 } },
+        .{ .analysis = .tran, .name = "pt", .func = .max, .first = .{ .ops = slope_t, .to = 14 } },
+    };
+    const names: []const []const u8 = &.{ "time", "v(a)", "v(b)" };
+    const rows = 400;
+    for ([_]bool{ false, true }) |early| {
+        var host: Stream = try .init(gpa, &cards, names, &.{ 0, 1 }, &.{"time"});
+        defer host.deinit();
+        var dev: Stream = try .init(gpa, &cards, names, &.{ 0, 1 }, &.{"time"});
+        defer dev.deinit();
+        const got = (try dev.deviceScans(gpa)).?;
+        defer gpa.free(got.scans);
+        defer gpa.free(got.cols);
+        var t: f64 = 0;
+        var rec: std.ArrayList(f64) = .empty;
+        defer rec.deinit(gpa);
+        var stop_host: ?usize = null;
+        var stop_dev: ?usize = null;
+        for (0..rows) |i| {
+            const x = [_]f64{ @sin(t) + 0.5 * @sin(3.1 * t), 0.3 * @cos(0.7 * t) };
+            if (stop_host == null) {
+                try rec.append(gpa, t);
+                host.feed(t, &x, rec.items);
+                if (early and host.open == 0) stop_host = i;
+            }
+            if (stop_dev == null) {
+                var all = true;
+                const at = struct {
+                    v: *const [2]f64,
+                    pub fn at(c: @This(), u: u32) f64 {
+                        return c.v[u];
+                    }
+                }{ .v = &x };
+                for (got.scans, got.cols, 0..) |*d, c, k| {
+                    const y = c.read(t, at);
+                    d.feed(&got.scans[k -| 1], t, y[0], y[1]);
+                    all = all and d.over;
+                }
+                if (early and all) stop_dev = i;
+            }
+            t += 0.05 + 0.04 * @abs(@sin(11 * t));
+        }
+        try std.testing.expectEqual(stop_host, stop_dev);
+        try std.testing.expect(!early or stop_dev != null);
+        dev.adoptScans(got.scans);
+        try std.testing.expectEqual(host.open, dev.open);
+        try std.testing.expectEqualSlices(u64, @ptrCast(host.values), @ptrCast(dev.values));
+        const mh = try host.measured(gpa);
+        defer gpa.free(mh);
+        const md = try dev.measured(gpa);
+        defer gpa.free(md);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(mh), std.mem.sliceAsBytes(md));
+    }
+    // A card that reads two rows at a time, or a power, keeps the host's rows.
+    const pow: []const core.MeasureOp = &.{ .{ .vector = "v(a)" }, .{ .num = 2 }, .pow };
+    const host_only = [_]core.Measure{
+        .{ .analysis = .tran, .name = "e1", .func = .err1, .first = .{ .vec = "v(a)", .vec2 = "v(b)", .to = 9 } },
+        .{ .analysis = .tran, .name = "pw", .func = .max, .first = .{ .ops = pow, .to = 9 } },
+    };
+    for (0..host_only.len) |k| {
+        var s: Stream = try .init(gpa, host_only[k..][0..1], names, &.{ 0, 1 }, &.{"time"});
+        defer s.deinit();
+        try std.testing.expect(try s.deviceScans(gpa) == null);
+    }
 }
 
 test "Stream measures each card as the whole recording does, to the bit, early stop too" {

@@ -1,7 +1,7 @@
 //! Spectre statements -> SPICE cards: the Spectre dialect's reader, run on
 //! the logical lines before netlist.zig reads any card, as pattern.zig
 //! rewrites PAT sources. dev/frontend.md "Spectre dialect" is the mapping;
-//! § numbers cite dev/research/spectre-syntax.md, and tests/grammar/spectre.peg
+//! § numbers cite dev/research/spectre-syntax.md, and tests/frontend/grammar/spectre.peg
 //! is the syntax. A Spectre instance name says nothing about its device, so
 //! each rewritten device card's letter is kept beside it (`Translated.kinds`).
 const std = @import("std");
@@ -54,14 +54,8 @@ pub fn translate(arena: Allocator, in: []const []const u8) Error!Translated {
     return .{ .lines = t.out.items, .kinds = t.kinds.items };
 }
 
-/// Whether `line` is `simulator lang=<lang> ...`, compared
-/// case-insensitively, as a SPICE region writes it; fields after the
-/// language are ignored.
-pub fn switchesTo(line: []const u8, lang: []const u8) bool {
-    var f = lines.Fields("\"", false).init(line);
-    for ([_][]const u8{ "simulator", "lang", "=" }) |w| if (!std.ascii.eqlIgnoreCase(f.next() orelse return false, w)) return false;
-    return std.ascii.eqlIgnoreCase(f.next() orelse return false, lang);
-}
+/// Whether `line` is `simulator lang=<lang> ...` (the line reader's own test).
+pub const switchesTo = lines.spectre.Lines.switchesTo;
 
 /// A card of a `simulator lang=spice` region (§3.2): lowercased, its numbers
 /// written plain (SPICE suffixes, `meg` is 1e6), and `'expr'` as `"expr"`,
@@ -891,7 +885,7 @@ const T = struct {
         for (ps) |p| {
             const used = for (lead) |key| {
                 if (std.mem.eql(u8, key, p.key)) break true;
-            } else source and isWaveKey(p.key);
+            } else source and wave_keys.has(p.key);
             if (used) continue;
             try kv.print(t.arena, " {s}={s}", .{ p.key, try value(t.arena, p.value) });
         }
@@ -899,11 +893,12 @@ const T = struct {
         try t.device(letter, "{s}{s}{s}{s}{s}", .{ name, sep, pins, pos.items, kv.items });
     }
 
-    fn isWaveKey(key: []const u8) bool {
-        const keys = [_][]const u8{ "dc", "mag", "phase", "type", "val0", "val1", "period", "rise", "fall", "width", "delay", "sinedc", "ampl", "freq", "sinephase", "damp", "td1", "tau1", "td2", "tau2", "wave" };
-        for (keys) |k| if (std.mem.eql(u8, k, key)) return true;
-        return false;
-    }
+    /// The source parameters `waveform` reads.
+    const wave_keys = std.StaticStringMap(void).initComptime(.{
+        .{"dc"},        .{"mag"},  .{"phase"}, .{"type"},  .{"val0"},   .{"val1"}, .{"period"},
+        .{"rise"},      .{"fall"}, .{"width"}, .{"delay"}, .{"sinedc"}, .{"ampl"}, .{"freq"},
+        .{"sinephase"}, .{"damp"}, .{"td1"},   .{"tau1"},  .{"td2"},    .{"tau2"}, .{"wave"},
+    });
 
     /// `dc`, `mag`/`phase` and `type=` waveforms as SPICE source values.
     fn waveform(t: *T, pos: *std.ArrayList(u8), ps: []const Param) Error!void {

@@ -24,7 +24,7 @@
 //! matching d(ln w) = (1/T) integral v.b harmonic by harmonic gives
 //! v = -(y_dc + 2 sum_h y_ch cos + y_sh sin), which `hb.orbit` samples.
 //!
-//! Cites: dev/analysis/phase-noise.md, the Demir paper above, HSPICE
+//! Cites: the Demir paper above, HSPICE
 //! `.phasenoise` (METHOD, PHNOISE_LORENTZ, carrierindex).
 const std = @import("std");
 const root = @import("../types.zig");
@@ -39,7 +39,7 @@ const min_samples: usize = 64;
 
 /// Phase diffusion of an oscillator, c(f_m) = white + sum_s dc_s^2 /
 /// (2 f_m^ef_s), in s.
-pub const Diffusion = struct {
+const Diffusion = struct {
     white: f64,
     /// Per noise source: (1/T) integral coeff·(v_p - v_n) sqrt(flicker_s(t))
     /// dt, and its flicker exponent. A correlated group sums into its first
@@ -48,7 +48,7 @@ pub const Diffusion = struct {
     ef: []f64,
 
     /// c at offset `f_m` (Hz), in s.
-    pub fn at(d: Diffusion, f_m: f64) f64 {
+    fn at(d: Diffusion, f_m: f64) f64 {
         var c = d.white;
         for (d.dc, d.ef) |m, ef| if (m != 0) {
             c += m * m / (2 * std.math.pow(f64, f_m, ef));
@@ -57,7 +57,7 @@ pub const Diffusion = struct {
     }
 
     /// Frees `dc` and `ef` with the allocator `diffusion` was given.
-    pub fn deinit(d: Diffusion, gpa: std.mem.Allocator) void {
+    fn deinit(d: Diffusion, gpa: std.mem.Allocator) void {
         gpa.free(d.dc);
         gpa.free(d.ef);
     }
@@ -67,7 +67,7 @@ pub const Diffusion = struct {
 /// from the normalized left null vector `y` (`hb.solveSpectrum`'s `ppv`,
 /// overwritten). Samples both on `n_samples` points. The caller frees the
 /// result with `allocator`.
-pub fn diffusion(ckt: *root.Circuit, x_hat: []const f64, y: []f64, f0: f64, n_samples: usize, allocator: std.mem.Allocator) !Diffusion {
+fn diffusion(ckt: *root.Circuit, x_hat: []const f64, y: []f64, f0: f64, n_samples: usize, allocator: std.mem.Allocator) !Diffusion {
     const n: usize = ckt.n;
     const nf = x_hat.len / n;
     // v's spectrum in the orbit's [dc, cos_h, sin_h] amplitude convention.
@@ -152,7 +152,7 @@ fn periodic(ckt: *root.Circuit, x_hat: []const f64, f0: f64, srcs: []const root.
 /// METHOD=2: `nlp` below the first offset where it and `pac` agree within
 /// `match_db`, `pac` from there on; all `nlp` when they never agree. Both
 /// in dBc/Hz, written into `nlp`. Asserts pac.len == nlp.len.
-pub fn stitch(nlp: []f64, pac: []const f64, match_db: f64) void {
+fn stitch(nlp: []f64, pac: []const f64, match_db: f64) void {
     for (nlp, pac, 0..) |l, p, i| if (@abs(l - p) <= match_db) {
         @memcpy(nlp[i..], pac[i..]);
         return;

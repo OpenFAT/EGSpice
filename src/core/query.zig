@@ -18,6 +18,7 @@ pub const invalid_query: QueryId = @fromBackingInt(@intCast(std.math.maxInt(u32)
 pub const Method = enum { backward_euler, trapezoidal, gear_2, gear_3, gear_4, gear_5, gear_6 };
 /// Re-exported so a query reads its sweep type from one place.
 pub const FreqSweep = @import("numerics.zig").FreqSweep;
+/// Reachable by embedders only here: `espice.requests` exports `query`, not `numerics`.
 pub const SweepKind = @import("numerics.zig").SweepKind;
 
 /// One `.sp` port: the node rows and branch row of its source and its
@@ -626,8 +627,10 @@ pub const Tran = struct {
     /// t = 0 with the same history; points before `t_start` are dropped and
     /// none is added at it, as in ngspice (dctran.c:484).
     t_start: f64 = 0,
-    /// ngspice tmax. Null means t_stop / 50.
+    /// Explicit maximum step; wins over ceiling_policy.
     dt_max: ?f64 = null,
+    /// Opt-in requested ceiling. Device/event bounds still apply.
+    ceiling_policy: enum { compatibility, duration } = .compatibility,
     method: Method = .trapezoidal,
     /// ngspice `.options xmu`: the trapezoidal weight on the previous step's
     /// derivative (nicomcof.c). 0.5 is the plain trapezoid; below it each
@@ -656,6 +659,18 @@ pub const Tran = struct {
     tangents: []const u32 = &.{},
     /// What `Problem.append_points` asked of this point.
     point: PointOptions = .{},
+
+    /// The output-window span sets the implicit ceiling even though
+    /// integration starts at zero. Deck compatibility additionally caps
+    /// it at TSTEP; the direct API has historically omitted that cap.
+    pub fn requestedCeiling(t: Tran, origin: enum { api, deck }) f64 {
+        if (t.dt_max) |explicit| return explicit;
+        const span = t.t_stop - t.t_start;
+        return switch (t.ceiling_policy) {
+            .duration => span / 10,
+            .compatibility => if (origin == .deck) @min(t.dt_init, span / 50) else span / 50,
+        };
+    }
 };
 
 /// The points API's per-point requests (`Problem.append_points`), carried
@@ -1101,6 +1116,21 @@ test "every transient-family query runs off the transient operating point" {
     // MATEX integrates in time like .tran, so it starts from MODETRANOP (#27).
     inline for (.{ Kind.tran, Kind.matex, Kind.envelope, Kind.pss }) |k| try std.testing.expect(k.transient());
     try std.testing.expect(!Kind.dc.transient());
+}
+
+test "transient ceiling policy preserves explicit, deck and API precedence" {
+    const t = std.testing;
+    var q: Tran = .{ .t_stop = 100, .t_start = 20, .dt_init = 0.1 };
+    try t.expectEqual(@as(f64, 0.1), q.requestedCeiling(.deck));
+    try t.expectEqual(@as(f64, 1.6), q.requestedCeiling(.api));
+    q.ceiling_policy = .duration;
+    try t.expectEqual(@as(f64, 8), q.requestedCeiling(.api));
+    try t.expectEqual(@as(f64, 8), q.requestedCeiling(.deck));
+    q.dt_max = 0.2;
+    try t.expectEqual(@as(f64, 0.2), q.requestedCeiling(.api));
+    try t.expectEqual(@as(f64, 0.2), q.requestedCeiling(.deck));
+    const short: Tran = .{ .t_stop = 2e-12, .dt_init = 2e-12 };
+    try t.expectEqual(@as(f64, 4e-14), short.requestedCeiling(.deck));
 }
 
 test "CardNames.init fails cleanly at every allocation" {

@@ -1,0 +1,56 @@
+# The release binary as a Homebrew formula (macOS and Linux), after VerA's.
+# `tools/release.py verify` fills the @...@ fields from a release's tarballs;
+# release.yml attaches the result and, given a token, pushes it to the
+# OmarSiwy/homebrew-espice tap.
+class Espice < Formula
+  desc "SPICE circuit simulator with a built-in Verilog-A compiler (CPU build)"
+  homepage "https://github.com/OmarSiwy/ESPice"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/OmarSiwy/ESPice/releases/download/v@VERSION@/espice-@VERSION@-macos-arm64-cpu.tar.gz"
+      sha256 "@SHA256_MACOS_ARM64@"
+    end
+    on_intel do
+      url "https://github.com/OmarSiwy/ESPice/releases/download/v@VERSION@/espice-@VERSION@-macos-x86_64-cpu.tar.gz"
+      sha256 "@SHA256_MACOS_X86_64@"
+    end
+  end
+  on_linux do
+    on_arm do
+      url "https://github.com/OmarSiwy/ESPice/releases/download/v@VERSION@/espice-@VERSION@-linux-aarch64-cpu.tar.gz"
+      sha256 "@SHA256_LINUX_AARCH64@"
+    end
+    on_intel do
+      url "https://github.com/OmarSiwy/ESPice/releases/download/v@VERSION@/espice-@VERSION@-linux-x86_64-v1-cpu.tar.gz"
+      sha256 "@SHA256_LINUX_X86_64@"
+    end
+  end
+
+  def install
+    # espice finds share/espice beside its executable: the tree keeps its layout.
+    prefix.install "bin", "lib", "include", "share", "LICENSE"
+    doc.install "README.md", "CHANGELOGS.md"
+  end
+
+  def caveats
+    "Runtime .hdl models build with Zig @ZIG@ (zig on PATH, or ZIG)."
+  end
+
+  test do
+    assert_match "espice @VERSION@", shell_output("#{bin}/espice --version")
+    (testpath/"divider.sp").write <<~EOS
+      divider
+      V1 in 0 2
+      R1 in out 1k
+      R2 out 0 1k
+      .op
+      .end
+    EOS
+    system bin/"espice", "--backend", "cpu", "--format=csv", "--rawfile=op.csv", "divider.sp"
+    header, row = File.read(testpath/"op.csv").lines.map { |l| l.strip.split(",") }
+    assert_in_delta 1.0, row[header.index("v(out)")].to_f, 1e-9
+  end
+end

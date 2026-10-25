@@ -9,8 +9,8 @@
 //! the time shift would otherwise leave free. The Jacobian keeps its n x n
 //! shape, the osc column holding d(phi)/d(ln T) instead of d(phi)/d(x0[osc]).
 //!
-//! Cites: dev/analysis/pss-shooting-harmonic-balance.md, Verilog-A LRM
-//! §4.6.1 (sources follow their waveform only in the transient phase).
+//! Cites: Verilog-A LRM §4.6.1 (sources follow their waveform only in the
+//! transient phase).
 const std = @import("std");
 const root = @import("../types.zig");
 const take = root.take;
@@ -21,6 +21,8 @@ const dense_lu = @import("solver").dense_lu;
 const Gmres = @import("solver").gmres.Gmres;
 const solver = @import("solver");
 const Lanes = solver.lanes.Lanes;
+const gpu_lanes = @import("../gpu/lanes.zig");
+const direct = solver.direct;
 
 /// The lane system one period's step Newtons run on: each lane's own
 /// circuit and its own `PeriodHook` (phase 3's per-lane hooks).
@@ -172,19 +174,6 @@ fn periodAccept(ckt: *root.Circuit, hook: *const PeriodHook, x: []const f64, pro
     return true;
 }
 
-/// Integrates one period from x0 into x_end, leaving x0 untouched.
-inline fn integrateFrom(
-    ckt: *root.Circuit,
-    ws: *converger.Workspace,
-    sc: *Companion,
-    x0: []const f64,
-    x_end: []f64,
-    options: Options,
-) error{ QueryCancelled, OutOfMemory }!bool {
-    num.copySimd(x_end, x0);
-    return integrateOnePeriod(ckt, ws, sc, x_end, &.{}, &.{}, options);
-}
-
 /// GMRES matvec context: one FD directional derivative of the shooting map.
 const ShootingKrylovCtx = struct {
     ckt: *root.Circuit,
@@ -224,7 +213,8 @@ fn shootingMatvec(ctx: *ShootingKrylovCtx, v: []const f64, w: []f64) void {
         opts.period *= 1 + ctx.options.fd_epsilon * v[osc];
     }
 
-    const ok = integrateFrom(ctx.ckt, ctx.ws, ctx.sc, ctx.x_pert, ctx.x_end_pert, opts) catch |err| blk: {
+    num.copySimd(ctx.x_end_pert, ctx.x_pert);
+    const ok = integrateOnePeriod(ctx.ckt, ctx.ws, ctx.sc, ctx.x_end_pert, &.{}, &.{}, opts) catch |err| blk: {
         ctx.failure = ctx.failure orelse err;
         break :blk false;
     };
@@ -243,6 +233,224 @@ fn fdColumn(out: []f64, x_end: []const f64, x_start: []const f64, phi: []const f
     num.sub(out, out, phi);
     num.scale(out, inv_eps, out);
 }
+
+/// f64s the monodromy recurrence may hold (planes and trajectory) before the
+/// solve keeps the finite-difference columns instead: 512 MB.
+/// ponytail: one fixed budget; store factors instead of planes, or
+/// checkpoint the trajectory, if long periods on large circuits need it.
+const mono_budget: usize = 1 << 26;
+
+/// The shooting Jacobian Φ = dx(T)/dx0 by the trapezoid's own sensitivity
+/// recurrence over one recorded period,
+/// instead of one period integration per column or matvec. The base
+/// integration records every step's x_k; `build` evaluates G_k and C_k
+/// there once per shooting iteration, and each product Φ·v is then one
+/// linear solve per step on A_k = G_k + αC_k, no device evaluation:
+///
+///   s_0 = v, dq_0 = C_0 v, σ_0 = -mask·G_0 v (the i_prev seed's derivative)
+///   A_k s_k = α dq_{k-1} + σ_{k-1}
+///   dq_k = C_k s_k,  σ_k = α (dq_k - dq_{k-1}) - σ_{k-1}
+///
+/// The Jacobians are taken at the converged x_k, not at the step's last
+/// Newton iterate, so Φ is the exact derivative of the discrete map to
+/// within the step tolerance. An autonomous circuit's period column
+/// d x_N / d(ln T) runs the same recurrence from s_0 = 0, driven by α's
+/// dependence on T (dα/d(ln T) = -α, and α(q_k - q_{k-1}) = i_k + i_{k-1}):
+///
+///   A_k s_k = α dq_{k-1} + σ_{k-1} + α(q_k - q_{k-1}) - t_k ∂f/∂t
+///   σ_k = α (dq_k - dq_{k-1}) - α(q_k - q_{k-1}) - σ_{k-1}
+///
+/// with t_k ∂f/∂t, the sources' share, a finite difference in time at the
+/// recorded x_k (zero when every source is constant).
+const Mono = struct {
+    /// 0..n-1, the base request's probe list: its wave is the trajectory.
+    rows: []u32,
+    /// (n_samples + 1) rows [t, x...] of the base period.
+    traj: []f64,
+    g0: []f64,
+    /// C_k for k = 0..n_samples and A_k for k = 1..n_samples, nnz each.
+    c: []f64,
+    a: []f64,
+    /// Autonomous only, else empty: q_k for k = 0..n_samples and
+    /// t_k ∂f/∂t for k = 1..n_samples, n each.
+    q: []f64 = &.{},
+    ft: []f64 = &.{},
+    /// dq, σ, the right-hand side and C s: n each per column; grown.
+    work: []f64 = &.{},
+    slv: direct.Solver,
+    /// The trajectory of the last base period was recorded and `build` ran.
+    ready: bool = false,
+
+    fn init(gpa: std.mem.Allocator, ckt: *const root.Circuit, steps: usize, autonomous: bool) !?Mono {
+        const n: usize = ckt.n;
+        const nnz: usize = ckt.nnz;
+        const period_planes = if (autonomous) (2 * steps + 1) * n else 0;
+        if ((2 * steps + 2) * nnz + (steps + 1) * (n + 1) + period_planes > mono_budget) return null;
+        const rows = try gpa.alloc(u32, n);
+        errdefer gpa.free(rows);
+        for (rows, 0..) |*r, i| r.* = @intCast(i);
+        const traj = try gpa.alloc(f64, (steps + 1) * (n + 1));
+        errdefer gpa.free(traj);
+        const g0 = try gpa.alloc(f64, nnz);
+        errdefer gpa.free(g0);
+        const c = try gpa.alloc(f64, (steps + 1) * nnz);
+        errdefer gpa.free(c);
+        const a = try gpa.alloc(f64, steps * nnz);
+        errdefer gpa.free(a);
+        const q = try gpa.alloc(f64, if (autonomous) (steps + 1) * n else 0);
+        errdefer gpa.free(q);
+        const ft = try gpa.alloc(f64, if (autonomous) steps * n else 0);
+        errdefer gpa.free(ft);
+        var slv = try direct.Solver.init(gpa, ckt.n, ckt.col_ptr, ckt.row_idx, null, ckt.knobs.lu);
+        // Each step's values differ; the bypass copy never matches.
+        slv.dropBypass();
+        return .{ .rows = rows, .traj = traj, .g0 = g0, .c = c, .a = a, .q = q, .ft = ft, .slv = slv };
+    }
+
+    fn deinit(m: *Mono, gpa: std.mem.Allocator) void {
+        m.slv.deinit();
+        inline for (.{ m.traj, m.g0, m.c, m.a, m.q, m.ft, m.work }) |b| gpa.free(b);
+        gpa.free(m.rows);
+    }
+
+    /// Evaluates G and C at every recorded x_k of the base period, and for
+    /// an autonomous circuit q_k and t_k ∂f/∂t (one more eval per step).
+    fn build(m: *Mono, ckt: *root.Circuit, opts: Options) void {
+        const n: usize = ckt.n;
+        const nnz: usize = ckt.nnz;
+        const steps: usize = opts.n_samples;
+        const dt = opts.period / @as(f64, @floatFromInt(steps));
+        for (0..steps + 1) |k| {
+            const x = m.traj[k * (n + 1) + 1 ..][0..n];
+            const t = if (k == 0) 0 else stepTime(opts, k - 1);
+            const ft: []f64 = if (m.ft.len != 0 and k != 0) m.ft[(k - 1) * n ..][0..n] else &.{};
+            if (ft.len != 0) {
+                // f at t(1 + ε): the stretched period's step time.
+                const t_eps = t * (1 + opts.fd_epsilon);
+                ckt.setSimState(.{ .t = t_eps, .dt = dt, .kind = .tran });
+                ckt.eval(x, t_eps);
+                @memcpy(ft, ckt.rhs[0..n]);
+            }
+            ckt.setSimState(.{ .t = t, .dt = dt, .kind = .tran });
+            ckt.eval(x, t);
+            if (ft.len != 0) for (ft, ckt.rhs[0..n]) |*d, f| {
+                d.* = (d.* - f) / opts.fd_epsilon;
+            };
+            if (m.q.len != 0) {
+                const qk = m.q[k * n ..][0..n];
+                if (ckt.has_charge) @memcpy(qk, ckt.q_vec[0..n]) else @memset(qk, 0);
+            }
+            @memcpy(m.c[k * nnz ..][0..nnz], ckt.c_vals[0..nnz]);
+            if (k == 0) {
+                @memcpy(m.g0, ckt.g_vals[0..nnz]);
+            } else {
+                ckt.combineGC(2.0 / dt, m.a[(k - 1) * nnz ..][0..nnz]);
+            }
+        }
+        m.ready = true;
+    }
+
+    /// y = A x over the circuit pattern.
+    fn spmv(ckt: *const root.Circuit, vals: []const f64, x: []const f64, y: []f64) void {
+        @memset(y, 0);
+        for (0..ckt.n) |j| for (ckt.col_ptr[j]..ckt.col_ptr[j + 1]) |p| {
+            y[ckt.row_idx[p]] += vals[p] * x[j];
+        };
+    }
+
+    /// Replaces each of the r columns of `blk` (column-major, n each) by
+    /// Φ times it; column `period_col`, which must enter zero, receives
+    /// d x_N / d(ln T) instead (autonomous `Mono` only). False when some
+    /// A_k is singular (`blk` is garbage then).
+    fn apply(m: *Mono, gpa: std.mem.Allocator, ckt: *const root.Circuit, opts: Options, blk: []f64, r: usize, period_col: ?usize) error{OutOfMemory}!bool {
+        std.debug.assert(m.ready);
+        const n: usize = ckt.n;
+        const nnz: usize = ckt.nnz;
+        const steps: usize = opts.n_samples;
+        const alpha = 2.0 * @as(f64, @floatFromInt(steps)) / opts.period;
+        std.debug.assert(blk.len == n * r);
+        if (period_col) |pc| std.debug.assert(pc < r and m.q.len != 0);
+        if (m.work.len < 2 * n * r + 2 * n) {
+            gpa.free(m.work);
+            m.work = &.{};
+            m.work = try gpa.alloc(f64, 2 * n * r + 2 * n);
+        }
+        const dq = m.work[0 .. n * r];
+        const sig = m.work[n * r ..][0 .. n * r];
+        const rhs = m.work[2 * n * r ..][0..n];
+        const cs = m.work[2 * n * r + n ..][0..n];
+        const c0 = m.c[0..nnz];
+        for (0..r) |j| {
+            const s = blk[j * n ..][0..n];
+            spmv(ckt, c0, s, dq[j * n ..][0..n]);
+            const sg = sig[j * n ..][0..n];
+            spmv(ckt, m.g0, s, sg);
+            // As `periodStart` seeds i_prev = -rhs on rows with a diagonal C.
+            sg[0] = 0;
+            for (1..n) |i| sg[i] = if (c0[ckt.diag_slots[i]] != 0) -sg[i] else 0;
+            if (!ckt.has_charge) @memset(sg, 0);
+        }
+        for (1..steps + 1) |k| {
+            m.slv.factor(m.a[(k - 1) * nnz ..][0..nnz], .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return false, // else: a singular step Jacobian
+            };
+            const ck = m.c[k * nnz ..][0..nnz];
+            for (0..r) |j| {
+                const s = blk[j * n ..][0..n];
+                const dqj = dq[j * n ..][0..n];
+                const sg = sig[j * n ..][0..n];
+                const drive = period_col != null and period_col.? == j;
+                for (rhs, dqj, sg) |*b, d, g| b.* = alpha * d + g;
+                if (drive) for (rhs, m.q[k * n ..][0..n], m.q[(k - 1) * n ..][0..n], m.ft[(k - 1) * n ..][0..n]) |*b, qk, qp, f| {
+                    b.* += alpha * (qk - qp) - f;
+                };
+                m.slv.solve(rhs, s);
+                spmv(ckt, ck, s, cs);
+                for (sg, cs, dqj) |*g, c, d| g.* = alpha * (c - d) - g.*;
+                if (drive) for (sg, m.q[k * n ..][0..n], m.q[(k - 1) * n ..][0..n]) |*g, qk, qp| {
+                    g.* -= alpha * (qk - qp);
+                };
+                @memcpy(dqj, cs);
+            }
+        }
+        return true;
+    }
+};
+
+/// GMRES operator on the recorded monodromy: w = (Φ - I) v, the
+/// autonomous period column from `dphi_dlnt`. A singular step Jacobian
+/// sets `singular` and returns w = 0; the caller then falls back.
+const MonoKrylovCtx = struct {
+    mono: *Mono,
+    gpa: std.mem.Allocator,
+    ckt: *const root.Circuit,
+    options: Options,
+    n: usize,
+    dphi_dlnt: []const f64,
+    singular: bool = false,
+    failure: ?error{OutOfMemory} = null,
+
+    /// The GMRES operator. Reports allocation failure in `failure` and a
+    /// singular step Jacobian in `singular`, since GMRES takes a void matvec.
+    pub fn matvec(ctx: *MonoKrylovCtx, v: []const f64, w: []f64) void {
+        const n = ctx.n;
+        const osc = ctx.options.osc_node;
+        @memcpy(w[0..n], v[0..n]);
+        if (osc != root.GROUND) w[osc] = 0;
+        const ok = ctx.mono.apply(ctx.gpa, ctx.ckt, ctx.options, w[0..n], 1, null) catch |err| blk: {
+            ctx.failure = err;
+            break :blk false;
+        };
+        if (!ok) {
+            ctx.singular = true;
+            @memset(w[0..n], 0);
+            return;
+        }
+        for (w[0..n], v[0..n], 0..) |*wi, vi, i| wi.* -= if (i == osc and osc != root.GROUND) 0 else vi;
+        if (osc != root.GROUND) num.axpy(w[0..n], v[osc], ctx.dphi_dlnt);
+    }
+};
 
 /// Krylov path: solves (Phi - I) dx0 = -phi with matrix-free GMRES from a
 /// zero start.
@@ -308,6 +516,8 @@ const Shoot = struct {
     neg_phi: []f64,
     sc: Companion,
     krylov: ?Gmres,
+    /// The monodromy recurrence, unless over `mono_budget`.
+    mono: ?Mono = null,
     iter: u16 = 0,
     res_norm: f64 = std.math.inf(f64),
     stage: Stage = .base,
@@ -366,9 +576,12 @@ const Shoot = struct {
         }
         errdefer if (krylov) |*k| k.deinit(allocator);
 
+        var mono = try Mono.init(allocator, ckt, options.n_samples, options.osc_node != root.GROUND);
+        errdefer if (mono) |*m| m.deinit(allocator);
         try ckt.computeBaseline();
         const ws = try ckt.workspace();
         s.* = .{
+            .mono = mono,
             .ckt = ckt,
             .ws = ws,
             .probes = probes,
@@ -394,6 +607,7 @@ const Shoot = struct {
     }
 
     fn deinit(s: *Shoot) void {
+        if (s.mono) |*m| m.deinit(s.allocator);
         if (s.krylov) |*k| k.deinit(s.allocator);
         s.allocator.free(s.arena);
         s.* = undefined;
@@ -410,8 +624,10 @@ const Shoot = struct {
                     continue :sw .final;
                 }
                 if (s.iter != 0) try s.ckt.checkpoint(.{ .phase = .periodic, .completed = s.iter });
-                // integrateFrom(x0 -> x_end).
+                // x0 -> x_end, recording the trajectory the monodromy
+                // recurrence linearizes around.
                 num.copySimd(s.x_end, s.x0);
+                if (s.mono) |*m| return .{ .x = s.x_end, .probes = m.rows, .wave = m.traj, .opts = s.opts };
                 return .{ .x = s.x_end, .probes = &.{}, .wave = &.{}, .opts = s.opts };
             },
             .column => {
@@ -451,6 +667,7 @@ const Shoot = struct {
                     s.stage = .final;
                     return;
                 }
+                if (try s.monoStep()) return;
                 if (s.krylov) |*k| {
                     // ponytail: unpreconditioned; add an ILU preconditioner if GMRES stalls.
                     try krylovSolve(s.ckt, s.ws, &s.sc, n, s.x0, s.phi, s.x0_pert, s.x_end_pert, s.dx0, s.neg_phi, k, s.opts);
@@ -483,6 +700,54 @@ const Shoot = struct {
             },
             .done => unreachable,
         }
+    }
+
+    /// The Newton step on the recorded monodromy (`Mono`): every column of
+    /// the dense Jacobian in one recurrence pass, or GMRES on (Φ - I) with
+    /// one pass per matvec. The autonomous period column is one more
+    /// recurrence column. False, nothing changed, when there is no record
+    /// or a step Jacobian is singular: the caller keeps its FD path.
+    fn monoStep(s: *Shoot) !bool {
+        const m = if (s.mono) |*m| m else return false;
+        const n = s.n;
+        m.build(s.ckt, s.opts);
+        defer m.ready = false;
+        const osc = s.opts.osc_node;
+        if (s.krylov) |*k| {
+            // d(phi)/d(ln T) into x_end_pert.
+            if (osc != root.GROUND) {
+                @memset(s.x_end_pert[0..n], 0);
+                if (!try m.apply(s.allocator, s.ckt, s.opts, s.x_end_pert[0..n], 1, 0)) return false;
+            }
+            num.scale(s.neg_phi[0..n], -1.0, s.phi[0..n]);
+            var ctx: MonoKrylovCtx = .{ .mono = m, .gpa = s.allocator, .ckt = s.ckt, .options = s.opts, .n = n, .dphi_dlnt = s.x_end_pert[0..n] };
+            @memset(s.dx0[0..n], 0);
+            _ = k.solve(&ctx, s.neg_phi[0..n], s.dx0[0..n], s.options.gmres_tol, s.options.gmres_max_restarts);
+            if (ctx.failure) |err| return err;
+            if (ctx.singular) return false;
+            s.update();
+            return true;
+        }
+        // Dense: J = Φ - I, row-major, from the n unit columns.
+        const blk = try s.allocator.alloc(f64, n * n);
+        defer s.allocator.free(blk);
+        @memset(blk, 0);
+        for (0..n) |j| blk[j * n + j] = if (j == osc and osc != root.GROUND) 0 else 1;
+        const period_col: ?usize = if (osc != root.GROUND) osc else null;
+        if (!try m.apply(s.allocator, s.ckt, s.opts, blk, n, period_col)) return false;
+        for (0..n) |j| for (0..n) |row| {
+            const col_osc = j == osc and osc != root.GROUND;
+            s.j_phi[row * n + j] = blk[j * n + row] - @as(f64, if (row == j and !col_osc) 1 else 0);
+        };
+        try dense_lu.factorizeSolveNeg(n, s.j_phi, s.phi[0..n], s.dx0);
+        s.update();
+        return true;
+    }
+
+    /// Integrates every period the solve asks for on the host, to `result`.
+    fn runAlone(s: *Shoot) !SolveResult {
+        while (try s.next()) |r| try s.done(try integrateOnePeriod(s.ckt, s.ws, &s.sc, r.x, r.probes, r.wave, r.opts));
+        return s.result;
     }
 
     /// The damped Newton update that ends a shooting iteration.
@@ -523,8 +788,7 @@ pub fn solve(
     var s: Shoot = undefined;
     try s.init(ckt, x_dc, probes, wave, options, allocator);
     defer s.deinit();
-    while (try s.next()) |r| try s.done(try integrateOnePeriod(ckt, s.ws, &s.sc, r.x, r.probes, r.wave, r.opts));
-    return s.result;
+    return s.runAlone();
 }
 
 /// Starts an oscillator for the autonomous solve: kicks `x` (the DC point)
@@ -617,16 +881,17 @@ fn startOscillator(
 /// rows (time, probes...), n_samples+1 of them. Non-convergence prints a
 /// warning and still returns the last period.
 pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
-    try ctx.circuit.refuseDigital("pss");
-    const names = try root.probeNames(ctx, "time");
-    const data = try ctx.allocator.alloc(f64, (@as(usize, opts.n_samples) + 1) * names.len);
+    var shot: Shoot = undefined;
+    var names: []const []const u8 = undefined;
+    var data: []f64 = undefined;
+    try start(ctx, opts, &shot, &names, &data);
+    defer shot.deinit();
     errdefer ctx.allocator.free(data);
-    const res = try solve(ctx.circuit, ctx.x_op, ctx.probes, data, opts, ctx.scratch_allocator);
-    return finish(res, names, data, opts);
+    return finish(try shot.runAlone(), names, data, opts);
 }
 
-/// `run`'s setup for a lane: the same refusals, names and row buffer,
-/// then the shooting state in `shot`.
+/// `run`'s setup, shared with the lane drivers: the refusals, names and row
+/// buffer, then the shooting state in `shot`.
 fn start(ctx: *const root.RunCtx, opts: Options, shot: *Shoot, names: *[]const []const u8, data: *[]f64) !void {
     try ctx.circuit.refuseDigital("pss");
     names.* = try root.probeNames(ctx, "time");
@@ -804,6 +1069,135 @@ pub fn runLanes(comptime W: usize, ctxs: []const root.RunCtx, opts: Options, out
         const ok = integrateLanes(W, &sys, &lws, xv, &shots, &reqs, round) catch |e| return fail(&shots, &live, out, e);
         it = L.each(round);
         while (it.next()) |l| shots[l].done(ok & (@as(L.Mask, 1) << @intCast(l)) != 0) catch |e| kill(&shots, &live, out, l, e);
+    }
+}
+
+/// The fixed-period GPU driver has no host callbacks or stateful-charge
+/// rebase. State flips discovered during a period rerun it on the host
+/// from its unchanged start.
+fn gpuRefusal(ckt: *const root.Circuit) ?[]const u8 {
+    if (!gpu_lanes.available) return "no GPU images";
+    if (ckt.vpi != null or ckt.display != null or ckt.load_check != null) return "host callbacks";
+    if (ckt.minDelay() != null or ckt.has_state_q) return "stateful charge or delay";
+    for (ckt.batches) |b| {
+        const h = b.hooks;
+        if (h.gpu_payload == null or h.commit_state != null or h.predict_first_iterate != null or
+            h.check_convergence != null or h.advance_iteration != null or
+            std.mem.eql(u8, b.type_name, "kinduc")) return b.type_name;
+        const p = h.gpu_payload.?(b.ctx);
+        // Timer-only sources carry generated State bytes but their host
+        // hooks are intentionally null (device/eval.zig skipsTimerState).
+        // Gate the work that runs, not the presence of unused storage.
+        if ((h.update_state != null and p.lim_kernel.len == 0) or
+            (h.state_ctl != null and p.ctl_kernel.len == 0))
+            return "device shooting state";
+    }
+    return null;
+}
+
+/// Arbitrary-width shooting lanes. Each lane retains the same host Shoot
+/// state machine as runLanes; each round's fixed periods run on the device.
+/// Unsupported circuits and Newton pins use the scalar path explicitly.
+/// Krylov directional integrations inside Shoot.done remain on the host.
+pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void {
+    std.debug.assert(ctxs.len > 0 and out.len == ctxs.len);
+    if (comptime !gpu_lanes.available) {
+        for (ctxs, out) |*c, *o| o.* = run(c, opts);
+        return;
+    }
+    const pin = ctxs[0].circuit.knobs.newton.pin;
+    var refusal: ?[]const u8 = if (!(pin == .auto or pin == .direct) or root.Circuit.certify) "Newton pin or certification" else null;
+    for (ctxs) |c| {
+        if (refusal != null) break;
+        refusal = gpuRefusal(c.circuit);
+        if (c.circuit.n != ctxs[0].circuit.n or c.circuit.nnz != ctxs[0].circuit.nnz) refusal = "different patterns";
+    }
+    if (refusal) |why| {
+        if (ctxs[0].circuit.knobs.gpu_stats != .off) std.debug.print("gpu-pss: off ({s})\n", .{why});
+        for (ctxs, out) |*c, *o| o.* = run(c, opts);
+        return;
+    }
+    gpuShots(ctxs, opts, out) catch |err| for (out) |*o| {
+        o.* = err;
+    };
+}
+
+fn gpuShots(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) LaneError!void {
+    const gpa = ctxs[0].scratch_allocator;
+    const N = ctxs.len;
+    const shots = try gpa.alloc(Shoot, N);
+    defer gpa.free(shots);
+    const live = try gpa.alloc(bool, N);
+    defer gpa.free(live);
+    @memset(live, false);
+    defer for (shots, live) |*s, on| if (on) s.deinit();
+    const names = try gpa.alloc([]const []const u8, N);
+    defer gpa.free(names);
+    const data = try gpa.alloc([]f64, N);
+    defer gpa.free(data);
+    const requests = try gpa.alloc(Shoot.Request, N);
+    defer gpa.free(requests);
+    const periods = try gpa.alloc(gpu_lanes.FixedLane, N);
+    defer gpa.free(periods);
+    const indices = try gpa.alloc(usize, N);
+    defer gpa.free(indices);
+    const ok = try gpa.alloc(bool, N);
+    defer gpa.free(ok);
+    for (ctxs, 0..) |*c, l| {
+        start(c, opts, &shots[l], &names[l], &data[l]) catch |err| {
+            out[l] = err;
+            continue;
+        };
+        live[l] = true;
+    }
+    while (true) {
+        var count: usize = 0;
+        for (shots, live, 0..) |*s, *on, l| {
+            if (!on.*) continue;
+            const r = s.next() catch |err| {
+                out[l] = err;
+                s.deinit();
+                on.* = false;
+                continue;
+            };
+            if (r) |req| {
+                requests[count] = req;
+                indices[count] = l;
+                periodStart(s.ckt, &s.sc, req.x, req.probes, req.wave, req.opts);
+                periods[count] = .{
+                    .ckt = s.ckt,
+                    .x = req.x,
+                    .q_prev = s.sc.q_prev,
+                    .i_prev = s.sc.i_prev,
+                    .period = req.opts.period,
+                    .n_samples = req.opts.n_samples,
+                    .probes = req.probes,
+                    .wave = req.wave,
+                };
+                count += 1;
+            } else {
+                out[l] = finish(s.result, names[l], data[l], opts);
+                s.deinit();
+                on.* = false;
+            }
+        }
+        if (count == 0) break;
+        const options: converger.Options = .{ .max_iter = opts.max_newton_iter, .abstol = opts.newton_tol };
+        gpu_lanes.integrateFixed(gpa, periods[0..count], options, ok[0..count]) catch |err| switch (err) {
+            error.QueryCancelled, error.OutOfMemory => |e| return e,
+            else => {
+                std.log.warn("gpu pss: {s}; running {d} periods on the CPU", .{ @errorName(err), count });
+                for (indices[0..count], requests[0..count], ok[0..count]) |l, req, *done| {
+                    const s = &shots[l];
+                    done.* = try integrateOnePeriod(s.ckt, s.ws, &s.sc, req.x, req.probes, req.wave, req.opts);
+                }
+            },
+        };
+        for (indices[0..count], ok[0..count]) |l, done| shots[l].done(done) catch |err| {
+            out[l] = err;
+            shots[l].deinit();
+            live[l] = false;
+        };
     }
 }
 

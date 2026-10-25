@@ -3,7 +3,9 @@
 
   nixConfig = {
     extra-substituters = [ "https://omarsiwy.cachix.org" ];
-    extra-trusted-public-keys = [ "omarsiwy.cachix.org-1:fE15rGllP0D8ijLsCorvAx66mlXLp+1H1l0lR72iZ3U=" ];
+    extra-trusted-public-keys = [
+      "omarsiwy.cachix.org-1:fE15rGllP0D8ijLsCorvAx66mlXLp+1H1l0lR72iZ3U="
+    ];
   };
 
   inputs = {
@@ -11,6 +13,14 @@
     flake-utils.url = "github:numtide/flake-utils";
     zig-overlay.url = "github:mitchellh/zig-overlay";
     zig-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    nix-bundle.url = "github:nix-community/nix-bundle/eff01593f62794d458ec714090091419194ab64d";
+    nix-bundle.inputs.nixpkgs.follows = "nixpkgs";
+    nix-bundle.inputs.utils.follows = "flake-utils";
+    # The SPICE decks (tests/netlist/), also checked out at tests/conformance:
+    # a git flake leaves submodules out of its source.
+    conformance.url = "github:OmarSiwy/VAMS-Conformance-Suite";
+    conformance.inputs.nixpkgs.follows = "nixpkgs";
+    conformance.inputs.flake-utils.follows = "flake-utils";
   };
 
   outputs =
@@ -19,10 +29,21 @@
       nixpkgs,
       flake-utils,
       zig-overlay,
+      nix-bundle,
+      conformance,
       ...
     }:
     {
-      overlays.default = _: prev: removeAttrs self.packages.${prev.stdenv.hostPlatform.system} [ "default" ];
+      # Source builds only; the release binaries stay flake packages.
+      overlays.default =
+        _: prev:
+        removeAttrs self.packages.${prev.stdenv.hostPlatform.system} (
+          [
+            "default"
+            "latest"
+          ]
+          ++ builtins.attrNames (builtins.fromJSON (builtins.readFile ./sources.json))
+        );
     }
     // flake-utils.lib.eachDefaultSystem (
       system:
@@ -34,8 +55,44 @@
         lib = pkgs.lib;
         zig = zig-overlay.packages.${system}.master;
 
+        # Release binaries by version, written by tools/update-sources.py.
+        sources = lib.importJSON ./sources.json;
+        # The Zig a release's runtime .hdl builds with; a dev Zig is keyed by date in zig-overlay.
+        zigOf =
+          version:
+          zig-overlay.packages.${system}.${version} or (lib.findFirst (
+            z: lib.isDerivation z && z.version == version
+          ) (throw "zig-overlay has no Zig ${version}") (lib.attrValues zig-overlay.packages.${system}));
+        fromRelease =
+          version: s:
+          pkgs.stdenv.mkDerivation {
+            pname = "espice";
+            inherit version;
+            src = pkgs.fetchurl { inherit (s.${system}) url sha256; };
+            nativeBuildInputs = [ pkgs.makeWrapper ] ++ lib.optional pkgs.stdenv.isLinux pkgs.autoPatchelfHook;
+            dontConfigure = true;
+            dontBuild = true;
+            # Zig's ad-hoc Mach-O signature does not survive strip.
+            dontStrip = true;
+            installPhase = ''
+              cp -r . $out
+              wrapProgram $out/bin/espice --set-default ZIG ${zigOf s.zig}/bin/zig
+            '';
+            meta = {
+              description = "SPICE circuit simulator (release ${version} binary, CPU)";
+              mainProgram = "espice";
+              license = lib.licenses.asl20;
+              sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
+            };
+          };
+        releases = lib.mapAttrs fromRelease (lib.filterAttrs (_: s: s ? ${system}) sources);
+        latest =
+          if releases == { } then null else releases.${lib.last (lib.sort lib.versionOlder (lib.attrNames releases))};
+
         # Explicit glibc target: in the sandbox Zig falls back to a dynamic musl binary that cannot run.
-        zigTarget = "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-${if pkgs.stdenv.isDarwin then "macos" else "linux-gnu"}";
+        zigTarget = "${pkgs.stdenv.hostPlatform.parsed.cpu.name}-${
+          if pkgs.stdenv.isDarwin then "macos" else "linux-gnu.2.28"
+        }";
 
         src = lib.fileset.toSource {
           root = ./.;
@@ -46,6 +103,8 @@
             ./models
             ./include
             ./tests
+            ./tools
+            ./docs/embed/host.c
           ];
         };
 
@@ -62,18 +121,20 @@
             cp -r "$TMPDIR/zgc/p" "$out"
           '';
           outputHashMode = "recursive";
-          outputHash = "sha256-gv4ne6LnTrMbVpT4+55C69XiqhWyra9bgy4XuNOzSj8=";
+          outputHash = "sha256-AXyfU9Mm5OMrR8ZLq3NAYv2uvQTmhzMXUlbJiW3TxgY=";
         };
 
-        gpuPkgs = [
-          pkgs.cudaPackages.cudatoolkit
-          pkgs.rocmPackages.clr
-          pkgs.rocmPackages.rocminfo
-        ];
+        gpuPkgs = lib.optionals pkgs.stdenv.isLinux (
+          [ pkgs.cudaPackages.cudatoolkit ]
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
+            pkgs.rocmPackages.clr
+            pkgs.rocmPackages.rocminfo
+          ]
+        );
         gpuLibPath = lib.makeLibraryPath ([ "/run/opengl-driver" ] ++ gpuPkgs);
 
-        openvafPkg = import ./nix/openvaf.nix { inherit pkgs; };
-        vacaskPkg = import ./nix/vacask.nix { inherit pkgs openvafPkg; };
+        # The reference simulators come from the conformance suite's flake.
+        refPkgs = conformance.packages.${system};
 
         devShells = rec {
           ci = pkgs.mkShell {
@@ -90,13 +151,16 @@
             packages = gpuPkgs;
             LD_LIBRARY_PATH = gpuLibPath;
           };
+        }
+        // lib.optionalAttrs (system == "x86_64-linux") {
           benchmarking = pkgs.mkShell {
-            inputsFrom = [ default ];
+            inputsFrom = [ devShells.default ];
             packages = [
               (pkgs.python3.withPackages (ps: [ ps.matplotlib ]))
               pkgs.ngspice
-              openvafPkg
-              vacaskPkg
+              pkgs.xyce
+              refPkgs.openvaf-r
+              refPkgs.vacask
               pkgs.perf
               pkgs.inferno
             ];
@@ -104,14 +168,30 @@
           };
         };
 
-        # No HIP: device-kernel imports keep the host target, which LLVM rejects for amdgcn.
+        releaseTargets = builtins.fromJSON (builtins.readFile ./tools/release-targets.json);
+        releaseVariants = lib.concatMap (
+          host:
+          map (
+            backend:
+            host
+            // {
+              name = "${host.name}-${backend.name}";
+              inherit (backend) cuda hip;
+            }
+          ) (builtins.filter (backend: builtins.elem system backend.systems) releaseTargets.backends)
+        ) (builtins.filter (host: host.system == system) releaseTargets.hosts);
+
         mkEspice =
           {
-            cuda ? false,
+            name ? "espice",
+            target ? zigTarget,
+            cpu ? (if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "generic"),
+            cuda ? "none",
+            hip ? "none",
           }:
           pkgs.stdenv.mkDerivation {
-            pname = if cuda then "espice-cuda" else "espice";
-            version = "1.2.0";
+            pname = name;
+            version = "0.3.0";
             inherit src;
             nativeBuildInputs = [
               zig
@@ -124,17 +204,45 @@
               export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
               mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
               cp -r --no-preserve=mode,ownership ${zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
-              zig build install -Dtarget=${zigTarget} -Dhip-arch=none -Dcuda-arch=${if cuda then "sm_75" else "none"} \
+              zig build install -Doptimize=ReleaseSafe -Dtarget=${target} -Dcpu=${cpu} \
+                -Dgpu=${if cuda != "none" || hip != "none" then "true" else "false"} \
+                -Dhip-arch=${hip} -Dcuda-arch=${cuda} \
                 -j$NIX_BUILD_CORES --prefix "$out"
-              wrapProgram $out/bin/espice --set-default ZIG ${zig}/bin/zig
+              wrapProgram $out/bin/espice --set-default ZIG ${zig}/bin/zig \
+                ${lib.optionalString (hip != "none")
+                  "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ pkgs.rocmPackages.clr ]}"
+                }
             '';
             meta = {
-              description = "SPICE circuit simulator" + (if cuda then " with CUDA device kernels" else " (CPU build)");
+              description = "SPICE circuit simulator (${cpu}, CUDA ${cuda}, HIP ${hip})";
               mainProgram = "espice";
               license = lib.licenses.asl20;
             };
           };
         espice = mkEspice { };
+        espiceCuda = mkEspice {
+          name = "espice-cuda";
+          cuda = "sm_75";
+        };
+        baselineName = if pkgs.stdenv.hostPlatform.isx86_64 then "linux-x86_64-v1" else "linux-aarch64";
+        smoke =
+          name: espice:
+          pkgs.runCommand name { } ''
+          export HOME=$TMPDIR ESPICE_CACHE=$TMPDIR/cache
+          check() {
+            awk -F, -v col="$2" -v want="$3" '
+              NR == 1 { for (i = 1; i <= NF; i++) if ($i == col) c = i }
+              NR == 2 { d = $c - want; ok = c && d * d <= 1e-12 * want * want }
+              END { exit !ok }' "$1" || { echo "$1: $2 != $3"; cat "$1"; exit 1; }
+          }
+          cp -r ${conformance}/tests/netlist/hdl/veriloga_res_divider.{sp,assets} .
+          ${lib.getExe espice} --format=csv --rawfile=op.csv ${conformance}/tests/netlist/op/balanced_bridge.sp
+          check op.csv 'v(a)' 5
+          ${lib.getExe espice} --format=csv --rawfile=hdl.csv veriloga_res_divider.sp
+          check hdl.csv 'v(out)' 0.35
+          ls cache/hdl > /dev/null
+          touch $out
+        '';
       in
       {
         inherit devShells;
@@ -143,24 +251,38 @@
           default = espice;
           inherit espice;
         }
-        // lib.optionalAttrs pkgs.stdenv.isLinux { espice-cuda = mkEspice { cuda = true; }; };
+        // releases
+        // lib.optionalAttrs (latest != null) { inherit latest; }
+        // builtins.listToAttrs (
+          map (variant: {
+            name = "espice-${variant.name}";
+            value = mkEspice {
+              name = "espice-${variant.name}";
+              inherit (variant)
+                target
+                cpu
+                cuda
+                hip
+                ;
+            };
+          }) releaseVariants
+        )
+        // lib.optionalAttrs pkgs.stdenv.isLinux {
+          espice-cuda = espiceCuda;
+          # Reuse CI's baseline packages when bundling these release variants.
+          "espice-${baselineName}-cpu" = espice;
+          "espice-${baselineName}-cuda-sm_75" = espiceCuda;
+        };
 
-        checks.smoke = pkgs.runCommand "espice-smoke" { } ''
-          export HOME=$TMPDIR ESPICE_CACHE=$TMPDIR/cache
-          check() {
-            awk -F, -v col="$2" -v want="$3" '
-              NR == 1 { for (i = 1; i <= NF; i++) if ($i == col) c = i }
-              NR == 2 { d = $c - want; ok = c && d * d <= 1e-12 * want * want }
-              END { exit !ok }' "$1" || { echo "$1: $2 != $3"; cat "$1"; exit 1; }
-          }
-          cp -r ${./tests/fixtures/hdl}/veriloga_res_divider.{sp,assets} .
-          ${lib.getExe espice} --format=csv --rawfile=op.csv ${./tests/fixtures/op/balanced_bridge.sp}
-          check op.csv 'v(a)' 5
-          ${lib.getExe espice} --format=csv --rawfile=hdl.csv veriloga_res_divider.sp
-          check hdl.csv 'v(out)' 0.35
-          ls cache/hdl > /dev/null
-          touch $out
-        '';
+        bundlers = lib.optionalAttrs pkgs.stdenv.isLinux {
+          default = nix-bundle.bundlers.${system}.default;
+        };
+
+        checks = {
+          smoke = smoke "espice-smoke" espice;
+        }
+        # The newest release binary, as `nix run .#latest` installs it.
+        // lib.optionalAttrs (latest != null) { release = smoke "espice-release-smoke" latest; };
       }
     );
 }

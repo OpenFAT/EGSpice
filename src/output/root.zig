@@ -15,7 +15,9 @@ pub const validateQuery = types.validateQuery;
 pub const write = @import("write.zig").write;
 /// `.meas` results in ngspice's print format.
 pub const printMeasures = @import("measure").print;
+/// A failed sweep point's `.meas` heading and `name = NaN` lines.
 pub const printFailedMeasures = @import("measure").printFailed;
+/// The sweep point a `.meas` block names in its heading.
 pub const MeasurePoint = @import("measure").Point;
 /// `.meas` statistics over Monte Carlo trials.
 pub const printMeasureStatistics = @import("measure").printStatistics;

@@ -17,6 +17,10 @@
 // history is empty, so the transparent-line rows are stamped explicitly under
 // analysis("static") (LRM §5.8.1 allows an analysis expression to guard a
 // filter function).
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module tline(p1, n1, p2, n2);
     inout p1, n1, p2, n2;
     electrical p1, n1, p2, n2;

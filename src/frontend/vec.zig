@@ -1,7 +1,7 @@
 //! HSPICE digital vector files [SA Ch.9 "Specifying a Digital Vector File
 //! and Mixed Mode Stimuli"; CR .VEC]: `.vec 'file'` becomes netlist text,
 //! a PWL voltage source per input bit and a `.dout` card per output bit,
-//! as HSPICE converts them. tests/grammar/vec.peg is the spec. Read: RADIX,
+//! as HSPICE converts them. tests/frontend/grammar/vec.peg is the spec. Read: RADIX,
 //! VNAME (buses in any nesting of `[] {} () <>` around the `[hi:lo]`
 //! range; V1, V2, ... when absent), IO with `i`, `o` and `u`, TUNIT (with a
 //! multiplier), PERIOD, TSKIP, TDELAY, IDELAY, ODELAY, SLOPE, TRISE, TFALL,
@@ -214,19 +214,20 @@ pub fn expand(arena: std.mem.Allocator, src: []const u8) Error![]const u8 {
         for (0..times.items.len) |r| if (states.items[r * n + b] == 'z') return error.InvalidVector;
         // An X or U input drives to zero: VIL.
         const levels = [2]f64{ bit.vil, bit.vih };
-        var prev = states.items[b];
-        try out.print(arena, "vvec_{s} {s} {s} pwl(0 {e}", .{ bit.name, bit.name, bit.ref, levels[@intFromBool(prev == '1')] });
+        var prev = levels[@intFromBool(states.items[b] == '1')];
+        try out.print(arena, "vvec_{s} {s} {s} pwl(0 {e}", .{ bit.name, bit.name, bit.ref, prev });
         var points: usize = 1;
         for (times.items, 0..) |t, r| {
             const s = states.items[r * n + b];
-            if (levels[@intFromBool(s == '1')] == levels[@intFromBool(prev == '1')]) continue;
+            const level = levels[@intFromBool(s == '1')];
+            if (level == prev) continue;
             points += 2;
             if (points > max_points) return error.InvalidVector;
             const start = (t + bit.idelay) * unit;
             const edge = if (s == '1') bit.trise else bit.tfall;
             const ramp = if (edge) |e| e * unit else 0.1e-9;
-            try out.print(arena, " {e} {e} {e} {e}", .{ start, levels[@intFromBool(prev == '1')], start + ramp, levels[@intFromBool(s == '1')] });
-            prev = s;
+            try out.print(arena, " {e} {e} {e} {e}", .{ start, prev, start + ramp, level });
+            prev = level;
         }
         try out.appendSlice(arena, ")\n");
     }

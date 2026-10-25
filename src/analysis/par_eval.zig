@@ -1,5 +1,7 @@
-//! ParEval: the device stamp threaded over persistent worker lanes, bit for
-//! bit the serial stamp at any lane count (#137).
+//! The host device walks: the serial stamp (`stampRange`), the hook walks
+//! (`limitBatches` and friends) and ParEval, the device stamp threaded over
+//! persistent worker lanes, bit for bit the serial stamp at any lane count
+//! (#137).
 //!
 //! A pass has two phases. Stamp: lanes claim chunks of instances and each
 //! instance stores every stamp at its own position in a staging array
@@ -22,6 +24,7 @@ const device_ir = @import("device").abi;
 
 const Batch = device_ir.Batch;
 const Planes = device_ir.Planes;
+const StateCtlOp = device_ir.StateCtlOp;
 
 /// Which planes a stamp writes; see `device_ir.StampMode`. `.charge` uses
 /// the same staging and reduce as `.full`, so its q plane is bit-for-bit
@@ -141,6 +144,18 @@ pub const ParEval = struct {
     job_x: []const f64,
     job_t: f64,
     job_mode: Mode,
+    job_kind: Kind = .stamp,
+    job_x_mut: []f64 = &.{},
+    job_x_old: []const f64 = &.{},
+    /// The limit pass's OR and the state pass's earliest reject (as f64
+    /// bits; reject times are finite, so `@min` order equals bit order
+    /// only after the sign check `minBits` does).
+    any_limited: std.atomic.Value(bool) = .init(false),
+    reject_lock: std.atomic.Mutex = .unlocked,
+    min_reject: ?f64 = null,
+
+    /// What a pass runs: the stamp and reduce, or one per-instance walk.
+    const Kind = enum { stamp, limit, update };
 
     /// A u32 counter padded to a whole cache line: the struct's size rounds
     /// up to its alignment, so no other field shares the line.
@@ -313,19 +328,12 @@ pub const ParEval = struct {
         self.job_x = x;
         self.job_t = t;
         self.job_mode = mode;
+        self.job_kind = .stamp;
         self.next_task.v.store(0, .monotonic);
         self.next_block.v.store(0, .monotonic);
         self.stamped.v.store(0, .monotonic);
         self.done.v.store(0, .monotonic);
-        // Comptime-false single-threaded, so `startWorkers` never compiles there.
-        if (!builtin.single_threaded and self.n_lanes > 1) {
-            if (!self.started) self.startWorkers();
-            // seq_cst pairs with the worker's `sleepers` increment and epoch
-            // re-check: either it sees the new epoch or this sees it parking.
-            _ = self.wake.epoch.fetchAdd(1, .seq_cst);
-            if (self.wake.sleepers.load(.seq_cst) != 0)
-                self.io.futexWake(u32, &self.wake.epoch.raw, std.math.maxInt(u32));
-        }
+        self.ring();
         self.pass();
         waitCount(&self.done.v, self.n_lanes - 1);
         // The trash cells take no stamps here; give them their initial value.
@@ -342,6 +350,85 @@ pub const ParEval = struct {
         }
     }
 
+    /// `limitBatches` over the lanes: each chunk limits its instances, a
+    /// batch without `limit_range` runs whole in its first chunk, and every
+    /// batch's limiting is armed once all chunks are done. Bitwise the
+    /// serial walk: instances write only their own lim cells.
+    pub fn limit(self: *ParEval, batches: []const Batch, x: []f64, x_old: []const f64) bool {
+        self.job_batches = batches;
+        self.job_x_mut = x;
+        self.job_x_old = x_old;
+        self.any_limited.store(false, .monotonic);
+        self.walk(.limit);
+        for (batches) |b| if (b.hooks.limit_range != null) if (b.hooks.arm_limits) |f| f(b.ctx);
+        return self.any_limited.load(.monotonic);
+    }
+
+    /// `updateBatches` over the lanes; the earliest reject of any instance.
+    pub fn update(self: *ParEval, batches: []const Batch, x: []const f64) ?f64 {
+        self.job_batches = batches;
+        self.job_x = x;
+        self.min_reject = null;
+        self.walk(.update);
+        for (batches) |b| if (b.hooks.update_range != null) if (b.hooks.update_done) |f| f(b.ctx);
+        return self.min_reject;
+    }
+
+    fn walk(self: *ParEval, kind: Kind) void {
+        self.job_kind = kind;
+        self.next_task.v.store(0, .monotonic);
+        self.done.v.store(0, .monotonic);
+        self.ring();
+        self.walkPass();
+        waitCount(&self.done.v, self.n_lanes - 1);
+    }
+
+    /// Starts the workers on first use, then bumps `epoch` so they run the
+    /// pass just published, paying for the wake only when one is parked.
+    fn ring(self: *ParEval) void {
+        // Comptime-false single-threaded, so `startWorkers` never compiles there.
+        if (!builtin.single_threaded and self.n_lanes > 1) {
+            if (!self.started) self.startWorkers();
+            // seq_cst pairs with the worker's `sleepers` increment and epoch
+            // re-check: either it sees the new epoch or this sees it parking.
+            _ = self.wake.epoch.fetchAdd(1, .seq_cst);
+            if (self.wake.sleepers.load(.seq_cst) != 0)
+                self.io.futexWake(u32, &self.wake.epoch.raw, std.math.maxInt(u32));
+        }
+    }
+
+    /// One lane's share of a limit or update pass.
+    fn walkPass(self: *ParEval) void {
+        var limited = false;
+        var reject: ?f64 = null;
+        while (true) {
+            const i = self.next_task.v.fetchAdd(1, .monotonic);
+            if (i >= self.tasks.len) break;
+            const task = self.tasks[i];
+            const b = self.job_batches[task.batch];
+            switch (self.job_kind) {
+                .limit => if (b.hooks.limit_range) |f| {
+                    if (f(b.ctx, self.job_x_mut, self.job_x_old, task.first, task.last)) limited = true;
+                } else if (task.first == 0) if (b.hooks.apply_limits) |f| {
+                    if (f(b.ctx, self.job_x_mut, self.job_x_old)) limited = true;
+                },
+                .update => {
+                    const tr = if (b.hooks.update_range) |f|
+                        f(b.ctx, self.job_x, task.first, task.last)
+                    else if (task.first == 0) if (b.hooks.update_state) |f| f(b.ctx, self.job_x) else null else null;
+                    if (tr) |t| reject = if (reject) |cur| @min(cur, t) else t;
+                },
+                .stamp => unreachable,
+            }
+        }
+        if (limited) self.any_limited.store(true, .monotonic);
+        if (reject) |t| {
+            while (!self.reject_lock.tryLock()) std.atomic.spinLoopHint();
+            defer self.reject_lock.unlock();
+            self.min_reject = if (self.min_reject) |cur| @min(cur, t) else t;
+        }
+    }
+
     fn startWorkers(self: *ParEval) void {
         const epoch0 = self.wake.epoch.load(.acquire);
         for (self.threads) |*th| {
@@ -352,6 +439,7 @@ pub const ParEval = struct {
     }
 
     fn workerMain(self: *ParEval, epoch0: u32) void {
+        pinToPerformanceCores();
         var last: u32 = epoch0;
         while (true) {
             var spins: u32 = 0;
@@ -376,7 +464,7 @@ pub const ParEval = struct {
             }
             last = e;
             if (self.wake.quit.load(.acquire)) return;
-            self.pass();
+            if (self.job_kind == .stamp) self.pass() else self.walkPass();
             _ = self.done.v.fetchAdd(1, .release);
         }
     }
@@ -503,11 +591,42 @@ fn cutBlocks(gpa: std.mem.Allocator, slot_seg: []const u32, row_seg: []const u32
 /// 64,244 capacitors and 241 ms of an eval pass that took the PSP103 lanes
 /// 5-7 s: a PSP103 instance costs about 1,000 capacitors, not 36. Only the
 /// chunk sizes depend on it, never the results.
-fn instanceWeight(b: Batch) u64 {
+pub fn instanceWeight(b: Batch) u64 {
     // At least 1: the chunking divides by it, and an instance with no
     // unknowns still costs a call.
     const stamps = @max(@as(u64, b.n_u) * b.n_u, 1);
     return if (b.has_const_jacobian) stamps else 16 * stamps;
+}
+
+/// Moves the calling thread onto the performance cores of a hybrid CPU
+/// (`/sys/devices/cpu_core/cpus`, Intel's P-core list), leaving it alone
+/// elsewhere or on any failure. A worker lane on an E-core stamped PSP103
+/// about 2x slower than one on a P-core, and four P-core lanes beat four
+/// mixed ones by 1.35-1.38x (dev/devices/gpu-evaluation.md, "Eight host
+/// threads"). The lane counts the thread pool hands out stay within the
+/// P-core threads, so pinned lanes do not pile onto each other.
+fn pinToPerformanceCores() void {
+    if (comptime builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
+    const rc = linux.open("/sys/devices/cpu_core/cpus", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [256]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS) return;
+    var set: linux.cpu_set_t = @splat(0);
+    var any = false;
+    var ranges = std.mem.tokenizeAny(u8, buf[0..n], ",\n ");
+    while (ranges.next()) |r| {
+        var ends = std.mem.splitScalar(u8, r, '-');
+        const lo = std.fmt.parseInt(usize, ends.first(), 10) catch return;
+        const hi = if (ends.next()) |h| std.fmt.parseInt(usize, h, 10) catch return else lo;
+        if (hi < lo or hi >= set.len * @bitSizeOf(usize)) return;
+        for (lo..hi + 1) |c| set[c / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(c % @bitSizeOf(usize));
+        any = true;
+    }
+    if (any) linux.sched_setaffinity(0, &set) catch {};
 }
 
 /// Spins, then yields, until `counter` reaches `target`. `pause` frees
@@ -610,4 +729,53 @@ test instanceWeight {
     try std.testing.expectEqual(@as(u64, 9), instanceWeight(b));
     b.has_const_jacobian = false;
     try std.testing.expectEqual(@as(u64, 144), instanceWeight(b));
+}
+
+// Host walks over a batch slice: each runs one device hook over every batch
+// in order. `Circuit` walks all of its batches; the GPU context walks the
+// ones it keeps on the host, or all of them after a fault.
+
+/// `applyLimits` over `batches` on the host.
+pub fn limitBatches(batches: []const Batch, x: []f64, x_old: []const f64) bool {
+    var any_limited = false;
+    for (batches) |b| if (b.hooks.apply_limits) |f| {
+        if (f(b.ctx, x, x_old)) any_limited = true;
+    };
+    return any_limited;
+}
+
+/// `seedJunctions` over `batches` on the host.
+pub fn seedBatches(batches: []const Batch, x: []f64) void {
+    for (batches) |b| if (b.hooks.seed) |f| f(b.ctx, x);
+}
+
+/// `clearLimits` over `batches` on the host.
+pub fn clearLimitBatches(batches: []const Batch) void {
+    for (batches) |b| if (b.hooks.clear_limits) |f| f(b.ctx);
+}
+
+/// `updateStates`' device walk over `batches`: the earliest reject time,
+/// or null. Stages state for the next `stateCtl`.
+pub fn updateBatches(batches: []const Batch, x: []const f64) ?f64 {
+    return minReject(batches, "update_state", x);
+}
+
+/// `stateCtl` over `batches` on the host.
+pub fn stateCtlBatches(batches: []const Batch, sop: StateCtlOp) bool {
+    var dirty = false;
+    for (batches) |b| if (b.hooks.state_ctl) |f| {
+        if (f(b.ctx, sop)) dirty = true;
+    };
+    return dirty;
+}
+
+/// Earliest step-reject time any batch's `hook` returns, or null.
+pub fn minReject(batches: []const Batch, comptime hook: []const u8, x: []const f64) ?f64 {
+    var min_reject: ?f64 = null;
+    for (batches) |b| {
+        if (@field(b.hooks, hook)) |f| if (f(b.ctx, x)) |tr| {
+            min_reject = if (min_reject) |cur| @min(cur, tr) else tr;
+        };
+    }
+    return min_reject;
 }

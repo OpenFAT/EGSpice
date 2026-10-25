@@ -105,3 +105,16 @@ test "Spectre line rules, by spectre-syntax.md section" {
     try expectLines(lines.spectre, "r1 a\n * b\n", &.{ "r1 a", "* b" });
     try expectLines(lines.spectre, "r1 \"a//b\" // c\n", &.{"r1 \"a//b\""});
 }
+
+test "logical lines per dialect" {
+    try expectLines(lines.ngspice, "", &.{});
+    try expectLines(lines.ngspice, "* c\nr1 a b 1k $ tail\n+ 2 ; more\n\n* mid\n+ 3\n$ only\nc1 x y 1p\r\n", &.{ "r1 a b 1k 2 3", "c1 x y 1p" });
+    // `\\` squeezes the blanks out of the join, ` \` keeps one (HSPICE User
+    // Guide B-2008.09 p. 40); `$` after a number or a comma is a comment (p. 56).
+    try expectLines(lines.hspice, "r1 a b$c 1k $ tail\nr2 a \\\\\nb 2\n+ 3\n", &.{ "r1 a b$c 1k", "r2 ab 2 3" });
+    try expectLines(lines.hspice, "$ note\nr3 a b \\\n  2k$c\nr4 a b 1,$c\n", &.{ "r3 a b 2k", "r4 a b 1," });
+    // No `/* */` in Spectre (spectre-syntax.md §1.3); `*` comments only in
+    // the first column; a SPICE region reads as HSPICE does.
+    try expectLines(lines.spectre, "r1 (a b) resistor r=1k // c\nr2 \"x//y\" b \\\n  r=2\n// note\n+ m=1\n* gone\n", &.{ "r1 (a b) resistor r=1k", "r2 \"x//y\" b r=2 m=1" });
+    try expectLines(lines.spectre, "simulator lang=spice\nR1 a b 1k $ c\n+ tc1=1\nsimulator lang=spectre\nr2 (a b) resistor r=1 $x\n", &.{ "simulator lang=spice", "R1 a b 1k tc1=1", "simulator lang=spectre", "r2 (a b) resistor r=1 $x" });
+}

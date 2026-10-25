@@ -8,12 +8,12 @@
 //! the noise that sampled runs on the same steps would add (`Covariance`).
 //! In: a circuit at its operating point and its noise sources. Out: the
 //! probes at every accepted point, plus `onoise` under SDE.
-//! Cites HSPICE `.trannoise` (SEED, TIME=, SAMPLES), Verilog-AMS LRM §9.10
-//! and dev/analysis/transient-noise.md.
+//! Cites HSPICE `.trannoise` (SEED, TIME=, SAMPLES) and Verilog-AMS LRM
+//! §9.10.
 const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
-const dense_lu = @import("solver").dense_lu;
+const direct = @import("solver").direct;
 const numerics = @import("core").numerics;
 const integrator = @import("integrator.zig");
 
@@ -199,16 +199,21 @@ const Injection = struct {
 ///   x_k = A^-1 (P x_{k-1} + J y_k + w_k)
 ///   K_k = A^-1 (P K P^T + P Kxy D J^T + J D Kxy^T P^T + J V J^T + N) A^-T
 ///   Kxy_k = A^-1 (P Kxy D + J V),
-/// with K = E[x x^T] and Kxy = E[x y^T], both zero at t = 0.
-// ponytail: dense n x n K and a dense LU per step, O(n^3) a step. A
-// low-rank factor of K over a sparse LU is the upgrade for large circuits.
+/// with K = E[x x^T] and Kxy = E[x y^T], both zero at t = 0. A is the
+/// circuit's sparse LU, so a step costs 2n + poles sparse solves and the
+/// O(n nnz) products, not a dense O(n^3) factor.
+// ponytail: K itself stays dense, n^2 memory and O(n^2) a step. A
+// low-rank factor of K is the upgrade past a few thousand unknowns.
 const Covariance = struct {
     /// Row-major n x n: K, then the products that become the next K.
     k: []f64,
     m: []f64,
-    /// Dense G + C/h, factored in place.
+    /// Row-major n x n scratch for P K.
     a: []f64,
-    piv: []u32,
+    /// G + C/h on the circuit pattern and its LU, made by the first `step`.
+    vals: []f64 = &.{},
+    slv: ?direct.Solver = null,
+    gpa: std.mem.Allocator,
     /// Pole-major `poles x n`: row p is E[x y_p].
     kxy: []f64,
     /// Where each group injects; the white PSD is its lead's.
@@ -224,7 +229,7 @@ const Covariance = struct {
             .m = buf[n * n ..][0 .. n * n],
             .a = buf[2 * n * n ..][0 .. n * n],
             .kxy = buf[3 * n * n ..],
-            .piv = try gpa.alloc(u32, n),
+            .gpa = gpa,
             .inj = inj,
             .n = n,
         };
@@ -232,7 +237,8 @@ const Covariance = struct {
 
     fn deinit(c: *Covariance, gpa: std.mem.Allocator) void {
         gpa.free(c.k.ptr[0 .. 3 * c.n * c.n + c.kxy.len]);
-        gpa.free(c.piv);
+        gpa.free(c.vals);
+        if (c.slv) |*slv| slv.deinit();
     }
 
     /// out[row] += alpha * C x for every row; C from the CSC plane.
@@ -289,16 +295,18 @@ const Covariance = struct {
             numerics.copySimd(row, u);
             for (nodes, weights) |node, w| row[node] += w * v;
         }
-        ckt.denseG(c.a);
-        for (0..n) |j| for (ckt.col_ptr[j]..ckt.col_ptr[j + 1]) |p| {
-            c.a[@as(usize, ckt.row_idx[p]) * n + j] += alpha * ckt.c_vals[p];
-        };
-        try dense_lu.factorize(n, c.a, c.piv);
-        for (0..flicker.source.len) |p| dense_lu.solveFactored(n, c.a, c.piv, c.kxy[p * n ..][0..n], c.kxy[p * n ..][0..n]);
+        if (c.slv == null) {
+            c.vals = try c.gpa.alloc(f64, ckt.nnz);
+            c.slv = try direct.Solver.init(c.gpa, ckt.n, ckt.col_ptr, ckt.row_idx, null, ckt.knobs.lu);
+        }
+        const slv = &c.slv.?;
+        ckt.combineGC(alpha, c.vals);
+        try slv.factor(c.vals, .{});
+        for (0..flicker.source.len) |p| slv.solve(c.kxy[p * n ..][0..n], c.kxy[p * n ..][0..n]);
         // K = A^-1 (A^-1 m)^T, m symmetric: rows of m are its columns.
-        for (0..n) |i| dense_lu.solveFactored(n, c.a, c.piv, c.m[i * n ..][0..n], c.m[i * n ..][0..n]);
+        for (0..n) |i| slv.solve(c.m[i * n ..][0..n], c.m[i * n ..][0..n]);
         transpose(c.m, n);
-        for (0..n) |i| dense_lu.solveFactored(n, c.a, c.piv, c.m[i * n ..][0..n], c.k[i * n ..][0..n]);
+        for (0..n) |i| slv.solve(c.m[i * n ..][0..n], c.k[i * n ..][0..n]);
     }
 
     /// Variance of x[a] - x[b].
@@ -356,7 +364,7 @@ const NoiseHook = struct {
 /// `options.sde` nothing is drawn, and `onoise` (required then) gets the rms
 /// noise of v(out_node, out_neg) at every recorded point, grown on
 /// `allocator`.
-pub fn simulate(
+fn simulate(
     ckt: *root.Circuit,
     x: []f64,
     probes: []const u32,
@@ -412,6 +420,7 @@ pub fn simulate(
     var t: f64 = 0;
     var dt: f64 = options.dt_init;
     var steps: u32 = 0;
+    const nr_opts = converger.optionsFromTolerances(options.tol, options.tol.itl4);
 
     var attempts: u64 = 0;
     while (t < options.t_stop and steps < options.max_steps) {
@@ -443,8 +452,7 @@ pub fn simulate(
         // targets (§9.10 `$abstime`); a rejected step retries from here.
         ckt.setSimState(.{ .t = t + dt, .dt = dt, .kind = .tran, .initial_step = steps == 0 });
         numerics.copySimd(x_try, x);
-        const tn_nr_opts = converger.optionsFromTolerances(options.tol, options.tol.itl4);
-        const nr = converger.run(ckt, ws, x_try, t + dt, tn_nr_opts, hook) catch |err| switch (err) {
+        const nr = converger.run(ckt, ws, x_try, t + dt, nr_opts, hook) catch |err| switch (err) {
             error.QueryCancelled, error.OutOfMemory => return err,
             else => converger.Result{ .converged = false, .iterations = 0 }, // else: a numerical failure retries the step
         };

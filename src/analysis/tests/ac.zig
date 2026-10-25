@@ -31,7 +31,7 @@ const StreamTests = struct {
             completed: u16 = 0,
             cancel: bool = false,
 
-            fn checkpoint(ctx: *anyopaque, event: @import("../progress.zig").Event) error{QueryCancelled}!void {
+            fn checkpoint(ctx: *anyopaque, event: @import("../worker.zig").Event) error{QueryCancelled}!void {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 self.calls += 1;
                 self.completed = @intCast(event.completed);
@@ -108,7 +108,7 @@ const StreamTests = struct {
 const NoiseTests = struct {
     const impl = @import("../ac/noise.zig");
     const Band = impl.test_access.Band;
-    const NoiseSource = impl.NoiseSource;
+    const NoiseSource = @import("../types.zig").NoiseSource;
     const nintegrate = impl.test_access.nintegrate;
     const sourcePsd = impl.sourcePsd;
     const std = @import("std");

@@ -19,7 +19,8 @@ const sparse_lu = @import("sparse_lu.zig");
 const tridiag_mod = @import("tridiag.zig");
 const order_mod = @import("order.zig");
 const bbd_mod = @import("bbd.zig");
-const lu_kernels = @import("lu_kernels.zig");
+const lu_kernels = @import("kernels/lu.zig");
+const subtree = @import("subtree.zig");
 const num = @import("core").numerics;
 
 const Allocator = std.mem.Allocator;
@@ -96,6 +97,8 @@ pub const Solver = struct {
     /// The live engine. The general LU is built only when a structured
     /// engine is demoted, so BBD and tridiagonal systems never pay for it.
     engine: Engine,
+    /// The engine `init` picked, which `reset` restores after a demotion.
+    init_engine: std.meta.Tag(Engine) = .lu,
     gpa: Allocator,
     /// True once a factorization matches `vcopy`.
     factored: bool = false,
@@ -111,6 +114,9 @@ pub const Solver = struct {
     /// The multicore refactor of the current pivot epoch, when the cost
     /// model admitted it (`refactorLu`).
     par: ?lu_kernels.HostRefactor = null,
+    /// The subtree refactor of the current pivot epoch, for a thin factor
+    /// the ticketed one declined (`refactorLu`).
+    sub: ?subtree.Plan = null,
     /// Pivot epoch the cost model last judged.
     par_epoch: u32 = 0,
     /// A device factored `vcopy` and the LU still holds older values. The
@@ -131,22 +137,73 @@ pub const Solver = struct {
     /// `deinit`. Asserts that `col_ptr` has n + 1 entries and `row_idx`
     /// covers them.
     pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs) !Self {
+        return initOrdered(gpa, n, col_ptr, row_idx, bbd, knobs, null);
+    }
+
+    /// `init`, reusing `order` (the `q` another solver's LU computed on this
+    /// same pattern, copied) when the engine is the sparse LU: a sweep's
+    /// queries share one pattern, and BTF + AMD cost 95M instructions a
+    /// call on a 100k-node ladder.
+    pub fn initOrdered(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs, order: ?[]const u32) !Self {
         assert(col_ptr.len == @as(usize, n) + 1);
         assert(row_idx.len >= col_ptr[n]);
         var self: Self = .{ .n = n, .col_ptr = col_ptr, .row_idx = row_idx, .engine = undefined, .gpa = gpa, .knobs = knobs };
+        if (order) |o| {
+            assert(o.len == n);
+            self.q = try gpa.dupe(u32, o);
+        }
+        // `q` is freed here on failure until an engine holds; after that,
+        // `deinit` frees it.
+        var engine_set = false;
+        errdefer if (!engine_set) gpa.free(self.q);
         if (tridiag_mod.isTridiag(n, col_ptr, row_idx)) {
             self.engine = .{ .tri = try TriDiag.init(gpa, n, col_ptr, row_idx) };
         } else if (try initBbd(gpa, n, col_ptr, row_idx, bbd, knobs)) |eng| {
             self.engine = .{ .bbd = eng };
         } else {
-            errdefer gpa.free(self.q);
             self.engine = .{ .lu = try self.initLu() };
         }
+        engine_set = true;
+        self.init_engine = self.engine;
         errdefer self.deinit();
         self.vcopy = try gpa.alloc(f64, col_ptr[n]);
         if (self.engine == .bbd) self.refine_buf = try gpa.alloc(f64, 4 * @as(usize, n));
         assert(!self.factored);
         return self;
+    }
+
+    /// Returns the solver to its state right after `initOrdered`, keeping
+    /// its allocations: the next `factor` pivots from scratch as a fresh
+    /// solver's would, so everything after it is bitwise a fresh solver's.
+    /// A structured engine demoted since `init` is rebuilt, which is why
+    /// `bbd` must be what `init` got. `gen` moves on, so a device copy of
+    /// the factors goes stale. Fails only with `OutOfMemory`, rebuilding a
+    /// demoted engine or the bypass copy `dropBypass` freed, and leaves the
+    /// solver usable (unfactored) then.
+    pub fn reset(self: *Self, bbd: ?num.BbdInfo) Allocator.Error!void {
+        self.factored = false;
+        self.host_stale = false;
+        self.params = .{};
+        self.gen +%= 1;
+        self.dropPlans();
+        if (self.sparse()) |lu| {
+            lu.factored = false;
+            self.par_epoch = lu.pattern_epoch;
+        }
+        if (self.vcopy.len == 0) self.vcopy = try self.gpa.alloc(f64, self.col_ptr[self.n]);
+        if (self.engine == self.init_engine) return;
+        const eng: Engine = switch (self.init_engine) {
+            .lu => unreachable, // the general LU is never demoted
+            .tri => .{ .tri = try TriDiag.init(self.gpa, self.n, self.col_ptr, self.row_idx) },
+            // `init` accepted this pattern and info, and `Bbd.init` is a
+            // function of them.
+            .bbd => .{ .bbd = (initBbd(self.gpa, self.n, self.col_ptr, self.row_idx, bbd, self.knobs) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+            }).? },
+        };
+        self.engine.lu.deinit(self.gpa);
+        self.engine = eng;
+        assert(self.engine == self.init_engine);
     }
 
     /// The general LU, or null while a structured engine is live.
@@ -159,10 +216,26 @@ pub const Solver = struct {
 
     /// Orders the pattern (once) and builds the general LU on it.
     fn initLu(self: *Self) !SparseLu {
-        if (self.q.len == 0) self.q = try computeOrdering(self.gpa, self.n, self.col_ptr, self.row_idx);
-        assert(self.q.len == self.n);
-        var lu = try SparseLu.init(self.gpa, self.n, self.col_ptr, self.q);
+        const gpa = self.gpa;
+        const n = self.n;
+        if (instrument and self.knobs.stats) btfCensus(gpa, n, self.col_ptr, self.row_idx) catch {};
+        // One slab for the ordering and the fill bound; both restore it.
+        const ws_buf = try gpa.alloc(u32, order_mod.wsSize(n, self.col_ptr[n]));
+        defer gpa.free(ws_buf);
+        var ws = order_mod.Ws.init(ws_buf);
+        if (self.q.len == 0) {
+            const q = try gpa.alloc(u32, n);
+            errdefer gpa.free(q);
+            try order_mod.order(n, self.col_ptr, self.row_idx, q, &ws);
+            self.q = q;
+        }
+        assert(self.q.len == n);
+        // At least nnz(A): a diagonal matrix bounds nothing.
+        const diag_fill = @max(try order_mod.diagFill(n, self.col_ptr, self.row_idx, self.q, &ws), self.col_ptr[n]);
+        assert(ws.used == 0);
+        var lu = try SparseLu.init(gpa, n, self.col_ptr, self.q);
         lu.stats = self.knobs.stats;
+        lu.diag_fill = diag_fill;
         return lu;
     }
 
@@ -197,9 +270,18 @@ pub const Solver = struct {
         return eng;
     }
 
+    /// Frees the multicore and subtree refactor plans of the current pivot
+    /// epoch; the next `refactorLu` on a new epoch prices them again.
+    fn dropPlans(self: *Self) void {
+        if (self.par) |*p| p.deinit(self.gpa);
+        self.par = null;
+        if (self.sub) |*p| p.deinit(self.gpa);
+        self.sub = null;
+    }
+
     /// Frees every engine and copy; the borrowed pattern stays the caller's.
     pub fn deinit(self: *Self) void {
-        if (self.par) |*p| p.deinit(self.gpa);
+        self.dropPlans();
         switch (self.engine) {
             .lu => |*lu| lu.deinit(self.gpa),
             .tri => |*tri| tri.deinit(self.gpa),
@@ -229,6 +311,7 @@ pub const Solver = struct {
         assert(vals.len >= self.col_ptr[self.n]);
         const nnz = self.vcopy.len;
         if (nnz != 0 and self.factored and !self.host_stale and simdEql(self.vcopy, vals[0..nnz])) return;
+        if (instrument and self.knobs.stats and self.factored and nnz != 0) if (self.sparse()) |lu| reachCensus(self.gpa, lu, self.col_ptr, self.vcopy, vals) catch {};
         try self.factorInner(vals, execution);
         assert(self.factored);
         self.host_stale = false;
@@ -243,7 +326,7 @@ pub const Solver = struct {
 
     /// Frees the copy behind the unchanged-matrix bypass, for a caller whose
     /// values never repeat (a frequency sweep): every `factor` then factors.
-    /// Not for a solver a device LU (`gpu_lu.zig`) shares, which syncs
+    /// Not for a solver a device LU (analysis/gpu/lu.zig) shares, which syncs
     /// through the copy, nor for a BBD engine, whose solves refine against
     /// the copy and go unrefined without it.
     pub fn dropBypass(self: *Self) void {
@@ -266,6 +349,8 @@ pub const Solver = struct {
         // A refactor that fails after overwriting the LU (the probe's OOM)
         // must not leave the old `vcopy` bypassing onto it.
         errdefer self.factored = false;
+        // BBD wants one value per pattern entry: drop the trash slot past it.
+        const pattern_vals = vals[0..self.col_ptr[self.n]];
         switch (self.engine) {
             .lu => {},
             // Thomas has no pivoting, so an MNA branch row's zero diagonal
@@ -276,9 +361,8 @@ pub const Solver = struct {
                 return;
             } else |_| try self.demote(),
             // A singular block, or a Schur reduction too unstable to refine.
-            // BBD wants one value per pattern entry: drop the trash slot past it.
-            .bbd => |*eng| if (eng.factorWithExecution(vals[0..self.col_ptr[self.n]], execution)) |_| {
-                if (!(eng.growth > bbd_refine_growth) or (self.probeOne(eng, false, vals[0..self.col_ptr[self.n]]) and self.probeOne(eng, true, vals[0..self.col_ptr[self.n]]))) {
+            .bbd => |*eng| if (eng.factorWithExecution(pattern_vals, execution)) |_| {
+                if (!(eng.growth > bbd_refine_growth) or (self.probeOne(eng, false, pattern_vals) and self.probeOne(eng, true, pattern_vals))) {
                     self.factored = true;
                     return;
                 }
@@ -373,13 +457,26 @@ pub const Solver = struct {
         if (threads < 2) return lu.refactor(self.col_ptr, vals, growth);
         if (self.par_epoch != lu.pattern_epoch) {
             self.par_epoch = lu.pattern_epoch;
-            if (self.par) |*p| p.deinit(self.gpa);
-            self.par = null;
+            self.dropPlans();
             // Out of memory for the tables: stay serial this epoch.
-            if (parWorthIt(lu, self.knobs)) self.par = lu_kernels.HostRefactor.init(self.gpa, lu, self.col_ptr, growth) catch null;
+            if (parWorthIt(lu, self.knobs)) {
+                self.par = lu_kernels.HostRefactor.init(self.gpa, lu, self.col_ptr, growth) catch null;
+            } else {
+                // Thin factors: lanes over independent subtrees when the
+                // model prices them at least `min_speedup` faster.
+                self.sub = subtree.Plan.init(self.gpa, lu, self.col_ptr, @min(threads, subtree.max_lanes), .{}) catch null;
+                if (self.knobs.par_stats) if (self.sub) |*p| {
+                    std.debug.print("lu-subtree: n={d} lanes={d} phases={d} cut={d} model={d:.2}x tail={d:.2}\n", .{ lu.n, p.width, p.phases(), p.cut, p.speedup, p.tail_share });
+                    if (instrument) benchSubtree(p, lu, self.col_ptr, vals, growth, io);
+                } else std.debug.print("lu-subtree: n={d} declined\n", .{lu.n});
+            }
         }
-        const p = if (self.par) |*p| p else return lu.refactor(self.col_ptr, vals, growth);
-        return p.run(lu, vals, io, threads);
+        if (self.par) |*p| {
+            lu.replay_mult = null; // its copy-out writes L behind `lu`'s back
+            return p.run(lu, vals, io, threads);
+        }
+        if (self.sub) |*p| return p.run(lu, self.col_ptr, vals, growth, io);
+        return lu.refactor(self.col_ptr, vals, growth);
     }
 
     /// Solves in place with whichever engine is live.
@@ -398,12 +495,12 @@ pub const Solver = struct {
     /// growth says it may not be backward stable (#136).
     fn solveBbd(self: *Self, eng: *BbdEng, comptime transpose: bool, x: []f64) void {
         if (!(eng.growth > bbd_refine_growth) or self.vcopy.len == 0) {
-            if (transpose) eng.solveTInPlace(x) else eng.solveInPlace(x);
+            eng.solve(transpose, x);
             return;
         }
         const b = self.refine_buf[0..self.n];
         num.copySimd(b, x);
-        if (transpose) eng.solveTInPlace(x) else eng.solveInPlace(x);
+        eng.solve(transpose, x);
         self.refine(eng, transpose, self.vcopy, b, x);
     }
 
@@ -423,7 +520,7 @@ pub const Solver = struct {
             bi.* = @as(f64, @floatFromInt(h >> 11)) / 0x1p53 * 2 - 1;
         }
         num.copySimd(x, b);
-        if (transpose) eng.solveTInPlace(x) else eng.solveInPlace(x);
+        eng.solve(transpose, x);
         self.refine(eng, transpose, vals, b, x);
         // r = b - op(A) x and s = the row sums of |op(A)|.
         num.copySimd(r, b);
@@ -467,7 +564,7 @@ pub const Solver = struct {
             };
             if (!(berr > std.math.floatEps(f64) and 2 * berr <= last)) break;
             last = berr;
-            if (transpose) eng.solveTInPlace(r) else eng.solveInPlace(r);
+            eng.solve(transpose, r);
             num.axpy(x, 1, r);
         }
     }
@@ -505,6 +602,49 @@ pub const Solver = struct {
     }
 };
 
+/// `-Dlu-instrument` with `ESPICE_LU_PAR_STATS`: the subtree refactor, and
+/// the same with its tail run serially, against the serial one on this
+/// epoch's first values, medians of 15 interleaved runs each. Leaves `lu`
+/// refactored on `vals` (or failed, as the caller's own refactor would).
+fn benchSubtree(p: *subtree.Plan, lu: *sparse_lu.SparseLu, col_ptr: []const u32, vals: []const f64, growth: f64, io: std.Io) void {
+    const reps = 15;
+    var ser: [reps]u64 = undefined;
+    var par: [reps]u64 = undefined;
+    var scan: [reps]u64 = undefined;
+    var stail: [reps]u64 = undefined;
+    var sink: f64 = 0;
+    const done = p.done;
+    defer p.done = done;
+    for (0..reps) |i| {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        lu.refactor(col_ptr, vals, growth) catch |e| {
+            std.debug.print("lu-subtree-bench: refactor {s}\n", .{@errorName(e)});
+            return;
+        };
+        const t1 = std.Io.Timestamp.now(io, .awake);
+        p.run(lu, col_ptr, vals, growth, io) catch return;
+        const t2 = std.Io.Timestamp.now(io, .awake);
+        lu.replay_mult = null;
+        sink += maxMultiplier(lu);
+        const t3 = std.Io.Timestamp.now(io, .awake);
+        p.done = &.{};
+        p.run(lu, col_ptr, vals, growth, io) catch return;
+        p.done = done;
+        const t4 = std.Io.Timestamp.now(io, .awake);
+        ser[i] = @intCast(t0.durationTo(t1).nanoseconds);
+        par[i] = @intCast(t1.durationTo(t2).nanoseconds);
+        scan[i] = @intCast(t2.durationTo(t3).nanoseconds);
+        stail[i] = @intCast(t3.durationTo(t4).nanoseconds);
+    }
+    std.sort.pdq(u64, &stail, {}, std.sort.asc(u64));
+    std.debug.print("lu-subtree-bench: serial-tail lanes={d}us\n", .{stail[reps / 2] / 1000});
+    std.mem.doNotOptimizeAway(sink);
+    std.sort.pdq(u64, &scan, {}, std.sort.asc(u64));
+    std.sort.pdq(u64, &ser, {}, std.sort.asc(u64));
+    std.sort.pdq(u64, &par, {}, std.sort.asc(u64));
+    std.debug.print("lu-subtree-bench: serial={d}us lanes={d}us L-scan={d}us speedup={d:.2}x\n", .{ ser[reps / 2] / 1000, par[reps / 2] / 1000, scan[reps / 2] / 1000, @as(f64, @floatFromInt(ser[reps / 2])) / @as(f64, @floatFromInt(par[reps / 2])) });
+}
+
 /// The multicore refactor's admission: enough flops per refactor to pay
 /// for the handoffs, and enough per column that the columns are not a
 /// dependent chain. `Knobs.par` forces it off or on.
@@ -532,6 +672,19 @@ const replay_ratio_max = 30.0;
 /// ran it (tape, columns, threads). Scale-accepted steps are left out of
 /// the max: their pivots sit decades below the raw column by design.
 fn maxMultiplier(lu: *const sparse_lu.SparseLu) f64 {
+    // A successful monitored replay leaves no NaN in L, and its recorded
+    // max is the scan's (at least 1, which the replay bar never reaches).
+    if (lu.replay_mult) |m| {
+        // Safe builds check the recorded max against the scan it replaces.
+        if (std.debug.runtime_safety) {
+            var scan: f64 = 1;
+            for (0..lu.n) |k| if (!lu.scaled_pivot[k]) {
+                scan = @max(scan, num.normInf(lu.lx.items[lu.lp[k]..lu.lp[k + 1]]));
+            };
+            assert(scan == m);
+        }
+        return m;
+    }
     const lx = lu.lx.items;
     const all = num.normInf(lx);
     if (std.math.isNan(all) or std.mem.indexOfScalar(bool, lu.scaled_pivot, true) == null) return all;
@@ -570,16 +723,71 @@ comptime {
     assert(par_max_flops <= std.math.maxInt(u32));
 }
 
-/// BTF + AMD column ordering; caller owns the result.
-fn computeOrdering(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) ![]u32 {
-    const q = try gpa.alloc(u32, n);
-    errdefer gpa.free(q);
-    const ws_buf = try gpa.alloc(u32, order_mod.wsSize(n, col_ptr[n]));
-    defer gpa.free(ws_buf);
-    var ws = order_mod.Ws.init(ws_buf);
-    try order_mod.order(n, col_ptr, row_idx, q, &ws);
-    assert(ws.used == 0); // order restores the slab
-    return q;
+/// The census for a partial refactor (TODO 2.8): the share of A entries
+/// that changed since the last factor, and of pivot steps a replay would
+/// have to redo, those whose column changed or whose U names a redone step.
+fn reachCensus(gpa: Allocator, lu: *const sparse_lu.SparseLu, col_ptr: []const u32, old: []const f64, vals: []const f64) !void {
+    const n = lu.n;
+    const redo = try gpa.alloc(bool, n);
+    defer gpa.free(redo);
+    var changed: u64 = 0;
+    var steps: u64 = 0;
+    var flops: u64 = 0;
+    var redo_flops: u64 = 0;
+    for (0..n) |k| {
+        const c = lu.q[k];
+        var r = false;
+        for (col_ptr[c]..col_ptr[c + 1]) |p| if (!(old[p] == vals[p])) {
+            changed += 1;
+            r = true;
+        };
+        var f: u64 = 0;
+        for (lu.ui.items[lu.up[k]..lu.up[k + 1]]) |i| {
+            r = r or redo[i];
+            f += lu.lp[i + 1] - lu.lp[i];
+        }
+        redo[k] = r;
+        flops += f;
+        if (r) {
+            steps += 1;
+            redo_flops += f;
+        }
+    }
+    const pct = struct {
+        fn f(a: u64, b: u64) f64 {
+            return 100 * @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(@max(b, 1)));
+        }
+    }.f;
+    std.debug.print("lu-reach: changed={d:.2}% steps={d:.2}% flops={d:.2}%\n", .{ pct(changed, col_ptr[n]), pct(steps, n), pct(redo_flops, flops) });
+}
+
+/// The census for keeping the BTF blocks through the factor (TODO 2.5):
+/// the block count, singletons, the largest block and the entries outside
+/// every diagonal block, which a block factor would leave unfactored.
+fn btfCensus(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) !void {
+    const buf = try gpa.alloc(u32, 3 * @as(usize, n) + 1 + order_mod.wsSize(n, col_ptr[n]));
+    defer gpa.free(buf);
+    const emit = buf[0..n];
+    const block_ptr = buf[n..][0 .. n + 1];
+    const blk_of = buf[2 * n + 1 ..][0..n];
+    var ws = order_mod.Ws.init(buf[3 * n + 1 ..]);
+    const nb = try order_mod.blocks(n, col_ptr, row_idx, emit, block_ptr, &ws);
+    var largest: u32 = 0;
+    var singletons: u32 = 0;
+    for (0..nb) |b| {
+        const size = block_ptr[b + 1] - block_ptr[b];
+        largest = @max(largest, size);
+        singletons += @intFromBool(size == 1);
+        for (emit[block_ptr[b]..block_ptr[b + 1]]) |v| blk_of[v] = @intCast(b);
+    }
+    var off: u64 = 0;
+    for (0..n) |j| for (row_idx[col_ptr[j]..col_ptr[j + 1]]) |r| {
+        off += @intFromBool(blk_of[r] != blk_of[j]);
+    };
+    std.debug.print("lu-btf: n={d} blocks={d} singletons={d} largest={d} ({d:.1}% of n) off_block_nnz={d} ({d:.1}% of nnz)\n", .{
+        n,                                                                            nb,  singletons,                                                                        largest,
+        100 * @as(f64, @floatFromInt(largest)) / @as(f64, @floatFromInt(@max(n, 1))), off, 100 * @as(f64, @floatFromInt(off)) / @as(f64, @floatFromInt(@max(col_ptr[n], 1))),
+    });
 }
 
 /// IEEE equality per element (-0 == +0, NaN != NaN) and equal lengths,
@@ -739,4 +947,43 @@ test "maxMultiplier is NaN when an L entry is NaN, scale-accepted steps included
     try testing.expect(std.math.isNan(maxMultiplier(&lu)));
     lu.scaled_pivot[1] = true;
     try testing.expect(std.math.isNan(maxMultiplier(&lu)));
+}
+
+test "Solver.reset: a reset solver factors and solves bitwise as a fresh one" {
+    const gpa = testing.allocator;
+    // The ring of the dropBypass test, and the tridiagonal pattern whose
+    // zero diagonal demotes Thomas to the LU.
+    const Case = struct { n: u32, cp: []const u32, ri: []const u32, a: []const f64, b: []const f64 };
+    const cases = [_]Case{
+        .{ .n = 4, .cp = &.{ 0, 3, 6, 9, 12 }, .ri = &.{ 0, 1, 3, 0, 1, 2, 1, 2, 3, 0, 2, 3 }, .a = &.{ 1e-6, 1, 1, 1, 4, 1, 1, 4, 1, 1, 1, 4 }, .b = &.{ 4, 1, 1, 1, 1e-9, 1, 1, 4, 1, 1, 1, 4 } },
+        .{ .n = 3, .cp = &.{ 0, 2, 5, 7 }, .ri = &.{ 0, 1, 0, 1, 2, 1, 2 }, .a = &.{ 0, 1, 1, 2, 1, 4, 3 }, .b = &.{ 2, 1, 1, 2, 1, 4, 3 } },
+    };
+    for (cases) |c| {
+        var a = try Solver.init(gpa, c.n, c.cp, c.ri, null, .{});
+        defer a.deinit();
+        var b = try Solver.init(gpa, c.n, c.cp, c.ri, null, .{});
+        defer b.deinit();
+        try a.factor(c.a, .{});
+        a.dropBypass();
+        try a.reset(null);
+        try testing.expect(std.meta.activeTag(a.engine) == std.meta.activeTag(b.engine) and !a.factored);
+        try a.factor(c.b, .{});
+        try b.factor(c.b, .{});
+        try testing.expect(std.meta.activeTag(a.engine) == std.meta.activeTag(b.engine));
+        if (a.sparse()) |la| {
+            const lb = b.sparse().?;
+            try testing.expectEqualSlices(u32, lb.pinv, la.pinv);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(lb.lx.items), std.mem.sliceAsBytes(la.lx.items));
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(lb.ux.items), std.mem.sliceAsBytes(la.ux.items));
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(lb.udiag), std.mem.sliceAsBytes(la.udiag));
+        }
+        var xa: [4]f64 = undefined;
+        var xb: [4]f64 = undefined;
+        const rhs = [_]f64{ 1, -2, 3, -4 };
+        a.solve(rhs[0..c.n], xa[0..c.n]);
+        b.solve(rhs[0..c.n], xb[0..c.n]);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(xb[0..c.n]), std.mem.sliceAsBytes(xa[0..c.n]));
+        // The bypass copy is back.
+        try testing.expect(a.unchanged(c.b));
+    }
 }

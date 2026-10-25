@@ -7,7 +7,7 @@
 //! Cites ngspice (inpcom.c, inp.c recifeval, subckt.c modtranslate,
 //! INPgetModBin) for the ngspice dialect, the HSPICE manuals ([SA], [CR])
 //! for the HSPICE cards, and dev/research/{ngspice,hspice,spectre}-syntax.md
-//! (§ and rule ids) for the grammar; tests/grammar/ngspice.peg, hspice.peg
+//! (§ and rule ids) for the grammar; tests/frontend/grammar/ngspice.peg, hspice.peg
 //! and spectre.peg are its oracle.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -22,11 +22,9 @@ const csr = @import("csr.zig");
 pub const expr = @import("expr.zig");
 const measure = @import("measure.zig");
 const pattern = @import("pattern.zig");
-const spectre = @import("spectre.zig");
 const core = @import("core");
 const Name = core.Name;
-const InternPool = @import("core").InternPool;
-const requests = @import("core").query;
+const InternPool = core.InternPool;
 
 /// Input syntax: ngspice, HSPICE or Spectre.
 pub const Dialect = lines.Dialect;
@@ -35,7 +33,7 @@ pub const VertexId = csr.VertexId;
 /// A device: a row of `Netlist.graph`'s edge table, in card order.
 pub const EdgeId = csr.EdgeId;
 /// Analysis kind, shared with the query layer.
-pub const Kind = requests.Kind;
+pub const Kind = core.query.Kind;
 /// Net 0; `0`, `gnd` and `ground` all name it.
 pub const ground: VertexId = @fromBackingInt(@intCast(0));
 /// Missing id in every u32 index space here.
@@ -534,45 +532,46 @@ pub const Netlist = struct {
         };
         for (live.ops, live.scale, 0..) |span, scale, k| {
             const at = nl.slot(k);
-            const ops = nl.exprOps(span);
-            const x = scale * if (@TypeOf(draw) == @TypeOf(null))
-                try expr.eval(gpa, stack, ops, nl.consts, values, null)
-            else
-                try expr.eval(gpa, stack, ops, nl.consts, values, SiteDraw(@TypeOf(draw)){ .inner = draw, .base = span.start, .ops = live.site_ops, .keys = live.site_keys });
+            const x = scale * try nl.evalLive(gpa, stack, span, values, draw);
             changed = changed or at.num != x;
             at.* = .{ .num = x };
         }
         for (live.site_rows, live.site_spans) |row, span| {
-            const ops = nl.exprOps(span);
-            const x = if (@TypeOf(draw) == @TypeOf(null))
-                try expr.eval(gpa, stack, ops, nl.consts, values, null)
-            else
-                try expr.eval(gpa, stack, ops, nl.consts, values, SiteDraw(@TypeOf(draw)){ .inner = draw, .base = span.start, .ops = live.site_ops, .keys = live.site_keys });
+            const x = try nl.evalLive(gpa, stack, span, values, draw);
             changed = changed or pool[row] != x;
             pool[row] = x;
         }
         // Each binned card with live geometry takes the bin its new L and W
         // select, read off the card as the slots above left them (scaled).
-        const R = Reader(lines.ngspice);
         const bins = live.bins;
         const model_of = nl.graph.edges.items(.model);
         const kv_of = nl.graph.edges.items(.kv);
         const positional_of = nl.graph.edges.items(.positional);
         for (bins.edges, bins.per_finger, 0..) |e, per_finger, k| {
             const kv = nl.kvs[kv_of[e].start..][0..kv_of[e].len];
-            const l = R.number(kv, "l") orelse return error.ParseError;
-            const nf = if (per_finger) R.number(kv, "nf") orelse 1 else 1;
-            const w = (R.number(kv, "w") orelse return error.ParseError) / nf;
+            const l = kvNumber(kv, "l") orelse return error.ParseError;
+            const nf = if (per_finger) kvNumber(kv, "nf") orelse 1 else 1;
+            const w = (kvNumber(kv, "w") orelse return error.ParseError) / nf;
             const lo = bins.starts[k];
             const hi = bins.starts[k + 1];
             const row = for (bins.rows[lo..hi], bins.bounds[lo..hi]) |row, b| {
-                if (R.binHolds(b, l, w)) break row;
+                if (binHolds(b, l, w)) break row;
             } else return error.ModelBinNotFound;
             changed = changed or model_of[e] != row;
             model_of[e] = row;
             @constCast(nl.values)[positional_of[e].start] = .{ .name = nl.models[row].name };
         }
         return changed;
+    }
+
+    /// Evaluates the postfix `span` at live values `values`, each
+    /// distribution call answered by `draw` (`null` keeps nominals).
+    fn evalLive(nl: *const Netlist, gpa: Allocator, stack: *std.ArrayList(expr.Val), span: Span, values: []const f64, draw: anytype) !f64 {
+        const ops = nl.exprOps(span);
+        return if (@TypeOf(draw) == @TypeOf(null))
+            expr.eval(gpa, stack, ops, nl.consts, values, null)
+        else
+            expr.eval(gpa, stack, ops, nl.consts, values, SiteDraw(@TypeOf(draw)){ .inner = draw, .base = span.start, .ops = nl.live.site_ops, .keys = nl.live.site_keys });
     }
 
     /// Sets live slot k to `values[k]` without evaluating its postfix, as
@@ -611,11 +610,7 @@ fn SiteDraw(comptime D: type) type {
         /// inner sampler's, under that call's site key. O(log sites).
         pub fn value(self: @This(), i: usize, f: expr.Fn, args: []const f64) f64 {
             const at: u32 = self.base + @as(u32, @intCast(i));
-            const k = std.sort.lowerBound(u32, self.ops, at, struct {
-                fn order(a: u32, b: u32) std.math.Order {
-                    return std.math.order(a, b);
-                }
-            }.order);
+            const k = std.sort.lowerBound(u32, self.ops, at, orderU32);
             return self.inner.sample(self.keys[k], f, args);
         }
     };
@@ -931,6 +926,8 @@ const Frame = struct {
     path: ?[]const u8 = null,
     ports: []const []const u8 = &.{},
     actuals: []const VertexId = &.{},
+    /// `ports` by name (`Subckt.port_index`), when long enough to keep one.
+    port_index: ?*const PortIndex = null,
     scopes: []const *const Scope,
     depth: u8 = 0,
     instance: u32 = 0,
@@ -939,6 +936,14 @@ const Frame = struct {
     /// Where this instance's rows start in `Reader.instance_models`.
     models_mark: u32 = 0,
 };
+
+/// A subcircuit's port names to their first position.
+const PortIndex = std.StringHashMapUnmanaged(u32);
+
+/// Ports past this count are looked up through a `PortIndex` instead of a
+/// scan, so a wrapper holding a whole extracted network costs pins, not
+/// pins × ports.
+const port_scan_max = 16;
 
 /// Nested `.subckt` definitions past this depth are refused; ngspice's
 /// syntax check warns past 10 (ngspice-syntax.md §4.1).
@@ -961,6 +966,8 @@ const Subckt = struct {
     /// The body holds a nested `.subckt` definition, whose lines `expand`
     /// skips (they are that subcircuit's).
     has_nested: bool = false,
+    /// `ports` by name past `port_scan_max` ports, else null.
+    port_index: ?*const PortIndex = null,
 };
 
 const ModelRow = struct { name: []const u8, kind: []const u8, kv: Span };
@@ -1063,6 +1070,14 @@ fn Reader(comptime S: type) type {
         /// distinct set of values, so instances with equal parameters share
         /// a row. Sized on the first `localRow`, once `local_models` is whole.
         variants: []std.ArrayList(u32) = &.{},
+        /// Per `local_models` row, the parameter names its line can read
+        /// (`localReads`); null until first needed.
+        local_reads: []?LocalReads = &.{},
+        /// `localRow` results keyed by the row and every scope entry its
+        /// line can reach (`localKey`): an instance whose parameters are the
+        /// same text as an earlier one's skips re-reading the card.
+        local_memo: std.StringHashMapUnmanaged(u32) = .empty,
+        local_key: std.ArrayList(u8) = .empty,
         /// `(name, row)` of the instance models the open expansions resolved;
         /// `Frame.models_mark` splits it by instance.
         instance_models: std.ArrayList(struct { name: []const u8, row: u32 }) = .empty,
@@ -1134,6 +1149,8 @@ fn Reader(comptime S: type) type {
         positional: std.ArrayList(Value) = .empty,
         card_kv: std.ArrayList(Kv) = .empty,
         scratch: expr.Scratch = .{},
+        /// Parameter and function texts compiled once each (`compiledText`).
+        compiled_texts: std.StringHashMapUnmanaged(*const expr.Scratch) = .empty,
         stack: std.ArrayList(expr.Val) = .empty,
         /// Open `name(` groups in the value being read.
         group_depth: u8 = 0,
@@ -1189,7 +1206,7 @@ fn Reader(comptime S: type) type {
             };
             // Spectre statements become the SPICE cards the walks read.
             if (dialect == .spectre) {
-                const translated = try spectre.translate(arena, r.lines.items);
+                const translated = try spectre_rewrite.translate(arena, r.lines.items);
                 r.lines = .empty;
                 try r.lines.appendSlice(arena, translated.lines);
                 r.kinds = translated.kinds;
@@ -1207,43 +1224,50 @@ fn Reader(comptime S: type) type {
             try r.net_of.ensureTotalCapacity(arena, names_hint + 1);
             try r.values.ensureTotalCapacity(arena, line_hint);
             // One `key=value` row per `=` of a flat deck.
-            try r.kvs.ensureTotalCapacity(arena, std.mem.countScalar(u8, text, '='));
+            const eq_hint = std.mem.countScalar(u8, text, '=');
+            try r.kvs.ensureTotalCapacity(arena, eq_hint);
 
             var top_devices: std.ArrayList(u32) = .empty;
             try top_devices.ensureTotalCapacityPrecise(arena, r.lines.items.len);
             var model_lines: std.ArrayList(ModelLine) = .empty;
             var directive_lines: std.ArrayList(u32) = .empty;
             try r.declarations(&top_devices, &model_lines, &directive_lines);
+            // Flattened, a hierarchical deck holds more cards than lines:
+            // sized for that too, so `expand` never regrows the tables (an
+            // arena regrowth copies them and keeps the old block).
+            const extra = try r.expandedExtra(top_devices.items);
+            if (extra.cards != 0) {
+                const flat = line_hint + extra.cards;
+                try r.hg.ensureTotalCapacity(arena, flat + 1, flat, 3 * flat);
+                const names: u32 = @intCast(@min(2 * flat, none - 1));
+                try r.pool.reserve(arena, names);
+                try r.net_of.ensureTotalCapacity(arena, names + 1);
+                try r.values.ensureTotalCapacity(arena, flat);
+                try r.kvs.ensureTotalCapacity(arena, eq_hint + extra.kvs);
+            }
             const top: Frame = .{ .scopes = &r.global_scopes };
-            // A MONTE sweep draws the distributions per trial, so the models
-            // read next (a PDK's shared bins) keep their sites: the analysis
-            // cards are read after them (#100).
-            for (directive_lines.items) |i| if (analysisOf(r.lines.items[i]) != null and setsKey(r.lines.items[i], "monte")) {
-                r.monte = true;
-                break;
-            };
-            // ngspice draws agauss/gauss/unif/aunif on every run; a seed makes
-            // that one reproducible sample, so the draws need their sites,
-            // and the models read next (a PDK's shared bins) need them too.
+            // Three kinds of card make the models read next (a PDK's shared
+            // bins) keep their distribution sites. A MONTE sweep draws them
+            // per trial; the analysis cards are read after the models
+            // (#100). ngspice draws agauss/gauss/unif/aunif on every run, and
+            // a seed makes that one reproducible sample. `.dcmatch`,
+            // `.acmatch` and `.dcsens` without a `.variation` block read the
+            // mismatch off the calls (`variants.Planner.siteVariations`).
             // ponytail: a top-level `.param` read in walk 1 stays nominal;
             // the PDK distributions sit in model cards and subcircuit params.
-            if (dialect == .ngspice and !r.monte) for (directive_lines.items) |i| {
-                if (seedOption(r.lines.items[i])) {
-                    r.monte = true;
-                    r.draw_seed = true;
-                    break;
-                }
-            };
-            // `.dcmatch`, `.acmatch` and `.dcsens` without a `.variation`
-            // block read the mismatch off the distribution calls
-            // (`variants.Planner.siteVariations`), so those keep sites too.
-            if (!r.monte) for (directive_lines.items) |i| {
-                const kind = analysisOf(r.lines.items[i]) orelse continue;
-                if (kind == .dcmatch or kind == .acmatch or kind == .dcsens) {
-                    r.monte = true;
-                    break;
-                }
-            };
+            var monte_card = false;
+            var seed = false;
+            var mismatch = false;
+            for (directive_lines.items) |i| {
+                const line = r.lines.items[i];
+                seed = seed or seedOption(line);
+                const kind = analysisOf(line) orelse continue;
+                monte_card = monte_card or setsKey(line, "monte");
+                mismatch = mismatch or kind == .dcmatch or kind == .acmatch or kind == .dcsens;
+            }
+            seed = seed and dialect == .ngspice;
+            r.draw_seed = seed and !monte_card;
+            r.monte = monte_card or seed or mismatch;
             // The caller's live names, registered before any model,
             // directive or device reads them, so a card that cannot follow a
             // later value (an analysis, `.ic`, `.options`) is refused.
@@ -1495,7 +1519,19 @@ fn Reader(comptime S: type) type {
                         const id: u16 = @intCast(r.subckts.items.len);
                         opens[depth] = .{ .id = id, .defaults = defaults };
                         depth += 1;
-                        try r.subckts.append(arena, .{ .name = name, .ports = ports.items, .defaults = &.{}, .first = i + 1, .end = i + 1 });
+                        var port_index: ?*const PortIndex = null;
+                        if (ports.items.len > port_scan_max) {
+                            const by_name = try arena.create(PortIndex);
+                            by_name.* = .empty;
+                            try by_name.ensureTotalCapacity(arena, @intCast(ports.items.len));
+                            // A repeated port keeps its first position, as the scan finds it.
+                            for (ports.items, 0..) |port, k| {
+                                const got = by_name.getOrPutAssumeCapacity(port);
+                                if (!got.found_existing) got.value_ptr.* = @intCast(k);
+                            }
+                            port_index = by_name;
+                        }
+                        try r.subckts.append(arena, .{ .name = name, .ports = ports.items, .defaults = &.{}, .first = i + 1, .end = i + 1, .port_index = port_index });
                         try r.subckt_ids.put(arena, name, id);
                     },
                     // A block's close outside its block closes nothing (#162).
@@ -1586,10 +1622,7 @@ fn Reader(comptime S: type) type {
             } else if (t.len >= 2 and (t[0] == '"' or t[0] == '\'') and t[t.len - 1] == t[0]) {
                 path = t[1 .. t.len - 1];
             }
-            const at = @intFromPtr(path.ptr);
-            const base = @intFromPtr(r.text.ptr);
-            if (at >= base and at + path.len <= base + r.text.len) return r.orig[at - base ..][0..path.len];
-            return path;
+            return r.written(path);
         }
 
         /// `name(a, b) [=] body`: a user function, from `.func` or from
@@ -1632,7 +1665,7 @@ fn Reader(comptime S: type) type {
         /// HSPICE reads an unquoted value only as a number or as an
         /// expression that starts with a letter and holds no blank
         /// (`lines.hspice.bareValue`); anything else is refused by name
-        /// (#203). tests/grammar/lower.zig `strictValue` refuses the same.
+        /// (#203). tests/frontend/lower.zig `strictValue` refuses the same.
         fn checkBare(r: *R, text: []const u8) Error!void {
             if (r.dialect != .hspice or lines.hspice.bareValue(text)) return;
             // A quoted expression is no bare one.
@@ -1653,7 +1686,8 @@ fn Reader(comptime S: type) type {
             const was_in_card = r.in_card;
             r.in_card = true;
             defer r.in_card = was_in_card;
-            r.site_owner = nameKey(nameKey(0, frame.path orelse ""), name);
+            // Site keys are read only under Monte Carlo (`emit`).
+            if (r.monte) r.site_owner = nameKey(nameKey(0, frame.path orelse ""), name);
             r.site_ordinal = 0;
             const matrix_keys = std.StaticStringMap(void).initComptime(.{ .{ "r", {} }, .{ "l", {} }, .{ "g", {} }, .{ "c", {} } });
             // CPL matrices are blank-separated; a negative entry is not a subtraction.
@@ -1728,7 +1762,7 @@ fn Reader(comptime S: type) type {
             // Read before any `localRow`, which reuses the card scratch.
             const kv = r.card_kv.items;
             const lg = try r.cardLength(kv, "l") orelse return r.model_ids.get(name) orelse none;
-            const use_nf = if (number(kv, "wnflag")) |flag| flag != 0 else r.wnflag;
+            const use_nf = if (kvNumber(kv, "wnflag")) |flag| flag != 0 else r.wnflag;
             const nfg: Geometry = if (use_nf) try r.cardLength(kv, "nf") orelse .{ .num = 1 } else .{ .num = 1 };
             const wg = try r.cardLength(kv, "w") orelse return r.model_ids.get(name) orelse none;
             const l = lg.num * r.scale;
@@ -1792,9 +1826,7 @@ fn Reader(comptime S: type) type {
                 .num => |n| return .{ .num = n },
                 .expr => |span| {
                     const ops = r.ops.items[span.start..][0..span.len];
-                    var reads = false;
-                    for (ops) |op| reads = reads or op.code == .live;
-                    if (!reads) return null;
+                    if (!readsLive(ops)) return null;
                     const v = try expr.fold(r.arena, &r.stack, ops, r.consts.items, false, r.live_nominal.items);
                     return if (v.known) .{ .num = v.num, .live = true } else null;
                 },
@@ -1815,7 +1847,17 @@ fn Reader(comptime S: type) type {
                 std.debug.assert(r.variants.len == 0);
                 r.variants = try r.arena.alloc(std.ArrayList(u32), r.local_models.items.len);
                 @memset(r.variants, .empty);
+                r.local_reads = try r.arena.alloc(?LocalReads, r.local_models.items.len);
+                @memset(r.local_reads, null);
             }
+            // A PDK reads each subcircuit-local card once per instance
+            // under the instance's parameters (78% of `Problem.init` on
+            // c7552_ihp); equal inputs fold to equal rows.
+            const memo = try r.localKey(lm, frame);
+            if (memo) |key| if (r.local_memo.get(key)) |row| {
+                try r.instance_models.append(r.arena, .{ .name = name, .row = row });
+                return row;
+            };
             const kv_mark = r.kvs.items.len;
             try r.readModel(r.lines.items[line], frame, false);
             var row: u32 = @intCast(r.models.items.len - 1);
@@ -1829,8 +1871,103 @@ fn Reader(comptime S: type) type {
                 row = old;
                 break;
             } else try seen.append(r.arena, row);
+            if (memo) |key| try r.local_memo.put(r.arena, try r.arena.dupe(u8, key), row);
             try r.instance_models.append(r.arena, .{ .name = name, .row = row });
             return row;
+        }
+
+        /// The memo key of local model `lm` read in `frame`: `lm`, then for
+        /// each name its line can read, every scope's entry for it (all
+        /// scopes, not only the innermost, so any lookup order the fold uses
+        /// is covered), following text entries' own names. Null when the
+        /// line draws a statistical value, which differs per instance site.
+        /// Borrows `r.local_key` until the next call.
+        fn localKey(r: *R, lm: usize, frame: *const Frame) Error!?[]const u8 {
+            const reads = r.local_reads[lm] orelse blk: {
+                const got = try r.localReads(r.lines.items[r.local_models.items[lm].line]);
+                r.local_reads[lm] = got;
+                break :blk got;
+            };
+            const names = switch (reads) {
+                .stochastic => return null,
+                .names => |ns| ns,
+            };
+            const key = &r.local_key;
+            key.clearRetainingCapacity();
+            try key.appendSlice(r.arena, std.mem.asBytes(&@as(u64, lm)));
+            // Names reached through text entries, breadth first, each once.
+            var queue: std.ArrayList([]const u8) = .empty;
+            defer queue.deinit(r.arena);
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(r.arena);
+            for (names) |n| if (!(try seen.getOrPut(r.arena, n)).found_existing) try queue.append(r.arena, n);
+            var i: usize = 0;
+            while (i < queue.items.len) : (i += 1) {
+                const n = queue.items[i];
+                for (frame.scopes) |scope| {
+                    const e = scope.get(n) orelse {
+                        try key.append(r.arena, 0);
+                        continue;
+                    };
+                    switch (e) {
+                        .num => |v| {
+                            try key.append(r.arena, 1);
+                            try key.appendSlice(r.arena, std.mem.asBytes(&v));
+                        },
+                        .text => |t| {
+                            try key.append(r.arena, 2);
+                            try key.appendSlice(r.arena, std.mem.asBytes(&@as(u64, t.len)));
+                            try key.appendSlice(r.arena, t);
+                            switch (try r.localReads(t)) {
+                                .stochastic => return null,
+                                .names => |more| for (more) |m| if (!(try seen.getOrPut(r.arena, m)).found_existing) try queue.append(r.arena, m),
+                            }
+                        },
+                    }
+                }
+            }
+            return key.items;
+        }
+
+        const LocalReads = union(enum) { stochastic, names: []const []const u8 };
+
+        /// The identifiers `text` holds, `.func` bodies followed, or
+        /// `.stochastic` when it calls a distribution. Keys and function
+        /// names count too: a superset only makes the memo key stricter.
+        fn localReads(r: *R, text: []const u8) Error!LocalReads {
+            var out: std.ArrayList([]const u8) = .empty;
+            var todo: std.ArrayList([]const u8) = .empty;
+            defer todo.deinit(r.arena);
+            try todo.append(r.arena, text);
+            var bodies: usize = 0;
+            while (todo.pop()) |t| {
+                var k: usize = 0;
+                while (k < t.len) {
+                    const c = t[k];
+                    if (std.ascii.isDigit(c) or c == '.') {
+                        // A number with its exponent and scale suffix.
+                        while (k < t.len and (std.ascii.isAlphanumeric(t[k]) or t[k] == '.' or t[k] == '_' or
+                            ((t[k] == '+' or t[k] == '-') and k > 0 and (t[k - 1] == 'e' or t[k - 1] == 'E')))) k += 1;
+                        continue;
+                    }
+                    if (!(std.ascii.isAlphabetic(c) or c == '_')) {
+                        k += 1;
+                        continue;
+                    }
+                    const start = k;
+                    while (k < t.len and (std.ascii.isAlphanumeric(t[k]) or t[k] == '_')) k += 1;
+                    const ident = t[start..k];
+                    if (expr.isDistributionName(ident)) return .stochastic;
+                    if (r.funcs.get(ident)) |func| {
+                        bodies += 1;
+                        // A recursive `.func` chain: give up on the memo.
+                        if (bodies > 64) return .stochastic;
+                        try todo.append(r.arena, func.body);
+                    }
+                    try out.append(r.arena, ident);
+                }
+            }
+            return .{ .names = out.items };
         }
 
         /// Equal keys and values; an unfolded expression never compares equal.
@@ -2439,7 +2576,7 @@ fn Reader(comptime S: type) type {
             const start = r.ops.items.len;
             const sites = r.site_ops.items.len;
             const top: Frame = .{ .scopes = &r.global_scopes };
-            try r.subst(mark.ops, r.scratch.ops.items.len, &top, &r.global_scopes, 0);
+            try r.subst(&r.scratch, mark.ops, r.scratch.ops.items.len, &top, &r.global_scopes, 0);
             const ops = r.ops.items[start..];
             const probe = try expr.fold(r.arena, &r.stack, ops, r.consts.items, false, &.{ 1, 1, 1 });
             var drawn = r.site_ops.items.len != sites;
@@ -2554,9 +2691,7 @@ fn Reader(comptime S: type) type {
                 },
                 .expr => |span| {
                     const sited = r.holdsSite(span.start, span.start + span.len);
-                    var reads = false;
-                    for (r.ops.items[span.start..][0..span.len]) |op| reads = reads or op.code == .live;
-                    if (!reads and !sited) return;
+                    if (!sited and !readsLive(r.ops.items[span.start..][0..span.len])) return;
                     const folded = try expr.fold(r.arena, &r.stack, r.ops.items[span.start..][0..span.len], r.consts.items, false, r.live_nominal.items);
                     if (folded.known) {
                         try slots.at.append(r.arena, at);
@@ -2625,10 +2760,6 @@ fn Reader(comptime S: type) type {
                 else => {},
             };
             return out.items;
-        }
-
-        fn orderU32(a: u32, b: u32) std.math.Order {
-            return std.math.order(a, b);
         }
 
         /// Logs `line` as `what` and fails the parse with `UnsupportedCard`.
@@ -2740,7 +2871,7 @@ fn Reader(comptime S: type) type {
         /// ESPice refuses it by name instead of reading a name `%3` (#200).
         /// In HSPICE, which has no `%` or `\` operator, a field led by one
         /// is refused the same way (#203). Node fields are names and stay
-        /// read, as do X cards and dot cards. tests/grammar/lower.zig
+        /// read, as do X cards and dot cards. tests/frontend/lower.zig
         /// `element` refuses the same fields.
         fn refuseOperatorField(r: *R, line: []const u8, t: []const u8) Error!void {
             if (!F.isWord(t)) return;
@@ -2788,26 +2919,17 @@ fn Reader(comptime S: type) type {
                 const head = f.next().?[1..];
                 if (std.mem.eql(u8, head, "check") or std.mem.eql(u8, head, "dout") or std.mem.eql(u8, head, "biaschk")) {
                     const n = r.measures.items.len;
-                    measure.parseCheck(r.arena, head, f.rest(), r, &global_level, checks + 1, &r.measures) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line}),
-                    };
+                    measure.parseCheck(r.arena, head, f.rest(), r, &global_level, checks + 1, &r.measures) catch |err| try skipBad(err, line);
                     if (r.measures.items.len > n) checks += 1;
                     continue;
                 }
                 if (std.mem.eql(u8, head, "power")) {
                     powers += 1;
-                    r.readPower(&f, powers) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line}),
-                    };
+                    r.readPower(&f, powers) catch |err| try skipBad(err, line);
                     continue;
                 }
                 if (std.mem.startsWith(u8, head, "stim")) {
-                    r.readStim(&f, &stims) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line}),
-                    };
+                    r.readStim(&f, &stims) catch |err| try skipBad(err, line);
                     continue;
                 }
                 if (std.mem.eql(u8, head, "jitter")) {
@@ -2829,6 +2951,13 @@ fn Reader(comptime S: type) type {
                 };
                 try r.measures.append(r.arena, m);
             }
+        }
+
+        /// Logs a card `readMeasures` cannot take and goes on, as ngspice
+        /// does; only `OutOfMemory` fails the parse.
+        fn skipBad(err: anyerror, line: []const u8) error{OutOfMemory}!void {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            std.log.warn("netlist: ignoring unsupported or malformed card '{s}'", .{line});
         }
 
         /// HSPICE `.power signal [REF=] [FROM=] [TO=]` [CR .POWER] as four
@@ -3045,12 +3174,11 @@ fn Reader(comptime S: type) type {
             const ops_mark = r.ops.items.len;
             const consts_mark = r.consts.items.len;
             const sites_mark = r.site_ops.items.len;
-            try r.subst(from, r.scratch.ops.items.len, frame, frame.scopes, 0);
+            try r.subst(&r.scratch, from, r.scratch.ops.items.len, frame, frame.scopes, 0);
             const ops = r.ops.items[ops_mark..];
             const v = try expr.fold(r.arena, &r.stack, ops, r.consts.items, geometry, r.live_nominal.items);
             if (v.known) {
-                var reads = false;
-                for (ops) |op| reads = reads or op.code == .live;
+                const reads = readsLive(ops);
                 const sited = r.site_ops.items.len > sites_mark;
                 if (reads and !r.in_card and !r.live_ok) {
                     if (!@import("builtin").is_test) std.log.err("netlist: a swept parameter is read outside a device or model value", .{});
@@ -3078,21 +3206,21 @@ fn Reader(comptime S: type) type {
             return null;
         }
 
-        /// Copies scratch ops `from..to` into the netlist's ops. A name a scope
+        /// Copies `src`'s ops `from..to` into the netlist's ops. A name a scope
         /// defines is replaced by its definition, read in the scope that
         /// defined it; probe nets are mapped through `frame`.
-        fn subst(r: *R, from: usize, to: usize, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
+        fn subst(r: *R, src: *const expr.Scratch, from: usize, to: usize, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
             if (depth == 64) return error.ParseError;
             // `expr.Code.ident`'s final operand: declared geometry, then the
             // B-source tape's simulator variables.
             const ident_class = std.StaticStringMap(u32).initComptime(.{ .{ "l", 1 }, .{ "w", 1 }, .{ "mult", 1 }, .{ "time", 2 }, .{ "temper", 3 } });
             var i = from;
             while (i < to) : (i += 1) {
-                const op = r.scratch.ops.items[i];
+                const op = src.ops.items[i];
                 switch (op.code) {
-                    .num => try r.emitNum(r.scratch.consts.items[op.a]),
+                    .num => try r.emitNum(src.consts.items[op.a]),
                     .ident => {
-                        const name = r.scratch.names.items[op.a];
+                        const name = src.names.items[op.a];
                         // A formal of the function being expanded: its argument.
                         if (bound(r.bindings.items, name)) |ops| {
                             try r.ops.appendSlice(r.arena, ops);
@@ -3109,9 +3237,7 @@ fn Reader(comptime S: type) type {
                         switch (hit.entry) {
                             .num => |n| try r.emitNum(n),
                             .text => |text| {
-                                const mark = r.scratch.mark();
-                                defer r.scratch.reset(mark);
-                                try expr.compileAll(S, r.arena, &r.scratch, text);
+                                const code = try r.compiledText(text);
                                 // Calls inside a parameter's text draw once per
                                 // scope that defines it: globally, or per instance.
                                 const owner = r.site_owner;
@@ -3120,22 +3246,22 @@ fn Reader(comptime S: type) type {
                                     r.site_owner = owner;
                                     r.site_ordinal = ordinal;
                                 }
-                                r.site_owner = nameKey(nameKey(0, levelPath(frame, hit.level)), name);
+                                if (r.monte) r.site_owner = nameKey(nameKey(0, levelPath(frame, hit.level)), name);
                                 r.site_ordinal = 0;
                                 // A parameter's text never sees the formals of a
                                 // function that reads it.
                                 const saved = r.bindings;
                                 r.bindings = .empty;
                                 defer r.bindings = saved;
-                                try r.subst(mark.ops, r.scratch.ops.items.len, frame, scopes[0 .. hit.level + 1], depth + 1);
+                                try r.subst(code, 0, code.ops.items.len, frame, scopes[0 .. hit.level + 1], depth + 1);
                             },
                         }
                     },
-                    .ucall => try r.inline_(op, frame, scopes, depth),
+                    .ucall => try r.inline_(src, op, frame, scopes, depth),
                     // The device by its flattened card name (`commit`), for a B-source tape.
                     .iprobe => {
                         const a = if (op.a == none) none else a: {
-                            const dev = r.scratch.names.items[op.a];
+                            const dev = src.names.items[op.a];
                             const flat = if (frame.path) |path| try r.joined(&.{ dev[0..1], ".", path, ".", dev }) else dev;
                             break :a (try r.internName(flat)).index();
                         };
@@ -3143,8 +3269,8 @@ fn Reader(comptime S: type) type {
                     },
                     .vprobe => try r.ops.append(r.arena, .{
                         .code = .vprobe,
-                        .a = if (op.a == none) none else (try r.netOf(frame, r.scratch.names.items[op.a])).index(),
-                        .b = if (op.b == none) none else (try r.netOf(frame, r.scratch.names.items[op.b])).index(),
+                        .a = if (op.a == none) none else (try r.netOf(frame, src.names.items[op.a])).index(),
+                        .b = if (op.b == none) none else (try r.netOf(frame, src.names.items[op.b])).index(),
                     }),
                     else => {
                         if (r.monte and op.code == .call and expr.isDistribution(@fromBackingInt(@intCast(op.a)))) {
@@ -3172,8 +3298,8 @@ fn Reader(comptime S: type) type {
         /// expands to its body with each formal bound to its argument (the
         /// arguments' final ops, the last `op.b` subtrees emitted); any
         /// other stays a `call` of `Fn.other`, which nothing folds.
-        fn inline_(r: *R, op: expr.Op, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
-            const name = r.scratch.names.items[op.a];
+        fn inline_(r: *R, src: *const expr.Scratch, op: expr.Op, frame: *const Frame, scopes: []const *const Scope, depth: u8) Error!void {
+            const name = src.names.items[op.a];
             const func = r.funcs.get(name) orelse
                 return r.ops.append(r.arena, .{ .code = .call, .a = @backingInt(expr.Fn.other), .b = op.b });
             if (func.formals.len != op.b) return error.ParseError;
@@ -3188,13 +3314,30 @@ fn Reader(comptime S: type) type {
                 end = start;
             }
             r.ops.shrinkRetainingCapacity(end);
-            const mark = r.scratch.mark();
-            defer r.scratch.reset(mark);
-            try expr.compileAll(S, r.arena, &r.scratch, func.body);
+            const code = try r.compiledText(func.body);
             const outer = r.bindings.items.len;
             defer r.bindings.shrinkRetainingCapacity(outer);
             for (func.formals, args) |formal, a| try r.bindings.append(r.arena, .{ .name = formal, .ops = a });
-            try r.subst(mark.ops, r.scratch.ops.items.len, frame, scopes, depth + 1);
+            try r.subst(code, 0, code.ops.items.len, frame, scopes, depth + 1);
+        }
+
+        /// `text` compiled, once per distinct text: a parameter's or a
+        /// function's text is read wherever it is named, once per instance
+        /// under a subcircuit. Compiling reads nothing but the text, so a
+        /// cached copy is what a fresh compile gives; a text that fails to
+        /// compile is not kept and fails the same way again.
+        fn compiledText(r: *R, text: []const u8) Error!*const expr.Scratch {
+            const got = try r.compiled_texts.getOrPut(r.arena, text);
+            if (got.found_existing) return got.value_ptr.*;
+            errdefer r.compiled_texts.removeByPtr(got.key_ptr);
+            // Its names are slices of the text, so the key owns a copy.
+            const key = try r.arena.dupe(u8, text);
+            const code = try r.arena.create(expr.Scratch);
+            code.* = .{};
+            try expr.compileAll(S, r.arena, code, key);
+            got.key_ptr.* = key;
+            got.value_ptr.* = code;
+            return code;
         }
 
         /// The instance path whose scope sits at `level` of `frame`'s
@@ -3267,7 +3410,9 @@ fn Reader(comptime S: type) type {
         /// is `<path>.<node>`.
         fn netOf(r: *R, frame: *const Frame, node: []const u8) Error!VertexId {
             const path = frame.path orelse return r.intern(node);
-            for (frame.ports, frame.actuals) |p, a| if (std.mem.eql(u8, p, node)) return a;
+            if (frame.port_index) |index| {
+                if (index.get(node)) |k| return frame.actuals[k];
+            } else for (frame.ports, frame.actuals) |p, a| if (std.mem.eql(u8, p, node)) return a;
             if (isGround(r.dialect, node) or r.global_nets.contains(node)) return r.intern(node);
             return r.intern(try r.joined(&.{ path, ".", node }));
         }
@@ -3354,7 +3499,7 @@ fn Reader(comptime S: type) type {
             const was_in_card = r.in_card;
             r.in_card = true;
             defer r.in_card = was_in_card;
-            r.site_owner = nameKey(nameKey(0, frame.path orelse ""), head);
+            if (r.monte) r.site_owner = nameKey(nameKey(0, frame.path orelse ""), head);
             r.site_ordinal = 0;
             if (!F.isWord(head) or !std.ascii.isAlphabetic(head[0])) return error.ParseError;
             // HSPICE's P element is a port: a V card that `port=` numbers
@@ -3485,7 +3630,7 @@ fn Reader(comptime S: type) type {
             var f = f_in;
             // HSPICE quotes these expressions (`VOL='...'`, `TABLE '...'`);
             // a brace is a name byte there, and the form takes no name with
-            // one (#203). tests/grammar/lower.zig `element` refuses the same.
+            // one (#203). tests/frontend/lower.zig `element` refuses the same.
             if (r.dialect == .hspice and std.mem.indexOfScalar(u8, f.rest(), '{') != null)
                 return r.unsupported(line, "a braced expression (HSPICE quotes expressions: '...')");
             r.nodes.clearRetainingCapacity();
@@ -3893,6 +4038,7 @@ fn Reader(comptime S: type) type {
                 .path = if (frame.path) |p| try std.mem.concat(arena, u8, &.{ p, ".", head }) else head,
                 .ports = sub.ports,
                 .actuals = actuals,
+                .port_index = sub.port_index,
                 .scopes = scopes,
                 .depth = frame.depth + 1,
                 .instance = instance,
@@ -3936,6 +4082,79 @@ fn Reader(comptime S: type) type {
                 if (card == .cond) try r.branch(&branches, card.cond, &f, &child);
             }
             if (branches.depth != 0) return error.ParseError;
+        }
+
+        /// Cards and `key=value` rows that flattening the `X` cards among
+        /// lines `top` adds, counted off each subcircuit's body (its own
+        /// lines, and its `X` cards' subcircuits in turn). A reservation
+        /// estimate: both arms of a body's `.if` count, and an `X` card whose
+        /// subcircuit this cannot name counts nothing.
+        /// ponytail: capped at 16M cards, so a deep or cyclic hierarchy
+        /// that `expand` refuses reserves nothing absurd.
+        fn expandedExtra(r: *R, top: []const u32) Error!struct { cards: usize, kvs: usize } {
+            if (r.subckts.items.len == 0) return .{ .cards = 0, .kvs = 0 };
+            const sizes = try r.arena.alloc(Size, r.subckts.items.len);
+            @memset(sizes, .{});
+            var total: Size = .{};
+            for (top) |i| if (r.xTarget(i)) |id| total.add(r.bodySize(sizes, id, 0));
+            const cap = 1 << 24;
+            return .{ .cards = @min(total.cards, cap), .kvs = @min(total.kvs, 8 * cap) };
+        }
+
+        const Size = struct {
+            cards: usize = 0,
+            kvs: usize = 0,
+            state: enum { new, busy, done } = .new,
+
+            fn add(a: *Size, b: Size) void {
+                a.cards +|= b.cards;
+                a.kvs +|= b.kvs;
+            }
+        };
+
+        /// Subcircuit `id` flattened: its body's cards and `=` signs, its
+        /// `X` cards' subcircuits included. Memoized in `sizes`; a
+        /// subcircuit reached again while counting (a cycle) or past
+        /// `expand`'s depth counts nothing.
+        fn bodySize(r: *R, sizes: []Size, id: u16, depth: u8) Size {
+            if (sizes[id].state == .done) return sizes[id];
+            if (sizes[id].state == .busy or depth >= 32) return .{};
+            sizes[id].state = .busy;
+            const sub = r.subckts.items[id];
+            var size: Size = .{};
+            var nested: u32 = 0;
+            for (r.lines.items[sub.first..sub.end], sub.first..) |line, i| {
+                if (line[0] == '.') {
+                    if (!sub.has_nested) continue;
+                    var f = F.init(line);
+                    const card = cardOf(f.next().?[1..]) orelse continue;
+                    _ = skipNested(card, &nested);
+                    continue;
+                }
+                if (nested != 0) continue;
+                size.add(.{ .cards = 1, .kvs = std.mem.countScalar(u8, line, '=') });
+                if (r.xTarget(i)) |x| size.add(r.bodySize(sizes, x, depth + 1));
+            }
+            size.state = .done;
+            sizes[id] = size;
+            return size;
+        }
+
+        /// The subcircuit line `i` instantiates when it is an `X` card
+        /// whose last word before its parameters names one, else null.
+        fn xTarget(r: *const R, i: usize) ?u16 {
+            const line = r.lines.items[i];
+            const letter = if (r.kindOf(i) != 0) r.kindOf(i) else std.ascii.toLower(line[0]);
+            if (letter != 'x') return null;
+            var f = F.init(line);
+            _ = f.next();
+            var last: ?[]const u8 = null;
+            while (true) {
+                const t = f.next() orelse break;
+                if (!F.isWord(t) or f.takeEq()) break;
+                if (!std.mem.eql(u8, t, "params:")) last = t;
+            }
+            return r.subckt_ids.get(last orelse return null);
         }
 
         /// Tracks nested `.subckt` ... `.ends` while reading a body: true
@@ -4072,10 +4291,10 @@ fn Reader(comptime S: type) type {
                 if (first.* != .name) continue;
                 var bin = names.get(first.name) orelse continue;
                 if (std.mem.eql(u8, first.name, models[bin].name)) continue;
-                const l = number(kv, "l") orelse return error.ParseError;
-                const use_nf = if (number(kv, "wnflag")) |flag| flag != 0 else wnflag;
-                const nf = if (use_nf) number(kv, "nf") orelse 1 else 1;
-                const w = (number(kv, "w") orelse return error.ParseError) / nf;
+                const l = kvNumber(kv, "l") orelse return error.ParseError;
+                const use_nf = if (kvNumber(kv, "wnflag")) |flag| flag != 0 else wnflag;
+                const nf = if (use_nf) kvNumber(kv, "nf") orelse 1 else 1;
+                const w = (kvNumber(kv, "w") orelse return error.ParseError) / nf;
                 // A swept or sampled l/w: every bin is a candidate a point
                 // may pick (`Live.bins`).
                 if (swept_geometry) {
@@ -4096,36 +4315,43 @@ fn Reader(comptime S: type) type {
                 if (bin == none) return error.ModelBinNotFound;
             }
         }
-
-        /// Whether `model` is a bin of `base`: `base.<n>`.
-        fn isBinOf(model: []const u8, base: []const u8) bool {
-            if (model.len <= base.len + 1 or !std.mem.startsWith(u8, model, base) or model[base.len] != '.') return false;
-            _ = std.fmt.parseInt(u32, model[base.len + 1 ..], 10) catch return false;
-            return true;
-        }
-
-        /// A bin card's `{lmin, lmax, wmin, wmax}`, null unless all four are numbers.
-        fn binBounds(kv: []const Kv) ?[4]f64 {
-            return .{
-                number(kv, "lmin") orelse return null, number(kv, "lmax") orelse return null,
-                number(kv, "wmin") orelse return null, number(kv, "wmax") orelse return null,
-            };
-        }
-
-        /// Whether bin bounds `b` hold `l` and `w`, each within 1 nm.
-        fn binHolds(b: [4]f64, l: f64, w: f64) bool {
-            return (@abs(l - b[0]) < 1e-9 or @abs(l - b[1]) < 1e-9 or (l > b[0] and l < b[1])) and
-                (@abs(w - b[2]) < 1e-9 or @abs(w - b[3]) < 1e-9 or (w > b[2] and w < b[3]));
-        }
-
-        fn number(kv: []const Kv, key: []const u8) ?f64 {
-            for (kv) |item| if (std.mem.eql(u8, item.key, key)) return switch (item.value) {
-                .num => |n| n,
-                else => null,
-            };
-            return null;
-        }
     };
+}
+
+/// Whether `model` is a bin of `base`: `base.<n>`.
+fn isBinOf(model: []const u8, base: []const u8) bool {
+    if (model.len <= base.len + 1 or !std.mem.startsWith(u8, model, base) or model[base.len] != '.') return false;
+    _ = std.fmt.parseInt(u32, model[base.len + 1 ..], 10) catch return false;
+    return true;
+}
+
+/// A bin card's `{lmin, lmax, wmin, wmax}`, null unless all four are numbers.
+fn binBounds(kv: []const Kv) ?[4]f64 {
+    return .{
+        kvNumber(kv, "lmin") orelse return null, kvNumber(kv, "lmax") orelse return null,
+        kvNumber(kv, "wmin") orelse return null, kvNumber(kv, "wmax") orelse return null,
+    };
+}
+
+/// Whether bin bounds `b` hold `l` and `w`, each within 1 nm.
+fn binHolds(b: [4]f64, l: f64, w: f64) bool {
+    return (@abs(l - b[0]) < 1e-9 or @abs(l - b[1]) < 1e-9 or (l > b[0] and l < b[1])) and
+        (@abs(w - b[2]) < 1e-9 or @abs(w - b[3]) < 1e-9 or (w > b[2] and w < b[3]));
+}
+
+/// The first `key` row's number; null when no row has `key` or the first is no number.
+fn kvNumber(kv: []const Kv, key: []const u8) ?f64 {
+    return if (kvIndex(kv, key)) |i| kv[i].value.number() else null;
+}
+
+/// Whether postfix `ops` reads a live name.
+fn readsLive(ops: []const expr.Op) bool {
+    for (ops) |op| if (op.code == .live) return true;
+    return false;
+}
+
+fn orderU32(a: u32, b: u32) std.math.Order {
+    return std.math.order(a, b);
 }
 
 /// A sweep grid: `lin` from an increment or a point count, `dec`/`oct`
@@ -4244,7 +4470,7 @@ test {
     _ = csr;
     _ = measure;
     _ = pattern;
-    _ = spectre;
+    _ = spectre_rewrite;
     _ = @import("vec.zig");
     _ = @import("tests/netlist.zig");
     _ = @import("tests/fuzz.zig");

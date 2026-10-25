@@ -38,7 +38,7 @@ fn lifecycle(allocator: std.mem.Allocator) !void {
     var params: std.ArrayList(ir.ParamRef) = .empty;
     defer params.deinit(allocator);
     try snapshot.hooks.collect_params(snapshot.ctx, allocator, &params).unwrap();
-    try t.expectEqual(@as(usize, 2), params.items.len);
+    try t.expectEqual(@as(usize, 1), params.items.len);
     var noise: std.ArrayList(ir.NoiseSource) = .empty;
     defer noise.deinit(allocator);
     try snapshot.hooks.collect_noise.?(snapshot.ctx, &.{ 0, 1 }, allocator, &noise).unwrap();
@@ -61,7 +61,7 @@ test "separately compiled statuses decode to consumer-local errors" {
         try t.expectEqual(@intFromError(error.OutOfMemory), @intFromError(err));
         try t.expectEqualStrings("OutOfMemory", @errorName(err));
         if (@sizeOf(usize) > 4) {
-            const too_many: *const fn () ir.DeviceResult(ir.Batch) = @ptrCast(testTooManyInstances());
+            const too_many: *const fn () ir.DeviceResult(ir.Batch) = @ptrCast(@alignCast(testTooManyInstances()));
             try t.expectError(error.TooManyInstances, too_many().unwrap());
         }
         return;

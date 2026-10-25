@@ -30,6 +30,10 @@
 //
 // ponytail: no tunnel (JTUN/NTUN/XTITUN/KEG), no TTT1/TTT2 transit-time
 // tempco, no `.options scale`. Add when a deck needs one.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module diode(a, c);
     inout a, c;
     electrical a, c, ai;

@@ -1,8 +1,7 @@
 //! Quasi-periodic steady state: `.qpss f1 f2 K1 K2` solved as two-tone
 //! harmonic balance by `mhb.solve` over the (2K1+1) x (2K2+1) box, then
 //! published two-sided, one row per mix product k*f1 + l*f2.
-//!
-//! Cites: dev/analysis/qpss.md, dev/analysis/multitone-hb.md §QPSS.
+//! No outside source beyond mhb.zig's.
 const std = @import("std");
 const root = @import("../types.zig");
 const mhb = @import("mhb.zig");

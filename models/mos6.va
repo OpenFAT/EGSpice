@@ -13,6 +13,10 @@
 // limiting (fetlim/limvds/pnjlim) is spelled with $limit: it is the identity
 // inside eval, and VerA's contract `limit`/`seed` hooks hand the host the
 // clamps to run between the linear solve and the next eval.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module mos6(d, g, s, b);
     inout d, g, s, b;
     electrical d, g, s, b;

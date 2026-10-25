@@ -9,21 +9,29 @@ const Library = @import("device").Library;
 const eval = @import("device_eval");
 const converger = @import("solver").converger;
 const D = @import("limiter_device");
+const models = @import("models");
 const t = std.testing;
+const GROUND = analysis.GROUND;
+
+/// One `va_limit_state` instance from a fresh node to ground, registered in
+/// `lib`. exp(V) = exp(2) puts its root at V = 2.
+fn limiter(lib: *Library) !@import("device").Circuit {
+    var b = try Builder.init(t.allocator, lib);
+    const out = try b.addNode();
+    const vt = eval.deviceVtable(D, "va_limit_state");
+    const proto = try b.protoOf(try lib.register("va_limit_state", vt, false));
+    const model: D.Model = .{};
+    const instance: D.Instance = .{};
+    const nodes = [_]u32{ out, GROUND };
+    try vt.proto_add(proto.ctx, t.allocator, @ptrCast(&model), @ptrCast(&instance), &nodes).unwrap();
+    return b.compile();
+}
 
 test "generated limiter: failed trial rollback and retry match an untried circuit" {
     inline for (.{ converger.newton, converger.jfnk }) |solve| {
         var lib = try Library.init(t.allocator);
         defer lib.deinit();
-        var b = try Builder.init(t.allocator, &lib);
-        const out = try b.addNode();
-        const vt = eval.deviceVtable(D, "va_limit_state");
-        const proto = try b.protoOf(try lib.register("va_limit_state", vt, false));
-        const model: D.Model = .{};
-        const instance: D.Instance = .{};
-        const nodes = [_]u32{ out, analysis.GROUND };
-        try vt.proto_add(proto.ctx, t.allocator, @ptrCast(&model), @ptrCast(&instance), &nodes).unwrap();
-        var prepared = try b.compile();
+        var prepared = try limiter(&lib);
         defer prepared.deinit();
         var tried = try analysis.Circuit.instantiate(&prepared, t.allocator);
         defer tried.deinit();
@@ -70,83 +78,92 @@ test "generated limiter: failed trial rollback and retry match an untried circui
     }
 }
 
-const testing = std.testing;
-const GROUND = analysis.GROUND;
+test "gminFactor: thresholds are the Newton budget's quarters" {
+    const gminFactor = @import("../dc/op.zig").gminFactor;
+    // The 100-iteration budget: 25 accelerates, 26-75 holds, 76 slows.
+    try t.expectEqual(@min(4 * @sqrt(4.0), 10.0), gminFactor(4, 25, 100));
+    try t.expectEqual(@as(f64, 4), gminFactor(4, 26, 100));
+    try t.expectEqual(@as(f64, 4), gminFactor(4, 75, 100));
+    try t.expectEqual(@as(f64, 2), gminFactor(4, 76, 100));
+    // Capped at 10, floored at 1.00005.
+    try t.expectEqual(@as(f64, 10), gminFactor(9, 1, 100));
+    try t.expectEqual(@as(f64, 1.00005), gminFactor(1.00001, 99, 100));
+}
 
 test "jfnk vs newton: divider OP agrees to 1e-9" {
-    var lib = try Library.init(testing.allocator);
+    var lib = try Library.init(t.allocator);
     defer lib.deinit();
-    var b = try Builder.init(testing.allocator, &lib);
+    var b = try Builder.init(t.allocator, &lib);
     const vin = try b.addNode();
     const out = try b.addNode();
-    try b.addDevice(@import("models").vsource, "", &.{ .dc = 10 }, &.{}, .{ vin, GROUND });
-    try b.addDevice(@import("models").resistor, "", &.{ .r = 1000 }, &.{}, .{ vin, out });
-    try b.addDevice(@import("models").resistor, "", &.{ .r = 3000 }, &.{}, .{ out, GROUND });
+    try b.addDevice(models.vsource, "", &.{ .dc = 10 }, &.{}, .{ vin, GROUND });
+    try b.addDevice(models.resistor, "", &.{ .r = 1000 }, &.{}, .{ vin, out });
+    try b.addDevice(models.resistor, "", &.{ .r = 3000 }, &.{}, .{ out, GROUND });
     var prepared = try b.compile();
     defer prepared.deinit();
-    var ckt = try analysis.Circuit.instantiate(&prepared, testing.allocator);
+    var ckt = try analysis.Circuit.instantiate(&prepared, t.allocator);
     defer ckt.deinit();
 
     try ckt.computeBaseline();
 
-    var ws_n = try converger.Workspace.init(testing.allocator, ckt.n, ckt.col_ptr, ckt.row_idx, ckt.bbd, .{}, .{});
-    defer ws_n.deinit(testing.allocator);
-    const x_n = try testing.allocator.alloc(f64, ckt.n);
-    defer testing.allocator.free(x_n);
+    var ws_n = try converger.Workspace.init(t.allocator, ckt.n, ckt.col_ptr, ckt.row_idx, ckt.bbd, .{}, .{});
+    defer ws_n.deinit(t.allocator);
+    const x_n = try t.allocator.alloc(f64, ckt.n);
+    defer t.allocator.free(x_n);
     @memset(x_n, 0);
     const nr = try converger.newton(&ckt, &ws_n, x_n, 0, .{}, analysis.EvalHook{});
-    try testing.expect(nr.converged);
+    try t.expect(nr.converged);
 
-    var ws_j = try converger.Workspace.init(testing.allocator, ckt.n, ckt.col_ptr, ckt.row_idx, ckt.bbd, .{}, .{});
-    defer ws_j.deinit(testing.allocator);
-    const x_j = try testing.allocator.alloc(f64, ckt.n);
-    defer testing.allocator.free(x_j);
+    var ws_j = try converger.Workspace.init(t.allocator, ckt.n, ckt.col_ptr, ckt.row_idx, ckt.bbd, .{}, .{});
+    defer ws_j.deinit(t.allocator);
+    const x_j = try t.allocator.alloc(f64, ckt.n);
+    defer t.allocator.free(x_j);
     @memset(x_j, 0);
     const jr = try converger.jfnk(&ckt, &ws_j, x_j, 0, .{}, analysis.EvalHook{});
-    try testing.expect(jr.converged);
+    try t.expect(jr.converged);
 
     for (0..ckt.n) |i| {
-        try testing.expectApproxEqAbs(x_n[i], x_j[i], 1e-9);
+        try t.expectApproxEqAbs(x_n[i], x_j[i], 1e-9);
     }
 }
 
 test "jfnk: 100-diode ladder converges" {
     const n_diodes: usize = 100;
-    var lib = try Library.init(testing.allocator);
+    var lib = try Library.init(t.allocator);
     defer lib.deinit();
-    var b = try Builder.init(testing.allocator, &lib);
+    var b = try Builder.init(t.allocator, &lib);
     const vin = try b.addNode();
-    try b.addDevice(@import("models").vsource, "", &.{ .dc = 5 }, &.{}, .{ vin, GROUND });
+    try b.addDevice(models.vsource, "", &.{ .dc = 5 }, &.{}, .{ vin, GROUND });
 
     // vin -R- n1 -R- n2 ... -R- gnd, a diode from every n to ground.
     var prev: u32 = vin;
     for (0..n_diodes) |_| {
         const mid = try b.addNode();
-        try b.addDevice(@import("models").resistor, "", &.{ .r = 100 }, &.{}, .{ prev, mid });
-        try b.addDevice(@import("models").diode, "", &.{ .is = 1e-14 }, &.{}, .{ mid, GROUND });
+        try b.addDevice(models.resistor, "", &.{ .r = 100 }, &.{}, .{ prev, mid });
+        try b.addDevice(models.diode, "", &.{ .is = 1e-14 }, &.{}, .{ mid, GROUND });
         prev = mid;
     }
-    try b.addDevice(@import("models").resistor, "", &.{ .r = 100 }, &.{}, .{ prev, GROUND });
+    try b.addDevice(models.resistor, "", &.{ .r = 100 }, &.{}, .{ prev, GROUND });
 
     var prepared = try b.compile();
     defer prepared.deinit();
-    var ckt = try analysis.Circuit.instantiate(&prepared, testing.allocator);
+    var ckt = try analysis.Circuit.instantiate(&prepared, t.allocator);
     defer ckt.deinit();
     try ckt.computeBaseline();
 
-    var ws = try converger.Workspace.init(testing.allocator, ckt.n, ckt.col_ptr, ckt.row_idx, ckt.bbd, .{}, .{});
-    defer ws.deinit(testing.allocator);
-    const x = try testing.allocator.alloc(f64, ckt.n);
-    defer testing.allocator.free(x);
+    var ws = try converger.Workspace.init(t.allocator, ckt.n, ckt.col_ptr, ckt.row_idx, ckt.bbd, .{}, .{});
+    defer ws.deinit(t.allocator);
+    const x = try t.allocator.alloc(f64, ckt.n);
+    defer t.allocator.free(x);
     @memset(x, 0);
 
     const r = try converger.jfnk(&ckt, &ws, x, 0, .{
         .max_iter = 200,
         .abstol = 1e-9,
     }, analysis.EvalHook{});
-    try testing.expect(r.converged);
+    try t.expect(r.converged);
 
-    try testing.expectApproxEqAbs(@as(f64, 5.0), x[vin], 1e-3);
+    try t.expectApproxEqAbs(@as(f64, 5.0), x[vin], 1e-3);
 }
 
 test "generated limiter: a cold OP converges where F(x) = 0, not at the limited image" {
@@ -155,15 +172,7 @@ test "generated limiter: a cold OP converges where F(x) = 0, not at the limited 
     // stale previous value; the published x then solved F(lim(x)) = 0.
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
-    var b = try Builder.init(t.allocator, &lib);
-    const out = try b.addNode();
-    const vt = eval.deviceVtable(D, "va_limit_state");
-    const proto = try b.protoOf(try lib.register("va_limit_state", vt, false));
-    const model: D.Model = .{};
-    const instance: D.Instance = .{};
-    const nodes = [_]u32{ out, analysis.GROUND };
-    try vt.proto_add(proto.ctx, t.allocator, @ptrCast(&model), @ptrCast(&instance), &nodes).unwrap();
-    var prepared = try b.compile();
+    var prepared = try limiter(&lib);
     defer prepared.deinit();
     var ckt = try analysis.Circuit.instantiate(&prepared, t.allocator);
     defer ckt.deinit();
@@ -189,7 +198,6 @@ test "OPtran: the published x satisfies KCL at the device state the operating po
     // #53: transientOp published the x the 1 us settle reached and then
     // restored the pre-transient device state, so the two disagreed. A PULSE
     // that has fired by 1 us shows it: the source reads 0 V at t = 0.
-    const models = @import("models");
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var b = try Builder.init(t.allocator, &lib);

@@ -2,27 +2,33 @@ name: nix
 
 # Builds the flake's espice and pushes it to the omarsiwy cache, so
 # `nix run github:OmarSiwy/ESPice` is a download, not a Zig compile.
-# ponytail: x86_64-linux only, the one system the flake is verified on; add
-# macos-latest / ubuntu-24.04-arm once their devShells evaluate (CUDA/ROCm
-# and perf are Linux/x86_64 packages, so `nix flake check` fails there today).
+# This job builds and smokes x86_64-linux. The release matrix builds on
+# Linux ARM64 and both macOS architectures as well.
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
+
+concurrency:
+  group: nix-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   nix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # tests/conformance: the SPICE decks
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
         with:
           name: omarsiwy
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -30,6 +36,6 @@ jobs:
           skipPush: ${{ github.event_name == 'pull_request' }}
 
       # checks = the CPU package plus a smoke run of a plain and an .hdl deck.
-      - run: nix flake check --print-build-logs
-      - run: nix build .#espice .#espice-cuda --print-build-logs
+      - run: nix flake check --cores 2 --max-jobs 1 --print-build-logs
+      - run: nix build .#espice .#espice-cuda --cores 2 --max-jobs 1 --print-build-logs
       - run: nix run . -- --version

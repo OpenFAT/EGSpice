@@ -2,19 +2,29 @@
 //! result schemas. The numerical implementations stay private to the module.
 /// The query graph and its scheduler (`Session`).
 pub const session = @import("session.zig");
+/// Per-Problem execution settings every query shares.
 pub const ExecutionConfig = @import("executor.zig").Config;
 /// Developer switches `ExecutionConfig.knobs` carries; the facade fills them.
 pub const Knobs = @import("types.zig").Knobs;
+/// Refuses a backend without kernels in this build or a zero thread count.
 pub const validateBackend = @import("executor.zig").validateBackend;
+/// Most points one lane batch runs together under a config; advisory.
+pub const batchWidth = @import("executor.zig").batchWidth;
+/// Threads a Problem lends its large queries (`ExecutionConfig.thread_pool`).
+pub const ThreadPool = @import("executor.zig").ThreadPool;
+/// Reusable query threads a Problem lends through `ExecutionConfig.threads`.
+pub const Threads = @import("worker.zig").Threads;
+/// Solver workspaces a Problem's queries share (`ExecutionConfig.ws_pool`).
+pub const WsPool = @import("ws_pool.zig").WsPool;
 /// Whether the GPU driver came up; the facade owns one per Problem and
 /// lends it through `ExecutionConfig.gpu_driver`.
-pub const GpuDriver = @import("gpu.zig").Driver;
+pub const GpuDriver = @import("gpu/context.zig").Driver;
 /// This build carries GPU kernel images, so a non-`cpu` backend can use the
 /// driver at all.
-pub const gpu_available = @import("gpu.zig").available;
+pub const gpu_available = @import("gpu/context.zig").available;
 /// The GPU transient lane backend (phase 4): `policy` decides
 /// `ExecutionConfig.gpu_lanes` once per Problem.
-pub const gpu_lanes = @import("gpu_lanes.zig");
+pub const gpu_lanes = @import("gpu/lanes.zig");
 /// The result shape of a query, without running it.
 pub const schemaOf = session.schemaOf;
 /// HSPICE MOSRA level 1 aging over a stress transient.
@@ -28,6 +38,9 @@ test {
     if (!@import("builtin").single_threaded) _ = @import("tests/executor.zig");
     _ = @import("tests/four.zig");
     _ = @import("tests/gpu.zig");
+    _ = @import("gpu/periodic.zig");
+    _ = @import("gpu/lane_color.zig");
+    _ = @import("gpu/devices.zig");
     _ = @import("tests/periodic.zig");
     _ = @import("tests/pz.zig");
     _ = @import("tests/session.zig");
@@ -36,9 +49,8 @@ test {
     _ = @import("tests/integration.zig");
     _ = @import("tests/jacobian.zig");
     _ = @import("tests/certify.zig");
-    _ = @import("tests/lane_circuit.zig");
     _ = @import("post/mosra.zig");
-    _ = @import("knobs.zig");
+    _ = @import("Circuit.zig");
     _ = @import("par_eval.zig");
     _ = @import("session.zig");
 

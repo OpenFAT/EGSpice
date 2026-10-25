@@ -1,7 +1,8 @@
 // The ESPice playground: every ```spice block on a page becomes an editable
 // netlist with its cktImg schematic beside it and a Run button that
 // simulates it with espice.wasm. No build step: the two wasm modules come
-// from wasm/ at the site root (`zig build wasm`), uPlot from jsDelivr.
+// from wasm/ at the site root (built by tools/playground/ in pages.yml),
+// uPlot from jsDelivr.
 //
 // The engine half (wasm loading, simulate, schematic) has no DOM
 // dependency: under node, `require` it and replace `fetchWasm`.

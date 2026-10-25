@@ -1,7 +1,6 @@
 //! Temperature sweep (`.temp`): one structural lane per temperature, using
 //! the devices' own temperature physics (setCircuitTemp), no external
-//! coefficients.
-//! Cites dev/analysis/dc-sweep.md and dev/analysis/ensemble-sweeps.md.
+//! coefficients. No outside source.
 const std = @import("std");
 const root = @import("../types.zig");
 const lanes = @import("lanes.zig");
@@ -29,17 +28,19 @@ pub const Setup = struct {
     t_step: f64,
     temp_c: f32,
 
-    pub fn apply(self: *Setup, k: usize) void {
+    pub fn apply(self: *Setup, k: usize) !void {
         self.ckt.setCircuitTemp(@floatCast(self.t_start + @as(f64, @floatFromInt(k)) * self.t_step));
     }
 
-    pub fn restore(self: *Setup) void {
+    pub fn restore(self: *Setup) !void {
         self.ckt.setCircuitTemp(self.temp_c);
     }
 
     pub fn deinit(_: *Setup, _: std.mem.Allocator) void {}
 };
 
+/// The installer for `ctx`'s circuit, saving its current temperature for
+/// `restore`. Never fails; the error union is the `lanes.run` protocol's.
 pub fn setup(ctx: *const root.RunCtx, opts: Options) !Setup {
     return .{ .ckt = ctx.circuit, .t_start = opts.t_start, .t_step = opts.t_step, .temp_c = ctx.circuit.temp_c };
 }

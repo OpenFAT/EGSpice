@@ -7,11 +7,6 @@ edit_uri: edit/main/docs/
 docs_dir: docs
 copyright: ESPice is Apache-2.0. Device models keep their own licences.
 
-# The bench reports and snippet sources are read through pymdownx.snippets,
-# not published as pages.
-exclude_docs: |
-  performance/bench/*/summary.md
-
 theme:
   name: material
   features:
@@ -107,5 +102,3 @@ nav:
   - Embedding ESPice:
       - The C API: embed/c-api.md
       - Zig package and Nix input: embed/packages.md
-  - Accuracy and performance:
-      - performance/index.md

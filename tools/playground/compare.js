@@ -6,7 +6,7 @@
 //   node tools/playground/compare.js WASM_DIR ESPICE DECK_OR_DIR...
 //
 // Decks the browser build refuses (.hdl, .include) and decks the native
-// espice fails on are skipped and counted. `zig build wasm-compare` runs it.
+// espice fails on are skipped and counted. pages.yml runs it after the build.
 // The native espice must be built for baseline x86_64 (two f64 lanes, as
 // wasm simd128 has), or every reassociated sum rounds differently.
 "use strict";

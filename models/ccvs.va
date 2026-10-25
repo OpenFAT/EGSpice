@@ -14,6 +14,10 @@
 // one polynomial covers both; `gain` and `c1` are the same coefficient.
 //
 // ponytail: POLY is limited to order 2 in one dimension, the same ceiling as bsource.va.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module ccvs(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;

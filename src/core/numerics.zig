@@ -168,7 +168,7 @@ pub fn norm2(buf: []const f64) f64 {
         const t = x / amax;
         acc += t * t;
     }
-    std.debug.assert(acc >= 1);
+    assert(acc >= 1);
     return amax * @sqrt(acc);
 }
 
@@ -311,10 +311,10 @@ pub const FreqSweep = struct {
             assert(k < self.list.len);
             return self.list[k];
         }
-        assert(k < self.count());
+        const n = self.count();
+        assert(k < n);
         const kf: f64 = @floatFromInt(k);
         if (self.kind == .lin) {
-            const n = self.count();
             if (n <= 1) return self.f_start;
             const frac = kf / @as(f64, @floatFromInt(n - 1));
             return self.f_start + frac * (self.f_stop - self.f_start);
@@ -401,6 +401,10 @@ pub const Tolerances = struct {
     temp_c: ?f64 = null,
     /// Row of `Deck.variants` this query runs; null runs the nominal circuit.
     variant: ?u32 = null,
+    /// This query's operating point, its own or its prerequisite, starts
+    /// from `Deck.warm_op` (`--warm-start`) instead of the cold ladder: the
+    /// same point within Newton's tolerances, usually in a few iterations.
+    warm_op: bool = false,
 };
 
 test "bulk buffers preserve bits, common prefixes and exact aliases" {

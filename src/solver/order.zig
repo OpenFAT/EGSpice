@@ -69,11 +69,11 @@ pub fn wsSize(n: usize, nnz: usize) usize {
 }
 
 /// Writes q[k] = the column factored at step k: strongly connected blocks of
-/// the graph j -> i for A(i,j) != 0, sink block first, each block's columns
-/// in AMD order or in natural order, whichever gives the smaller Cholesky
-/// factor of the block's A + A^T (#46). Requires a structurally full
-/// diagonal (the pattern merge guarantees it), so no matching step is
-/// needed. Restores `ws` on return.
+/// the graph j -> i for A(i,j) != 0 (`blocks`), sink block first, each
+/// block's columns in AMD order or in natural order, whichever gives the
+/// smaller Cholesky factor of the block's A + A^T (#46). Requires a
+/// structurally full diagonal (the pattern merge guarantees it), so no
+/// matching step is needed. Restores `ws` on return.
 /// Asserts that `q` has n entries and `col_ptr` n + 1.
 pub fn order(n: u32, col_ptr: []const u32, row_idx: []const u32, q: []u32, ws: *Ws) Error!void {
     if (n == 0) return;
@@ -82,15 +82,86 @@ pub fn order(n: u32, col_ptr: []const u32, row_idx: []const u32, q: []u32, ws: *
     const base = ws.mark();
     defer ws.release(base);
 
-    // Iterative Tarjan.
+    const emit = try ws.alloc(n); // vertices grouped by block
+    const block_ptr = try ws.alloc(n + 1); // block boundaries in `emit`
+    const nb = try blocks(n, col_ptr, row_idx, emit, block_ptr, ws);
+
+    // AMD inside each non-singleton block, on the block's sub-pattern.
+    const blk_of = try ws.alloc(n);
+    const loc = try ws.alloc(n);
+    for (0..nb) |b| {
+        for (block_ptr[b]..block_ptr[b + 1], 0..) |i, li| {
+            blk_of[emit[i]] = @intCast(b);
+            loc[emit[i]] = @intCast(li);
+        }
+    }
+
+    for (0..nb) |b| {
+        const lo = block_ptr[b];
+        const hi = block_ptr[b + 1];
+        const bs = hi - lo;
+        const verts = emit[lo..hi];
+
+        if (bs == 1) {
+            q[lo] = verts[0];
+            continue;
+        }
+
+        const blk_mark = ws.mark();
+        defer ws.release(blk_mark);
+
+        const sub_cp = try ws.alloc(bs + 1);
+        var sub_nnz: u32 = 0;
+        sub_cp[0] = 0;
+        for (verts, 0..) |v, j| {
+            for (row_idx[col_ptr[v]..col_ptr[v + 1]]) |r| sub_nnz += @intFromBool(blk_of[r] == b);
+            sub_cp[j + 1] = sub_nnz;
+        }
+        const sub_ri = try ws.alloc(sub_nnz);
+        var w: u32 = 0;
+        for (verts) |v| {
+            for (col_ptr[v]..col_ptr[v + 1]) |p| {
+                const r = row_idx[p];
+                if (blk_of[r] == b) {
+                    sub_ri[w] = loc[r];
+                    w += 1;
+                }
+            }
+        }
+        const sub_q = try ws.alloc(bs);
+        try amd(@intCast(bs), sub_cp, sub_ri, sub_q, ws);
+        // AMD is a heuristic: on a rail-last inverter chain it fills more
+        // than the natural order (50 against 48 at n = 10), so the block
+        // keeps whichever of the two fills less.
+        const nat = try ws.alloc(bs);
+        @memcpy(nat, verts);
+        std.sort.pdq(u32, nat, {}, std.sort.asc(u32));
+        for (nat) |*v| v.* = loc[v.*];
+        // The natural count stops at AMD's: a block whose natural order
+        // fills densely (chain_bsim4_100k: tens of seconds) costs no more
+        // than AMD's own count.
+        const amd_count = try cholCount(sub_cp, sub_ri, sub_q, ws, std.math.maxInt(u64));
+        const ord = if (try cholCount(sub_cp, sub_ri, nat, ws, amd_count) < amd_count) nat else sub_q;
+        for (ord, 0..) |lq, i| q[lo + i] = verts[lq];
+    }
+}
+
+/// Block triangular form: the strongly connected blocks of the graph
+/// j -> i for A(i,j) != 0 by iterative Tarjan, sink block first. Writes
+/// each block's vertices to `emit[block_ptr[b]..block_ptr[b + 1]]` and
+/// returns the block count. Restores `ws` on return. Asserts that `emit`
+/// has n entries and `block_ptr` n + 1.
+pub fn blocks(n: u32, col_ptr: []const u32, row_idx: []const u32, emit: []u32, block_ptr: []u32, ws: *Ws) Error!u32 {
+    assert(emit.len == n);
+    assert(block_ptr.len == @as(usize, n) + 1);
+    const base = ws.mark();
+    defer ws.release(base);
     const num = try ws.allocSet(n, NONE); // DFS number
     const low = try ws.alloc(n); // low-link
     const on = try ws.allocSet(n, 0); // on the SCC stack
     const scc_stack = try ws.alloc(n);
     const frame_v = try ws.alloc(n); // DFS frame: vertex
     const frame_p = try ws.alloc(n); // DFS frame: next edge
-    const emit = try ws.alloc(n); // vertices grouped by block
-    const block_ptr = try ws.alloc(n + 1); // block boundaries in `emit`
 
     var sp: u32 = 0;
     var fp: u32 = 0;
@@ -160,69 +231,24 @@ pub fn order(n: u32, col_ptr: []const u32, row_idx: []const u32, q: []u32, ws: *
     assert(sp == 0);
     assert(block_ptr[nb] == n);
 
-    // AMD inside each non-singleton block, on the block's sub-pattern.
-    const blk_of = try ws.alloc(n);
-    const loc = try ws.alloc(n);
-    for (0..nb) |b| {
-        for (block_ptr[b]..block_ptr[b + 1], 0..) |i, li| {
-            blk_of[emit[i]] = @intCast(b);
-            loc[emit[i]] = @intCast(li);
-        }
-    }
+    return nb;
+}
 
-    for (0..nb) |b| {
-        const lo = block_ptr[b];
-        const hi = block_ptr[b + 1];
-        const bs = hi - lo;
-        const verts = emit[lo..hi];
-
-        if (bs == 1) {
-            q[lo] = verts[0];
-            continue;
-        }
-
-        const blk_mark = ws.mark();
-        defer ws.release(blk_mark);
-
-        const sub_cp = try ws.alloc(bs + 1);
-        var sub_nnz: u32 = 0;
-        sub_cp[0] = 0;
-        for (verts, 0..) |v, j| {
-            for (col_ptr[v]..col_ptr[v + 1]) |p| {
-                if (blk_of[row_idx[p]] == b) sub_nnz += 1;
-            }
-            sub_cp[j + 1] = sub_nnz;
-        }
-        const sub_ri = try ws.alloc(sub_nnz);
-        var w: u32 = 0;
-        for (verts) |v| {
-            for (col_ptr[v]..col_ptr[v + 1]) |p| {
-                const r = row_idx[p];
-                if (blk_of[r] == b) {
-                    sub_ri[w] = loc[r];
-                    w += 1;
-                }
-            }
-        }
-        const sub_q = try ws.alloc(bs);
-        try amd(@intCast(bs), sub_cp, sub_ri, sub_q, ws);
-        // AMD is a heuristic: on a rail-last inverter chain it fills more
-        // than the natural order (50 against 48 at n = 10), so the block
-        // keeps whichever of the two fills less.
-        const nat = try ws.alloc(bs);
-        @memcpy(nat, verts);
-        std.sort.pdq(u32, nat, {}, std.sort.asc(u32));
-        for (nat) |*v| v.* = loc[v.*];
-        const ord = if (try cholCount(sub_cp, sub_ri, nat, ws) < try cholCount(sub_cp, sub_ri, sub_q, ws)) nat else sub_q;
-        for (ord, 0..) |lq, i| q[lo + i] = verts[lq];
-    }
+/// A bound on the strictly lower plus strictly upper entries of an LU of
+/// the pattern under diagonal pivots in column order `q` (q[k] = column at
+/// step k): twice the off-diagonal Cholesky count of A + A^T. O(|L|).
+/// Restores `ws` on return; `wsSize(n, nnz)` words suffice.
+pub fn diagFill(n: u32, col_ptr: []const u32, row_idx: []const u32, q: []const u32, ws: *Ws) Error!u64 {
+    assert(q.len == n);
+    return 2 * (try cholCount(col_ptr, row_idx, q, ws, std.math.maxInt(u64)) - n);
 }
 
 /// Entries of the Cholesky factor L, diagonal included, of the symmetrized
 /// pattern A + A^T eliminated in the order `perm` (perm[k] = column at step
 /// k): Liu's elimination tree with path compression, then each row's
-/// subtree walked once, so O(|L|). Restores `ws` on return.
-fn cholCount(col_ptr: []const u32, row_idx: []const u32, perm: []const u32, ws: *Ws) Error!u64 {
+/// subtree walked once, so O(|L|). Stops once the count reaches `cap`
+/// and returns a value of at least `cap`. Restores `ws` on return.
+fn cholCount(col_ptr: []const u32, row_idx: []const u32, perm: []const u32, ws: *Ws, cap: u64) Error!u64 {
     const n = perm.len;
     const nnz = col_ptr[n];
     const base = ws.mark();
@@ -278,6 +304,7 @@ fn cholCount(col_ptr: []const u32, row_idx: []const u32, perm: []const u32, ws: 
                 count += 1;
             }
         }
+        if (count >= cap) return count;
     }
     assert(count >= n);
     return count;
@@ -440,9 +467,7 @@ fn amd(n: u32, col_ptr: []const u32, row_idx: []const u32, q: []u32, ws: *Ws) Er
     const isq: u32 = std.math.sqrt(n);
     const dense_thresh: u32 = @max(@as(u32, 16), 10 * isq);
     var ndense: u32 = 0;
-    for (0..n) |i| {
-        if (va_len[i] >= dense_thresh) ndense += 1;
-    }
+    for (va_len) |l| ndense += @intFromBool(l >= dense_thresh);
     const dense_start = n - ndense;
     {
         var di: u32 = 0;
@@ -725,6 +750,37 @@ test "order and amd return permutations and restore the workspace on random patt
                 seen[c] = true;
             }
         }
+    }
+}
+
+test "cholCount under a cap: the full count below it, at least the cap otherwise" {
+    var prng = std.Random.DefaultPrng.init(0x0de9);
+    const r = prng.random();
+    const n = 40;
+    var col_ptr: [n + 1]u32 = undefined;
+    var row_idx: [n * n]u32 = undefined;
+    var perm: [n]u32 = undefined;
+    var buf: [wsSize(n, n * n)]u32 = undefined;
+    for (0..50) |_| {
+        var nnz: u32 = 0;
+        col_ptr[0] = 0;
+        for (0..n) |j| {
+            for (0..n) |i| {
+                if (i != j and r.float(f64) >= 0.08) continue;
+                row_idx[nnz] = @intCast(i);
+                nnz += 1;
+            }
+            col_ptr[j + 1] = nnz;
+        }
+        for (&perm, 0..) |*c, i| c.* = @intCast(i);
+        r.shuffle(u32, &perm);
+        var ws = Ws.init(buf[0..wsSize(n, nnz)]);
+        const full = try cholCount(col_ptr[0 .. n + 1], row_idx[0..nnz], &perm, &ws, std.math.maxInt(u64));
+        for ([_]u64{ n, full - 1, full, full + 1 }) |cap| {
+            const got = try cholCount(col_ptr[0 .. n + 1], row_idx[0..nnz], &perm, &ws, cap);
+            if (full < cap) try std.testing.expectEqual(full, got) else try std.testing.expect(got >= cap);
+        }
+        try std.testing.expectEqual(@as(usize, 0), ws.used);
     }
 }
 

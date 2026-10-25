@@ -24,12 +24,12 @@ const std = @import("std");
 const assert = std.debug.assert;
 const direct = @import("direct.zig");
 const Gmres = @import("gmres.zig").Gmres;
-const BbdInfo = @import("core").numerics.BbdInfo;
-const Execution = @import("core").numerics.Execution;
 const num = @import("core").numerics;
-const lanes = @import("lanes.zig");
+const BbdInfo = num.BbdInfo;
+const Execution = num.Execution;
+const lanes = @import("lane/lanes.zig");
 const Lanes = lanes.Lanes;
-const LaneSolver = @import("lane_solver.zig").LaneSolver;
+const LaneSolver = @import("lane/solver.zig").LaneSolver;
 
 /// `ESPICE_SOLVER` overrides `run`'s choice: direct, jfnk (LU-preconditioned
 /// GMRES) or jfnk-nolu (Jacobi-preconditioned, no factorization at all).
@@ -76,7 +76,7 @@ fn executionOf(sys: anytype) Execution {
 }
 
 /// The user-facing accuracy profile (SPICE .options).
-pub const Tolerances = @import("core").numerics.Tolerances;
+pub const Tolerances = num.Tolerances;
 
 /// Newton options for `tol`, with `max_iter_override` replacing ITL1. The
 /// cap is never below 100: ngspice's NIiter raises any smaller maxIter to
@@ -190,7 +190,7 @@ pub fn LaneResult(comptime W: usize) type {
 /// leaves `active` when it converges or its factor fails, and freezes;
 /// its slots still compute and are discarded. At W = 1 this is `newton`
 /// (the `gen_newton` probe). Above, `sys` is a lane system whose methods
-/// take and return lane masks and read `sys.active` (`LaneCircuit(W)`),
+/// take and return lane masks and read `sys.active` (`lane_system.LaneSystem`),
 /// and `t` is per lane; the lanes `sys.active` holds on entry are solved.
 /// Every other error fails all lanes: a checkpoint
 /// cancel, or out of memory in a lane's factor. Traces (`ZP_OPDBG`,
@@ -409,11 +409,6 @@ fn plausible(x: []const f64, limit: f64) bool {
     return bad == 0;
 }
 
-/// Rows whose |F_i| exceeds `residualGate`, NaN included. A branchless
-/// count, not an early return: it runs only on an iterate that passed the
-/// delta gate, where it nearly always passes and reads every row anyway.
-/// 0.52 ns per row against the early-return loop's 1.22 (ReleaseFast, n =
-/// 64 to 16384).
 /// The lanes with every unknown finite and within their `limit` lane:
 /// `plausible` per lane.
 fn plausibleLanes(comptime V: type, x: []const V, limit: V) lanes.Of(V).Mask {
@@ -436,6 +431,11 @@ fn residualLanes(comptime V: type, opts: Options, residual: []const V, x: []cons
     return ~bad;
 }
 
+/// Rows whose |F_i| exceeds `residualGate`, NaN included. A branchless
+/// count, not an early return: it runs only on an iterate that passed the
+/// delta gate, where it nearly always passes and reads every row anyway.
+/// 0.52 ns per row against the early-return loop's 1.22 (ReleaseFast, n =
+/// 64 to 16384).
 fn residualMisses(opts: Options, residual: []const f64, x: []const f64, vals: []const f64, diag_slots: []const u32) usize {
     assert(residual.len >= x.len);
     assert(diag_slots.len >= x.len);
@@ -611,8 +611,8 @@ pub fn jfnk(
 
         assembleShifted(sys, x, t, opts, hook);
         @memcpy(f0, sys.rhs[0..n]);
-        if (iter == 0) limit = plausibleLimit(sys, x, f0, hook.vals(sys));
         const v = hook.vals(sys);
+        if (iter == 0) limit = plausibleLimit(sys, x, f0, v);
         loadGmin(f64, sys, v, null, x, opts);
         // Before the factor, which may overwrite `v`.
         const load_ok = if (comptime @hasDecl(S, "loadCheck")) sys.loadCheck(x, v, f0, opts.reltol, opts.abstol) else true;
@@ -833,12 +833,16 @@ pub const Prof = struct {
     /// limiting and the convergence gates.
     pub const Phase = enum(u3) { eval, load, factor, solve, update };
 
+    /// Opens one Newton iteration: stamps the clock and counts it. A no-op
+    /// while `io` is null.
     pub fn start(p: *Prof) void {
         const io = p.io orelse return;
         p.last = .now(io, .awake);
         p.counts[0] += 1;
     }
 
+    /// Charges the time since the last `start` or `lap` to `phase`; a
+    /// `.factor` lap also counts a factorization. A no-op while `io` is null.
     pub fn lap(p: *Prof, phase: Phase) void {
         comptime assert(@typeInfo(Phase).@"enum".field_names.len == @typeInfo(@FieldType(Prof, "ns")).array.len);
         const io = p.io orelse return;
@@ -870,17 +874,31 @@ pub const Workspace = struct {
     /// `OutOfWorkspace`), leaving nothing allocated. Asserts that `col_ptr`
     /// has n + 1 entries.
     pub fn init(gpa: std.mem.Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?BbdInfo, knobs: Knobs, lu_knobs: direct.Knobs) !Workspace {
+        return initOrdered(gpa, n, col_ptr, row_idx, bbd, knobs, lu_knobs, null);
+    }
+
+    /// `init` with a column order to reuse (`direct.Solver.initOrdered`).
+    pub fn initOrdered(gpa: std.mem.Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?BbdInfo, knobs: Knobs, lu_knobs: direct.Knobs, order: ?[]const u32) !Workspace {
         assert(col_ptr.len == @as(usize, n) + 1);
         const dx = try gpa.alloc(f64, n);
         errdefer gpa.free(dx);
         const x_old = try gpa.alloc(f64, n);
         errdefer gpa.free(x_old);
         return .{
-            .slv = try direct.Solver.init(gpa, n, col_ptr, row_idx, bbd, lu_knobs),
+            .slv = try direct.Solver.initOrdered(gpa, n, col_ptr, row_idx, bbd, lu_knobs, order),
             .dx = dx,
             .x_old = x_old,
             .knobs = knobs,
         };
+    }
+
+    /// Returns the workspace to its state right after `initOrdered`,
+    /// keeping its allocations (`direct.Solver.reset`; `bbd` must be what
+    /// `init` got). The GMRES and combined-value buffers are scratch every
+    /// call rewrites, so they stay.
+    pub fn reset(self: *Workspace, bbd: ?BbdInfo) std.mem.Allocator.Error!void {
+        try self.slv.reset(bbd);
+        self.prof = .{};
     }
 
     fn ensureKrylov(self: *Workspace) !*Gmres {
@@ -940,6 +958,7 @@ pub fn LaneWorkspace(comptime W: usize) type {
         /// Fails only on allocation. Asserts that the lanes share n.
         pub fn init(gpa: std.mem.Allocator, ws: [W]*Workspace) !Self {
             const n = ws[0].slv.n;
+            for (ws) |w| assert(w.slv.n == n);
             var solvers: [W]*direct.Solver = undefined;
             for (&solvers, ws) |*s, w| s.* = &w.slv;
             var slv = try LaneSolver(W).init(gpa, solvers);

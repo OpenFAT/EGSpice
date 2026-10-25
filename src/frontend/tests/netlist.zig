@@ -19,10 +19,7 @@ fn device(nl: Netlist, name: []const u8) !Netlist.View {
 }
 
 fn numeric(value: Value) !f64 {
-    return switch (value) {
-        .num => |n| n,
-        else => error.UnresolvedConstant,
-    };
+    return value.number() orelse error.UnresolvedConstant;
 }
 
 fn parameter(kv: []const netlist.Kv, name: []const u8) !f64 {
@@ -132,6 +129,19 @@ test "source: nested relative includes select only requested case-insensitive co
     const unchanged = try source.load(io, std.testing.allocator, path);
     defer std.testing.allocator.free(unchanged);
     try std.testing.expectEqualStrings(plain, unchanged);
+}
+
+test "source: a library named by several .lib cards gives each its own section" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "deck.sp", .data = "t\n.lib 'lib.sp' tt\n.lib 'lib.sp' res\n.lib lib.sp tt\n.end\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib.sp", .data = ".lib tt\nm1 d g s b n\n.endl tt\n.lib res\nr1 a 0 1k\n.endl res\n" });
+    const path = try std.testing.allocator.print(".zig-cache/tmp/{s}/deck.sp", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const text = try source.load(io, std.testing.allocator, path);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("t\nm1 d g s b n\nr1 a 0 1k\nm1 d g s b n\n.end\n\n", text);
 }
 
 fn expandAll(gpa: std.mem.Allocator, io: std.Io, path: []const u8, src: []const u8) !void {
@@ -724,6 +734,57 @@ test "nested .subckt definitions flatten through both levels (#121)" {
     _ = try device(nl, "r.x2.r2");
 }
 
+test "hierarchies flatten whole, and a subcircuit that instantiates itself is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Sized from the bodies (2 x 3 x 2 resistors, plus the top one) before
+    // any is read; the parse is the same as without the reservation.
+    const nl = try parse(arena.allocator(),
+        \\t
+        \\.subckt leaf a b
+        \\r1 a b 1k
+        \\r2 a b r=2k
+        \\.ends leaf
+        \\.subckt mid a b
+        \\x1 a m leaf
+        \\x2 m n leaf
+        \\x3 n b leaf
+        \\.ends mid
+        \\x1 in out mid
+        \\x2 out 0 mid
+        \\r0 in 0 1
+    );
+    try std.testing.expectEqual(@as(usize, 13), nl.deviceCount());
+    _ = try device(nl, "r.x2.x3.r2");
+    try std.testing.expectError(error.ParseError, parse(arena.allocator(),
+        \\t
+        \\.subckt rec a
+        \\x1 a rec
+        \\.ends rec
+        \\x1 n rec
+    ));
+}
+
+test "a subcircuit past 16 ports maps its pins as the scan does, a repeated port by its first position" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\t
+        \\.subckt wide p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 p12 p13 p14 p15 p16 p17 p18 p0
+        \\r1 p18 p0 1k
+        \\r2 p17 inner 1k
+        \\.ends wide
+        \\x1 n0 n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 n13 n14 n15 n16 n17 n18 n19 wide
+    );
+    var buf: [2][]const u8 = undefined;
+    const r1 = pinNames(nl, try device(nl, "r.x1.r1"), &buf);
+    try std.testing.expectEqualStrings("n18", r1[0]);
+    try std.testing.expectEqualStrings("n0", r1[1]);
+    const r2 = pinNames(nl, try device(nl, "r.x1.r2"), &buf);
+    try std.testing.expectEqualStrings("n17", r2[0]);
+    try std.testing.expectEqualStrings("x1.inner", r2[1]);
+}
+
 test "user functions: .func and .param f(x)= expand where they are called (#121)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -740,6 +801,24 @@ test "user functions: .func and .param f(x)= expand where they are called (#121)
     // Over a probe the body stays an expression for the B source.
     try std.testing.expect((try device(nl, "b1")).kv[0].value == .expr);
     try std.testing.expectError(error.ParseError, parse(arena.allocator(), "t\n.func f(x) {x}\nr1 a 0 {f(1,2)}\n"));
+}
+
+test "a default's text and a function body, compiled once, read each instance's own values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const nl = try parse(arena.allocator(),
+        \\t
+        \\.func sq(x) {x*x}
+        \\.subckt s p q k=1 rv={sq(k)+1}
+        \\r1 p q {rv}
+        \\.ends
+        \\x1 a 0 s
+        \\x2 a 0 s k=3
+        \\x3 a 0 s k={sq(2)}
+    );
+    try std.testing.expectEqual(@as(f64, 2), try numeric((try device(nl, "r.x1.r1")).positional[0]));
+    try std.testing.expectEqual(@as(f64, 10), try numeric((try device(nl, "r.x2.r1")).positional[0]));
+    try std.testing.expectEqual(@as(f64, 17), try numeric((try device(nl, "r.x3.r1")).positional[0]));
 }
 
 test "malformed cards fail with ParseError, never a panic" {

@@ -37,7 +37,7 @@ vpi_loaded: bool = false,
 /// one design (VerA#84).
 systf_hosts: std.ArrayList(SystfBinding) = .empty,
 
-pub const SystfBinding = struct { t: DeviceType, host: *const abi.SystfHost };
+const SystfBinding = struct { t: DeviceType, host: *const abi.SystfHost };
 
 /// The VPI application host. The executable implements it over VerA's
 /// `vpi` module, so the `vpi_*` symbols an application calls are exported
@@ -115,6 +115,9 @@ pub const Toolchain = struct {
     /// The directory loaded devices' builds are cached in; null uses
     /// `/tmp/espice-cache/hdl`.
     cache_dir: ?[]const u8 = null,
+    /// Searched for a source's `` `include``s after its own directory, in
+    /// order (VerA's `-I`).
+    include_dirs: []const []const u8 = &.{},
 };
 
 /// Catalog entries with an evaluator, in catalog order.
@@ -291,13 +294,14 @@ pub fn load(self: *Library, io: std.Io, files: []const []const u8) LoadError!voi
     const int_systfs: []const []const u8 = if (self.vpi) |v| (if (self.vpi_loaded) v.int_systfs(v.ctx) else &.{}) else &.{};
     try self.loadWith(io, files, if (installed) .{
         .work_dir = work_dir,
-        .contract = try std.fs.path.join(a, &.{ share, "vera", "tools", "contract.zig" }),
+        .contract = try std.fs.path.join(a, &.{ share, "vera", "lib", "contract.zig" }),
         .dyn = try std.fs.path.join(a, &.{ share, "device", "eval.zig" }),
         .gompute = try std.fs.path.join(a, &.{ share, "gompute", "root.zig" }),
         .device_abi = try std.fs.path.join(a, &.{ share, "device", "abi.zig" }),
         .core = try std.fs.path.join(a, &.{ share, "core", "root.zig" }),
         .zig = zig,
         .int_systfs = int_systfs,
+        .include_dirs = self.toolchain.include_dirs,
     } else .{
         .work_dir = work_dir,
         .contract = build_options.contract_path,
@@ -307,6 +311,7 @@ pub fn load(self: *Library, io: std.Io, files: []const []const u8) LoadError!voi
         .core = build_options.core_path,
         .zig = zig,
         .int_systfs = int_systfs,
+        .include_dirs = self.toolchain.include_dirs,
     });
 }
 

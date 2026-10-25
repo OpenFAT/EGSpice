@@ -52,9 +52,10 @@ open PDKs (sky130, GF180, IHP SG13G2) are written against:
   103.
 - An R card whose braced value reads `v(`, `i(`, `time`, `temper` or
   `hertz` becomes a behavioural B source, as ngspice's `inp_compat` does.
-- In `.param` expressions `x^y`, `x**y`, `pow(x, y)` and `pwr(x, y)` are
-  |x|^y, as ngspice's numparam computes them; a B source reading a probe
-  keeps the sign of x for a constant integer power.
+- `x^y`, `x**y` and `pow(x, y)` use |x|^y in both `.param` expressions
+  and B sources, including integer exponents, as ngspice 45 does by default.
+  `pwr(x, y)` folds to |x|^y for constant arguments; a B source using
+  `pwr` with a probe is currently refused.
 - `.option seed=N` without a Monte Carlo sweep draws the statistical
   functions once from the seed, instead of folding them to their nominal.
 - Unknown `.option` names are ignored with one warning each.

@@ -17,8 +17,7 @@ const n_minlog = 1e-38;
 const n_intfthresh = 1e-10;
 const n_intuselog = 1e-10;
 
-/// One device noise generator between two nodes, as collected at the op.
-pub const NoiseSource = root.NoiseSource;
+const NoiseSource = root.NoiseSource;
 
 /// Query options, defined in core/query.zig.
 pub const Options = @import("core").query.Noise;
@@ -89,13 +88,13 @@ pub fn transfer(rows: []const NoiseSource, y: []const f64, n: usize) [2]f64 {
 
 /// Band integrals in V^2: output-referred, and referred back through the gain
 /// to the input source's terminals (zero when the deck named no input).
-pub const Integrals = struct { onoise: f64, inoise: f64 };
+const Integrals = struct { onoise: f64, inoise: f64 };
 
 /// Per-generator results for the contribution columns: `dens` is point-major
 /// (`n_points * n_sources`, V^2/Hz at the output); `out` and `in` are each
 /// generator's own band integral in V^2. A correlated group's values land
 /// on its first row only, so the caller zeroes all three.
-pub const PerSource = struct { dens: []f64, out: []f64, in: []f64 };
+const PerSource = struct { dens: []f64, out: []f64, in: []f64 };
 
 /// Fills `freqs`, `density` and `in_density` (V^2/Hz, all `sweep.count()`
 /// long) and returns the band integrals. `in_density` is all zeros unless
@@ -105,7 +104,7 @@ pub const PerSource = struct { dens: []f64, out: []f64, in: []f64 };
 /// Every work buffer comes from and returns to `allocator`; error.QueryCancelled unwinds at a checkpoint.
 /// `pre` is the stream's solutions solved up front (`freq.Stream.pre`), or
 /// empty to solve as it goes.
-pub fn sweep(
+fn sweep(
     ckt: *root.Circuit,
     x_op: []const f64,
     noise_sources: []const NoiseSource,

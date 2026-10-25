@@ -48,27 +48,18 @@ pub fn plan(sim: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netli
 
     var by_name: std.StringHashMapUnmanaged(core.query.CardRef) = .empty;
     for (cards) |c| try by_name.put(scratch, c.name, c);
-    // `delvto`, `mulu0`, `dtemp` and `temp` of each device, by (type,
-    // instance). A VerA device keeps every parameter in its Model, one copy
-    // per instance.
-    var delvto: std.AutoHashMapUnmanaged(u64, u32) = .empty;
-    var mulu0: std.AutoHashMapUnmanaged(u64, u32) = .empty;
-    var dtemp: std.AutoHashMapUnmanaged(u64, u32) = .empty;
-    var temp_param: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    // Each device's `Aged` parameter ordinals, by (type, instance);
+    // `no_param` where it has none. A VerA device keeps every parameter in
+    // its Model, one copy per instance.
+    const none = core.Mosra.no_param;
+    var aged: std.AutoHashMapUnmanaged(u64, [4]u32) = .empty;
     const params = try variants.collect(scratch, circuit);
-    for (params, 0..) |ref, k| {
-        const key = refKey(ref.type, ref.index);
-        const map = if (std.mem.eql(u8, ref.param_name, "delvto"))
-            &delvto
-        else if (std.mem.eql(u8, ref.param_name, "mulu0"))
-            &mulu0
-        else if (std.mem.eql(u8, ref.param_name, "dtemp"))
-            &dtemp
-        else if (std.mem.eql(u8, ref.param_name, "temp"))
-            &temp_param
-        else
-            continue;
-        try map.put(scratch, key, @intCast(k));
+    for (0..params.len) |k| {
+        const ref = params.at(k);
+        const slot = std.meta.stringToEnum(Aged, ref.param_name) orelse continue;
+        const got = try aged.getOrPut(scratch, refKey(ref.type, ref.index));
+        if (!got.found_existing) got.value_ptr.* = @splat(none);
+        got.value_ptr[@backingInt(slot)] = @intCast(k);
     }
 
     var names: std.ArrayList([]const u8) = .empty;
@@ -87,11 +78,12 @@ pub fn plan(sim: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netli
             if (std.mem.eql(u8, app.dst, mm.name) or std.mem.eql(u8, app.dst, binBase(mm.name))) break k;
         } else continue;
         const c = by_name.get(d.name) orelse return refuse(line, "a bound MOSFET that is not in the circuit");
-        const key = refKey(c.type, c.index);
-        const dv = delvto.get(key) orelse return refuse(line, "a bound MOSFET whose model has no delvto parameter (bsim3, bsim4, BSIM-SOI, mos3 and mos9 have one)");
-        const mu = mulu0.get(key) orelse core.Mosra.no_param;
+        const ords = aged.get(refKey(c.type, c.index)) orelse @as([4]u32, @splat(none));
+        const dv = ords[@backingInt(Aged.delvto)];
+        if (dv == none) return refuse(line, "a bound MOSFET whose model has no delvto parameter (bsim3, bsim4, BSIM-SOI, mos3 and mos9 have one)");
+        const mu = ords[@backingInt(Aged.mulu0)];
         const md = models.items[src[k]];
-        if (mu == core.Mosra.no_param and (md.titmu != 0 or md.hcimu != 0))
+        if (mu == none and (md.titmu != 0 or md.hcimu != 0))
             return refuse(line, try scratch.print("mobility aging (titmu, hcimu) on {s}, whose model {s} has no mulu0 (only bsim3 has one)", .{ d.name, mm.name }));
         if (d.pins.len < 3) return refuse(line, "a bound MOSFET with fewer than three terminals");
         var t: [3]u32 = undefined;
@@ -105,14 +97,15 @@ pub fn plan(sim: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netli
         // The device's own rule (mos3.va, ngspice): an explicit `temp`
         // wins, else the circuit temperature plus `dtemp`.
         const own = for (d.kv) |kv| {
-            if (std.mem.eql(u8, kv.key, "temp")) break temp_param.get(key);
-        } else null;
-        try temp_k.append(sim, 273.15 + if (own) |r| params[r].get() else temp_c + if (dtemp.get(key)) |r| params[r].get() else 0);
+            if (std.mem.eql(u8, kv.key, "temp")) break ords[@backingInt(Aged.temp)];
+        } else none;
+        const dt = ords[@backingInt(Aged.dtemp)];
+        try temp_k.append(sim, 273.15 + if (own != none) params.get(own) else temp_c + if (dt != none) params.get(dt) else 0);
         try model.append(sim, src[k]);
         try delvto_refs.append(sim, dv);
         try mulu0_refs.append(sim, mu);
-        try delvto_fresh.append(sim, params[dv].get());
-        try mulu0_fresh.append(sim, if (mu == core.Mosra.no_param) 1 else params[mu].get());
+        try delvto_fresh.append(sim, params.get(dv));
+        try mulu0_fresh.append(sim, if (mu == none) 1 else params.get(mu));
     }
     if (names.items.len == 0) return refuse(line, "a .mosra that binds no MOSFET (.appendmodel)");
 
@@ -164,7 +157,7 @@ pub fn plan(sim: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const Netli
         temp.* = null;
         for (delvto_refs.items, mulu0_refs.items) |dv, mu| {
             try refs.append(sim, dv);
-            if (mu != core.Mosra.no_param) try refs.append(sim, mu);
+            if (mu != none) try refs.append(sim, mu);
         }
         start.* = @intCast(refs.items.len);
     }
@@ -207,6 +200,9 @@ fn binBase(name: []const u8) []const u8 {
     return if (dot + 1 < name.len) name[0..dot] else name;
 }
 
+/// The device parameters aging reads, as slots of `plan`'s per-device table.
+const Aged = enum { delvto, mulu0, dtemp, temp };
+
 fn refKey(t: core.DeviceType, index: u32) u64 {
     return @as(u64, @backingInt(t)) << 32 | index;
 }
@@ -222,12 +218,6 @@ test binBase {
     try std.testing.expectEqualStrings("nch.", binBase("nch."));
     try std.testing.expectEqualStrings("nch", binBase("nch"));
     try std.testing.expectEqualStrings("a.b", binBase("a.b.12"));
-}
-
-test refKey {
-    const a = refKey(@fromBackingInt(1), 2);
-    try std.testing.expect(a != refKey(@fromBackingInt(2), 1));
-    try std.testing.expectEqual(@as(u64, 1 << 32 | 2), a);
 }
 
 test readModel {

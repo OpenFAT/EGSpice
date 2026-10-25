@@ -12,6 +12,10 @@
 // = 0 is an ammeter carrying its whole current. Several sensors of one
 // source chain in series. `m` folds into the transfer as in cccspar.c.
 // Constant stamp.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module cccs(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;

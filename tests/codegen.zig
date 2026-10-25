@@ -1,4 +1,4 @@
-//! Residue probes (AGENTS.md §1.2 R8, `zig/zero-cost.md`): each hot-path
+//! Residue probes (TESTING.md, abstraction costs run time): each hot-path
 //! abstraction as an exported `gen_<name>` beside the hand-written
 //! `hand_<name>` it claims to equal. Nothing links or runs this object; the
 //! build emits its x86_64_v3 ReleaseFast assembly and `tools/asm_probe.py`
@@ -13,10 +13,10 @@ const std = @import("std");
 const eval = @import("device_eval");
 const solver = @import("solver");
 
-// ---- device Dual(2, f64).mul (S3): the product rule through the AD family
+// ---- device Dual(2).mul (S3): the product rule through the AD family
 // against a value plus a 2-lane gradient written out. ----
 
-const D2 = eval.Dual(2, f64);
+const D2 = eval.Dual(2);
 const Val2 = D2.Of(0b11);
 
 export fn gen_dual_mul(a: *const [3]f64, b: *const [3]f64, out: *[3]f64) void {
@@ -47,7 +47,7 @@ export fn gen_engine_solve(e: *Engine, x: [*]f64, n: u32) void {
     switch (e.*) {
         .lu => |*lu| lu.solve(x[0..n], x[0..n]),
         .tri => |*tri| tri.solve(x[0..n]),
-        .bbd => |*bbd| bbd.solveInPlace(x[0..n]),
+        .bbd => |*bbd| bbd.solve(false, x[0..n]),
     }
 }
 
@@ -59,7 +59,7 @@ const HandEngines = struct {
 
 export fn hand_engine_solve(e: *HandEngines, x: [*]f64, n: u32) void {
     if (e.tri) |*tri| return tri.solve(x[0..n]);
-    if (e.bbd) |*bbd| return bbd.solveInPlace(x[0..n]);
+    if (e.bbd) |*bbd| return bbd.solve(false, x[0..n]);
     e.lu.?.solve(x[0..n], x[0..n]);
 }
 
@@ -73,6 +73,7 @@ const num = @import("core").numerics;
 
 extern fn probe_eval(x: [*]const f64, len: usize, t: f64) void;
 extern fn probe_combine(alpha: f64, out: [*]f64, len: usize) void;
+extern fn probe_eval_gc(x: [*]const f64, len: usize, t: f64, alpha: f64) void;
 
 const Ckt = struct {
     n: u32,
@@ -86,6 +87,13 @@ const Ckt = struct {
     }
     pub fn combineGC(_: *Ckt, alpha: f64, out: []f64) void {
         probe_combine(alpha, out.ptr, out.len);
+    }
+    pub fn evalNewtonGC(_: *Ckt, x: []const f64, t: f64, alpha: f64) void {
+        probe_eval_gc(x.ptr, x.len, t, alpha);
+    }
+    pub fn newtonGC(_: *Ckt, alpha: f64, out: []f64) []f64 {
+        probe_combine(alpha, out.ptr, out.len);
+        return out;
     }
     pub fn gcAt(self: *const Ckt, alpha: f64, slot: u32) f64 {
         return self.g_vals[slot] + alpha * self.c_vals[slot];
@@ -126,7 +134,7 @@ export fn gen_hook_step_assemble(h: *const StepHook, ckt: *Ckt, x: [*]const f64,
 }
 
 export fn hand_hook_step_assemble(h: *const HandStep, ckt: *Ckt, x: [*]const f64, t: f64) void {
-    ckt.evalNewton(x[0..ckt.n], t);
+    if (h.has_charge) ckt.evalNewtonGC(x[0..ckt.n], t, h.c.ag0) else ckt.evalNewton(x[0..ckt.n], t);
     if (h.has_charge) {
         const n: usize = ckt.n;
         switch (h.method) {

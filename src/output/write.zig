@@ -15,10 +15,7 @@ const types = @import("types.zig");
 pub fn write(io: Io, path: []const u8, format: types.Format, plot: types.Plot) !void {
     try types.validatePlot(format, plot);
     var buf: [8192]u8 = undefined;
-    // A device or FIFO (`-r /dev/null`) cannot be renamed over: write to it
-    // directly.
-    const stat = Io.Dir.cwd().statFile(io, path, .{}) catch null;
-    if (stat != null and stat.?.kind != .file) {
+    if (isDevice(io, path)) {
         const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .write_only });
         defer file.close(io);
         var fw = file.writer(io, &buf);
@@ -31,6 +28,13 @@ pub fn write(io: Io, path: []const u8, format: types.Format, plot: types.Plot) !
     try encode(&fw.interface, format, plot);
     try fw.interface.flush();
     try atomic.replace(io);
+}
+
+/// Whether `path` exists and is not a regular file: a device or FIFO
+/// (`-r /dev/null`), which cannot be renamed over and is written in place.
+pub fn isDevice(io: Io, path: []const u8) bool {
+    const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return stat.kind != .file;
 }
 
 /// Whether one file holds several plots back to back. ngspice writes every

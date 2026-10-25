@@ -1,9 +1,7 @@
 name: bench
 
 # On every release tag: time the fixture corpus in ESPice, ngspice and VACASK
-# (`zig build bench`), then commit the charts, summary and report to
-# docs/performance/bench/corpus/ and the README's <!-- bench:start/end -->
-# block on main, and redeploy the docs.
+# (`zig build bench`) and attach the charts, summary and report to the release.
 # ponytail: a shared 4-vCPU hosted runner, so absolute times are noisy; the
 # speedups are ratios of runs on the same machine. Self-host when they wobble.
 on:
@@ -13,7 +11,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: bench
@@ -24,14 +21,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # tests/conformance: the SPICE decks
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
         with:
           name: omarsiwy
           skipPush: true
@@ -44,24 +43,25 @@ jobs:
           -Doptimize=ReleaseFast -Dcuda-arch=sm_75 -Dhip-arch=gfx1100
           -- --iters 3
 
-      # The bench ran on the tag; the results and README block land on main's tip.
-      - name: Plot and commit to main
+      # Generated files stay off main: the charts ship as a release asset (or a
+      # run artifact for a manual run):
+      #   gh release download vX -p bench-corpus.tar.gz && tar xzf bench-corpus.tar.gz
+      - name: Plot
         run: |
-          cp zig-out/benchmark-results.md "$RUNNER_TEMP/results.md"
-          git fetch origin main
-          git checkout -B main origin/main
-          rm -rf docs/performance/bench/corpus
+          out=bench-corpus
+          rm -rf "$out"
           nix develop .#benchmarking -c python3 tools/bench_plot.py \
-            "$RUNNER_TEMP/results.md" tests/fixtures docs/performance/bench/corpus --readme README.md
-          cp "$RUNNER_TEMP/results.md" docs/performance/bench/corpus/results.md
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md docs/performance/bench/corpus
-          git commit -m "bench: corpus results for ${GITHUB_REF_NAME} (${GITHUB_SHA::8})" || exit 0
-          git push origin main
+            zig-out/benchmark-results.md tests/conformance/tests/netlist "$out"
+          cp zig-out/benchmark-results.md "$out/results.md"
+          tar czf bench-corpus.tar.gz "$out"
 
-      # A GITHUB_TOKEN push triggers no workflow, so start the docs deploy.
-      - name: Redeploy docs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-corpus
+          path: bench-corpus.tar.gz
+
+      - name: Attach to the release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run pages.yml --ref main
+        run: gh release upload "$GITHUB_REF_NAME" bench-corpus.tar.gz --clobber

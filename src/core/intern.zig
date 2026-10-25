@@ -82,12 +82,6 @@ pub const InternPool = struct {
         try p.offs.ensureTotalCapacity(gpa, @as(usize, names) + 1);
     }
 
-    /// Pre-sizes the byte buffer for `bytes` bytes of names in all (a source
-    /// length bounds them). Only capacity changes, also on error.
-    pub fn reserveBytes(p: *InternPool, gpa: Allocator, bytes: usize) Allocator.Error!void {
-        try p.bytes.ensureTotalCapacity(gpa, bytes);
-    }
-
     /// Returns the id of `s` if it was interned, without adding it.
     pub fn find(p: *const InternPool, s: []const u8) ?Name {
         return p.map.getKeyAdapted(s, Adapter{ .pool = p });
@@ -163,7 +157,7 @@ test "reserve sizes every column, so interning that much never reallocates" {
     var p: InternPool = .{};
     defer p.deinit(gpa);
     try p.reserve(gpa, 50);
-    try p.reserveBytes(gpa, 50 * 3);
+    try p.bytes.ensureTotalCapacity(gpa, 50 * 3);
     const bytes = p.bytes.items.ptr;
     const offs = p.offs.items.ptr;
     for (0..50) |i| {

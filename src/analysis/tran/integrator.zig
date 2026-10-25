@@ -2,8 +2,7 @@
 //! recurrence, the companion step's Newton hook and the CKTterr LTE bound.
 //! tran.zig drives them per step; envelope and pss reuse the hook, and
 //! tran_noise the companion kernel.
-//! Cites ngspice nicomcof.c, niinteg.c, cktterr.c and dctran.c;
-//! dev/analysis/transient-integration.md.
+//! Cites ngspice nicomcof.c, niinteg.c, cktterr.c and dctran.c.
 const std = @import("std");
 const Method = @import("types.zig").Method;
 const num = @import("core").numerics;
@@ -237,7 +236,7 @@ pub fn Hook(comptime fixed: ?Method) type {
         /// Stamps the planes at `x` and adds the companion's dynamic current
         /// to the residual rows.
         pub fn assemble(self: *const Self, ckt: anytype, x: []const f64, t: f64) void {
-            ckt.evalNewton(x, t);
+            if (fixed == null and self.has_charge) ckt.evalNewtonGC(x, t, self.c.ag0) else ckt.evalNewton(x, t);
             if (!self.has_charge) return;
             const n: usize = ckt.n;
             if (fixed) |m| {
@@ -252,6 +251,7 @@ pub fn Hook(comptime fixed: ?Method) type {
         /// rebuilt into `a_vals`, overwriting the previous return.
         pub fn vals(self: *const Self, ckt: anytype) []f64 {
             if (!self.has_charge) return ckt.g_vals;
+            if (fixed == null) return ckt.newtonGC(self.c.ag0, self.a_vals);
             ckt.combineGC(self.c.ag0, self.a_vals);
             return self.a_vals;
         }
@@ -280,6 +280,83 @@ pub fn rebaseCurrent(i_cur: []f64, q_new: []const f64, q_old: []const f64, alpha
 /// Step history and tolerances for one `stepBound`: `dt` is the step just
 /// taken, `dt1`/`dt2` the two before it, all in seconds.
 pub const LteIn = struct { dt: f64, dt1: f64, dt2: f64, reltol: f64, abstol: f64, chgtol: f64, trtol: f64 };
+
+/// Read-only diagnostic of one limiting state. `index` is in the supplied
+/// history's space, not necessarily a matrix row. Only requested on rejected
+/// attempts; the production reduction and its arithmetic remain unchanged.
+pub const LteDiagnostic = struct {
+    index: usize = 0,
+    bound: f64 = std.math.inf(f64),
+    q: [8]f64 = @splat(0),
+    i_prev: f64 = 0,
+    i_new: f64 = 0,
+    current_tol: f64 = 0,
+    charge_tol: f64 = 0,
+    tolerance: f64 = 0,
+    difference: f64 = 0,
+    coefficient: f64 = 0,
+    unrooted_bound: f64 = 0,
+};
+
+/// Replays each captured state through the scalar production kernel, then
+/// reports the winning state's operands. NaNs win before finite minima so
+/// nonfinite-state rejection is diagnosed too. No device evaluation, writes
+/// to history, or allocation. The caller checks `bound` against the original
+/// SIMD/device reduction before trusting the identity.
+pub fn diagnoseBound(method: Method, cur_method: Method, q: []const []const f64, i_prev: []const f64, g: []const f64, c: Coeffs, lte: LteIn, dts: []const f64) LteDiagnostic {
+    var hit: LteDiagnostic = .{};
+    const high = order(method) > 2 or order(cur_method) > 2;
+    for (0..q[0].len) |j| {
+        var one: [8][]const f64 = undefined;
+        for (q, 0..) |h, k| one[k] = h[j..][0..1];
+        const del = if (high)
+            stepBoundGear(method, cur_method, one[0..q.len], i_prev[j..][0..1], if (g.len > 0) g[j..][0..1] else &.{}, c, lte, dts)
+        else
+            stepBound(1, method, cur_method, one[0..4].*, i_prev[j..][0..1], c, lte);
+        if (j == 0 or del < hit.bound or std.math.isNan(del)) {
+            hit.index = j;
+            hit.bound = del;
+            if (std.math.isNan(del)) break;
+        }
+    }
+    if (q[0].len == 0) return hit;
+    const j = hit.index;
+    for (q, 0..) |h, k| hit.q[k] = h[j];
+    hit.i_prev = i_prev[j];
+    const d = c.ag0 * (hit.q[0] - hit.q[1]);
+    hit.i_new = switch (cur_method) {
+        .backward_euler => d,
+        .trapezoidal => d - c.ag1 * hit.i_prev,
+        .gear_2 => d - c.ag2 * (hit.q[1] - hit.q[2]),
+        else => d - g[j],
+    };
+    hit.current_tol = lte.abstol + lte.reltol * @max(@abs(hit.i_new), @abs(hit.i_prev));
+    hit.charge_tol = lte.reltol * @max(@max(@abs(hit.q[0]), @abs(hit.q[1])), lte.chgtol) / (if (high) dts[0] else lte.dt);
+    hit.tolerance = @max(hit.current_tol, hit.charge_tol);
+    if (high) {
+        var diff = hit.q;
+        var deltmp: [7]f64 = undefined;
+        var k: usize = order(method);
+        @memcpy(deltmp[0 .. k + 1], dts[0 .. k + 1]);
+        while (true) {
+            for (0..k + 1) |i| diff[i] = (diff[i] - diff[i + 1]) / deltmp[i];
+            if (k == 0) break;
+            k -= 1;
+            for (0..k + 1) |i| deltmp[i] = deltmp[i + 1] + dts[i];
+        }
+        hit.difference = diff[0];
+    } else {
+        const f12 = (hit.q[1] - hit.q[2]) / lte.dt1;
+        hit.difference = ((hit.q[0] - hit.q[1]) / lte.dt - f12) / (lte.dt + lte.dt1);
+        if (method != .backward_euler) {
+            const f123 = (f12 - (hit.q[2] - hit.q[3]) / lte.dt2) / (lte.dt1 + lte.dt2);
+            hit.difference = (hit.difference - f123) / (lte.dt + (lte.dt1 + lte.dt2));
+        }
+    }
+    hit.coefficient = lteCoeff(method);
+    hit.unrooted_bound = lte.trtol * hit.tolerance / @max(lte.abstol, hit.coefficient * @abs(hit.difference));
+    return hit;
+}
 
 /// ngspice CKTterr: the next-step bound in seconds, min over every charge
 /// state j of
@@ -364,6 +441,14 @@ pub fn stepBoundGear(method: Method, cur_method: Method, q: []const []const f64,
     };
 }
 
+/// `@max` without its NaN handling (two of ~8 instructions each): `minDel`
+/// returns NaN through `poison` whenever an operand could be one, and every
+/// operand is an absolute value or a positive tolerance, so no signed zero
+/// can tell the two apart.
+inline fn maxNoNan(comptime w: usize, a: @Vector(w, f64), b: @Vector(w, f64)) @Vector(w, f64) {
+    return @select(f64, a > b, a, b);
+}
+
 /// The min over the states of del_j, before the order-2 root; NaN when any
 /// entry it reads is NaN or inf.
 fn minDel(comptime w: usize, comptime method: Method, comptime cur_method: Method, q: [4][]const f64, i_prev: []const f64, c: Coeffs, lte: LteIn) f64 {
@@ -399,9 +484,9 @@ fn minDel(comptime w: usize, comptime method: Method, comptime cur_method: Metho
             .backward_euler => av * (qc - qp),
             else => comptime unreachable,
         };
-        const volttol = abstol + reltol * @max(@abs(i_new), @abs(ip));
-        const chargetol = reltol * @max(@max(@abs(qc), @abs(qp)), chgtol) / dt;
-        const tol = @max(volttol, chargetol);
+        const volttol = abstol + reltol * maxNoNan(w, @abs(i_new), @abs(ip));
+        const chargetol = reltol * maxNoNan(w, maxNoNan(w, @abs(qc), @abs(qp)), chgtol) / dt;
+        const tol = maxNoNan(w, volttol, chargetol);
         poison += (qc - qc) + (qp - qp) + (qp2 - qp2) + (ip - ip);
         const f12 = (qp - qp2) / dt1;
         var dd = ((qc - qp) / dt - f12) / sum01;
@@ -411,9 +496,9 @@ fn minDel(comptime w: usize, comptime method: Method, comptime cur_method: Metho
             const f123 = (f12 - (qp2 - qp3) / dt2) / sum12;
             dd = (dd - f123) / sum012;
         }
-        const del = trtol * tol / @max(abstol, coeff * @abs(dd));
+        const del = trtol * tol / maxNoNan(w, abstol, coeff * @abs(dd));
         poison += @select(f64, del == del, @as(V, @splat(0)), del);
-        vmin = @min(vmin, del);
+        vmin = @select(f64, del < vmin, del, vmin);
     }
     if (std.math.isNan(@reduce(.Add, poison))) return std.math.nan(f64);
     const min_del = @reduce(.Min, vmin);

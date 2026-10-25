@@ -91,7 +91,7 @@ const Tree = struct {
     /// read off `compile`'s grammar: a unary operator's operand reaches to
     /// the next operator looser than a power, `!`'s to the next operator,
     /// and the ternary's condition is everything before its `?`.
-    fn paren(t: *const Tree, parent: Node, side: usize, child: Node) bool {
+    fn paren(parent: Node, side: usize, child: Node) bool {
         const unary = child.tag == .neg or child.tag == .plus or child.tag == .not;
         const prec: u8 = switch (child.tag) {
             .num, .call => 10,
@@ -99,7 +99,6 @@ const Tree = struct {
             .bin => bin_ops[child.op].prec,
             .tern => 0,
         };
-        _ = t;
         return switch (parent.tag) {
             .num => unreachable,
             .neg, .plus => prec < 6,
@@ -138,7 +137,7 @@ const Tree = struct {
                 .tern => if (side == 1) "?" else ":",
                 .num, .neg, .plus, .not, .call => "",
             }, sp });
-            const p = t.paren(n, side, t.nodes[k]);
+            const p = paren(n, side, t.nodes[k]);
             if (p) try w.writeAll("(");
             try t.print(w, src, k);
             if (p) try w.writeAll(")");

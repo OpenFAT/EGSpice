@@ -1,6 +1,10 @@
 // Inductor: linear, V(p,n) = l * d/dt I(br).
 //
 // Verilog-A implementation: Omar El-Sawy, University of Waterloo.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module inductor(p, n);
     inout p, n;
     electrical p, n;

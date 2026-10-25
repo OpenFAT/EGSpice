@@ -1,3 +1,7 @@
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 /***********************************************************************
 
  HiSIM (Hiroshima University STARC IGFET Model)

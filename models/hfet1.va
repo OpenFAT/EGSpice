@@ -8,7 +8,7 @@
 //   ngspice: Copyright Regents of the University of California and others,
 //   modified BSD license.
 //
-// Spec: dev/jfet-mesfet-hfet.md §1 (topology + normal/inverse swap), §1.4
+// Structure: §1 (topology + normal/inverse swap), §1.4
 // (DIBL V_T,eff, exponential subthreshold with unified n_s, knee shaping,
 // dual-exponential gate leakage + GGR), §1.5 (temperature/limiting), §3
 // (fet_eval spine). §1.4 defers the HFET1 equations to ngspice, so the algebra
@@ -19,6 +19,10 @@
 // folded into the channel conductance as `rt` (hfeta()). ngspice's RI/RF gate
 // access nodes (s''/d'') are not modelled; with their default RI=RF=0 they
 // collapse onto sp/dp, which is where the Meyer caps land here.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module hfet1(d, g, s);
     inout d, g, s;
     electrical d, g, s;

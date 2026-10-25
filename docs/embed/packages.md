@@ -9,7 +9,7 @@ ESPice builds with Zig 0.17.0 and can be a dependency of your own
 zig fetch --save git+https://github.com/OmarSiwy/ESPice#main
 ```
 
-Pin a revision after 1.0.0: the `libespice` lazy path used below was added
+Pin a revision after 0.1.0: the `libespice` lazy path used below was added
 after that release. ESPice's own dependencies (VerA, Gompute) come
 along through its `build.zig.zon`.
 

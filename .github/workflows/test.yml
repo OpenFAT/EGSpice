@@ -1,32 +1,59 @@
 name: test
 
-# The merge gate (TESTING.md § Gates): every unit suite, the codegen probes,
-# and the full fixture corpus with its verdict name list,
-# in the shipped mode (ReleaseSafe: LLVM with every safety check on).
+# The merge gate, on every OS a release ships for: every unit suite, the
+# codegen and HIP compile probes, the C API example, the full fixture corpus
+# with its verdict name list, and every deck the docs show, in ReleaseSafe
+# (LLVM with every safety check on). Gate on $?: `zig build test | tail`
+# swallows the exit code.
 # ponytail: no Debug job. Debug builds use the self-hosted backend, which
 # diverges from LLVM (#25: numeric results, a pthread_create EINVAL, an
 # allocation count); add `zig build test -Doptimize=Debug` once #25 closes.
-# ponytail: x86_64-linux CPU only; the GPU corpus (`zig build test-gpu`) needs
-# an NVIDIA runner and runs locally until one exists (TESTING.md, nightly).
+# HIP codegen runs without a GPU; the GPU corpus (`zig build test -- --backend cuda --jobs 1`) needs
+# an NVIDIA runner and runs locally until one exists.
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group: # the merge queue tests the merged result before it lands
   workflow_dispatch:
+  workflow_call:
+
+# A newer push to the same PR supersedes the run; main and the queue never cancel.
+concurrency:
+  group: test-${{ github.workflow_ref }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   release-safe:
-    runs-on: ubuntu-latest
+    # Every OS a release ships for (tools/release-targets.json).
+    runs-on: ${{ matrix.os }}
     # ~7400 CPU-seconds of compile + tests; a 4-core runner needs over an hour.
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    env:
+      FLAGS: -Doptimize=ReleaseSafe -Dgpu=false -Dcuda-arch=none -Dhip-arch=none -j2 --summary failures
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # tests/conformance: the SPICE decks
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
         with:
           name: omarsiwy
           skipPush: true
-      - run: nix develop .#ci -c zig build test -Dgpu=false -Doptimize=ReleaseSafe --summary failures
+      - name: Release matrix and publication checks
+        run: nix develop .#ci -c python3 -m unittest discover -s tools -p 'test_release*.py'
+      - name: Every suite and the corpus
+        run: nix develop .#ci -c zig build test $FLAGS
+      # The same espice the corpus ran (cached), installed, then every deck
+      # the docs show: a page whose example stopped running fails here.
+      - name: Docs decks
+        run: |
+          nix develop .#ci -c zig build $FLAGS --prefix out
+          nix develop .#ci -c bash tools/doc_decks.sh out/bin/espice

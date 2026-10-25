@@ -28,7 +28,7 @@ pub const std_options: std.Options = .{ .signal_stack_size = null };
 /// Only a host device object (eval.zig as the build root) has the per-model
 /// `models` module; a runtime `.hdl` build (VerA's shim re-exports this decl
 /// from `dyn`) has neither it nor GPU kernels, so it keeps the Debug checks.
-pub const vera_validate_contract = @import("builtin").mode == .debug and
+pub const vera_validate_contract = builtin.mode == .debug and
     !(@import("root") == @This() and gpuKernelsBuilt());
 
 fn gpuKernelsBuilt() bool {
@@ -60,16 +60,26 @@ const fma_ok = switch (builtin.target.cpu.arch) {
     else => false, // else: no shipped target beyond these has a fused multiply-add guaranteed
 };
 
+/// Safety panics of this root's objects. On a GPU a failed check traps: the
+/// default handler formats its message through an `Io.Writer` (a 4 KB stack
+/// buffer and indirect calls) that no device prints, and that AMDGPU's LLVM
+/// backend cannot lay out in ReleaseSafe ("Cannot scavenge register in FI
+/// elimination"). The host keeps the default.
+pub const panic = switch (builtin.target.cpu.arch) {
+    .nvptx64, .amdgcn => std.debug.no_panic,
+    else => std.debug.FullPanic(std.debug.defaultPanic),
+};
+
 /// A `Dual` family over lanes `0..n` with unknown u on lane u, every value
 /// carrying all n lanes. For tests and one-off evaluations; `evalRange`
 /// builds its families from a device's `Basis`.
-pub fn Dual(comptime N: usize, comptime F: type) type {
+pub fn Dual(comptime N: usize) type {
     const lane = comptime blk: {
         var l: [N]u8 = undefined;
         for (&l, 0..) |*e, u| e.* = u;
         break :blk l;
     };
-    return DualFor(F, &lane, false, false);
+    return DualFor(&lane, false, false);
 }
 
 /// Number of lanes `lane` maps unknowns onto.
@@ -94,11 +104,7 @@ fn laneCount(comptime lane: []const u8) usize {
 /// 12- or 26-wide vector into shuffles and spills (gummel_poon's eval body
 /// doubled). The pad lanes hold zeros (or a NaN from a 0/0) that nothing
 /// reads.
-/// `F` is the float width of the derivative half only. The value half and
-/// every boundary (`con`/`scale`/`addC`/`val`/`ddxAt`) stay f64, so the
-/// residual is identical at either width. `F = f32` trades Newton iterations
-/// for GPU throughput; see `jacFloat` and `gpuJacFloat` for who takes it.
-fn DualFor(comptime F: type, comptime lane: []const u8, comptime pad: bool, comptime collapsed: bool) type {
+fn DualFor(comptime lane: []const u8, comptime pad: bool, comptime collapsed: bool) type {
     const n_lanes = laneCount(lane);
     // A lane set, one bit per lane.
     const L = Mask(n_lanes);
@@ -108,6 +114,7 @@ fn DualFor(comptime F: type, comptime lane: []const u8, comptime pad: bool, comp
         /// Read by the generated device: the builder already applied
         /// `D.collapse` to the scatter tapes.
         pub const collapse_applied = collapsed;
+        /// The value type (contract `RefFamily`).
         pub const V = f64;
 
         /// The lanes the unknowns in `m` occupy, one bit per lane.
@@ -156,7 +163,7 @@ fn DualFor(comptime F: type, comptime lane: []const u8, comptime pad: bool, comp
             const pick = @as(u64, @bitCast(c.v)) << 1 != 0;
             // A lane select, not a branch: on the GPU each thread's indicator
             // differs, and selection is exact, so the bits are the branch's.
-            const d = if (comptime width(r) == 0) a.spread(r) else @select(F, @as(@Vector(width(r), bool), @splat(pick)), a.spread(r), b.spread(r));
+            const d = if (comptime width(r) == 0) a.spread(r) else @select(f64, @as(@Vector(width(r), bool), @splat(pick)), a.spread(r), b.spread(r));
             return .{ .v = if (pick) a.v else b.v, .d = d };
         }
 
@@ -167,11 +174,11 @@ fn DualFor(comptime F: type, comptime lane: []const u8, comptime pad: bool, comp
                 /// Aligned to the element, not the vector: natural vector
                 /// alignment pads 8 f64 lanes from 72 to 128 bytes, and
                 /// nothing reads `d` through a pointer that needs it.
-                d: Lanes align(@alignOf(F)),
+                d: Lanes align(@alignOf(f64)),
 
                 /// The lanes this value carries, one bit per lane.
                 pub const lanes = ls;
-                const Lanes = @Vector(width(ls), F);
+                const Lanes = @Vector(width(ls), f64);
                 const T = @This();
 
                 comptime {
@@ -184,13 +191,13 @@ fn DualFor(comptime F: type, comptime lane: []const u8, comptime pad: bool, comp
                     return @popCount(ls & ((@as(L, 1) << l) - 1));
                 }
                 inline fn k(c: f64) Lanes {
-                    return @splat(@floatCast(c));
+                    return @splat(c);
                 }
                 inline fn map(a: T, v: f64, c: f64) T {
                     return .{ .v = v, .d = a.d * k(c) };
                 }
                 /// These lanes laid out as `to_ls`'s. New and pad lanes are +0.
-                inline fn spread(a: T, comptime to_ls: L) @Vector(width(to_ls), F) {
+                inline fn spread(a: T, comptime to_ls: L) @Vector(width(to_ls), f64) {
                     if (ls & ~to_ls != 0) @compileError("Dual: lanes do not widen");
                     if (ls == to_ls) return a.d;
                     if (ls == 0) return @splat(0);
@@ -203,7 +210,7 @@ fn DualFor(comptime F: type, comptime lane: []const u8, comptime pad: bool, comp
                         };
                         break :blk idx;
                     };
-                    return @shuffle(F, a.d, @as(@Vector(1, F), @splat(0)), idx);
+                    return @shuffle(f64, a.d, @as(@Vector(1, f64), @splat(0)), idx);
                 }
                 fn toLanes(a: T, comptime to_ls: L) Val(to_ls) {
                     return .{ .v = a.v, .d = a.spread(to_ls) };
@@ -217,16 +224,15 @@ fn DualFor(comptime F: type, comptime lane: []const u8, comptime pad: bool, comp
                 pub fn val(a: T) f64 {
                     return a.v;
                 }
-                /// The partial with respect to unknown `u`, widened to f64.
+                /// The partial with respect to unknown `u`.
                 pub fn ddxAt(a: T, comptime u: usize) f64 {
                     const l = lane[u];
                     if (comptime l == contract.no_lane or !has(ls, l)) return 0.0;
                     return a.d[comptime pos(l)];
                 }
-                /// Every lane widened to f64, pad lanes included, so `F`
-                /// never leaks past the arithmetic.
+                /// Every lane, pad lanes included.
                 pub inline fn grad(a: T) @Vector(width(ls), f64) {
-                    return if (F == f64) a.d else @floatCast(a.d);
+                    return a.d;
                 }
 
                 pub fn add(a: T, b: anytype) Val(ls | @TypeOf(b).lanes) {
@@ -365,7 +371,8 @@ fn RealFor(comptime collapsed: bool) type {
             return .{ .v = v };
         }
         pub fn sel(c: Self, a: Self, b: Self) Self {
-            return if (c.v != 0.0) a else b;
+            // The bit test `DualFor.sel` uses, not `c.v != 0.0` (#25).
+            return if (@as(u64, @bitCast(c.v)) << 1 != 0) a else b;
         }
         pub fn to(a: Self, comptime _: anytype) Self {
             return a;
@@ -448,20 +455,6 @@ fn RealFor(comptime collapsed: bool) type {
 
 /// The value-only family every non-eval entry point runs on.
 const Real = RealFor(false);
-
-/// Derivative width of `Dual` for device D on the host. f32 only when the
-/// device declares `jac_f32_host`: the f32 Jacobian helps some CPU decks and
-/// costs others extra gmin-ladder steps (dev/analysis/refactoring.md, "Retired
-/// paths"; the per-deck numbers were not kept).
-pub fn jacFloat(comptime D: type) type {
-    return if (@hasDecl(D, "jac_f32_host") and D.jac_f32_host) f32 else f64;
-}
-
-/// Derivative width of `Dual` for device D in its GPU kernel: f32 whenever the
-/// device permits it with `jac_f32`, since GPUs run f32 many times faster.
-pub fn gpuJacFloat(comptime D: type) type {
-    return if (@hasDecl(D, "jac_f32") and D.jac_f32) f32 else f64;
-}
 
 // The ABI types a module importing only this file (the runtime `.so` shim,
 // the test suites) needs.
@@ -727,25 +720,31 @@ fn constEntry(comptime D: type, comptime ru: usize, comptime cu: usize) ?contrac
 
 /// Whether D gets a second `evalRange` instantiation on the narrow basis for
 /// its fully collapsed instances. It pays only when it saves a register on
-/// AVX2 (dev/devices/abi.md, "Derivative lanes"): the wide dual spans two ymm
-/// (4 < w <= 8) and the narrow one fits in one (w <= 4). That admits
-/// mos1/2/3/6/9, bsim1, bsim3, hfet2, jfet and mes.
+/// AVX2 (dev/devices/abi.md, "Derivative lanes"): the narrow dual spans
+/// fewer ymm than the wide one. That admits mos1/2/3/6/9, bsim1, bsim3,
+/// hfet2, jfet and mes, and BSIM4 (11 lanes, three ymm, down to 4, one).
 ///
 /// Limiting adds a correctness gate: the correction is stored per lane, so no
 /// two unknowns `limit` writes may share one.
-// ponytail: n_u <= 8 keeps bsim4 and hisim wide because nothing prices them
-// yet; lift the bound when one of them sits on a benchmark deck.
+///
+/// A model past 8 unknowns (BSIM4) narrows only in its linked device object
+/// (`eval.zig` as the build root), so a test-built vtable stays the forced
+/// wide reference the narrow one is checked against.
 fn canNarrow(comptime D: type) bool {
+    return narrowEligible(D) and (contract.nU(D) <= 8 or @import("root") == @This());
+}
+
+fn narrowEligible(comptime D: type) bool {
     if (!@hasDecl(D, "collapse_full")) return false;
     const n_u = contract.nU(D);
-    if (n_u > 8 or n_u <= 4) return false;
+    if (n_u <= 4) return false;
     const b = comptime basisOf(D, true);
-    if (b.w > 4 or b.w >= comptime basisOf(D, false).w) return false;
+    if ((b.w + 3) / 4 >= (comptime basisOf(D, false).w + 3) / 4) return false;
     if (@hasDecl(D, "limit")) {
         var seen: [n_u]bool = @splat(false);
         const writes = limitWritesOf(D);
         for (0..n_u) |u| if (has(writes, u)) {
-            if (seen[b.lane[u]]) return false;
+            if (b.lane[u] == contract.no_lane or seen[b.lane[u]]) return false;
             seen[b.lane[u]] = true;
         };
     }
@@ -758,7 +757,7 @@ fn canNarrow(comptime D: type) bool {
 /// rows are homogeneous in their own unknowns. VerA scales hierarchical
 /// children itself and leaves the top-level instance to the host. A model
 /// with its own `m` parameter keeps `mfactor` at 1.
-pub inline fn mfactorOf(comptime D: type, inst: anytype) f64 {
+inline fn mfactorOf(comptime D: type, inst: anytype) f64 {
     return if (comptime @hasField(D.Instance, "mfactor")) inst.mfactor else 1.0;
 }
 
@@ -767,7 +766,7 @@ pub inline fn mfactorOf(comptime D: type, inst: anytype) f64 {
 /// it as 0 (#119).
 fn NoiseFamily(comptime D: type) type {
     const lane = comptime basisOf(D, false).lane[0..contract.nU(D)].*;
-    return DualFor(f64, &lane, false, @hasDecl(D, "collapse"));
+    return DualFor(&lane, false, @hasDecl(D, "collapse"));
 }
 
 /// Evaluates instances `[first, end)` of D and stamps residual, charge and
@@ -776,10 +775,9 @@ fn NoiseFamily(comptime D: type) type {
 ///
 /// `narrow` selects the reduced derivative basis (see `Basis`) and is sound
 /// only on maximally collapsed instances, which `ProtoStore.finalize` sorts to
-/// `[0, narrow_count)`. `F` is the derivative width: `jacFloat(D)` on the
-/// host, `gpuJacFloat(D)` in `DeviceKernel`. `pad` is `host_pad` on the host
-/// and false in `DeviceKernel`, where pad lanes cost registers.
-fn evalRange(comptime D: type, comptime narrow: bool, comptime F: type, comptime pad: bool, sink: anytype, first: u32, end: u32, sim: SimState, limiting: bool) void {
+/// `[0, narrow_count)`. `pad` is `host_pad` on the host and false in
+/// `DeviceKernel`, where pad lanes cost registers.
+fn evalRange(comptime D: type, comptime narrow: bool, comptime pad: bool, sink: anytype, first: u32, end: u32, sim: SimState, limiting: bool) void {
     @setEvalBranchQuota(1_000_000);
     const SinkT = @typeInfo(@TypeOf(sink)).pointer.child;
     // Strict float mode, as everywhere here: `.optimized` grants `nnan`,
@@ -805,7 +803,7 @@ fn evalRange(comptime D: type, comptime narrow: bool, comptime F: type, comptime
     };
     const jac_rep = comptime repMask(n_u, lane, alias, jac_pat);
     const q_rep = comptime repMask(n_u, lane, alias, q_pat);
-    const S = DualFor(F, &lane, pad, @hasDecl(D, "collapse"));
+    const S = DualFor(&lane, pad, @hasDecl(D, "collapse"));
     // Every lane of the basis: the layout the limiting correction sums in.
     const full = comptime S.Of(reads).lanes;
     const use_lim = if (comptime has_limit) limiting else false;
@@ -910,7 +908,7 @@ fn evalRange(comptime D: type, comptime narrow: bool, comptime F: type, comptime
                     }
                 }
             };
-            if (comptime !SinkT.on_device) inline for (comptime lteSites(D), 0..) |k, j| {
+            if (comptime !SinkT.on_device and !(@hasDecl(SinkT, "skip_tape") and SinkT.skip_tape)) inline for (comptime lteSites(D), 0..) |k, j| {
                 var qv = qs[k].v;
                 if (comptime has_limit and @TypeOf(qs[k]).lanes != 0) {
                     if (corr_live) qv += @reduce(.Add, head(W, qs[k].toLanes(full).grad()) * corr);
@@ -919,6 +917,90 @@ fn evalRange(comptime D: type, comptime narrow: bool, comptime F: type, comptime
             };
         }
     }
+}
+
+/// One write `RecordSink` keeps: the cell's address with bit 0 set for a
+/// store (staging positions, the charge tape), clear for an add, and the
+/// value. `tag`: kind << 16 | local row << 8 | local column (residual and
+/// Jacobian writes); 0 for the charge tape.
+const RecordWrite = struct { ptr: usize, val: f64, tag: u32 = 0 };
+const rec_res = 1;
+const rec_jac = 2;
+const rec_q = 3;
+const rec_qjac = 4;
+
+/// A host `Sink` that also records every write into `out`, in order: the
+/// latency bypass (`DeviceBatch.evalBypass`) replays them.
+fn RecordSink(comptime Inner: type) type {
+    return struct {
+        inner: *const Inner,
+        out: []RecordWrite,
+        id: u32,
+        n: usize = 0,
+        overflow: bool = false,
+        // evalRange writes residual rows in ascending local order, so the
+        // next row at or after the last one is the writer.
+        res_ru: u32 = 0,
+
+        pub const skip_g = Inner.skip_g;
+        pub const skip_c = Inner.skip_c;
+        pub const on_device = false;
+        pub const skip_tape = Inner.skip_tape;
+        const Rs = @This();
+
+        inline fn rec(s: *const Rs, p: *f64, val: f64, store: bool, tag: u32) void {
+            const m: *Rs = @constCast(s);
+            if (m.n == m.out.len) {
+                m.overflow = true;
+                return;
+            }
+            m.out[m.n] = .{ .ptr = @intFromPtr(p) | @intFromBool(store), .val = val, .tag = tag };
+            m.n += 1;
+        }
+        fn rowOf(s: *const Rs, next: *u32, row: u32) u32 {
+            while (s.inner.rhsRow(s.id, next.*) != row) next.* += 1;
+            next.* += 1;
+            return next.* - 1;
+        }
+        pub inline fn x(s: *const Rs, gi: u32) f64 {
+            return s.inner.x(gi);
+        }
+        pub inline fn gath(s: *const Rs, id: u32, u: usize) u32 {
+            return s.inner.gath(id, u);
+        }
+        pub inline fn rhsRow(s: *const Rs, id: u32, ru: usize) u32 {
+            return s.inner.rhsRow(id, ru);
+        }
+        pub inline fn lim(s: *const Rs, id: u32, comptime u: usize) f64 {
+            return s.inner.lim(id, u);
+        }
+        pub inline fn model(s: *const Rs, id: u32) @TypeOf(s.inner.model(id)) {
+            return s.inner.model(id);
+        }
+        pub inline fn inst(s: *const Rs, id: u32) @TypeOf(s.inner.inst(id)) {
+            return s.inner.inst(id);
+        }
+        pub inline fn scatterRes(s: *const Rs, row: u32, val: f64) void {
+            s.inner.scatterRes(row, val);
+            s.rec(s.inner.resPtr(row), val, Inner.stores, rec_res << 16 | s.rowOf(&@constCast(s).res_ru, row) << 8);
+        }
+        pub inline fn scatterJac(s: *const Rs, id: u32, comptime ru: usize, comptime cu: usize, val: f64) void {
+            s.inner.scatterJac(id, ru, cu, val);
+            s.rec(s.inner.jacPtr(id, ru, cu), val, Inner.stores, rec_jac << 16 | ru << 8 | cu);
+        }
+        pub inline fn scatterQ(s: *const Rs, row: u32, qv: f64) void {
+            s.inner.scatterQ(row, qv);
+            s.rec(s.inner.qPtr(row), qv, Inner.stores, rec_q << 16);
+        }
+        pub inline fn scatterQJac(s: *const Rs, id: u32, comptime ru: usize, comptime cu: usize, val: f64) void {
+            s.inner.scatterQJac(id, ru, cu, val);
+            s.rec(s.inner.qJacPtr(id, ru, cu), val, Inner.stores, rec_qjac << 16);
+        }
+        pub inline fn tapeQ(s: *const Rs, id: u32, j: usize, qv: f64) void {
+            s.inner.tapeQ(id, j, qv);
+            s.rec(s.inner.tapePtr(id, j), qv, true, 0);
+        }
+    };
 }
 
 /// The host pads each value's lanes to a power of two. Callgrind Ir per
@@ -1089,12 +1171,38 @@ pub fn permuteInPlace(comptime T: type, items: []T, dst: []const u32, seen: []bo
 pub fn ProtoStore(comptime D: type) type {
     const n_u: usize = comptime contract.nU(D);
     return struct {
-        /// One entry per instance in each column, owned by `staging_gpa`.
+        /// One entry per instance in `instances` and `nodes`, owned by
+        /// `staging_gpa`. `models` holds one row per distinct (canonical)
+        /// Model when the batch shares rows, `model_ids` naming each
+        /// instance's; otherwise one row per instance and no ids. A BSIM4
+        /// row is ~10 KB, so staging a copy per instance held most of the
+        /// 1.8 GB a 1M-device deck peaked at during preparation.
         models: std.ArrayList(D.Model) = .empty,
+        model_ids: std.ArrayList(u32) = .empty,
+        /// `models` rows by content, for `append`'s lookup.
+        seen: std.ArrayHashMapUnmanaged(u32, void, void, true) = .empty,
         instances: std.ArrayList(D.Instance) = .empty,
         nodes: std.ArrayList([n_u]u32) = .empty,
 
         const Self = @This();
+        const shares = DeviceBatch(D).shares_models;
+
+        /// Hashes and compares Model rows by bytes, padding included
+        /// (rows are canonical: `canonicalize` zeroes the padding).
+        const RowCtx = struct {
+            rows: []const D.Model,
+            pub fn hash(_: @This(), m: *const D.Model) u32 {
+                return @truncate(std.hash.Wyhash.hash(0, std.mem.asBytes(m)));
+            }
+            pub fn eql(c: @This(), m: *const D.Model, row: u32, _: usize) bool {
+                return std.mem.eql(u8, std.mem.asBytes(m), std.mem.asBytes(&c.rows[row]));
+            }
+        };
+
+        /// Instance k's staged Model.
+        fn stagedModel(self: *Self, k: usize) *D.Model {
+            return &self.models.items[if (shares) self.model_ids.items[k] else k];
+        }
 
         /// Stages one instance. The rows live on `staging_gpa`, never the
         /// caller's allocator. On failure no column grows. Asserts that a
@@ -1109,8 +1217,31 @@ pub fn ProtoStore(comptime D: type) type {
                 std.debug.assert(instance.systf != null);
             try self.models.ensureUnusedCapacity(staging_gpa, 1);
             try self.instances.ensureUnusedCapacity(staging_gpa, 1);
-            try self.nodes.append(staging_gpa, nodes);
-            self.models.addOneAssumeCapacity().* = model.*;
+            try self.nodes.ensureUnusedCapacity(staging_gpa, 1);
+            if (comptime shares) {
+                try self.model_ids.ensureUnusedCapacity(staging_gpa, 1);
+                try self.seen.ensureUnusedCapacity(staging_gpa, 1);
+                const n: u32 = @intCast(self.models.items.len);
+                const row = self.models.addOneAssumeCapacity();
+                row.* = model.*;
+                canonicalize(row);
+                const gop = self.seen.getOrPutAssumeCapacityAdapted(row, RowCtx{ .rows = self.models.items[0..n] });
+                if (gop.found_existing) self.models.items.len -= 1 else gop.key_ptr.* = n;
+                self.model_ids.appendAssumeCapacity(gop.key_ptr.*);
+            } else self.models.addOneAssumeCapacity().* = model.*;
+            self.nodes.appendAssumeCapacity(nodes);
+            self.instances.addOneAssumeCapacity().* = instance.*;
+        }
+
+        /// `append` of an instance whose Model is staged row `row` already.
+        pub fn appendRow(self: *Self, row: u32, instance: *const D.Instance, nodes: [n_u]u32) !void {
+            comptime std.debug.assert(shares);
+            std.debug.assert(row < self.models.items.len);
+            try self.model_ids.ensureUnusedCapacity(staging_gpa, 1);
+            try self.instances.ensureUnusedCapacity(staging_gpa, 1);
+            try self.nodes.ensureUnusedCapacity(staging_gpa, 1);
+            self.model_ids.appendAssumeCapacity(row);
+            self.nodes.appendAssumeCapacity(nodes);
             self.instances.addOneAssumeCapacity().* = instance.*;
         }
 
@@ -1151,13 +1282,12 @@ pub fn ProtoStore(comptime D: type) type {
 
         fn finalizeLocal(ctx: *anyopaque, gpa: std.mem.Allocator, pv: PatternView) error{ OutOfMemory, TooManyInstances }!Batch {
             const has_q = @hasDecl(D, "q");
-            const has_attempt_decl = @hasDecl(D, "attempt");
             const self: *Self = @ptrCast(@alignCast(ctx));
             // The count guard runs first: a row count past u32 fails before any
             // column or the pattern is read.
             const count = std.math.cast(u32, self.nodes.items.len) orelse return error.TooManyInstances;
-            // `append` grows the three columns together.
-            std.debug.assert(self.models.items.len == self.nodes.items.len);
+            // `append` grows the per-instance columns together.
+            std.debug.assert((if (shares) self.model_ids.items.len else self.models.items.len) == self.nodes.items.len);
             std.debug.assert(self.instances.items.len == self.nodes.items.len);
             std.debug.assert(pv.col_ptr.len == @as(usize, pv.n) + 1);
             const store = try gpa.create(DeviceBatch(D));
@@ -1170,6 +1300,7 @@ pub fn ProtoStore(comptime D: type) type {
             store.committed_initial = false;
             store.owns_tapes = true;
             store.unshared = false;
+            store.cowed = false;
             store.models_shared = &.{};
             store.models = &.{};
             store.model_of = &.{};
@@ -1177,29 +1308,45 @@ pub fn ProtoStore(comptime D: type) type {
             store.gath = &.{};
             store.rhs_idx = &.{};
             store.slots = &.{};
+            store.original_ids = &.{};
+            store.bypass = null;
             if (comptime has_q) store.q_tape = &.{};
-            if (comptime has_attempt_decl) store.saved_models = &.{};
             if (comptime hasSpiceBreaks(D)) store.src_brk = &.{};
             if (comptime @hasDecl(D, "limit")) store.lim_x = &.{};
             if (comptime @hasDecl(D, "State")) store.states = &.{};
             errdefer DeviceBatch(D).hooks.deinit(store, gpa);
             // The staged rows can only be reordered before the copies below.
-            if (comptime canNarrow(D)) store.narrow_count = try self.partitionCollapsed();
+            if (comptime canNarrow(D)) store.narrow_count = try self.partitionCollapsed(gpa, &store.original_ids);
 
             // Each column moves to `gpa` at exact size and its staging copy
             // dies right after, so at most one column exists twice.
             store.model_of = try gpa.alloc(u32, count);
-            const rows = if (comptime DeviceBatch(D).shares_models) try self.dedupModels(store.model_of) else blk: {
+            if (comptime shares) {
+                // Rows numbered by first use in instance order, as a dedup
+                // over one row per instance numbered them.
+                const remap = try staging_gpa.alloc(u32, self.models.items.len);
+                defer staging_gpa.free(remap);
+                @memset(remap, std.math.maxInt(u32));
+                var n: u32 = 0;
+                for (self.model_ids.items, store.model_of) |old, *row| {
+                    if (remap[old] == std.math.maxInt(u32)) {
+                        remap[old] = n;
+                        n += 1;
+                    }
+                    row.* = remap[old];
+                }
+                store.models = try gpa.alloc(D.Model, n);
+                for (self.models.items, remap) |*m, to| if (to != std.math.maxInt(u32)) @memcpy(std.mem.asBytes(&store.models[to]), std.mem.asBytes(m));
+                self.model_ids.deinit(staging_gpa);
+                self.model_ids = .empty;
+                self.seen.deinit(staging_gpa);
+                self.seen = .empty;
+            } else {
                 for (store.model_of, 0..) |*row, id| row.* = @intCast(id);
-                break :blk self.models.items;
-            };
-            store.models = try gpa.dupe(D.Model, rows);
+                store.models = try gpa.dupe(D.Model, self.models.items);
+            }
             self.models.deinit(staging_gpa);
             self.models = .empty;
-            if (comptime has_attempt_decl) {
-                store.saved_models = try gpa.alloc(D.Model, count);
-                store.attempt_saved = false;
-            }
             if (comptime @hasDecl(D, "nextBreakpoint") and skipsTimerState(D)) store.bp = .{ .lo = std.math.inf(f64), .hi = std.math.inf(f64) };
             if (comptime hasSpiceBreaks(D)) {
                 store.src_brk = try gpa.alloc(SrcBrk, count);
@@ -1245,42 +1392,6 @@ pub fn ProtoStore(comptime D: type) type {
             return DeviceBatch(D).binding(store);
         }
 
-        /// Compacts the staged Models to their distinct values, in order of
-        /// first use, writing each instance's row to `model_of`, and returns
-        /// the distinct rows (a prefix of the staging column). Equal means
-        /// bit-equal field by field: every row is first rebuilt from its
-        /// fields over zeroed bytes, so padding cannot hide a match.
-        fn dedupModels(self: *Self, model_of: []u32) error{OutOfMemory}![]D.Model {
-            const items = self.models.items;
-            for (items) |*m| canonicalize(m);
-            const Ctx = struct {
-                rows: []const D.Model,
-                pub fn hash(_: @This(), m: *const D.Model) u32 {
-                    return @truncate(std.hash.Wyhash.hash(0, std.mem.asBytes(m)));
-                }
-                pub fn eql(c: @This(), m: *const D.Model, row: u32, _: usize) bool {
-                    return std.mem.eql(u8, std.mem.asBytes(m), std.mem.asBytes(&c.rows[row]));
-                }
-            };
-            var seen: std.ArrayHashMapUnmanaged(u32, void, void, true) = .empty;
-            defer seen.deinit(staging_gpa);
-            try seen.ensureTotalCapacity(staging_gpa, items.len);
-            var n: u32 = 0;
-            for (items, model_of) |*m, *row| {
-                const gop = seen.getOrPutAssumeCapacityAdapted(m, Ctx{ .rows = items[0..n] });
-                if (!gop.found_existing) {
-                    // Bytes, padding included; n <= this row, so no row
-                    // still to be read is overwritten. A row already in
-                    // place is left alone: @memcpy forbids overlap (#122).
-                    if (&items[n] != m) @memcpy(std.mem.asBytes(&items[n]), std.mem.asBytes(m));
-                    gop.key_ptr.* = n;
-                    n += 1;
-                }
-                row.* = gop.key_ptr.*;
-            }
-            return items[0..n];
-        }
-
         /// Rewrites `m` field by field over zeroed bytes.
         fn canonicalize(m: *D.Model) void {
             @setEvalBranchQuota(10 * @typeInfo(D.Model).@"struct".field_names.len + 1000);
@@ -1294,13 +1405,28 @@ pub fn ProtoStore(comptime D: type) type {
         /// width and needs a uniform range. A uniform batch is left in place,
         /// so instance order (and slot summation order) only changes in a
         /// genuinely mixed batch.
-        fn partitionCollapsed(self: *Self) !u32 {
+        fn partitionCollapsed(self: *Self, gpa: std.mem.Allocator, original_ids: *[]u32) !u32 {
             const len = self.nodes.items.len;
             const flags = try staging_gpa.alloc(bool, len);
             defer staging_gpa.free(flags);
             var n: usize = 0;
-            for (self.models.items, self.instances.items, flags) |*m, *i, *f| {
-                f.* = std.meta.eql(D.collapse(Real, m, i), D.collapse_full);
+            // `collapse` is pure in (Model, Instance): an instance that reads
+            // the row an earlier one read, with equal Instance bytes, takes
+            // that one's answer (a flattened deck repeats a few cells).
+            const first = try staging_gpa.alloc(u32, if (shares) self.models.items.len else 0);
+            defer staging_gpa.free(first);
+            @memset(first, std.math.maxInt(u32));
+            for (self.instances.items, flags, 0..) |*i, *f, k| {
+                if (comptime shares) {
+                    const seen = &first[self.model_ids.items[k]];
+                    if (seen.* != std.math.maxInt(u32) and std.mem.eql(u8, std.mem.asBytes(&self.instances.items[seen.*]), std.mem.asBytes(i))) {
+                        f.* = flags[seen.*];
+                        if (f.*) n += 1;
+                        continue;
+                    }
+                    if (seen.* == std.math.maxInt(u32)) seen.* = @intCast(k);
+                }
+                f.* = std.meta.eql(D.collapse(Real, self.stagedModel(k), i), D.collapse_full);
                 if (f.*) n += 1;
             }
             if (n == 0 or n == len) return @intCast(n);
@@ -1315,7 +1441,12 @@ pub fn ProtoStore(comptime D: type) type {
                 d.* = next.*;
                 next.* += 1;
             }
-            permuteInPlace(D.Model, self.models.items, dst, flags);
+            // Allocate before mutating any column. Uniform batches need no
+            // mapping; mixed batches retain the source identity once, shared
+            // immutably by query clones alongside the other tapes.
+            original_ids.* = try gpa.alloc(u32, len);
+            for (dst, 0..) |d, id| original_ids.*[d] = @intCast(id);
+            if (comptime shares) permuteInPlace(u32, self.model_ids.items, dst, flags) else permuteInPlace(D.Model, self.models.items, dst, flags);
             permuteInPlace(D.Instance, self.instances.items, dst, flags);
             permuteInPlace([n_u]u32, self.nodes.items, dst, flags);
             return @intCast(n);
@@ -1336,6 +1467,8 @@ pub fn ProtoStore(comptime D: type) type {
         pub fn destroy(ctx: *anyopaque, gpa: std.mem.Allocator) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             self.models.deinit(staging_gpa);
+            self.model_ids.deinit(staging_gpa);
+            self.seen.deinit(staging_gpa);
             self.instances.deinit(staging_gpa);
             self.nodes.deinit(staging_gpa);
             gpa.destroy(self);
@@ -1356,6 +1489,24 @@ pub fn ProtoStore(comptime D: type) type {
 const timer_only_state = std.StaticStringMap(void).initComptime(.{
     .{"vsource"},
     .{"isource"},
+});
+
+/// Models whose evaluation reads no time (`sim.t`, `sim.dt`) beyond the
+/// flags the bypass class keys on (the MOS levels test `t > 0` on the
+/// initial step), so a recording stays valid across timepoints. An unlisted
+/// model, a runtime `.hdl` one included, always evaluates.
+// ponytail: hand-kept list (grep of the generated sources); a VerA flag for time reads would replace it.
+const bypass_models = std.StaticStringMap(void).initComptime(.{
+    .{"asmesd"},         .{"asmesd_dio"},   .{"asmhemt"},     .{"b3soidd"},        .{"b3soifd"},
+    .{"bjt505"},         .{"bjt505t"},      .{"bsim1"},       .{"bsim2"},          .{"bsim3"},
+    .{"bsim4va"},        .{"bsimbulk"},     .{"bsimcmg_std"}, .{"bsimimg"},        .{"bsimsoi"},
+    .{"diode_cmc"},      .{"diode"},        .{"gummel_poon"}, .{"hfet1"},          .{"hfet2"},
+    .{"hicumL0_v2p1p0"}, .{"hicumL2_v320"}, .{"hisim2_va"},   .{"hisimhv"},        .{"hisimsoi_std"},
+    .{"hisimsotb_std"},  .{"jfet2"},        .{"jfet"},        .{"juncap200"},      .{"L_UTSOI_102"},
+    .{"mesa"},           .{"mes"},          .{"mosvar"},      .{"mvsg_cmc_5.0.0"}, .{"psp103"},
+    .{"psp103t"},        .{"psp104"},       .{"psp104t"},     .{"r2_cmc"},         .{"r3_cmc"},
+    .{"vbic13_4t"},      .{"vdmos"},        .{"mos1"},        .{"mos2"},           .{"mos3"},
+    .{"mos6"},           .{"mos9"},
 });
 
 fn skipsTimerState(comptime D: type) bool {
@@ -1380,7 +1531,21 @@ fn hasSpiceBreaks(comptime D: type) bool {
     return @hasDecl(D, "nextBreakpoint") and skipsTimerState(D) and @hasField(D.Model, "pulse_td");
 }
 
-const SrcBrk = struct { req: f64 = std.math.inf(f64), at: f64 = std.math.inf(f64) };
+/// `extern`: `GpuPayload.brk` hands these to device step control as bytes.
+const SrcBrk = extern struct { req: f64 = std.math.inf(f64), at: f64 = std.math.inf(f64) };
+
+/// Model `m`'s next breakpoint after `t`, through its cache `c`: kept until a
+/// query reaches it or goes back before the request that set it. Shared by
+/// `nextBreakpointFn` and `LaneBreakKernel`, so host and device round alike.
+/// isrcacct.c requests the raw PWL table times, so only the V source rounds
+/// its PWL corners.
+inline fn srcBreak(comptime D: type, c: *SrcBrk, m: *const D.Model, t_acc: f64, t: f64) f64 {
+    if (t < c.req or t >= c.at)
+        c.* = .{ .req = t, .at = spicePulseBreak(m, t_acc, t) orelse
+            (if (comptime std.mem.eql(u8, baseName(D), "vsource")) spicePwlBreak(m, t_acc, t) else null) orelse
+            D.nextBreakpoint(m, t) orelse std.math.inf(f64) };
+    return c.at;
+}
 
 /// Models whose ngspice load extrapolates the first Newton iterate of a
 /// transient step over CKTdeltaOld[2], the step two back, where the host
@@ -1482,8 +1647,7 @@ fn spicePwlBreak(m: anytype, t_acc: f64, tq: f64) ?f64 {
 }
 
 /// Whether D's `updateState` pushes delay-line history, which only accepted
-/// transient points may feed: LRM §4.5 `absdelay`, and the native lines that
-/// declare `unrevertible_state` (they have no `stateCtl`). A VerA ring would
+/// transient points may feed: LRM §4.5 `absdelay`. A VerA ring would
 /// revert, but a push at the operating point seeds it with a static solve
 /// (multi_analysis/bench_hb_tline_guard: 6.7e-8 to 0.66 of its tolerance).
 /// VerA devices are recognized by the `__analog_op__absdelay__` infix its
@@ -1493,8 +1657,27 @@ fn spicePwlBreak(m: anytype, t_acc: f64, tq: f64) ?f64 {
 /// `updateState` at the operating point, so its fixed point never forms.
 // ponytail: field-name matching until VerA's contract marks delay history.
 fn hasAbsdelayState(comptime D: type) bool {
-    if (@hasDecl(D, "unrevertible_state")) return D.unrevertible_state;
     return hasInstanceField(D, "__analog_op__absdelay__");
+}
+
+/// The §5.4.2 branch-flow unknown of generator `noise_gens[k]`'s branch,
+/// or null when the branch has none. A branch with a flow unknown is a
+/// potential (or switch) branch, whose flow row VerA writes as
+/// `V(p,n) − (contribution)` or `I − (contribution)`: a generator in the
+/// contribution is a source in that row, not a current between the nodes
+/// (`noise_gens` names only the nodes). VerA names the unknown
+/// `flow(p,n)`, or `flow(p,gnd)` for a to-ground branch.
+// ponytail: name matching, as `idtUnknowns`, until VerA's contract says
+// which generators sit on a potential contribution.
+fn noiseFlow(comptime D: type, comptime k: usize) ?usize {
+    comptime {
+        const names = @typeInfo(D.U).@"enum".field_names;
+        const g = D.noise_gens[k];
+        const col = if (g.row == g.col) "gnd" else names[g.col];
+        const want = "flowZ28" ++ names[g.row] ++ "Z2c" ++ col ++ "Z29";
+        for (names, 0..) |name, u| if (std.mem.eql(u8, name, want)) return u;
+        return null;
+    }
 }
 
 /// The order `collect_noise` emits D's generators in: `gen[j]` is the
@@ -1564,6 +1747,18 @@ fn hasInstanceField(comptime D: type, comptime infix: []const u8) bool {
     return false;
 }
 
+/// Where D's frequency-dependent terms come from: D itself, except ltra,
+/// whose exact dispersive AC kernel no Verilog-A operator expresses
+/// (models/ltra_ac.zig). build.zig puts it in ltra's own `models` wrapper,
+/// so only ltra's device object (eval.zig as root) sees it.
+fn AcTerms(comptime D: type) type {
+    if (@import("root") == @This()) {
+        const models = @import("models");
+        if (@hasDecl(models, "ltra_ac") and std.mem.eql(u8, baseName(D), "ltra")) return models.ltra_ac;
+    }
+    return D;
+}
+
 /// The frozen per-type batch: SoA columns for every instance of D plus the
 /// shared tapes, reached through `Batch` and the comptime `hooks` table. A
 /// hook is null when D lacks the decl it needs.
@@ -1571,24 +1766,24 @@ pub fn DeviceBatch(comptime D: type) type {
     const n_u: usize = comptime contract.nU(D);
     const has_state = @hasDecl(D, "State");
     const has_q = @hasDecl(D, "q");
-    const has_attempt = @hasDecl(D, "attempt");
     const has_limit = @hasDecl(D, "limit");
     const narrowable = canNarrow(D);
     // Only timer-only models: their breakpoints are pure in (model, t).
     // Native lines rewrite `Model.brk` as they step, so theirs are not.
     const has_bp = @hasDecl(D, "nextBreakpoint") and skipsTimerState(D);
     const has_src_brk = hasSpiceBreaks(D);
-    // isrcacct.c requests the raw PWL table times, so only the V source
-    // rounds its PWL corners.
-    const is_vsource = comptime std.mem.eql(u8, baseName(D), "vsource");
-    const has_ac_dyn = @hasDecl(D, "ac_dyn_slots");
+    const Ac = AcTerms(D);
+    // `update_state` stages: not the delay lines (`commit_state`), not
+    // timer-only state.
+    const stages_update = @hasDecl(D, "updateState") and !hasAbsdelayState(D) and !skipsTimerState(D);
+    const has_ac_dyn = @hasDecl(Ac, "ac_dyn_slots");
 
     return struct {
         /// Instances whose cards bind bit-identical Models share one row of
-        /// `models`. Only VerA devices, whose Model nothing but the host's
-        /// parameter writes changes after `derive`; a model that caches
-        /// per-instance breakpoints or rewrites itself keeps one row each.
-        pub const shares_models = isVera(D) and !has_attempt and !has_bp and !has_src_brk and !@hasDecl(D, "nextBreakpoint");
+        /// `models`: nothing but the host's parameter writes changes a Model
+        /// after `derive`. A model that caches per-instance breakpoints or
+        /// rewrites itself keeps one row each.
+        pub const shares_models = !has_bp and !has_src_brk and !@hasDecl(D, "nextBreakpoint");
 
         count: u32,
         /// Prepared templates own the tapes; instances made from them borrow.
@@ -1607,12 +1802,13 @@ pub fn DeviceBatch(comptime D: type) type {
         /// own (a template's is the Problem arena).
         unshared: bool,
         models_shared: []D.Model,
-        saved_models: if (has_attempt) []D.Model else void,
-        attempt_saved: if (has_attempt) bool else void,
+        /// `writeParams` appended private rows, so `models.len` no longer
+        /// tells whether every instance owns its row.
+        cowed: bool,
         /// `nextBreakpointFn` returned `hi` (inf for none) at `lo`. That
         /// answer holds for every `t` in `[lo, hi)`: no fire lies strictly
         /// between. `lo = inf` is empty. Every model write goes through
-        /// `reprep` or `applyAttempt`, which empty it.
+        /// `reprep`, which empties it.
         bp: if (has_bp) struct { lo: f64, hi: f64 } else void,
         /// Per model, ngspice's VSRCbreak_time: the PULSE or PWL breakpoint `at`
         /// requested at query time `req`, kept until a query reaches it
@@ -1635,11 +1831,79 @@ pub fn DeviceBatch(comptime D: type) type {
         gath: []u32,
         rhs_idx: []u32,
         slots: []u32,
+        /// Empty means identity; otherwise frozen row -> original staged row.
+        original_ids: []u32,
         /// Charge per instance and LTE site, indexed `id * lteSites(D).len +
         /// j`. Written by `Sink.tapeQ` on the host only; see `Hooks.q_tape`.
         q_tape: if (has_q) []f64 else void,
+        /// Latency bypass records (`Hooks.set_bypass`), null when off.
+        bypass: ?*Bypass = null,
 
         const Self = @This();
+
+        /// Whether a Newton evaluation of D is a pure function of the
+        /// instance's limited unknowns, its bytes and the iteration class:
+        /// no time-dependent stimulus, no Newton history, no evaluation that
+        /// writes the instance beyond a status latch, and not a constant
+        /// Jacobian (whose evaluation costs less than a replay).
+        const bypassable = !has_bp and !has_src_brk and !skipsTimerState(D) and
+            !@hasDecl(D, "advanceIteration") and !@hasDecl(D, "checkConvergence") and
+            !(@hasDecl(D, "mutable_eval") and D.mutable_eval and !statusOnlyMutable(D)) and
+            !(@hasDecl(D, "constant") and D.constant.g) and @hasDecl(D, "u_kinds") and
+            @sizeOf(D.Instance) <= 4096 and bypass_models.has(baseName(D));
+
+        /// Per instance: the limited unknowns and the writes of its last
+        /// full Newton evaluation, and what that evaluation depended on.
+        const Bypass = struct {
+            tol: ir.BypassTol,
+            ref: []f64, // count * n_u
+            meta: []Meta, // count
+            writes: []RecordWrite, // count * max_writes
+            /// Instance evaluations that replayed and that evaluated, summed
+            /// over ParEval's lanes; read between solves (`setSimState`).
+            /// usize: wasm32 has no 64-bit atomics.
+            // ponytail: wraps after 2^32 evaluations on 32-bit targets, which
+            // only skews `review`'s ratio there; u64 again if that matters.
+            hits: std.atomic.Value(usize) = .init(0),
+            misses: std.atomic.Value(usize) = .init(0),
+            /// Set once the hit rate proved too low to pay for recording:
+            /// the batch evaluates plainly for the rest of the run.
+            off: bool = false,
+            const Meta = struct { class: u16 = 0, len: u16 = 0, key: u64 = 0 };
+
+            /// After four evaluations per instance, a batch that replays
+            /// under one in five pays the recording for nothing (a BSIM4
+            /// whose instance bytes move every step: 3%; a CMOS chain: 85%).
+            fn review(bp: *Bypass, count: u32) void {
+                if (bp.off) return;
+                const h = bp.hits.load(.monotonic);
+                const total = h + bp.misses.load(.monotonic);
+                if (total < 4 * @as(u64, count)) return;
+                if (h * 5 < total) bp.off = true;
+            }
+        };
+
+        /// Upper bound on one instance's sink writes in a Newton pass: each
+        /// written row's residual and pattern entries, the same for charge,
+        /// and the LTE sites.
+        const max_writes: usize = blk: {
+            @setEvalBranchQuota(100_000);
+            const jp = rowPattern(D, "jac_pattern");
+            const jr = writtenRows(D, "jac_rows");
+            var w: usize = 0;
+            for (0..n_u) |ru| if (jr[ru]) {
+                w += 1 + @popCount(jp[ru]);
+            };
+            if (has_q) {
+                const qp = rowPattern(D, "q_pattern");
+                const qr = writtenRows(D, "q_rows");
+                for (0..n_u) |ru| if (qr[ru]) {
+                    w += 1 + @popCount(qp[ru]);
+                };
+                w += lteSites(D).len;
+            }
+            break :blk w;
+        };
 
         const noise_order = if (@hasDecl(D, "noise_gens")) noiseOrder(D) else {};
 
@@ -1663,22 +1927,30 @@ pub fn DeviceBatch(comptime D: type) type {
             .stage = stage,
             .scatter_tapes = scatterTapes,
             .q_tape = if (has_q) qTape else null,
+            .charge_identity = if (has_q and lteSites(D).len > 0) chargeIdentity else null,
+            .derivative_counts = derivativeCounts,
             .eval_q = if (has_q) evalQOnly else null,
             // Only where `update_state` is the hook that stages (not the
             // delay lines' `commit_state`, not timer-only state).
             .accept_q = if (has_q and @hasDecl(D, "acceptQ") and !hasAbsdelayState(D) and !skipsTimerState(D)) acceptQOnly else null,
             .apply_limits = if (has_limit) applyLimits else null,
             .clear_limits = if (has_limit) clearLimits else null,
+            .limit_range = if (has_limit) limitRangeHook else null,
+            .arm_limits = if (has_limit) armLimits else null,
             .advance_iteration = if (@hasDecl(D, "advanceIteration")) advanceIteration else null,
             .check_convergence = if (@hasDecl(D, "checkConvergence")) checkConvergence else null,
             .predict_first_iterate = if (predictsOverDeltaOld2(D)) predictFirstIterate else null,
             .mark_load_check_rows = if (load_check.get(baseName(D)) != null) markInternalRows else null,
             .seed = if (@hasDecl(D, "seed")) seedFn else null,
             .seed_ic = if (idtUnknowns(D).len != 0) seedIc else null,
+            .seed_nodeset = if (@hasDecl(D, "u_nodeset")) seedNodeset else null,
             .mark_current_rows = if (@hasDecl(D, "u_kinds")) markCurrentRows else null,
             // Delay history runs once per accepted point; everything else
             // per converged solve. See `Hooks.commit_state`.
-            .update_state = if (@hasDecl(D, "updateState") and !hasAbsdelayState(D) and !skipsTimerState(D)) updateState else null,
+            .update_state = if (stages_update) updateState else null,
+            .update_range = if (stages_update) updateRange else null,
+            .set_bypass = if (bypassable) setBypass else null,
+            .update_done = if (stages_update) updateDone else null,
             .commit_state = if (@hasDecl(D, "updateState") and hasAbsdelayState(D)) updateState else null,
             .state_ctl = if (@hasDecl(D, "stateCtl") and !skipsTimerState(D)) stateCtl else null,
             // Only `updateState` writes `bound_step`.
@@ -1691,6 +1963,9 @@ pub fn DeviceBatch(comptime D: type) type {
             .status = if (@hasDecl(D, "status_sites")) statusFn else null,
             .say = if (@hasDecl(D, "say")) sayFn else null,
             .collect_params = collectParams,
+            .param_layout = paramLayout,
+            .write_params = writeParams,
+            .isolate_rows = isolateRows,
             // A generator is only priced by the device's own `noisePsd`.
             .collect_noise = if (@hasDecl(D, "noise_gens")) blk: {
                 if (!@hasDecl(D, "noisePsd")) @compileError(@typeName(D) ++
@@ -1702,8 +1977,6 @@ pub fn DeviceBatch(comptime D: type) type {
             .ac_dyn = if (has_ac_dyn) acDyn else null,
             .recompute = if (@hasDecl(D, "collapse") or @hasDecl(D, "precompute") or @hasDecl(D, "setup") or has_bp) recomputePrecomputed else null,
             .gpu_payload = if (gpuEligible(D)) gpuPayload else null,
-            .apply_attempt = if (has_attempt) applyAttempt else null,
-            .restore_models = if (has_attempt) restoreAttempt else null,
             .deinit = destroy,
         };
 
@@ -1716,18 +1989,39 @@ pub fn DeviceBatch(comptime D: type) type {
             return &self.models[self.model_of[id]];
         }
 
+        /// Every instance owns its Model row, and `model_of` is the identity.
+        fn ownsRows(self: *const Self) bool {
+            return self.models.len == self.count and !self.cowed;
+        }
+
         /// Gives every instance its own Model row, so a write through one
         /// instance's `ParamRef` reaches that instance alone.
         fn unshareModels(self: *Self) error{OutOfMemory}!void {
-            if (self.unshared or self.models.len == self.count) return;
+            if (self.ownsRows()) return;
             const own = try staging_gpa.alloc(D.Model, self.count);
             for (own, self.model_of, 0..) |*m, row, id| {
                 m.* = self.models[row];
                 self.model_of[id] = @intCast(id);
             }
-            self.models_shared = self.models;
+            if (self.unshared) staging_gpa.free(self.models) else self.models_shared = self.models;
             self.models = own;
             self.unshared = true;
+            self.cowed = false;
+        }
+
+        /// Appends `extra` rows to `models` (`staging_gpa`, as `unshareModels`).
+        fn growModels(self: *Self, extra: usize) error{OutOfMemory}!void {
+            const len = self.models.len;
+            if (self.unshared) {
+                self.models = try staging_gpa.realloc(self.models, len + extra);
+            } else {
+                const own = try staging_gpa.alloc(D.Model, len + extra);
+                @memcpy(own[0..len], self.models);
+                self.models_shared = self.models;
+                self.models = own;
+                self.unshared = true;
+            }
+            self.cowed = true;
         }
 
         fn evalNewton(ctx: *anyopaque, pl: *const Planes, first: u32, last: u32, x: []const f64, t: f64) void {
@@ -1772,6 +2066,29 @@ pub fn DeviceBatch(comptime D: type) type {
             return self.q_tape;
         }
 
+        fn derivativeCounts(ctx: *anyopaque) ir.DerivativeCounts {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const narrow: u32 = if (narrowable) self.narrow_count else 0;
+            return .{
+                .wide = self.count - narrow,
+                .narrow = narrow,
+                .wide_lanes = @intCast(comptime basisOf(D, false).w),
+                .narrow_lanes = if (narrowable) @intCast(comptime basisOf(D, true).w) else 0,
+            };
+        }
+
+        fn chargeIdentity(ctx: *anyopaque, index: usize) ir.ChargeIdentity {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const sites = comptime lteSites(D);
+            const id = index / sites.len;
+            std.debug.assert(index < self.q_tape.len);
+            return .{
+                .instance = if (self.original_ids.len == 0) @intCast(id) else self.original_ids[id],
+                .site = @intCast(sites[index % sites.len]),
+                .rows = self.gath[id * n_u ..][0..n_u],
+            };
+        }
+
         fn evalInner(ctx: *anyopaque, pl: *const Planes, first: u32, last: u32, x: []const f64, t: f64, comptime skip_const: bool, comptime staged: bool) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             // Once per batch call, outside the per-instance loop.
@@ -1779,16 +2096,172 @@ pub fn DeviceBatch(comptime D: type) type {
             std.debug.assert(last <= self.count);
             const limiting = if (comptime has_limit) self.lim_active else false;
             var sink = Sink(D, false, skip_const, staged).host(self, pl, x, undefined);
-            const F = jacFloat(D);
             const sim = self.simAt(t);
+            // A replay needs the recorded Jacobian (and charge Jacobian) to
+            // move the residual to the new point.
+            const SinkT = @TypeOf(sink);
+            if (comptime bypassable and skip_const and !SinkT.skip_g and !(has_q and SinkT.skip_c)) if (self.bypass) |bp| if (!bp.off) {
+                self.evalBypass(bp, &sink, first, last, sim, limiting, pl, staged);
+                return;
+            };
+            self.evalSplit(&sink, first, last, sim, limiting);
+        }
+
+        /// `evalRange` over `[first, last)`, the narrow basis on the part
+        /// below `narrow_count`: a ParEval slice may straddle the boundary.
+        inline fn evalSplit(self: *const Self, sink: anytype, first: u32, last: u32, sim: SimState, limiting: bool) void {
             if (comptime narrowable) {
-                // A ParEval slice may straddle the partition boundary.
                 const split = std.math.clamp(self.narrow_count, first, last);
-                if (split > first) evalRange(D, true, F, host_pad, &sink, first, split, sim, limiting);
-                if (last > split) evalRange(D, false, F, host_pad, &sink, split, last, sim, limiting);
+                if (split > first) evalRange(D, true, host_pad, sink, first, split, sim, limiting);
+                if (last > split) evalRange(D, false, host_pad, sink, split, last, sim, limiting);
             } else {
-                evalRange(D, false, F, host_pad, &sink, first, last, sim, limiting);
+                evalRange(D, false, host_pad, sink, first, last, sim, limiting);
             }
+        }
+
+        fn setBypass(ctx: *anyopaque, tol: ?ir.BypassTol) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (comptime !bypassable) return;
+            if (self.bypass) |bp| {
+                bp.tol = tol orelse {
+                    self.freeBypass();
+                    return;
+                };
+                if (!bp.off) @memset(bp.meta, .{});
+                return;
+            }
+            const t = tol orelse return;
+            const ref = staging_gpa.alloc(f64, self.count * n_u) catch return;
+            const meta = staging_gpa.alloc(Bypass.Meta, self.count) catch return staging_gpa.free(ref);
+            const writes = staging_gpa.alloc(RecordWrite, self.count * max_writes) catch {
+                staging_gpa.free(meta);
+                return staging_gpa.free(ref);
+            };
+            const bp = staging_gpa.create(Bypass) catch {
+                staging_gpa.free(writes);
+                staging_gpa.free(meta);
+                return staging_gpa.free(ref);
+            };
+            @memset(meta, .{});
+            bp.* = .{ .tol = t, .ref = ref, .meta = meta, .writes = writes };
+            self.bypass = bp;
+        }
+
+        fn freeBypass(self: *Self) void {
+            const bp = self.bypass orelse return;
+            staging_gpa.free(bp.writes);
+            staging_gpa.free(bp.meta);
+            staging_gpa.free(bp.ref);
+            staging_gpa.destroy(bp);
+            self.bypass = null;
+        }
+
+        /// Newton evaluation with the latency bypass: each instance replays
+        /// its recorded writes when its inputs are within tolerance of the
+        /// recording, else evaluates (recording afresh). The writes replay in
+        /// their recorded order, so each plane cell sums as a fresh
+        /// evaluation with those values would.
+        fn evalBypass(self: *Self, bp: *Bypass, sink: anytype, first: u32, last: u32, sim: SimState, limiting: bool, pl: *const Planes, comptime staged: bool) void {
+            const SinkT = @typeInfo(@TypeOf(sink)).pointer.child;
+            // Which planes the recorded pointers address, and the
+            // iteration class (Meyer models branch on the first iterate).
+            var key = std.hash.Wyhash.init(@intFromBool(staged));
+            key.update(std.mem.asBytes(&[_]usize{ @intFromPtr(pl.g_vals.ptr), @intFromPtr(pl.c_vals.ptr), @intFromPtr(pl.rhs.ptr), @intFromPtr(pl.q_vec.ptr) }));
+            const plane_key = key.final();
+            // The first iterate neither replays nor records (Meyer models
+            // branch on it), so a later iterate's recording reaches the
+            // next timepoint.
+            if (sim.iteration <= 1) {
+                self.evalSplit(sink, first, last, sim, limiting);
+                return;
+            }
+            const class: u16 = 1 + 2 * @as(u16, @intCast(@backingInt(sim.kind))) + 64 * @as(u16, @intFromBool(sim.analog_initial)) +
+                128 * @as(u16, @intFromBool(sim.initial_step)) + 256 * @as(u16, @intFromBool(sim.final_step)) + 512 * @as(u16, @intFromBool(sim.t > 0));
+            const lim_writes = comptime if (has_limit) limitWritesOf(D) else 0;
+            var hits: usize = 0;
+            var misses: usize = 0;
+            defer {
+                _ = bp.hits.fetchAdd(hits, .monotonic);
+                _ = bp.misses.fetchAdd(misses, .monotonic);
+            }
+            var id = first;
+            while (id < last) : (id += 1) {
+                var lx: [n_u]f64 = undefined;
+                var corr = false;
+                inline for (0..n_u) |u| {
+                    const xg = sink.x(sink.gath(id, u));
+                    lx[u] = xg;
+                    if (comptime has(lim_writes, u)) if (limiting) {
+                        const l = sink.lim(id, u);
+                        lx[u] = l;
+                        if (@as(u64, @bitCast(xg)) != @as(u64, @bitCast(l))) corr = true;
+                    };
+                }
+                const state_key = self.stateKey(id, plane_key);
+                const m = &bp.meta[id];
+                const ref = bp.ref[@as(usize, id) * n_u ..][0..n_u];
+                if (!corr and m.class == class and m.key == state_key) replay: {
+                    inline for (0..n_u) |u| {
+                        const tol = bp.tol.reltol * @max(@abs(lx[u]), @abs(ref[u])) +
+                            (if (comptime D.u_kinds[u] == .voltage) bp.tol.vntol else bp.tol.abstol);
+                        if (!(@abs(lx[u] - ref[u]) <= tol)) break :replay;
+                    }
+                    // Residual form: f(x) ~ f(ref) + J (x - ref). Charges and
+                    // the tape are re-read exactly (values only): a Meyer
+                    // model's C is not dq/dx, and the transient multiplies a
+                    // charge error by 2/dt.
+                    const ws = bp.writes[@as(usize, id) * max_writes ..][0..m.len];
+                    var jl = std.mem.zeroes([n_u][n_u]f64);
+                    var d: [n_u]f64 = undefined;
+                    inline for (0..n_u) |u| d[u] = lx[u] - ref[u];
+                    for (ws) |w| switch (w.tag >> 16) {
+                        rec_jac => jl[(w.tag >> 8) & 0xff][w.tag & 0xff] += w.val,
+                        else => {},
+                    };
+                    // SPICE's second test: the predicted change itself
+                    // within tolerance (an exponential junction moves far
+                    // more current than a vntol-sized step suggests).
+                    for (ws) |w| if (w.tag >> 16 == rec_res) {
+                        const dv = bypassDelta(w, &jl, &d);
+                        if (!(@abs(dv) <= bp.tol.reltol * @abs(w.val) + bp.tol.abstol)) break :replay;
+                    };
+                    for (ws) |w| switch (w.tag >> 16) {
+                        rec_q, 0 => {},
+                        else => {
+                            const p: *f64 = @ptrFromInt(w.ptr & ~@as(usize, 1));
+                            const v = w.val + bypassDelta(w, &jl, &d);
+                            if (w.ptr & 1 != 0) p.* = v else p.* += v;
+                        },
+                    };
+                    if (comptime has_q) evalQRange(D, RealFor(@hasDecl(D, "collapse")), sink, id, id + 1, sim, null);
+                    hits += 1;
+                    continue;
+                }
+                misses += 1;
+                // Full evaluation, recorded.
+                var rec: RecordSink(SinkT) = .{ .inner = sink, .id = id, .out = bp.writes[@as(usize, id) * max_writes ..][0..max_writes] };
+                self.evalSplit(&rec, id, id + 1, sim, limiting);
+                @memcpy(ref, &lx);
+                m.* = if (corr or rec.overflow) .{} else .{ .class = class, .len = @intCast(rec.n), .key = state_key };
+            }
+        }
+
+        /// A recorded residual write's first-order move to `d`.
+        fn bypassDelta(w: RecordWrite, jl: *const [n_u][n_u]f64, d: *const [n_u]f64) f64 {
+            if (w.tag >> 16 != rec_res) return 0;
+            var dv: f64 = 0;
+            for (jl[(w.tag >> 8) & 0xff], d) |j, dx| dv += j * dx;
+            return dv;
+        }
+
+        /// What a recording depends on beyond the unknowns: the planes it
+        /// wrote and the instance's bytes, which hold latched and held
+        /// values. `State` is `updateState`'s staging, which `eval` never
+        /// reads.
+        fn stateKey(self: *Self, id: u32, plane_key: u64) u64 {
+            var h = std.hash.Wyhash.init(plane_key);
+            h.update(std.mem.asBytes(&self.instances[id]));
+            return h.final();
         }
 
         /// The stored analysis state at eval time `t`.
@@ -1853,6 +2326,14 @@ pub fn DeviceBatch(comptime D: type) type {
             }
         }
 
+        fn seedNodeset(ctx: *anyopaque, x: []f64) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            for (0..self.count) |id| inline for (D.u_nodeset, 0..) |ns, u| if (ns) |value| {
+                const row = self.gath[id * n_u + u];
+                if (row != GROUND) x[row] = value;
+            };
+        }
+
         fn seedIc(ctx: *anyopaque, x: []f64) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const R = RealFor(@hasDecl(D, "collapse"));
@@ -1890,13 +2371,44 @@ pub fn DeviceBatch(comptime D: type) type {
 
         fn applyLimits(ctx: *anyopaque, x: []f64, x_old: []const f64) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
+            const any = limitRangeHook(ctx, x, x_old, 0, self.count);
+            self.lim_active = true;
+            return any;
+        }
+
+        fn limitRangeHook(ctx: *anyopaque, x: []f64, x_old: []const f64, first: u32, last: u32) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
             // `limitRange` never touches the planes, but `host` reads their
             // pointers, and `undefined` would trap in Debug.
             const no_planes: Planes = .{ .g_vals = &.{}, .c_vals = &.{}, .rhs = &.{}, .q_vec = &.{} };
             var sink = Sink(D, false, false, false).host(self, &no_planes, x, x_old.ptr);
-            const any = limitRange(D, &sink, 0, @intCast(self.count), self.lim_active, self.sim);
+            return limitRange(D, &sink, first, last, self.lim_active, self.sim) != 0;
+        }
+
+        fn armLimits(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
             self.lim_active = true;
-            return any != 0;
+        }
+
+        fn updateRange(ctx: *anyopaque, x: []const f64, first: u32, last: u32) ?f64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            var min_reject: ?f64 = null;
+            for (first..last) |id| {
+                const lx = self.localX(x, id);
+                switch (D.updateState(Real, self.model(id), &self.instances[id], lx, &self.states[id], self.sim)) {
+                    .ok => {},
+                    .request_reject_at => |tr| {
+                        min_reject = if (min_reject) |cur| @min(cur, tr) else tr;
+                    },
+                }
+            }
+            return min_reject;
+        }
+
+        fn updateDone(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.held_initial = true;
+            self.sim.analog_initial = false;
         }
 
         fn clearLimits(ctx: *anyopaque) void {
@@ -1910,18 +2422,8 @@ pub fn DeviceBatch(comptime D: type) type {
         /// `commit_state`), not per Newton iteration.
         fn updateState(ctx: *anyopaque, x: []const f64) ?f64 {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            var min_reject: ?f64 = null;
-            for (0..self.count) |id| {
-                const lx = self.localX(x, id);
-                switch (D.updateState(Real, self.model(id), &self.instances[id], lx, &self.states[id], self.sim)) {
-                    .ok => {},
-                    .request_reject_at => |tr| {
-                        min_reject = if (min_reject) |cur| @min(cur, tr) else tr;
-                    },
-                }
-            }
-            self.held_initial = true;
-            self.sim.analog_initial = false;
+            const min_reject = updateRange(ctx, x, 0, self.count);
+            updateDone(ctx);
             return min_reject;
         }
 
@@ -2026,34 +2528,25 @@ pub fn DeviceBatch(comptime D: type) type {
 
         fn setSimState(ctx: *anyopaque, st: SimState) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
+            // Serial and between solves, so the counts are final and the
+            // decision does not depend on how ParEval split the batch. Only
+            // a transient decides: a cold operating point moves every
+            // instance, which says nothing about the latency to come.
+            if (comptime bypassable) if (self.bypass) |bp| {
+                if (st.kind != self.sim.kind) {
+                    bp.hits.store(0, .monotonic);
+                    bp.misses.store(0, .monotonic);
+                } else if (st.kind == .tran) bp.review(self.count);
+            };
             self.sim = st;
             if (self.held_initial) self.sim.analog_initial = false;
-        }
-
-        fn applyAttempt(ctx: *anyopaque, lambda: f64) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            if (!self.attempt_saved) {
-                @memcpy(self.saved_models, self.models);
-                self.attempt_saved = true;
-            }
-            for (self.models, self.saved_models) |*m, s| m.* = D.attempt(s, lambda);
-            if (comptime has_bp) self.bp.lo = std.math.inf(f64);
-            self.reprep();
-        }
-
-        fn restoreAttempt(ctx: *anyopaque) void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            if (!self.attempt_saved) return;
-            self.attempt_saved = false;
-            @memcpy(self.models, self.saved_models);
-            self.reprep();
         }
 
         /// This batch's GPU working set. The slices stay owned by the batch.
         fn gpuPayload(ctx: *anyopaque) GpuPayload {
             const self: *Self = @ptrCast(@alignCast(ctx));
             return .{
-                .kernel = comptime kernelName(D),
+                .kernel = comptime kernelSym(D, "eval"),
                 .count = self.count,
                 .n_u = n_u,
                 .models = std.mem.sliceAsBytes(self.models),
@@ -2062,12 +2555,13 @@ pub fn DeviceBatch(comptime D: type) type {
                 .gath = self.gath,
                 .rhs_idx = self.rhs_idx,
                 .slots = self.slots,
-                .lim_kernel = comptime if (hasStateKernel(D)) stateKernelName(D) else "",
-                .ctl_kernel = comptime if (hasCtlKernel(D)) ctlKernelName(D) else "",
-                .reduce_kernel = comptime reduceKernelName(D),
+                .lim_kernel = comptime if (hasStateKernel(D)) kernelSym(D, "lim") else "",
+                .ctl_kernel = comptime if (hasCtlKernel(D)) kernelSym(D, "ctl") else "",
+                .reduce_kernel = comptime kernelSym(D, "reduce"),
                 .lim_x = if (comptime has_limit) self.lim_x else &.{},
                 .states = if (comptime has_state) std.mem.sliceAsBytes(self.states) else &.{},
                 .lim_active = if (comptime has_limit) self.lim_active else false,
+                .brk = if (comptime has_src_brk) std.mem.sliceAsBytes(self.src_brk) else &.{},
             };
         }
 
@@ -2137,12 +2631,7 @@ pub fn DeviceBatch(comptime D: type) type {
             var best: f64 = std.math.inf(f64);
             if (comptime @hasDecl(D, "nextBreakpoint")) for (self.models, 0..) |*m, i| {
                 if (comptime has_src_brk) {
-                    const b = &self.src_brk[i];
-                    if (t < b.req or t >= b.at)
-                        b.* = .{ .req = t, .at = spicePulseBreak(m, t_acc, t) orelse
-                            (if (comptime is_vsource) spicePwlBreak(m, t_acc, t) else null) orelse
-                            D.nextBreakpoint(m, t) orelse std.math.inf(f64) };
-                    best = @min(best, b.at);
+                    best = @min(best, srcBreak(D, &self.src_brk[i], m, t_acc, t));
                     continue;
                 }
                 if (D.nextBreakpoint(m, t)) |bp| best = @min(best, bp);
@@ -2169,22 +2658,195 @@ pub fn DeviceBatch(comptime D: type) type {
             try appendParams(D.Model, self.models, false, gpa, list);
         }
 
+        /// `appendParams`' fields for the Instance then the Model, with
+        /// each field's byte offset in its struct.
+        const param_table = blk: {
+            @setEvalBranchQuota(100_000 + 100 * (@typeInfo(D.Instance).@"struct".field_names.len + @typeInfo(D.Model).@"struct".field_names.len));
+            var fs: []const ir.ParamField = &.{};
+            var os: []const u32 = &.{};
+            for (.{ D.Instance, D.Model }, .{ true, false }) |T, is_instance| {
+                var field_idx: usize = 0;
+                for (@typeInfo(T).@"struct".field_names) |field_name| {
+                    if (!paramField(T, field_name)) continue;
+                    fs = fs ++ [_]ir.ParamField{.{ .name = field_name, .offset = @offsetOf(T, field_name), .is_instance = is_instance, .primary = !is_instance and field_idx == 0 }};
+                    os = os ++ [_]u32{@offsetOf(T, field_name)};
+                    field_idx += 1;
+                }
+            }
+            const f = fs[0..fs.len].*;
+            const o = os[0..os.len].*;
+            break :blk struct {
+                const fields: [f.len]ir.ParamField = f;
+                const offsets: [o.len]u32 = o;
+            };
+        };
+
+        fn paramLayout(ctx: *anyopaque) ir.DeviceResult(ir.ParamLayout) {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return .{ .ok = .{
+                .count = @intCast(self.instances.len),
+                .fields = &param_table.fields,
+                .instances = @ptrCast(self.instances.ptr),
+                .instance_stride = @sizeOf(D.Instance),
+                .models = @ptrCast(self.models.ptr),
+                .model_stride = @sizeOf(D.Model),
+                .model_of = self.model_of.ptr,
+            } };
+        }
+
+        fn writeParams(ctx: *anyopaque, refs: []const u32, values: []const f64, lo: u32, hi: u32) ir.DeviceResult(void) {
+            return ir.DeviceResult(void).fromLocal(writeParamsLocal(ctx, refs, values, lo, hi));
+        }
+
+        /// One Model-field write through instance `id`.
+        const RowWrite = struct {
+            id: u32,
+            offset: u32,
+            value: f64,
+
+            fn before(_: void, a: RowWrite, b: RowWrite) bool {
+                return a.id < b.id or (a.id == b.id and a.offset < b.offset);
+            }
+
+            fn same(a: []const RowWrite, b: []const RowWrite) bool {
+                if (a.len != b.len) return false;
+                for (a, b) |x, y| if (x.offset != y.offset or @as(u64, @bitCast(x.value)) != @as(u64, @bitCast(y.value))) return false;
+                return true;
+            }
+        };
+
+        fn fieldOf(row: anytype, offset: u32) *f64 {
+            return @ptrCast(@alignCast(@as([*]u8, @ptrCast(row)) + offset));
+        }
+
+        /// `Hooks.write_params`. A shared row is written in place when
+        /// every instance reading it receives the same writes (a `.step`
+        /// of a model parameter); otherwise each written instance gets a
+        /// copy of the row, and the others keep it.
+        fn writeParamsLocal(ctx: *anyopaque, refs: []const u32, values: []const f64, lo: u32, hi: u32) error{OutOfMemory}!void {
+            if (comptime param_table.fields.len == 0) return;
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const fields = &param_table.fields;
+            const n = self.count;
+            std.debug.assert(hi - lo == n * fields.len);
+            const owns = self.ownsRows();
+            var shared: usize = 0;
+            for (refs, values) |r, v| {
+                if (r < lo or r >= hi) continue;
+                const f = fields[(r - lo) / n];
+                const id = (r - lo) % n;
+                if (f.is_instance) {
+                    fieldOf(&self.instances[id], f.offset).* = v;
+                } else if (owns) {
+                    fieldOf(self.model(id), f.offset).* = v;
+                } else shared += 1;
+            }
+            if (shared == 0) return;
+            const ws = try staging_gpa.alloc(RowWrite, shared);
+            defer staging_gpa.free(ws);
+            var k: usize = 0;
+            for (refs, values) |r, v| {
+                if (r < lo or r >= hi) continue;
+                const f = fields[(r - lo) / n];
+                if (f.is_instance) continue;
+                ws[k] = .{ .id = (r - lo) % n, .offset = f.offset, .value = v };
+                k += 1;
+            }
+            // Stable, so a repeated write keeps the last value.
+            std.mem.sort(RowWrite, ws, {}, RowWrite.before);
+            const Row = struct { first: u32 = 0, len: u32 = 0, written: u32 = 0, readers: u32 = 0, same: bool = true };
+            const rows = try staging_gpa.alloc(Row, self.models.len);
+            defer staging_gpa.free(rows);
+            @memset(rows, .{});
+            for (self.model_of) |row| rows[row].readers += 1;
+            // Per row: how many of its readers are written, and whether
+            // all with the same writes.
+            var a: usize = 0;
+            while (a < ws.len) {
+                var b = a + 1;
+                while (b < ws.len and ws[b].id == ws[a].id) b += 1;
+                const row = &rows[self.model_of[ws[a].id]];
+                if (row.written == 0) {
+                    row.first = @intCast(a);
+                    row.len = @intCast(b - a);
+                } else row.same = row.same and RowWrite.same(ws[row.first..][0..row.len], ws[a..b]);
+                row.written += 1;
+                a = b;
+            }
+            var copies: usize = 0;
+            for (rows) |row| {
+                if (row.written != 0 and !(row.same and row.written == row.readers)) copies += row.written;
+            }
+            var next = self.models.len;
+            if (copies != 0) try self.growModels(copies);
+            a = 0;
+            while (a < ws.len) {
+                var b = a + 1;
+                while (b < ws.len and ws[b].id == ws[a].id) b += 1;
+                const id = ws[a].id;
+                const row = rows[self.model_of[id]];
+                if (row.same and row.written == row.readers) {
+                    // The row's other readers write the same values.
+                    if (row.first != a) {
+                        a = b;
+                        continue;
+                    }
+                } else {
+                    self.models[next] = self.models[self.model_of[id]];
+                    self.model_of[id] = @intCast(next);
+                    next += 1;
+                }
+                for (ws[a..b]) |w| fieldOf(self.model(id), w.offset).* = w.value;
+                a = b;
+            }
+            std.debug.assert(next == self.models.len);
+        }
+
+        fn isolateRows(ctx: *anyopaque, ids: []const u32) ir.DeviceResult(void) {
+            return ir.DeviceResult(void).fromLocal(isolateRowsLocal(ctx, ids));
+        }
+
+        /// `Hooks.isolate_rows`: every reader in `ids` of a row with other
+        /// readers moves to a copy, until the row has one reader left.
+        fn isolateRowsLocal(ctx: *anyopaque, ids: []const u32) error{OutOfMemory}!void {
+            if (comptime param_table.fields.len == 0) return;
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (self.ownsRows()) return;
+            const readers = try staging_gpa.alloc(u32, self.models.len);
+            defer staging_gpa.free(readers);
+            // Twice over the same counts: once to size the copies, once to
+            // make them.
+            var next = self.models.len;
+            for (0..2) |pass| {
+                @memset(readers, 0);
+                for (self.model_of) |row| readers[row] += 1;
+                var copies: usize = 0;
+                for (ids, 0..) |id, k| {
+                    std.debug.assert(k == 0 or ids[k - 1] < id);
+                    const row = self.model_of[id];
+                    if (readers[row] < 2) continue;
+                    readers[row] -= 1;
+                    if (pass == 1) {
+                        self.models[next] = self.models[row];
+                        self.model_of[id] = @intCast(next);
+                        next += 1;
+                    }
+                    copies += 1;
+                }
+                if (copies == 0) return;
+                if (pass == 0) try self.growModels(copies);
+            }
+            std.debug.assert(next == self.models.len);
+        }
+
         fn appendParams(comptime T: type, items: anytype, comptime is_instance: bool, gpa: std.mem.Allocator, list: *std.ArrayList(ParamRef)) error{OutOfMemory}!void {
             comptime var field_idx: usize = 0;
             inline for (@typeInfo(T).@"struct".field_names) |field_name| {
                 if (comptime paramField(T, field_name)) {
-                    const primary = comptime if (@hasDecl(D, "mc_param"))
-                        std.mem.eql(u8, field_name, D.mc_param)
-                    else if (isVera(D))
-                        !is_instance and field_idx == 0
-                    else
-                        is_instance and field_idx == 0;
+                    const primary = !is_instance and field_idx == 0;
                     for (items, 0..) |*it, idx| {
                         try list.append(gpa, .{
-                            .ptr = if (@FieldType(T, field_name) == f32)
-                                .{ .f32 = &@field(it, field_name) }
-                            else
-                                .{ .f64 = &@field(it, field_name) },
+                            .ptr = &@field(it, field_name),
                             .param_name = field_name,
                             .index = @intCast(idx),
                             .is_instance = is_instance,
@@ -2196,17 +2858,17 @@ pub fn DeviceBatch(comptime D: type) type {
             }
         }
 
-        /// Whether field `field_name` of T is a sweepable parameter: a float with a
+        /// Whether field `field_name` of T is a sweepable parameter: an f64 with a
         /// finite default that is not a VerA-internal or runtime-state field.
         fn paramField(comptime T: type, comptime field_name: []const u8) bool {
-            if (@FieldType(T, field_name) != f32 and @FieldType(T, field_name) != f64) return false;
+            if (@FieldType(T, field_name) != f64) return false;
             // A trailing `__` is VerA's own namespace (no escaped Verilog-A
             // name ends in `_`), e.g. `nom_temp__` from `.options tnom`,
             // which `.mc`/`.sens` must not perturb. So is `<flow>__retained`,
             // the retention flag `derive` writes (contract `JacWhen`).
             if (comptime std.mem.endsWith(u8, field_name, "__") or
                 std.mem.endsWith(u8, field_name, "__retained")) return false;
-            if (isVera(D) and T == D.Instance) {
+            if (T == D.Instance) {
                 // A VerA Instance holds runtime state; only `mfactor` is a
                 // parameter (the temperature is the Model row's
                 // `temperature__`, VerA device ABI 6).
@@ -2237,20 +2899,36 @@ pub fn DeviceBatch(comptime D: type) type {
                 // (noise-contract.md §3). `@abs` matches ngspice
                 // nevalsrc.c:106. Zero-power generators stay: their ordinal
                 // identifies them across PSS samples. A (u, u) branch is u to
-                // ground.
+                // ground. A generator on a branch with a retained flow unknown
+                // enters its flow row with a minus sign (`noiseFlow`):
+                // ground to that row.
                 inline for (noise_order.gen, noise_order.lead) |k, lead| {
                     const gen = D.noise_gens[k];
                     const t = terms[k];
+                    // ponytail: no device publishes a §4.6.4.6 partial
+                    // correlation (VerA correlates through `source`); one that
+                    // does needs a NoiseSource field and the consumers' cross
+                    // term 2·rho·sqrt(S_a·S_b)·Re(H_a·conj(H_b)).
+                    std.debug.assert(t.corr_with == null);
                     const table = comptime if (@hasField(@TypeOf(gen), "table")) gen.table else null;
+                    // A collapsed flow unknown shares another unknown's row
+                    // (a switch branch in its flow arm): the branch adds
+                    // to KCL directly, so the generator stays a current.
+                    const flow: ?u32 = if (comptime noiseFlow(D, k)) |u| blk: {
+                        const r = self.gath[id * n_u + u];
+                        if (r == GROUND) break :blk null;
+                        for (0..n_u) |v| if (v != u and self.gath[id * n_u + v] == r) break :blk null;
+                        break :blk r;
+                    } else null;
                     list.appendAssumeCapacity(.{
-                        .node_p = self.gath[id * n_u + gen.row],
-                        .node_n = if (gen.row == gen.col) GROUND else self.gath[id * n_u + gen.col],
+                        .node_p = if (flow != null) GROUND else self.gath[id * n_u + gen.row],
+                        .node_n = flow orelse if (gen.row == gen.col) GROUND else self.gath[id * n_u + gen.col],
                         .white = @abs(t.white) * mf,
                         .flicker = @abs(t.flicker) * mf,
                         .ef = t.ef,
                         .coeff = if (table != null) t.coeff * @sqrt(mf) else t.coeff,
                         .group = base + lead,
-                        .table = if (table) |i| D.noise_tables[i] else .{ .interp = .linear, .points = &.{} },
+                        .table = if (table) |i| contract.noiseTable(D, self.model(id), i) else .{ .interp = .linear, .points = &.{} },
                     });
                 }
             }
@@ -2258,12 +2936,12 @@ pub fn DeviceBatch(comptime D: type) type {
 
         fn collectAcDyn(ctx: *anyopaque, gpa: std.mem.Allocator, list: *std.ArrayList(u32)) ir.DeviceResult(void) {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            list.ensureUnusedCapacity(gpa, self.count * D.ac_dyn_slots.len) catch return .out_of_memory;
+            list.ensureUnusedCapacity(gpa, self.count * Ac.ac_dyn_slots.len) catch return .out_of_memory;
             const k = SlotMap(D).k;
             const pos = comptime blk: {
                 @setEvalBranchQuota(10_000_000);
-                var p: [D.ac_dyn_slots.len]u32 = undefined;
-                for (&p, D.ac_dyn_slots) |*o, s| o.* = SlotMap(D).at(s / n_u, s % n_u);
+                var p: [Ac.ac_dyn_slots.len]u32 = undefined;
+                for (&p, Ac.ac_dyn_slots) |*o, s| o.* = SlotMap(D).at(s / n_u, s % n_u);
                 break :blk p;
             };
             for (0..self.count) |id| {
@@ -2272,11 +2950,11 @@ pub fn DeviceBatch(comptime D: type) type {
             return .{ .ok = {} };
         }
 
-        /// `Hooks.ac_dyn`: one `D.acDyn` call per instance and lane-width
+        /// `Hooks.ac_dyn`: one `Ac.acDyn` call per instance and lane-width
         /// chunk of `omegas`, a ragged tail padded with its last ω.
         fn acDyn(ctx: *anyopaque, x: []const f64, omegas: []const f64, re: []f64, im: []f64) usize {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            const K = D.ac_dyn_slots.len;
+            const K = Ac.ac_dyn_slots.len;
             const LW = std.simd.suggestVectorLength(f64) orelse 1;
             const V = @Vector(LW, f64);
             const nw = omegas.len;
@@ -2289,7 +2967,7 @@ pub fn DeviceBatch(comptime D: type) type {
                     var ow: [LW]f64 = undefined;
                     for (0..LW) |l| ow[l] = omegas[j + @min(l, cnt - 1)];
                     var out: [K]std.math.Complex(V) = undefined;
-                    D.acDyn(V, self.model(id), &self.instances[id], &lx, sim, ow, &out);
+                    Ac.acDyn(V, self.model(id), &self.instances[id], &lx, sim, ow, &out);
                     const mf: V = @splat(mfactorOf(D, &self.instances[id]));
                     for (out, 0..) |o, k| {
                         const e = (id * K + k) * nw + j;
@@ -2304,8 +2982,6 @@ pub fn DeviceBatch(comptime D: type) type {
         }
 
         fn binding(self: *Self) Batch {
-            const const_g = @hasDecl(D, "constant") and D.constant.g;
-            const const_c = @hasDecl(D, "constant") and D.constant.c;
             return .{
                 .ctx = self,
                 .eval = eval,
@@ -2313,7 +2989,7 @@ pub fn DeviceBatch(comptime D: type) type {
                 .count = self.count,
                 .n_u = n_u,
                 .has_charge = has_q,
-                .has_const_jacobian = const_g and (!has_q or const_c),
+                .has_const_jacobian = comptime constJacobian(D),
                 .type_name = comptime baseName(D),
                 .hooks = &hooks,
             };
@@ -2330,8 +3006,9 @@ pub fn DeviceBatch(comptime D: type) type {
         fn copyState(dst_ctx: *anyopaque, src_ctx: *const anyopaque) void {
             const dst: *Self = @ptrCast(@alignCast(dst_ctx));
             const src: *const Self = @ptrCast(@alignCast(src_ctx));
-            // Either side may have been unshared since the copy was made.
-            if (dst.models.len == src.models.len) {
+            // Either side may have been unshared or written since the copy
+            // was made.
+            if (dst.models.len == src.models.len and std.mem.eql(u32, dst.model_of, src.model_of)) {
                 @memcpy(dst.models, src.models);
             } else for (0..dst.count) |id| {
                 dst.model(id).* = src.model(id).*;
@@ -2339,10 +3016,6 @@ pub fn DeviceBatch(comptime D: type) type {
             @memcpy(dst.instances, src.instances);
             if (comptime has_state) @memcpy(dst.states, src.states);
             if (comptime has_q) @memcpy(dst.q_tape, src.q_tape);
-            if (comptime has_attempt) {
-                @memcpy(dst.saved_models, src.saved_models);
-                dst.attempt_saved = src.attempt_saved;
-            }
             if (comptime has_limit) {
                 @memcpy(dst.lim_x, src.lim_x);
                 dst.lim_active = src.lim_active;
@@ -2366,6 +3039,7 @@ pub fn DeviceBatch(comptime D: type) type {
             const template: *const Self = @ptrCast(@alignCast(ctx));
             const self = try gpa.create(Self);
             self.* = template.*;
+            self.bypass = null;
             self.owns_tapes = false;
             self.unshared = false;
             self.models_shared = &.{};
@@ -2379,10 +3053,6 @@ pub fn DeviceBatch(comptime D: type) type {
             self.instances = &.{};
             if (comptime has_state) self.states = &.{};
             if (comptime has_q) self.q_tape = &.{};
-            if (comptime has_attempt) {
-                self.saved_models = &.{};
-                self.attempt_saved = if (accepted) template.attempt_saved else false;
-            }
             if (comptime has_limit) {
                 self.lim_x = &.{};
                 self.lim_active = if (accepted) template.lim_active else false;
@@ -2395,10 +3065,6 @@ pub fn DeviceBatch(comptime D: type) type {
             self.model_of = try gpa.dupe(u32, template.model_of);
             self.instances = try gpa.dupe(D.Instance, template.instances);
             if (comptime has_src_brk) self.src_brk = try gpa.dupe(SrcBrk, template.src_brk);
-            if (comptime has_attempt) {
-                self.saved_models = try gpa.alloc(D.Model, self.count);
-                if (accepted and template.attempt_saved) @memcpy(self.saved_models, template.saved_models);
-            }
             if (comptime has_limit) {
                 self.lim_x = try gpa.alloc(f64, self.count * LimMap(D).k);
                 if (accepted) @memcpy(self.lim_x, template.lim_x) else @memset(self.lim_x, 0);
@@ -2422,17 +3088,18 @@ pub fn DeviceBatch(comptime D: type) type {
 
         fn destroy(ctx: *anyopaque, gpa: std.mem.Allocator) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
+            self.freeBypass();
             if (self.unshared) {
                 staging_gpa.free(self.models);
                 gpa.free(self.models_shared);
             } else gpa.free(self.models);
             gpa.free(self.model_of);
-            if (comptime has_attempt) gpa.free(self.saved_models);
             if (comptime has_limit) gpa.free(self.lim_x);
             if (comptime has_src_brk) gpa.free(self.src_brk);
             gpa.free(self.instances);
             if (comptime has_state) gpa.free(self.states);
             if (self.owns_tapes) {
+                gpa.free(self.original_ids);
                 gpa.free(self.gath);
                 gpa.free(self.rhs_idx);
                 gpa.free(self.slots);
@@ -2441,13 +3108,6 @@ pub fn DeviceBatch(comptime D: type) type {
             gpa.destroy(self);
         }
     };
-}
-
-/// Whether VerA generated D (every VerA device declares `lane_masks`; the
-/// hand-written ones do not). A VerA Instance holds runtime state beside its
-/// two parameters.
-fn isVera(comptime D: type) bool {
-    return @hasDecl(D, "lane_masks");
 }
 
 /// Whether D gets GPU kernels. Excluded, and kept on the host:
@@ -2530,37 +3190,24 @@ fn baseName(comptime D: type) []const u8 {
     return full[dot + 1 ..];
 }
 
-// Kernel symbols, derived from the type so the build root that exports them
-// and `gpuPayload` that names them for the launcher cannot drift apart.
-
-fn kernelName(comptime D: type) [:0]const u8 {
-    return "arp_eval_" ++ comptime baseName(D);
+/// Kernel symbol `arp_<what>_<model>`, derived from the type so the build
+/// root that exports it and `gpuPayload` that names it for the launcher
+/// cannot drift apart. `what`: `eval`, `evalc` (constant Jacobian), `lim`,
+/// `ctl`, `qtp`, `qonly`, and `reduce`, whose body is device-independent but
+/// whose name gompute needs unique across the per-device build roots. The
+/// lane kernels (`l` ++ what) are not carried in the frozen `GpuPayload`:
+/// the host derives them from the eval name (`gpu_lanes.laneName`), so the
+/// prefix swap there must match this.
+fn kernelSym(comptime D: type, comptime what: []const u8) [:0]const u8 {
+    return "arp_" ++ what ++ "_" ++ comptime baseName(D);
 }
 
-fn stateKernelName(comptime D: type) [:0]const u8 {
-    return "arp_lim_" ++ comptime baseName(D);
-}
-
-fn ctlKernelName(comptime D: type) [:0]const u8 {
-    return "arp_ctl_" ++ comptime baseName(D);
-}
-
-/// The reduce body is device-independent, but gompute needs kernel names
-/// unique across the per-device build roots, so each device exports a copy.
-fn reduceKernelName(comptime D: type) [:0]const u8 {
-    return "arp_reduce_" ++ comptime baseName(D);
-}
-
-/// Not carried in the frozen `GpuPayload`: the host derives it from
-/// `kernelName`, so the prefix swap there must match this.
-/// Lane kernel symbols, named from `kernelName` by the host
-/// (`gpu_lanes.laneName`), not carried in the frozen `GpuPayload`.
-fn laneKernelName(comptime D: type, comptime what: []const u8) [:0]const u8 {
-    return "arp_l" ++ what ++ "_" ++ comptime baseName(D);
-}
-
-fn qTapeKernelName(comptime D: type) [:0]const u8 {
-    return "arp_qtp_" ++ comptime baseName(D);
+/// D's whole Jacobian is constant (`Batch.has_const_jacobian`), so its g
+/// and c stamps can live in a baseline.
+fn constJacobian(comptime D: type) bool {
+    const const_g = @hasDecl(D, "constant") and D.constant.g;
+    const const_c = @hasDecl(D, "constant") and D.constant.c;
+    return const_g and (!@hasDecl(D, "q") or const_c);
 }
 
 /// Memory access for `evalRange`/`limitRange`. `device` changes only how
@@ -2576,8 +3223,6 @@ fn qTapeKernelName(comptime D: type) [:0]const u8 {
 fn Sink(comptime D: type, comptime device: bool, comptime skip_const: bool, comptime staged: bool) type {
     if (device and staged) @compileError("staging is host only");
     const n_u: usize = comptime contract.nU(D);
-    const const_g = @hasDecl(D, "constant") and D.constant.g;
-    const const_c = @hasDecl(D, "constant") and D.constant.c;
     const BatchT = DeviceBatch(D);
     return struct {
         xs: gompute.GlobalPtr(f64),
@@ -2605,10 +3250,13 @@ fn Sink(comptime D: type, comptime device: bool, comptime skip_const: bool, comp
         // is constant (`Batch.has_const_jacobian`). A lone constant half has
         // no baseline copy, so skipping it would drop it from the Newton
         // matrix: an idt's charge (C = 1) beside a non-constant G, say.
-        const in_baseline = const_g and (!@hasDecl(D, "q") or const_c);
+        const in_baseline = constJacobian(D);
         pub const skip_g = skip_const and in_baseline;
         pub const skip_c = skip_const and in_baseline;
         pub const on_device = device;
+        /// Newton passes leave the LTE tape alone: the transient reads it
+        /// only after a full, charge-only or accepted-point pass.
+        pub const skip_tape = skip_const;
 
         const Sk = @This();
 
@@ -2644,14 +3292,18 @@ fn Sink(comptime D: type, comptime device: bool, comptime skip_const: bool, comp
             if (comptime staged) return @intCast(@as(usize, id) * SlotMap(D).k + comptime SlotMap(D).at(ru, cu));
             return s.slots_[@as(usize, id) * SlotMap(D).k + comptime SlotMap(D).at(ru, cu)];
         }
-        // Plain `+=` on the GPU too. There the tape indexes a staging cell
-        // only this thread writes, and `ReduceKernel` sums each plane cell's
-        // cells in tape order; an atomic add would make the order, and so
-        // the rounding, vary between runs. The staging is zeroed per pass,
-        // so `0 + v` keeps signed zeros and NaNs as the host stamp does.
+        // A store on the GPU. There the tape indexes a staging cell only
+        // this thread writes, once per pass (the host's staged positions
+        // rely on the same), and `ReduceKernel` sums each plane cell's
+        // cells in tape order from +0.0; an atomic add would make the order,
+        // and so the rounding, vary between runs. A store needs no cleared
+        // staging per pass (01 1.10), and `+0.0 + v` in the reduce gives the
+        // bits `+0.0 + (0 + v)` did, signed zeros included. Cells no pass
+        // writes (rows outside `jac_rows`/`q_rows`, an entry
+        // `jacConstApplies` drops) hold the zero the launcher cleared once.
         inline fn add(p: gompute.GlobalPtr(f64), i: u32, v: f64) void {
             // A staged position takes one stamp per pass.
-            if (comptime staged) p[i] = v else p[i] += v;
+            if (comptime staged or device) p[i] = v else p[i] += v;
         }
         pub inline fn scatterRes(s: *const Sk, row: u32, val: f64) void {
             add(s.rhs, row, val);
@@ -2668,6 +3320,24 @@ fn Sink(comptime D: type, comptime device: bool, comptime skip_const: bool, comp
         }
         pub inline fn scatterQJac(s: *const Sk, id: u32, comptime ru: usize, comptime cu: usize, val: f64) void {
             add(s.c_vals, s.slot(id, ru, cu), val);
+        }
+        /// The cell each scatter writes, and whether it stores (a staged
+        /// position) rather than adds: what `RecordSink` keeps.
+        pub const stores = staged;
+        pub inline fn resPtr(s: *const Sk, row: u32) *f64 {
+            return &s.rhs[row];
+        }
+        pub inline fn jacPtr(s: *const Sk, id: u32, comptime ru: usize, comptime cu: usize) *f64 {
+            return &s.g_vals[s.slot(id, ru, cu)];
+        }
+        pub inline fn qPtr(s: *const Sk, row: u32) *f64 {
+            return &s.q_vec[row];
+        }
+        pub inline fn qJacPtr(s: *const Sk, id: u32, comptime ru: usize, comptime cu: usize) *f64 {
+            return &s.c_vals[s.slot(id, ru, cu)];
+        }
+        pub inline fn tapePtr(s: *const Sk, id: u32, j: usize) *f64 {
+            return &s.q_tape[@as(usize, id) * (comptime lteSites(D).len) + j];
         }
 
         /// Host sink over batch `b`, writing into `pl`. `xo` may be undefined
@@ -2695,7 +3365,11 @@ fn Sink(comptime D: type, comptime device: bool, comptime skip_const: bool, comp
 
 /// GPU eval kernel for D, one thread per instance, running the same
 /// `evalRange` as the host through a device `Sink`.
-fn DeviceKernel(comptime D: type, comptime block_size: u32) type {
+///
+/// `skip_const` (`arp_evalc_<model>`, only for a batch whose whole Jacobian
+/// is constant) drops the g and c stamps, which the launcher keeps in a
+/// device baseline instead (01 1.6); residuals and charges stamp as usual.
+fn DeviceKernel(comptime D: type, comptime block_size: u32, comptime skip_const: bool) type {
     return struct {
         pub fn run(
             count: u64,
@@ -2716,7 +3390,7 @@ fn DeviceKernel(comptime D: type, comptime block_size: u32) type {
         ) callconv(gompute.kernel_callconv) void {
             const tid = gompute.globalIdX(block_size);
             if (tid >= count) return;
-            var sink = Sink(D, true, false, false){
+            var sink = Sink(D, true, skip_const, false){
                 .xs = xs,
                 .gath_ = gath,
                 .rhs_idx_ = rhs_idx,
@@ -2736,10 +3410,17 @@ fn DeviceKernel(comptime D: type, comptime block_size: u32) type {
             // Always the wide basis here: the kernel arguments carry no
             // `narrow_count`, and they are part of the frozen GPU boundary.
             // ponytail: pass `narrow_count` once narrowing is measured on a GPU.
-            evalRange(D, false, gpuJacFloat(D), false, &sink, id, id + 1, sim, limiting != 0);
+            evalRange(D, false, false, &sink, id, id + 1, sim, limiting != 0);
         }
     };
 }
+
+// Zig 0.18.0-dev.349's AMDGPU backend aborts with "Cannot scavenge register
+// in FI elimination!" on the outlined coupled-line updateState call.
+// Inline it into both state kernels to avoid that call's frame lowering.
+// Keep CUDA's existing inlining policy. `zig build test`'s HIP probe emits machine
+// code for all three coupled-line widths, including their lane kernels.
+const gpu_state_call: std.lang.CallModifier = if (builtin.target.cpu.arch == .amdgcn) .always_inline else .auto;
 
 /// GPU limit and state-latch kernel, one thread per instance: the device side
 /// of `applyLimits` and of `updateState`. `halves` (`ir.lim_pass_*` bits)
@@ -2798,7 +3479,7 @@ fn StateKernel(comptime D: type, comptime block_size: u32) type {
             if (comptime has_state) if (halves & ir.lim_pass_state != 0) {
                 const inst_m: *D.Instance = @addrSpaceCast(&instances[id]);
                 const st: *StateT = @addrSpaceCast(&states[id]);
-                switch (D.updateState(Real, model, inst_m, cur, st, sim)) {
+                switch (@call(gpu_state_call, D.updateState, .{ Real, model, inst_m, cur, st, sim })) {
                     .ok => {},
                     .request_reject_at => flag |= 2,
                 }
@@ -2851,6 +3532,50 @@ inline fn segmentSum(stage: gompute.GlobalPtr(f64), first: u32, end: u32) f64 {
     }
     while (k < end) : (k += 1) sum += stage[k];
     return sum;
+}
+
+/// GPU charge-only kernel, one thread per instance: `evalQRange`'s q rows
+/// into the q staging (`q_vec`, through `rhs_idx` as the eval kernel), and
+/// with `with_tape` the LTE charges into `tape` as `QTapeKernel` writes them.
+/// The host's `evalQ` pass: values only, at `xs` unlimited, so the
+/// accepted-point charge re-read costs a fraction of a full eval (04 4.4).
+fn ChargeKernel(comptime D: type, comptime block_size: u32) type {
+    const n_u: usize = comptime contract.nU(D);
+    const sites = comptime lteSites(D);
+    const q_row = comptime writtenRows(D, "q_rows");
+    return struct {
+        pub fn run(
+            count: u64,
+            sim: SimState,
+            xs: gompute.GlobalPtr(f64),
+            gath: gompute.GlobalPtr(u32),
+            rhs_idx: gompute.GlobalPtr(u32),
+            models: gompute.GlobalPtr(D.Model),
+            model_of: gompute.GlobalPtr(u32),
+            instances: gompute.GlobalPtr(D.Instance),
+            q_vec: gompute.GlobalPtr(f64),
+            tape: gompute.GlobalPtr(f64),
+            with_tape: u64,
+        ) callconv(gompute.kernel_callconv) void {
+            const tid = gompute.globalIdX(block_size);
+            if (tid >= count) return;
+            const id: usize = @intCast(tid);
+            const S = RealFor(@hasDecl(D, "collapse"));
+            var lx: [n_u]f64 = undefined;
+            inline for (0..n_u) |u| lx[u] = xs[gath[id * n_u + u]];
+            const qs = D.q(S, &lx, @addrSpaceCast(&models[model_of[id]]), @addrSpaceCast(&instances[id]), sim);
+            const qo = contract.qRows(D, S, qs);
+            const mf = mfactorOf(D, &instances[id]);
+            // Stores, as the device `Sink`; the q rows are not ground-masked
+            // there either.
+            inline for (0..n_u) |ru| if (comptime q_row[ru]) {
+                q_vec[rhs_idx[id * n_u + ru]] = qo[ru].v * mf;
+            };
+            if (with_tape != 0) inline for (sites, 0..) |k, j| {
+                tape[id * sites.len + j] = qs[k].v * mf;
+            };
+        }
+    };
 }
 
 /// GPU charge-tape kernel, one thread per instance: the LTE charges
@@ -2939,7 +3664,8 @@ fn LaneSink(comptime D: type) type {
         /// Lane-major lim plane: instance id's limited unknown `at(u)` at
         /// `(id * k + at(u)) * n + l`.
         lim_: gompute.GlobalPtr(f64),
-        /// Lane l's tape slot (`LaneChargeKernel`), else undefined.
+        /// Lane l's entry 0 of its tape slot, entries `n` apart
+        /// (`LaneChargeKernel`), else undefined.
         tape_: gompute.GlobalPtr(f64) = undefined,
 
         pub const skip_g = false;
@@ -2985,9 +3711,23 @@ fn LaneSink(comptime D: type) type {
         }
         /// LTE site `j` of instance `id` into lane l's tape slot.
         pub inline fn tapeQ(s: *const Sk, id: u32, j: usize, qv: f64) void {
-            s.tape_[@as(usize, id) * (comptime lteSites(D).len) + j] = qv;
+            s.tape_[(@as(usize, id) * (comptime lteSites(D).len) + j) * s.n] = qv;
         }
     };
+}
+
+/// Thread `tid`'s lane and instance range in a lane kernel: with `n_ids` > 0
+/// instance `ids[ids_off + tid / n_lanes]` on lane `tid % n_lanes` (lanes
+/// innermost, 06 6.11, `gpu/lane_color.zig`), else lane `tid` over all
+/// `count` instances. Null for a thread past the grid's end.
+inline fn laneRange(tid: usize, n_lanes: u64, count: u64, ids: gompute.GlobalPtr(u32), ids_off: u64, n_ids: u64) ?struct { l: u32, first: u32, last: u32 } {
+    if (n_ids == 0) {
+        if (tid >= n_lanes) return null;
+        return .{ .l = @intCast(tid), .first = 0, .last = @intCast(count) };
+    }
+    if (tid >= n_ids * n_lanes) return null;
+    const first = ids[@intCast(ids_off + tid / n_lanes)];
+    return .{ .l = @intCast(tid % n_lanes), .first = first, .last = first + 1 };
 }
 
 /// GPU lane eval for D: thread l is lane l of `n_lanes`, evaluating every
@@ -3015,10 +3755,13 @@ fn LaneEvalKernel(comptime D: type, comptime block_size: u32) type {
             rhs: gompute.GlobalPtr(f64),
             q_vec: gompute.GlobalPtr(f64),
             lim: gompute.GlobalPtr(f64),
+            // `laneRange` maps threads to (lane, instances).
+            ids: gompute.GlobalPtr(u32),
+            ids_off: u64,
+            n_ids: u64,
         ) callconv(gompute.kernel_callconv) void {
-            const tid = gompute.globalIdX(block_size);
-            if (tid >= n_lanes) return;
-            const l: u32 = @intCast(tid);
+            const r = laneRange(gompute.globalIdX(block_size), n_lanes, count, ids, ids_off, n_ids) orelse return;
+            const l = r.l;
             if (active[l] == 0) return;
             var sink: LaneSink(D) = .{
                 .n = @intCast(n_lanes),
@@ -3036,7 +3779,7 @@ fn LaneEvalKernel(comptime D: type, comptime block_size: u32) type {
                 .q_vec = q_vec,
                 .lim_ = lim,
             };
-            evalRange(D, false, gpuJacFloat(D), false, &sink, 0, @intCast(count), sims[l], limiting[0] != 0);
+            evalRange(D, false, false, &sink, r.first, r.last, sims[l], limiting[l] != 0);
         }
     };
 }
@@ -3088,7 +3831,7 @@ fn LaneStateKernel(comptime D: type, comptime block_size: u32) type {
                 inline for (0..n_u) |u| {
                     const xo = x_old[@as(usize, gath[id * n_u + u]) * n + l];
                     old[u] = if (comptime has(writes, u))
-                        (if (lim_active[0] != 0) lim[(id * k + comptime LimMap(D).at(u)) * n + l] else xo)
+                        (if (lim_active[l] != 0) lim[(id * k + comptime LimMap(D).at(u)) * n + l] else xo)
                     else
                         xo;
                 }
@@ -3102,7 +3845,7 @@ fn LaneStateKernel(comptime D: type, comptime block_size: u32) type {
             if (comptime has_state) if (halves & ir.lim_pass_state != 0) {
                 const inst_m: *D.Instance = @addrSpaceCast(&instances[id * n + l]);
                 const st: *StateT = @addrSpaceCast(&states[id * n + l]);
-                switch (D.updateState(Real, model, inst_m, cur, st, sim)) {
+                switch (@call(gpu_state_call, D.updateState, .{ Real, model, inst_m, cur, st, sim })) {
                     .ok => {},
                     .request_reject_at => flag |= 2,
                 }
@@ -3151,7 +3894,8 @@ fn LaneCtlKernel(comptime D: type, comptime block_size: u32) type {
 }
 
 /// GPU lane charge kernel: the device side of `Circuit.evalQ` for lane l of
-/// `n_lanes` (thread l walks every instance, as `LaneEvalKernel`):
+/// `n_lanes` (thread l walks every instance, or with `n_ids` > 0 a thread
+/// per (instance colour, lane), as `LaneEvalKernel`):
 /// `evalQRange` adds each instance's charges into lane l's q plane (zeroed
 /// first) and writes its LTE sites into slot `slot0[l]` of lane l's
 /// lane-minor tape ring, site j of instance id at `((l * n_hist +
@@ -3175,10 +3919,13 @@ fn LaneChargeKernel(comptime D: type, comptime block_size: u32) type {
             n_hist: u64,
             n_qt: u64,
             off: u64,
+            ids: gompute.GlobalPtr(u32),
+            ids_off: u64,
+            n_ids: u64,
         ) callconv(gompute.kernel_callconv) void {
-            const tid = gompute.globalIdX(block_size);
-            if (tid >= n_lanes) return;
-            const l: u32 = @intCast(tid);
+            _ = n_hist; // the lane-major tape ring needs no per-lane base
+            const r = laneRange(gompute.globalIdX(block_size), n_lanes, count, ids, ids_off, n_ids) orelse return;
+            const l = r.l;
             if (mask[l] == 0) return;
             var sink: LaneSink(D) = .{
                 .n = @intCast(n_lanes),
@@ -3195,9 +3942,56 @@ fn LaneChargeKernel(comptime D: type, comptime block_size: u32) type {
                 .rhs = undefined,
                 .q_vec = q_vec,
                 .lim_ = undefined,
-                .tape_ = tape + ((@as(usize, l) * @as(usize, @intCast(n_hist)) + slot0[l]) * @as(usize, @intCast(n_qt)) + @as(usize, @intCast(off))),
+                // Lane-major ring: entry j of slot k at `(k * n_qt + j) * N + l`.
+                .tape_ = tape + ((@as(usize, slot0[l]) * @as(usize, @intCast(n_qt)) + @as(usize, @intCast(off))) * @as(usize, @intCast(n_lanes)) + l),
             };
-            evalQRange(D, RealFor(@hasDecl(D, "collapse")), &sink, 0, @intCast(count), sims[l], null);
+            evalQRange(D, RealFor(@hasDecl(D, "collapse")), &sink, r.first, r.last, sims[l], null);
+        }
+    };
+}
+
+/// Device step control's `nextBreakpointFn` per lane of `mask`, after the
+/// commit: `best[l] = min(best[l], the earliest breakpoint after tt[l][1])`,
+/// with `tt[l][0]` the accepted time the host's PULSE/PWL corners round
+/// from. The source caches live per instance and lane (`brk`, instance
+/// `id` of lane l at `id * N + l`), seeded from `GpuPayload.brk`, so a
+/// corner cached at an earlier request keeps that request's rounding as it
+/// does on the host. The host's timer-only cache changes no answer and has
+/// no device copy.
+fn LaneBreakKernel(comptime D: type, comptime block_size: u32) type {
+    return struct {
+        pub fn run(
+            n_lanes: u64,
+            count: u64,
+            mask: gompute.GlobalPtr(u8),
+            tt: gompute.GlobalPtr([2]f64),
+            models: gompute.GlobalPtr(D.Model),
+            model_of: gompute.GlobalPtr(u32),
+            instances: gompute.GlobalPtr(D.Instance),
+            brk: gompute.GlobalPtr(SrcBrk),
+            best: gompute.GlobalPtr(f64),
+        ) callconv(gompute.kernel_callconv) void {
+            const tid = gompute.globalIdX(block_size);
+            if (tid >= n_lanes) return;
+            const l: usize = @intCast(tid);
+            if (mask[l] == 0) return;
+            const N: usize = @intCast(n_lanes);
+            const t_acc = tt[l][0];
+            const t = tt[l][1];
+            var b = best[l];
+            if (comptime @hasDecl(D, "nextBreakpoint")) for (0..@as(usize, @intCast(count))) |id| {
+                const m: *const D.Model = @addrSpaceCast(&models[model_of[id * N + l]]);
+                if (comptime hasSpiceBreaks(D)) {
+                    b = @min(b, srcBreak(D, @addrSpaceCast(&brk[id * N + l]), m, t_acc, t));
+                    continue;
+                }
+                if (D.nextBreakpoint(m, t)) |bp| b = @min(b, bp);
+            };
+            if (comptime walksPending(D)) for (0..@as(usize, @intCast(count))) |id| {
+                const inst: *const D.Instance = @addrSpaceCast(&instances[id * N + l]);
+                if (D.pendingBreakpoint(inst, t)) |bp| b = @min(b, bp);
+            };
+            best[l] = b;
         }
     };
 }
@@ -3216,6 +4010,10 @@ fn VpiHost(comptime D: type) type {
         /// Every small-signal matrix adds the device's `acDyn` terms
         /// (`Hooks.ac_dyn`).
         pub const calls_ac_dyn = true;
+        /// A table row's knots come from its Model row
+        /// (`contract.noiseTable`), so a card's §4.6.4.3 array overrides
+        /// the declared defaults.
+        pub const noise_table_points = true;
         /// Null: ESPice binds the application per instance instead, through
         /// `DeviceVtable.bind_systf`, because it is chosen at run time (a
         /// `--vpi` application, or a no-op for task calls only) and refused
@@ -3278,6 +4076,8 @@ fn Impl(comptime D: type, comptime device_name: []const u8) type {
             .collapse = if (@hasDecl(D, "collapse")) collapseFn else null,
             .proto_create = protoCreate,
             .proto_add = protoAdd,
+            .proto_last_row = if (Store.shares) protoLastRow else null,
+            .proto_add_row = if (Store.shares) protoAddRow else null,
             .unknown_names = &unknown_names,
             .systf_calls = if (has_systf) &D.systf_calls else &.{},
             .bind_systf = if (has_systf) bindSystf else null,
@@ -3346,6 +4146,17 @@ fn Impl(comptime D: type, comptime device_name: []const u8) type {
             const i: *const D.Instance = @ptrCast(@alignCast(instance));
             return ir.DeviceResult(void).fromLocal(store.append(m, i, nodes[0..n_u].*));
         }
+
+        fn protoLastRow(ctx: *anyopaque) u32 {
+            const store: *Store = @ptrCast(@alignCast(ctx));
+            return store.model_ids.items[store.model_ids.items.len - 1];
+        }
+
+        fn protoAddRow(ctx: *anyopaque, row: u32, instance: [*]const u8, nodes: [*]const u32) ir.DeviceResult(void) {
+            const store: *Store = @ptrCast(@alignCast(ctx));
+            const i: *const D.Instance = @ptrCast(@alignCast(instance));
+            return ir.DeviceResult(void).fromLocal(store.appendRow(row, i, nodes[0..n_u].*));
+        }
     };
 }
 
@@ -3357,25 +4168,29 @@ fn placeholder(_: u64) callconv(gompute.kernel_callconv) void {}
 comptime {
     if (@import("root") == @This() and !builtin.is_test) {
         for (@typeInfo(@import("models")).@"struct".decl_names) |decl_name| {
-            // `gpu_kernels` is a build flag, not a device.
+            // `gpu_kernels` is a build flag and `ltra_ac` a term, not devices.
             if (@TypeOf(@field(@import("models"), decl_name)) != type) continue;
             const D = @field(@import("models"), decl_name);
+            if (!@hasDecl(D, "Model")) continue;
             if (gompute.is_device) {
                 const block_size = ir.gpu_block_size;
                 if (gpuEligible(D)) {
-                    gompute.exportRaw(kernelName(D), &DeviceKernel(D, block_size).run);
-                    if (hasStateKernel(D)) gompute.exportRaw(stateKernelName(D), &StateKernel(D, block_size).run);
-                    if (hasCtlKernel(D)) gompute.exportRaw(ctlKernelName(D), &CtlKernel(D, block_size).run);
-                    if (@hasDecl(D, "q")) gompute.exportRaw(qTapeKernelName(D), &QTapeKernel(D, block_size).run);
-                    gompute.exportRaw(reduceKernelName(D), &ReduceKernel(D, block_size).run);
+                    gompute.exportRaw(kernelSym(D, "eval"), &DeviceKernel(D, block_size, false).run);
+                    if (constJacobian(D)) gompute.exportRaw(kernelSym(D, "evalc"), &DeviceKernel(D, block_size, true).run);
+                    if (hasStateKernel(D)) gompute.exportRaw(kernelSym(D, "lim"), &StateKernel(D, block_size).run);
+                    if (hasCtlKernel(D)) gompute.exportRaw(kernelSym(D, "ctl"), &CtlKernel(D, block_size).run);
+                    if (@hasDecl(D, "q")) gompute.exportRaw(kernelSym(D, "qtp"), &QTapeKernel(D, block_size).run);
+                    if (@hasDecl(D, "q")) gompute.exportRaw(kernelSym(D, "qonly"), &ChargeKernel(D, block_size).run);
+                    gompute.exportRaw(kernelSym(D, "reduce"), &ReduceKernel(D, block_size).run);
                     // `-Dgpu-lanes`: also the lane kernels (phase 4), always
                     // at the lane block width (`lane_block_size`).
                     if (@import("lane_options").enabled) {
                         const lb = lane_block_size;
-                        gompute.exportRaw(laneKernelName(D, "eval"), &LaneEvalKernel(D, lb).run);
-                        if (hasStateKernel(D)) gompute.exportRaw(laneKernelName(D, "lim"), &LaneStateKernel(D, lb).run);
-                        if (hasCtlKernel(D)) gompute.exportRaw(laneKernelName(D, "ctl"), &LaneCtlKernel(D, lb).run);
-                        if (@hasDecl(D, "q")) gompute.exportRaw(laneKernelName(D, "chg"), &LaneChargeKernel(D, lb).run);
+                        gompute.exportRaw(kernelSym(D, "leval"), &LaneEvalKernel(D, lb).run);
+                        if (hasStateKernel(D)) gompute.exportRaw(kernelSym(D, "llim"), &LaneStateKernel(D, lb).run);
+                        if (hasCtlKernel(D)) gompute.exportRaw(kernelSym(D, "lctl"), &LaneCtlKernel(D, lb).run);
+                        if (@hasDecl(D, "q")) gompute.exportRaw(kernelSym(D, "lchg"), &LaneChargeKernel(D, lb).run);
+                        if (@hasDecl(D, "nextBreakpoint") or walksPending(D)) gompute.exportRaw(kernelSym(D, "lbrk"), &LaneBreakKernel(D, lb).run);
                     }
                 } else gompute.exportRaw("arp_nop_" ++ decl_name, &placeholder);
             } else {
@@ -3401,14 +4216,15 @@ comptime {
 /// Private decls exposed to the test suites. Tests live in tests/eval.zig,
 /// not here: this file is a dependency module of every test root, and Zig
 /// runs only the root module's tests.
-pub const test_access = if (@import("builtin").is_test) .{
+pub const test_access = if (builtin.is_test) .{
+    .narrowEligible = narrowEligible,
+    .NoiseFamily = NoiseFamily,
     .gpuRefusal = gpuRefusal,
     .GpuRefusal = GpuRefusal,
     .Real = Real,
-    .Sparse = DualFor(f64, &.{ 0, 1 }, host_pad, false),
-    .SparseF32 = DualFor(f32, &.{ 0, 1 }, host_pad, false),
+    .Sparse = DualFor(&.{ 0, 1 }, host_pad, false),
     // Three lanes pad to four: the shuffle path with a pad lane.
-    .Sparse3 = DualFor(f64, &.{ 0, 1, 2 }, host_pad, false),
+    .Sparse3 = DualFor(&.{ 0, 1, 2 }, host_pad, false),
     .anyNonzero = anyNonzero,
     .segmentSum = segmentSum,
     .repMask = repMask,

@@ -26,6 +26,10 @@
 // as in diode.va and mos1.va: $limit stays the identity inside eval, and
 // VerA's contract `limit`/`seed` hooks hand the host the clamps to run between
 // the linear solve and the next eval.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module vdmos(d, g, s);
     inout d, g, s;
     electrical d, g, s;

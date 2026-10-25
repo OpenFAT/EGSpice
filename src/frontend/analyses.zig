@@ -7,8 +7,8 @@
 const std = @import("std");
 const core = @import("core");
 const Library = @import("device").Library;
-const requests = @import("core").query;
-const numerics = @import("core").numerics;
+const requests = core.query;
+const numerics = core.numerics;
 const netlist = @import("netlist");
 const Value = netlist.Value;
 const nameAt = Value.nameAt;
@@ -320,6 +320,8 @@ fn cardError(line: []const u8, err: anytype) @TypeOf(err) {
 
 /// Parsed `.options` overrides, in deck order: a later card wins.
 pub const DeckOptions = struct {
+    /// The `.options` tolerances and iteration limits, copied into every
+    /// query by `applyDeckOptions`.
     tol: numerics.Tolerances = .{},
     /// `.options method`; null keeps each query's default.
     method: ?requests.Method = null,
@@ -330,6 +332,9 @@ pub const DeckOptions = struct {
     /// `.options delmax`: the transient step cap when the `.tran` card sets
     /// none.
     delmax: ?f64 = null,
+    /// `.options tran_ceiling=duration|compatibility`; null keeps the
+    /// `.tran` query's own policy.
+    tran_ceiling: ?@FieldType(requests.Tran, "ceiling_policy") = null,
     /// `.options xmu`: the trapezoidal damping weight; null keeps 0.5.
     xmu: ?f64 = null,
     /// `.options tnom=<degC>`: the temperature model cards were extracted at
@@ -358,7 +363,7 @@ const runlvl_trtol = [6]f64{ 28, 14, 7, 3.5, 1.75, 0.875 };
 /// Option names outside this list (and the ones `foldOptions` passes on to
 /// other readers) are not simulated, and each draws a warning in every
 /// dialect. `gshunt`, `cshunt` and `rshunt` are read by the netlist.
-const Option = enum(u8) { method, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt };
+const Option = enum(u8) { method, tran_ceiling, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt };
 
 /// Folds the deck's `.options` and `.temp` cards; `InvalidAnalysisArguments`
 /// on a value out of range, logged with its card. The last `.temp` card
@@ -378,14 +383,14 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
     // HSPICE spellings: ABSV/RELV/ABSI are VNTOL/RELTOL/ABSTOL, GMINDC the DC
     // gmin (ESPice has one gmin), METHOD=BDF its Gear.
     const names = std.StaticStringMap(Option).initComptime(.{
-        .{ "method", .method }, .{ "reltol", .reltol }, .{ "abstol", .abstol },
-        .{ "vntol", .vntol },   .{ "gmin", .gmin },     .{ "trtol", .trtol },
-        .{ "chgtol", .chgtol }, .{ "itl1", .itl1 },     .{ "itl2", .itl2 },
-        .{ "itl4", .itl4 },     .{ "maxord", .maxord }, .{ "temp", .temp },
-        .{ "tnom", .tnom },     .{ "absv", .vntol },    .{ "relv", .reltol },
-        .{ "absi", .abstol },   .{ "gmindc", .gmin },   .{ "delmax", .delmax },
-        .{ "gshunt", .gshunt }, .{ "cshunt", .cshunt }, .{ "xmu", .xmu },
-        .{ "rshunt", .rshunt },
+        .{ "method", .method }, .{ "reltol", .reltol },             .{ "abstol", .abstol },
+        .{ "vntol", .vntol },   .{ "gmin", .gmin },                 .{ "trtol", .trtol },
+        .{ "chgtol", .chgtol }, .{ "itl1", .itl1 },                 .{ "itl2", .itl2 },
+        .{ "itl4", .itl4 },     .{ "maxord", .maxord },             .{ "temp", .temp },
+        .{ "tnom", .tnom },     .{ "absv", .vntol },                .{ "relv", .reltol },
+        .{ "absi", .abstol },   .{ "gmindc", .gmin },               .{ "delmax", .delmax },
+        .{ "gshunt", .gshunt }, .{ "cshunt", .cshunt },             .{ "xmu", .xmu },
+        .{ "rshunt", .rshunt }, .{ "tran_ceiling", .tran_ceiling },
     });
     const methods = std.StaticStringMap(requests.Method).initComptime(.{
         .{ "gear", .gear_2 }, .{ "trap", .trapezoidal }, .{ "trapezoidal", .trapezoidal }, .{ "bdf", .gear_2 },
@@ -444,6 +449,15 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
                 continue;
             };
             i += 1;
+            if (option == .tran_ceiling) {
+                const value = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
+                if (std.ascii.eqlIgnoreCase(value, "duration")) {
+                    o.tran_ceiling = .duration;
+                } else if (std.ascii.eqlIgnoreCase(value, "compatibility")) {
+                    o.tran_ceiling = .compatibility;
+                } else return error.InvalidAnalysisArguments;
+                continue;
+            }
             if (option == .method) {
                 const method = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
                 if (method.len > lower.len) return error.InvalidAnalysisArguments;
@@ -458,7 +472,7 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
                 else => raw,
             };
             switch (option) {
-                .method => unreachable,
+                .method, .tran_ceiling => unreachable,
                 .temp, .tnom => {
                     if (value <= -273.15) return error.InvalidAnalysisArguments;
                     if (option == .temp) o.temp_c = value else o.tnom_c = value;
@@ -531,7 +545,9 @@ pub fn applyDeckOptions(job: *Job, o: DeckOptions) void {
         if (o.trtol) |trtol| t.tol.trtol = trtol;
         // ngspice's default tmax, min(tstep, (tstop - tstart) / 50)
         // (traninit.c:29-34).
-        t.dt_max = t.dt_max orelse o.delmax orelse @min(t.dt_init, (t.t_stop - t.t_start) / 50);
+        if (o.tran_ceiling) |policy| t.ceiling_policy = policy;
+        t.dt_max = t.dt_max orelse o.delmax;
+        t.dt_max = t.requestedCeiling(.deck);
     }
 }
 
@@ -1674,20 +1690,18 @@ pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const
             try singleEnded(node_neg);
             // HSPICE `.snac <sweep>` and `.snxf v(out) <sweep>` [CR .SNAC,
             // .SNXF] run at the `.sn` fundamental.
+            var opts: requests.Pac = undefined;
             if (a.sn) {
                 const lo = ctx.sn_f0 orelse return error.MissingAnalysisCard;
-                const first: usize = @intFromBool(id == .pxf);
-                const grid = try acGrid(ctx.arena, args, first);
+                const grid = try acGrid(ctx.arena, args, @intFromBool(id == .pxf));
                 if (grid.end != args.len) return error.InvalidAnalysisArguments;
-                const opts: requests.Pac = .{ .f_lo = lo, .sweep = grid.sweep, .out_node = try outputNode(node_id) };
-                return if (id == .pac) .{ .pac = opts } else .{ .pxf = opts };
+                opts = .{ .f_lo = lo, .sweep = grid.sweep, .out_node = try outputNode(node_id) };
+            } else {
+                try arity(args, 5, 5);
+                const sweep = try frequencySweep(args, 1);
+                opts = .{ .f_lo = try positive(args, 0), .sweep = sweep, .out_node = try outputNode(node_id) };
             }
-            try arity(args, 5, 5);
-            const sweep = try frequencySweep(args, 1);
-            const lo = try positive(args, 0);
-            const out = try outputNode(node_id);
-            if (id == .pac) return .{ .pac = .{ .f_lo = lo, .sweep = sweep, .out_node = out } };
-            return .{ .pxf = .{ .f_lo = lo, .sweep = sweep, .out_node = out } };
+            return if (id == .pac) .{ .pac = opts } else .{ .pxf = opts };
         },
         .sp => {
             if (cardIs(a.line, "net")) return .{ .sp = try net(a, sources, ctx) };

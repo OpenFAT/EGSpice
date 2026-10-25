@@ -8,6 +8,10 @@
 // At DC the delay is transparent (the history is the operating point), as the
 // ideal line in tline.va; small-signal analyses read absdelay's exact
 // e^(-jw td) through the host's frequency-dependent stamps.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module vcvs_delay(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;

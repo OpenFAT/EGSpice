@@ -13,14 +13,13 @@
 const std = @import("std");
 const device_ir = @import("device").abi;
 const Prepared = @import("device").Circuit;
-const progress_api = @import("progress.zig");
+const progress_api = @import("worker.zig");
 const par_eval = @import("par_eval.zig");
-const walk = @import("walk.zig");
-const gpu_mod = @import("gpu.zig");
+const gpu_mod = @import("gpu/context.zig");
 const GpuContext = gpu_mod.GpuContext;
-const GpuLu = @import("gpu_lu.zig").GpuLu;
-const kcl_cert = @import("certify.zig");
+const GpuLu = @import("gpu/lu.zig").GpuLu;
 const converger = @import("solver").converger;
+const WsPool = @import("ws_pool.zig").WsPool;
 const freq_solve = @import("solver").freq_solve;
 const direct = @import("solver").direct;
 const numerics = @import("core").numerics;
@@ -36,8 +35,240 @@ const BbdInfo = numerics.BbdInfo;
 const zeroSimd = numerics.zeroSimd;
 const copySimd = numerics.copySimd;
 
-/// The developer switches; see knobs.zig.
-pub const Knobs = @import("knobs.zig").Knobs;
+/// Developer switches, read from the environment once by the facade
+/// (`espice.zig` `knobsFromEnv`) and carried by `Config.knobs` into
+/// `Circuit.knobs`, so nothing below the facade reads the environment. Each
+/// field names its variable; dev/ notes cite them.
+pub const Knobs = struct {
+    /// `-Dlu-instrument`: `lu.stats`, `gpu_lu_bench` and `gpu_lu_threads`
+    /// are read; otherwise the facade leaves them unset.
+    pub const instrument = direct.instrument;
+
+    newton: converger.Knobs = .{},
+    lu: direct.Knobs = .{},
+    /// `ESPICE_LANES`: `1` groups ready operating points and `.dc` sweeps
+    /// into lane batches (`Session.gather`), `0` runs every query alone;
+    /// null leaves it to `executor.lanesOn`.
+    lanes: ?bool = null,
+    /// `ESPICE_HB_TRACE`: trace harmonic-balance iterates.
+    hb_trace: bool = false,
+    /// `ZP_NO_QTAPE`: run the LTE over the row plane, not the charge tape.
+    no_qtape: bool = false,
+    /// `ZP_TRAN_STATS`: print the transient step statistics.
+    tran_stats: bool = false,
+    /// The device latency bypass (`Hooks.set_bypass`) on host Newton
+    /// evaluations; each batch drops it once its hit rate is too low
+    /// (`Bypass.review`). Changes values within the Newton tolerance, so a
+    /// lane (which never bypasses) equals its scalar run within tolerance,
+    /// not bitwise. Off only in tests whose oracle is the plain scalar run.
+    bypass: bool = true,
+    /// `ZP_TRAN_LTE_TRACE`: diagnose the first 16 rejected LTE estimates
+    /// from captured history, without evaluating devices or changing steps.
+    tran_lte_trace: bool = false,
+    /// `ZP_NO_TANGENTS`: an optimization takes every Jacobian by finite
+    /// differences, not from `.dc`/`.tran` tangents, for A/B runs.
+    no_tangents: bool = false,
+    /// `ESPICE_GPU_LU`: `1` forces the device LU on, any other value off;
+    /// null leaves it to the size gate.
+    gpu_lu: ?bool = null,
+    /// `ESPICE_GPU_LU_CHECK`: check every device solve against the host.
+    gpu_lu_check: bool = false,
+    /// `ESPICE_GPU_LU_NOGATHER`: refactor without the gather kernel.
+    gpu_lu_nogather: bool = false,
+    /// `ESPICE_GPU_LU_TAIL`: dense-tail columns (0 when unparsable).
+    gpu_lu_tail: ?u32 = null,
+    /// `ESPICE_GPU_LU_BENCH` (`-Dlu-instrument`): time the device LU,
+    /// stopping after this many samples (0, or unparsable: never).
+    gpu_lu_bench: ?usize = null,
+    /// `ESPICE_GPU_LU_THREADS`: host refactor threads the bench compares.
+    gpu_lu_threads: u32 = 8,
+    /// `ESPICE_GPU_STATS`: set, or `phases` for the per-phase wall split.
+    gpu_stats: enum { off, on, phases } = .off,
+    /// `ESPICE_GPU_BLOCK`: the CUDA block width, 1..1024.
+    gpu_block: u32 = 64,
+    /// `ESPICE_GPU_EVAL_CHECK`: replay every device eval at the same x and
+    /// report the worst plane cell that moved (`GpuContext.evalCheck`).
+    gpu_eval_check: bool = false,
+    /// `ESPICE_GPU_NOFUSE`: give every device eval its own host wait instead
+    /// of sharing the limit pass's (`GpuContext.evalFollows`), for A/B runs.
+    gpu_nofuse: bool = false,
+    /// `ESPICE_GPU_NOGRAPHS`: use direct kernel launches for graph A/B runs.
+    gpu_nographs: bool = false,
+    /// `ESPICE_GPU_HOST_STEP`: GPU transient lanes keep step control on the
+    /// host (`tran.Sim` per lane), the bitwise oracle for device step control.
+    gpu_host_step: bool = false,
+    /// `XDG_CACHE_HOME` and `HOME`, where the GPU JIT warm markers live.
+    xdg_cache_home: ?[]const u8 = null,
+    home: ?[]const u8 = null,
+
+    /// `ESPICE_GPU_BLOCK`'s width, or 64 when unset, unparsable or outside
+    /// CUDA's 1..1024: a zero width would divide by zero in `Dim3.linear`.
+    pub fn parseBlock(env: ?[]const u8) u32 {
+        const v = std.fmt.parseInt(u32, env orelse return 64, 10) catch return 64;
+        return if (v >= 1 and v <= 1024) v else 64;
+    }
+};
+
+test "Knobs.parseBlock" {
+    const parseBlock = Knobs.parseBlock;
+    try std.testing.expectEqual(@as(u32, 64), parseBlock(null));
+    try std.testing.expectEqual(@as(u32, 32), parseBlock("32"));
+    try std.testing.expectEqual(@as(u32, 1), parseBlock("1"));
+    try std.testing.expectEqual(@as(u32, 1024), parseBlock("1024"));
+    for ([_][]const u8{ "0", "1025", "", "-8", "64x", "99999999999" }) |bad|
+        try std.testing.expectEqual(@as(u32, 64), parseBlock(bad));
+}
+
+/// The KCL certificate (`zig build -Dcertify`, #53): at every point direct
+/// Newton converges on and stages, re-evaluate the devices at the
+/// published x with the limiters cleared and check the result against the
+/// solver's own promise.
+///
+/// Asserted: the converger's per-row residual gate
+/// (`converger.residualGate`, with the same gmin and force loads). A row
+/// over it panics, naming the row, so a corpus run fails that deck.
+/// Reported: the current bound ||F_kcl||_inf <= abstol + reltol * max|I|,
+/// where F_kcl is every non-branch row and max|I| the largest branch
+/// current in x. The circuit keeps the worst ratio and prints it once, on
+/// release. The gate is looser than this bound by design (dev/analysis/
+/// tolerance-system.md, "KCL certificate"), so the bound only reports.
+///
+/// Off by default, and comptime-gated: without `-Dcertify` the `Tally`
+/// field is void and `newton` never calls `check`.
+pub const kcl_cert = struct {
+    /// Whether this build certifies, from `-Dcertify`.
+    pub const enabled = @import("build_options").certify;
+
+    /// One circuit's certificate record: the worst current-bound ratio, where
+    /// it fell, and the point counts. `scratch` holds the planes `check`
+    /// restores, sized on first use and freed by `deinit`.
+    pub const Tally = struct {
+        points: u64 = 0,
+        /// Points whose ratio exceeded 1.
+        over: u64 = 0,
+        worst: f64 = 0,
+        worst_t: f64 = 0,
+        worst_row: u32 = 0,
+        worst_kind: []const u8 = "",
+        scratch: []f64 = &.{},
+
+        /// Prints the record when any point was certified, then frees `scratch`.
+        pub fn deinit(self: *Tally, gpa: std.mem.Allocator, node_name: []const u8) void {
+            if (self.points > 0) std.debug.print(
+                "certify: {d} points, {d} over abstol+reltol*max|I|, worst |F|/bound = {e:.3} ({s} t={e:.3} row {d} {s})\n",
+                .{ self.points, self.over, self.worst, self.worst_kind, self.worst_t, self.worst_row, node_name },
+            );
+            gpa.free(self.scratch);
+            self.* = .{};
+        }
+    };
+
+    /// What `measure` found at one point.
+    pub const Point = struct {
+        /// The first row over the converger's gate, or null when every row
+        /// passes it.
+        gate_row: ?u32,
+        /// |F| and the gate on `gate_row`; zero when it is null.
+        gate_f: f64 = 0,
+        gate_tol: f64 = 0,
+        /// ||F_kcl||_inf / (abstol + reltol * max|I|), and its row.
+        ratio: f64,
+        kcl_row: u32,
+    };
+
+    /// The f64 count of `scratch` that `measure` needs for `ckt`.
+    pub fn scratchLen(ckt: anytype) usize {
+        return ckt.g_vals.len + ckt.c_vals.len + ckt.rhs.len + ckt.q_vec.len;
+    }
+
+    /// Re-evaluates `ckt` at the converged `x` through `hook`, with the
+    /// limiters cleared and `opts`' gmin and force loads, and measures it
+    /// against the gate and the current bound (see the file comment). Leaves
+    /// the planes and `q_fresh` as it found them, but the limiters cleared: a
+    /// transient carries limiter history from point to point, so a certified
+    /// run can take other steps than an uncertified one.
+    /// `scratch.len` must be `scratchLen(ckt)`.
+    pub fn measure(ckt: anytype, hook: anytype, x: []const f64, t: f64, opts: converger.Options, scratch: []f64) Point {
+        const n: usize = ckt.n;
+        std.debug.assert(x.len == n);
+        std.debug.assert(scratch.len == scratchLen(ckt));
+        const planes = .{ "g_vals", "c_vals", "rhs", "q_vec" };
+        var off: usize = 0;
+        inline for (planes) |p| {
+            const src = @field(ckt, p);
+            @memcpy(scratch[off..][0..src.len], src);
+            off += src.len;
+        }
+        const q_fresh = ckt.q_fresh;
+
+        ckt.clearLimits();
+        hook.assemble(ckt, x, t);
+        const v = hook.vals(ckt);
+        converger.loadExtras(ckt, v, x, opts);
+        var pt: Point = .{ .gate_row = null, .ratio = 0, .kcl_row = 0 };
+        var kcl: f64 = 0;
+        var i_max: f64 = 0;
+        for (0..n) |i| {
+            const f = @abs(ckt.rhs[i]);
+            const gate = converger.residualGate(opts, v[ckt.diag_slots[i]], x[i]);
+            // Negated, so a NaN residual fails too.
+            if (!(f <= gate) and pt.gate_row == null) {
+                pt.gate_row = @intCast(i);
+                pt.gate_f = f;
+                pt.gate_tol = gate;
+            }
+            if (ckt.current_row[i]) {
+                i_max = @max(i_max, @abs(x[i]));
+            } else if (!(f <= kcl)) {
+                kcl = f;
+                pt.kcl_row = @intCast(i);
+            }
+        }
+        pt.ratio = kcl / (opts.abstol + opts.reltol * i_max);
+
+        ckt.clearLimits();
+        off = 0;
+        inline for (planes) |p| {
+            const dst = @field(ckt, p);
+            @memcpy(dst, scratch[off..][0..dst.len]);
+            off += dst.len;
+        }
+        ckt.q_fresh = q_fresh;
+        std.debug.assert(off == scratch.len);
+        return pt;
+    }
+
+    /// `measure`, then panics when a row is over the converger's gate, and
+    /// records the ratio in `ckt.cert`. `newton` calls it, through
+    /// `Circuit.certifyPoint`, on every converged x it stages under
+    /// `-Dcertify`, after every gate and before `updateStates` stages the
+    /// point: a device whose eval reads its staged history would otherwise see
+    /// x twice. Sizes `ckt.cert.scratch` on first use and panics if that
+    /// allocation fails.
+    pub fn check(ckt: anytype, hook: anytype, x: []const f64, t: f64, opts: converger.Options) void {
+        comptime std.debug.assert(enabled);
+        const tally = &ckt.cert;
+        const need = scratchLen(ckt);
+        if (tally.scratch.len != need) {
+            ckt.gpa.free(tally.scratch);
+            tally.scratch = ckt.gpa.alloc(f64, need) catch @panic("certify: out of memory");
+        }
+        const pt = measure(ckt, hook, x, t, opts, tally.scratch);
+        if (pt.gate_row) |row| std.debug.panic(
+            "certify: row {d} ({s}) |F| = {e:.3} exceeds the converger's gate {e:.3} at {s} t={e:.6}, x = {e:.6}",
+            .{ row, ckt.nodeName(row), pt.gate_f, pt.gate_tol, @tagName(ckt.sim.kind), t, x[row] },
+        );
+        tally.points += 1;
+        if (pt.ratio > 1) tally.over += 1;
+        if (!(pt.ratio <= tally.worst)) {
+            tally.worst = pt.ratio;
+            tally.worst_t = t;
+            tally.worst_row = pt.kcl_row;
+            tally.worst_kind = @tagName(ckt.sim.kind);
+        }
+        std.debug.assert(tally.over <= tally.points);
+    }
+};
 
 /// Row and column index of the ground node in every pattern.
 pub const GROUND: u32 = 0;
@@ -134,6 +365,9 @@ pub const Circuit = struct {
     intern_offs: []u32,
 
     bbd: ?BbdInfo = null,
+    /// The template's shared column-order slot (`device.Circuit.column_order`),
+    /// borrowed; the pattern is the template's.
+    column_order: ?*Prepared.ColumnOrder = null,
     /// CSC slot of each frequency-dependent small-signal entry, the trash
     /// slot for a ground one (`Prepared.ac_dyn_slots`); `acDyn` fills their
     /// terms. Borrowed topology.
@@ -144,6 +378,8 @@ pub const Circuit = struct {
     /// Executor-owned threaded stamp, borrowed: set it to null before
     /// freeing it. Null means serial eval.
     par_eval: ?*ParEval = null,
+    /// `setBypass`'s tolerances while the bypass is on.
+    bypass_tol: ?device_ir.BypassTol = null,
     /// The executor's GPU evaluation context, borrowed while attached
     /// (`attachGpu`); null means every batch stamps on the host.
     gpu: ?*GpuContext = null,
@@ -152,6 +388,10 @@ pub const Circuit = struct {
     /// devices all evaluate on the host can still factor on the device. Null
     /// means the host factors.
     lu: ?*GpuLu = null,
+    /// Where `newtonGC` finds A after the last eval (`evalNewtonGC`, 02
+    /// 2.3), and the alpha that eval formed it at.
+    gc: gpu_mod.GcServed = .full,
+    gc_alpha: f64 = 0,
     /// Executor-owned display output; null when no batch has `Hooks.say`.
     /// Borrowed: set it to null before freeing it.
     display: ?*Display = null,
@@ -194,6 +434,9 @@ pub const Circuit = struct {
     /// Symbolic LU and Newton scratch, built on first use and shared by every
     /// analysis. The pattern is frozen, so it stays valid for the lifetime.
     ws: ?converger.Workspace = null,
+    /// Where `release` returns `ws` and `workspace` takes one from, shared
+    /// by the Problem's queries; borrowed. Null builds and frees its own.
+    ws_pool: ?*WsPool = null,
     /// `loadCheck`'s rows and last iterate, built with `ws`; null when no
     /// batch marks rows (`Hooks.mark_load_check_rows`).
     load_check: ?LoadCheck = null,
@@ -222,8 +465,9 @@ pub const Circuit = struct {
     /// `newton`'s device path: factors `vals` and solves dx = -A^-1 rhs on
     /// the device. Null without a device LU; see `GpuLu.solve` for true and
     /// false.
-    pub fn deviceSolve(self: *Circuit, slv: *direct.Solver, vals: []const f64, dx: []f64) ?bool {
+    pub fn deviceSolve(self: *Circuit, slv: *direct.Solver, vals: []f64, dx: []f64) ?bool {
         const lu = self.lu orelse return null;
+        if (self.gc == .device) if (self.gpuContext()) |g| return g.gcSolve(lu, slv, vals, self.rhs[0..self.n], dx, self.gc_alpha);
         return lu.solve(slv, vals, self.rhs[0..self.n], dx);
     }
 
@@ -233,8 +477,24 @@ pub const Circuit = struct {
     pub fn workspace(self: *Circuit) !*converger.Workspace {
         if (self.ws == null) {
             self.load_check = try LoadCheck.init(self.gpa, self.batches, self.col_ptr, self.row_idx[0..self.nnz]);
-            errdefer if (self.load_check) |*lc| lc.deinit(self.gpa);
-            self.ws = try converger.Workspace.init(self.gpa, self.n, self.col_ptr, self.row_idx, self.bbd, self.knobs.newton, self.knobs.lu);
+            errdefer if (self.load_check) |*lc| {
+                lc.deinit(self.gpa);
+                self.load_check = null;
+            };
+            if (self.pooled()) |p| if (p.take(@intFromPtr(self.col_ptr.ptr), self.knobs.newton, self.knobs.lu)) |w| {
+                var ws = w;
+                ws.reset(self.bbd) catch |e| {
+                    ws.deinit(self.gpa);
+                    return e;
+                };
+                self.ws = ws;
+                return &self.ws.?;
+            };
+            const shared = if (self.column_order) |o| o.get(self.n) else null;
+            var ws = try converger.Workspace.initOrdered(self.gpa, self.n, self.col_ptr, self.row_idx, self.bbd, self.knobs.newton, self.knobs.lu, shared);
+            errdefer ws.deinit(self.gpa);
+            if (shared == null) if (self.column_order) |o| if (ws.slv.q.len == self.n) try o.share(ws.slv.q);
+            self.ws = ws;
         }
         return &self.ws.?;
     }
@@ -277,6 +537,12 @@ pub const Circuit = struct {
         return ok;
     }
 
+    /// `ws_pool` when this circuit's workspaces come from the same allocator.
+    fn pooled(self: *const Circuit) ?*WsPool {
+        const p = self.ws_pool orelse return null;
+        return if (p.gpa.ptr == self.gpa.ptr and p.gpa.vtable == self.gpa.vtable) p else null;
+    }
+
     // The executor's setup. None touches the planes or a device parameter,
     // so none clears `lin`.
 
@@ -300,7 +566,7 @@ pub const Circuit = struct {
     }
 
     /// The attached GPU context, or null; comptime null in a build without
-    /// kernel images (`gpu.zig` `available`), so every GPU branch below
+    /// kernel images (`gpu/context.zig` `available`), so every GPU branch below
     /// folds away there.
     inline fn gpuContext(self: *const Circuit) ?*GpuContext {
         return if (comptime gpu_mod.available) self.gpu else null;
@@ -412,6 +678,7 @@ pub const Circuit = struct {
             .bbd = data.bbd,
             .ac_dyn_slots = data.ac_dyn_slots,
             .param_starts = data.param_starts,
+            .column_order = data.column_order,
             .owns_topology = owns_topology,
         };
     }
@@ -427,8 +694,15 @@ pub const Circuit = struct {
     /// solve it afterwards.
     pub fn release(self: *Circuit) void {
         const gpa = self.gpa;
+        if (self.knobs.tran_stats) for (self.batches) |b| {
+            const count = b.hooks.derivative_counts orelse continue;
+            const counts = count(b.ctx);
+            std.debug.print("derivative-stats: model={s} wide={d} narrow={d} wide_lanes={d} narrow_lanes={d}\n", .{ b.type_name, counts.wide, counts.narrow, counts.wide_lanes, counts.narrow_lanes });
+        };
         if (kcl_cert.enabled) self.cert.deinit(gpa, self.nodeName(self.cert.worst_row));
-        if (self.ws) |*w| w.deinit(gpa);
+        if (self.ws) |*w| {
+            if (self.pooled()) |p| p.give(@intFromPtr(self.col_ptr.ptr), self.knobs.newton, self.knobs.lu, w.*) else w.deinit(gpa);
+        }
         self.ws = null;
         if (self.load_check) |*lc| lc.deinit(gpa);
         self.load_check = null;
@@ -454,6 +728,8 @@ pub const Circuit = struct {
             gpa.free(self.intern_bytes);
             gpa.free(self.intern_offs);
             gpa.free(self.param_starts);
+            if (self.column_order) |o| o.destroy(self.n);
+            self.column_order = null;
             self.owns_topology = false;
         }
     }
@@ -581,6 +857,7 @@ pub const Circuit = struct {
         // Callers also eval at points other than x_op (disto, pss, pac, ...),
         // so the linearization memo cannot survive this.
         self.lin.valid = false;
+        self.gc = .full;
         if (self.gpuContext()) |g| return self.evalGpu(g, x, t, false);
         self.stamp(x, t, .full);
     }
@@ -638,12 +915,16 @@ pub const Circuit = struct {
     /// Stamps only the charges at `x`: `q_vec` and every batch's `q_tape`,
     /// bit-for-bit what `eval` would leave there, with g/c/rhs untouched.
     /// ParEval reuses the lane cuts and reduce order of `.full`, so the
-    /// promise holds threaded too. The GPU has no charge-only kernel: with a
-    /// context attached this runs the full pass, so g, c and rhs change too,
-    /// and the resident batches' tapes reach the host at `snapshotQTape`.
+    /// promise holds threaded too. With a context attached the device runs
+    /// its charge-only kernels (`GpuContext.evalQ`), or the full pass when
+    /// one is missing, which changes g, c and rhs too; the resident
+    /// batches' tapes reach the host at `snapshotQTape`.
     pub fn evalQ(self: *Circuit, x: []const f64, t: f64) void {
         self.lin.valid = false;
-        if (self.gpuContext()) |g| return self.evalGpu(g, x, t, true);
+        if (self.gpuContext()) |g| {
+            if (g.evalQ(x, t, self.sim)) return self.bindPlanes(g.planes());
+            return self.evalGpu(g, x, t, true);
+        }
         self.stamp(x, t, .charge);
     }
 
@@ -712,11 +993,58 @@ pub const Circuit = struct {
     /// baseline when one exists.
     pub fn evalNewton(self: *Circuit, x: []const f64, t: f64) void {
         self.lin.valid = false;
+        self.gc = .full;
         // The device path ignores the baseline: `g_base` includes the resident
         // batches too, and the GPU sink cannot skip them, so it zeroes and
         // restamps instead.
         if (self.gpuContext()) |g| return self.evalGpu(g, x, t, false);
         self.evalNewtonCpu(x, t);
+    }
+
+    /// `evalNewton` for a companion step whose matrix is G + alpha·C, read
+    /// back through `newtonGC`: with a context attached the device forms A
+    /// (02 2.3), which then comes down in place of g and c, or stays on the
+    /// device for the device LU (`deviceSolve`). The planes' g and c then
+    /// hold only the diagonal until the next eval.
+    pub fn evalNewtonGC(self: *Circuit, x: []const f64, t: f64, alpha: f64) void {
+        if (self.gpuContext()) |g| if (self.gcDevice()) |device| {
+            self.lin.valid = false;
+            self.gc = g.evalGc(x, t, self.sim, .{ .alpha = alpha, .device = device }, self.diag_slots[0..self.n], self.nnz);
+            self.gc_alpha = alpha;
+            self.bindPlanes(g.planes());
+            if (self.gc != .failed) return self.groundStamp(x);
+            self.gc = .full;
+            return self.evalNewtonCpu(x, t);
+        };
+        self.evalNewton(x, t);
+    }
+
+    /// Whether `evalNewtonGC` may hand A to the device, and whether the
+    /// device LU takes it there (`GpuLu.residentReady`). Null under a JFNK
+    /// pin, which reads g and c apart, with load-check rows, which read A
+    /// off the diagonal, and under `-Dcertify`, which restamps.
+    fn gcDevice(self: *Circuit) ?bool {
+        if (kcl_cert.enabled or self.load_check != null) return null;
+        switch (self.knobs.newton.pin) {
+            .auto, .direct => {},
+            else => return null,
+        }
+        const lu = self.lu orelse return false;
+        const ws = if (self.ws) |*w| w else return false;
+        return lu.residentReady(&ws.slv);
+    }
+
+    /// The Newton matrix G + alpha·C after `evalNewtonGC` at the same
+    /// alpha: `combineGC` into `out`, the A the device brought down, or,
+    /// for the device LU, `out` with only the diagonal written, which
+    /// `deviceSolve` completes.
+    pub fn newtonGC(self: *Circuit, alpha: f64, out: []f64) []f64 {
+        if (self.gc != .full) if (self.gpuContext()) |g| {
+            std.debug.assert(@as(u64, @bitCast(alpha)) == @as(u64, @bitCast(self.gc_alpha)));
+            return g.gcVals(self.gc, alpha, out, self.diag_slots[0..self.n], self.nnz);
+        };
+        self.combineGC(alpha, out);
+        return out;
     }
 
     /// Host half of `evalNewton`, also the GPU context's fault fallback.
@@ -762,7 +1090,7 @@ pub const Circuit = struct {
     }
 
     /// Drops the baseline and computes it again: for a caller that moved
-    /// device parameters the baseline reads (`applyAttempt`, a restored
+    /// device parameters the baseline reads (a homotopy rung, a restored
     /// state). Fails as `computeBaseline` does.
     pub fn rebuildBaseline(self: *Circuit) !void {
         self.has_baseline = false;
@@ -844,7 +1172,8 @@ pub const Circuit = struct {
     /// device clamped `x`.
     pub fn applyLimits(self: *const Circuit, x: []f64, x_old: []const f64) bool {
         if (self.gpuContext()) |g| return g.applyLimits(x, x_old, self.sim);
-        return walk.limitBatches(self.batches, x, x_old);
+        if (self.par_eval) |p| return p.limit(self.batches, x, x_old);
+        return par_eval.limitBatches(self.batches, x, x_old);
     }
 
     /// Sets every `idt` state unknown with an ic to that ic (`Hooks.seed_ic`):
@@ -854,19 +1183,25 @@ pub const Circuit = struct {
         for (self.batches) |b| if (b.hooks.seed_ic) |f| f(b.ctx, x);
     }
 
+    /// Writes the devices' §3.6.3.2 net initializers into `x`
+    /// (`Hooks.seed_nodeset`). Cold starts only.
+    pub fn seedNodesets(self: *const Circuit, x: []f64) void {
+        for (self.batches) |b| if (b.hooks.seed_nodeset) |f| f(b.ctx, x);
+    }
+
     /// SPICE MODEINITJCT: devices write junction seed voltages into a zeroed
     /// `x`, so iteration 1 linearizes at vcrit/vto instead of 0 and the
     /// limiters clamp against the seed. Cold starts only.
     pub fn seedJunctions(self: *const Circuit, x: []f64) void {
         if (self.gpuContext()) |g| return g.seedJunctions(x);
-        walk.seedBatches(self.batches, x);
+        par_eval.seedBatches(self.batches, x);
     }
 
     /// Resets device-private limiting state after a Newton solve, so later
     /// evals (waveform, AC, noise) see the node vector itself.
     pub fn clearLimits(self: *const Circuit) void {
         if (self.gpuContext()) |g| return g.clearLimits();
-        walk.clearLimitBatches(self.batches);
+        par_eval.clearLimitBatches(self.batches);
     }
 
     /// Starts a nonlinear solve: `$simparam("iteration")` reads 1.
@@ -917,10 +1252,16 @@ pub const Circuit = struct {
         // the charge before `updateState` latches the `$prev` values `q`
         // reads (the Meyer caps average against the last accepted point).
         const accept = self.land_rejects and self.has_charge;
-        const tr = if (accept) self.acceptStates(x) else if (self.gpuContext()) |g| g.updateStates(x, self.sim) else walk.updateBatches(self.batches, x);
+        const tr = if (accept) self.acceptStates(x) else if (self.gpuContext()) |g| g.updateStates(x, self.sim) else self.hostUpdate(x);
         if (!self.land_rejects) return tr;
         self.reject_at = tr;
         return null;
+    }
+
+    /// `updateBatches` on the host, over ParEval's lanes when it exists.
+    fn hostUpdate(self: *const Circuit, x: []const f64) ?f64 {
+        if (self.par_eval) |p| return p.update(self.batches, x);
+        return par_eval.updateBatches(self.batches, x);
     }
 
     /// Stages every `Hooks.say` line at x, before `updateState` moves the
@@ -940,9 +1281,17 @@ pub const Circuit = struct {
     // ponytail: the GPU and ParEval paths run two passes; a ParEval
     // `.accept` mode would fuse them when lanes are on.
     fn acceptStates(self: *Circuit, x: []const f64) ?f64 {
+        // The device runs the charges, the state halves and the query on
+        // one wait (`GpuContext.acceptStates`).
+        if (self.gpuContext()) |g| if (g.acceptStates(x, self.sim.t, self.sim)) |tr| {
+            self.lin.valid = false;
+            self.bindPlanes(g.planes());
+            self.q_fresh = true;
+            return tr;
+        };
         if (self.gpuContext() != null or self.par_eval != null) {
             self.evalQ(x, self.sim.t);
-            const tr = if (self.gpuContext()) |g| g.updateStates(x, self.sim) else walk.updateBatches(self.batches, x);
+            const tr = if (self.gpuContext()) |g| g.updateStates(x, self.sim) else self.hostUpdate(x);
             self.q_fresh = true;
             return tr;
         }
@@ -968,7 +1317,7 @@ pub const Circuit = struct {
     /// static solve may push (`Hooks.commit_state`). The transient calls it
     /// once per accepted point, before `stateCtl(.commit)`.
     pub fn commitStates(self: *const Circuit, x: []const f64) ?f64 {
-        return walk.minReject(self.batches, "commit_state", x);
+        return par_eval.minReject(self.batches, "commit_state", x);
     }
 
     /// Commits, reverts or queries the accepted device state. `.commit` at
@@ -983,7 +1332,7 @@ pub const Circuit = struct {
             d.staged.clearRetainingCapacity();
         };
         if (self.gpuContext()) |g| return g.stateCtl(sop, self.sim);
-        return walk.stateCtlBatches(self.batches, sop);
+        return par_eval.stateCtlBatches(self.batches, sop);
     }
 
     /// Returns the smallest model delay (`D.delays`) in the circuit, or null.
@@ -1038,7 +1387,13 @@ pub const Circuit = struct {
             f(b.ctx, gmin, source_scale);
             any = true;
         };
-        if (!any) return;
+        if (any) self.paramsMoved();
+    }
+
+    /// Device parameters moved: drops the `linearize` memo and the
+    /// constant-Jacobian baseline, and marks the resident GPU parameters and
+    /// every bypass recording stale.
+    fn paramsMoved(self: *Circuit) void {
         self.lin.valid = false;
         self.has_baseline = false;
         self.markGpuDirty();
@@ -1046,6 +1401,16 @@ pub const Circuit = struct {
 
     fn markGpuDirty(self: *Circuit) void {
         if (self.gpuContext()) |g| g.markDirty();
+        // Device parameters moved: every bypass recording is stale.
+        if (self.bypass_tol) |tol| self.setBypass(tol);
+    }
+
+    /// Turns the device latency bypass on with `tol`, or off with null, on
+    /// every batch that supports it; turning it on again drops every
+    /// recording.
+    pub fn setBypass(self: *Circuit, tol: ?device_ir.BypassTol) void {
+        self.bypass_tol = tol;
+        for (self.batches) |b| if (b.hooks.set_bypass) |f| f(b.ctx, tol);
     }
 
     /// Publishes the analysis state (`$abstime`, timestep, `analysis()`,
@@ -1070,9 +1435,7 @@ pub const Circuit = struct {
     /// wiring moved and the circuit must be rebuilt; restore the parameters
     /// and recompute before reusing it.
     pub fn recompute(self: *Circuit) error{TopologyChanged}!void {
-        self.lin.valid = false;
-        self.has_baseline = false;
-        self.markGpuDirty();
+        self.paramsMoved();
         for (self.batches) |b| if (b.hooks.recompute) |f| {
             if (!f(b.ctx)) return error.TopologyChanged;
         };
@@ -1087,30 +1450,10 @@ pub const Circuit = struct {
     /// RB(T) reaches zero). The caller owns that distinction; `.dc` takes the
     /// full walk on the first point of every inner sweep and narrows after.
     pub fn recomputeType(self: *Circuit, t: device_ir.DeviceType) error{TopologyChanged}!void {
-        self.lin.valid = false;
-        self.has_baseline = false;
-        self.markGpuDirty();
-        for (self.batches, self.batch_types) |b, bt| {
-            if (bt != t) continue;
-            if (b.hooks.recompute) |f| {
-                if (!f(b.ctx)) return error.TopologyChanged;
-            }
-        }
-    }
-
-    /// Scales device parameters for homotopy step `lambda`; undone by
-    /// `restoreModels`.
-    pub fn applyAttempt(self: *Circuit, lambda: f64) void {
-        self.lin.valid = false;
-        for (self.batches) |b| if (b.hooks.apply_attempt) |f| f(b.ctx, lambda);
-        self.markGpuDirty();
-    }
-
-    /// Restores the parameters `applyAttempt` scaled.
-    pub fn restoreModels(self: *Circuit) void {
-        self.lin.valid = false;
-        for (self.batches) |b| if (b.hooks.restore_models) |f| f(b.ctx);
-        self.markGpuDirty();
+        self.paramsMoved();
+        for (self.batches, self.batch_types) |b, bt| if (bt == t) if (b.hooks.recompute) |f| {
+            if (!f(b.ctx)) return error.TopologyChanged;
+        };
     }
 
     /// Returns every device parameter, typed by batch. Built once and freed by
@@ -1150,18 +1493,86 @@ pub const Circuit = struct {
         defer list.deinit(gpa);
         for (self.batches, touched, starts[0..self.batches.len], starts[1..]) |b, t, lo, hi| {
             if (!t) continue;
+            if (b.hooks.write_params) |write| {
+                try write(b.ctx, refs, values, lo, hi).unwrap();
+                continue;
+            }
             list.clearRetainingCapacity();
             try b.hooks.collect_params(b.ctx, gpa, &list).unwrap();
             std.debug.assert(list.items.len == hi - lo);
             for (refs, values) |r, v| if (r >= lo and r < hi) list.items[r - lo].set(v);
         }
         if (!rederive) return;
-        self.lin.valid = false;
-        self.has_baseline = false;
-        self.markGpuDirty();
+        self.paramsMoved();
         for (self.batches, touched) |b, t| if (t) if (b.hooks.recompute) |f| {
             if (!f(b.ctx)) return error.TopologyChanged;
         };
+    }
+
+    /// Refs to the parameters numbered `ords` (`collectParams` numbering)
+    /// that each write their own instance alone: an instance a Model-field
+    /// ref reaches gets a private copy of its row when others read it
+    /// (`Hooks.isolate_rows`), and the rest keep sharing, so a mismatch over
+    /// a few devices of a large circuit copies a few rows. Without the
+    /// template's `param_starts`, or on a batch without the hooks, every row
+    /// is unshared (`collectParams`). Valid until the rows move again (a
+    /// `setParams`, `collectParams` or another call). Fails with
+    /// `error.InvalidVariation` for an ordinal past the circuit's
+    /// parameters. Caller frees the slice with `gpa`.
+    pub fn isolatedParams(self: *Circuit, gpa: std.mem.Allocator, ords: []const u32) ![]ParamRef {
+        const out = try gpa.alloc(ParamRef, ords.len);
+        errdefer gpa.free(out);
+        const starts = self.param_starts;
+        const layouts = starts.len != 0 and self.param_refs == null and for (ords) |o| {
+            if (o >= starts[self.batches.len]) return error.InvalidVariation;
+            const h = self.batches[std.sort.upperBound(u32, starts, o, orderU32) - 1].hooks;
+            if (h.param_layout == null or h.isolate_rows == null) break false;
+        } else true;
+        if (!layouts) {
+            const all = try self.collectParams();
+            for (ords, out) |o, *ref| ref.* = if (o < all.len) all[o] else return error.InvalidVariation;
+            return out;
+        }
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(gpa);
+        for (self.batches, starts[0..self.batches.len], starts[1..]) |b, lo, hi| {
+            ids.clearRetainingCapacity();
+            for (ords) |o| if (o >= lo and o < hi) {
+                const l = try b.hooks.param_layout.?(b.ctx).unwrap();
+                if (!l.fields[(o - lo) / l.count].is_instance) try ids.append(gpa, (o - lo) % l.count);
+            };
+            if (ids.items.len == 0) continue;
+            std.mem.sort(u32, ids.items, {}, std.sort.asc(u32));
+            var unique: usize = 0;
+            for (ids.items) |id| if (unique == 0 or ids.items[unique - 1] != id) {
+                ids.items[unique] = id;
+                unique += 1;
+            };
+            try b.hooks.isolate_rows.?(b.ctx, ids.items[0..unique]).unwrap();
+        }
+        for (ords, out) |o, *ref| {
+            const k = std.sort.upperBound(u32, starts, o, orderU32) - 1;
+            const b = self.batches[k];
+            const l = try b.hooks.param_layout.?(b.ctx).unwrap();
+            const r = o - starts[k];
+            const f = l.fields[r / l.count];
+            ref.* = .{ .ptr = l.ptr(r), .type = self.batch_types[k], .param_name = f.name, .index = r % l.count, .is_instance = f.is_instance, .primary = f.primary };
+        }
+        return out;
+    }
+
+    /// Parameter `ord`'s (`collectParams` numbering) value and device type,
+    /// read without unsharing any Model row when the template has
+    /// `param_starts` and the batch a `param_layout`.
+    pub fn paramAt(self: *Circuit, ord: u32) !struct { value: f64, type: device_ir.DeviceType } {
+        const starts = self.param_starts;
+        if (starts.len != 0) {
+            const k = std.sort.upperBound(u32, starts, ord, orderU32) - 1;
+            const b = self.batches[k];
+            if (b.hooks.param_layout) |layout| return .{ .value = (try layout(b.ctx).unwrap()).ptr(ord - starts[k]).*, .type = self.batch_types[k] };
+        }
+        const ref = (try self.collectParams())[ord];
+        return .{ .value = ref.get(), .type = ref.type };
     }
 
     /// Returns the short type name of device type `t`, or "" when absent.
@@ -1172,7 +1583,7 @@ pub const Circuit = struct {
 
     /// Appends every batch's parameters to `list`, each stamped with its
     /// batch's Library type. Invalidates pointers into `list` when it grows.
-    pub fn collectTyped(batches: []const Batch, types: []const device_ir.DeviceType, gpa: std.mem.Allocator, list: *std.ArrayList(ParamRef)) !void {
+    fn collectTyped(batches: []const Batch, types: []const device_ir.DeviceType, gpa: std.mem.Allocator, list: *std.ArrayList(ParamRef)) !void {
         for (batches, types) |b, t| {
             const first = list.items.len;
             try b.hooks.collect_params(b.ctx, gpa, list).unwrap();

@@ -43,6 +43,10 @@
 // Timer arguments must be constant or parameter expressions (LRM §4.5, E0515),
 // and the same sentinel resolutions are needed as ordinary arithmetic in the
 // body, so they are macros rather than variables.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 `define P_TR   max(pulse_tr, 1.0e-12)
 `define P_TF   max(pulse_tf, 1.0e-12)
 // VerA accepts `?:` as a timer start but not as a timer period, and this macro

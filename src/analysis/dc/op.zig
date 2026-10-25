@@ -11,6 +11,7 @@ const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
 const tran = @import("../tran/tran.zig");
+const gpu_lanes = @import("../gpu/lanes.zig");
 
 /// Query options, defined in core/query.zig.
 pub const Options = @import("core").query.Op;
@@ -19,10 +20,13 @@ const Ic = @import("core").Ic;
 
 const failed: converger.Result = .{ .converged = false, .iterations = 0 };
 
-/// Zeroes `x`, then applies the SPICE MODEINITJCT junction seeds so the first
-/// iteration linearizes at vcrit/vto instead of 0. `x.len` must be `ckt.n`.
+/// Zeroes `x`, writes the devices' §3.6.3.2 net initializers (Newton's
+/// guess, never held), then applies the SPICE MODEINITJCT junction seeds so
+/// the first iteration linearizes at vcrit/vto instead of 0; a limiter
+/// without a seed starts from the initializer. `x.len` must be `ckt.n`.
 pub fn coldStart(ckt: *root.Circuit, x: []f64) void {
     @memset(x, 0);
+    ckt.seedNodesets(x);
     ckt.seedJunctions(x);
 }
 
@@ -49,9 +53,7 @@ pub fn solve(
     // power-on state from `ic` here, before any @(cross) can move it.
     // computeBaseline() evaluates const-Jacobian batches, so the state has to
     // be in place first.
-    ckt.setSimState(.{ .kind = if (options.tran_op) .ic else .dc, .initial_step = true });
-    if (!options.warm_start) coldStart(ckt, x);
-    try ckt.computeBaseline();
+    try beginSolve(ckt, x, options);
 
     const ws = try ckt.workspace();
     const gpa = ws.slv.gpa;
@@ -68,12 +70,24 @@ pub fn solve(
         } else force.appendAssumeCapacity(.{ .slot = ckt.diag_slots[ns.node], .row = ns.node, .value = ns.value });
     }
     const r = try nodesetLadder(ckt, ws, x, options, force.items, held.len);
-    // Commit device state so later analyses start from the accepted state.
-    if (r.converged) _ = ckt.stateCtl(.commit);
-    // Every later eval at this point (ac, tf, noise, post-processing) is not
-    // an initial step and must not re-latch.
-    ckt.setSimState(.{ .kind = if (options.tran_op) .ic else .dc });
+    endSolve(ckt, r.converged, options);
     return r;
+}
+
+/// `solve`'s setup: the static simulation state of the first step, the
+/// cold start unless `options.warm_start`, then the const-Jacobian baseline.
+fn beginSolve(ckt: *root.Circuit, x: []f64, options: Options) !void {
+    ckt.setSimState(.{ .kind = if (options.tran_op) .ic else .dc, .initial_step = true });
+    if (!options.warm_start) coldStart(ckt, x);
+    try ckt.computeBaseline();
+}
+
+/// `solve`'s close: commits the device state of a converged point so later
+/// analyses start from it, and leaves the initial step, since every later
+/// eval at this point (ac, tf, noise, post-processing) must not re-latch.
+fn endSolve(ckt: *root.Circuit, converged: bool, options: Options) void {
+    if (converged) _ = ckt.stateCtl(.commit);
+    ckt.setSimState(.{ .kind = if (options.tran_op) .ic else .dc });
 }
 
 /// The `.nodeset` step, then the ladder holding the first `n_hold` rows of
@@ -158,9 +172,10 @@ fn afterPlain(
     var total_iter: u16 = if (plain) |p| p.iterations else 0;
 
     // Rung 2: dynamic gmin stepping (ngspice cktop.c dynamic_gmin). Descend
-    // gmin by `factor`; on a failed step, back up toward the last good gmin
-    // with the 4th root of the factor and retry from the last converged x;
-    // give up once the factor is ~1.
+    // gmin by `factor` (`gminFactor`); on a failed step, back up toward the
+    // last good gmin with the 4th root of the factor (the square root when
+    // the LU refused the matrix) and retry from the last converged x; give
+    // up once the factor is ~1.
     {
         // The planes still hold the plain rung's last assembly, which is
         // where ngspice's preorder reads its twins.
@@ -174,12 +189,20 @@ fn afterPlain(
         var good_gmin = options.tol.gmin_start; // upper bound to back up toward
         var gmin_val = good_gmin / factor;
         var have_good = false;
+        // The Newton budget each step gets: NIiter's floor of 100 over itl2.
+        const budget = converger.optionsFromTolerances(options.tol, options.tol.itl2).max_iter;
         var solves: u32 = 0;
-        while (solves < 100) : (solves += 1) {
+        // ngspice has no step cap: the factor floor ends the rung. This one
+        // only bounds a pathological ladder.
+        while (solves < max_ladder_solves) : (solves += 1) {
             ckt.setHomotopy(gmin_val, 1.0);
             try ckt.computeBaseline();
+            var refused = false;
             const r = newtonRun(ckt, ws, x, options.tol, hold, gmin_val, stamps, options.tol.itl2, !have_good) catch |e| switch (e) {
-                error.SingularMatrix => failed,
+                error.SingularMatrix => blk: {
+                    refused = true;
+                    break :blk failed;
+                },
                 else => return e, // else: only a singular Jacobian is a failed step
             };
             total_iter +|= r.iterations;
@@ -203,23 +226,17 @@ fn afterPlain(
                 @memcpy(x_good, x);
                 have_good = true;
                 good_gmin = gmin_val;
-                // An easy step accelerates (capped at the start factor); a
-                // hard one (over 3/4 of the budget) slows down before it
-                // fails, so folds are approached with shrinking steps.
-                // Thresholds, floor and final clamp are cktop.c:207-222, on
-                // the itl2 budget these solves run with.
-                if (r.iterations <= options.tol.itl2 / 4) {
-                    factor = @min(factor * @sqrt(factor), 10.0);
-                } else if (r.iterations > 3 * options.tol.itl2 / 4) {
-                    factor = @max(@sqrt(factor), 1.00005);
-                }
+                factor = gminFactor(factor, r.iterations, budget);
                 if (gmin_val < factor * gtarget) {
                     factor = gmin_val / gtarget;
                     gmin_val = gtarget;
                 } else gmin_val /= factor;
             } else {
                 if (factor < 1.00005) break; // wedged against the last good step
-                factor = @sqrt(@sqrt(factor));
+                // A matrix the LU refused (a singular or fill-capped
+                // factor at it = 0) says less about the step than a Newton
+                // that ran out: back up by the square root only.
+                factor = if (refused) @sqrt(factor) else @sqrt(@sqrt(factor));
                 gmin_val = good_gmin / factor;
                 if (have_good) @memcpy(x, x_good) else coldStart(ckt, x);
             }
@@ -227,9 +244,9 @@ fn afterPlain(
         ckt.setHomotopy(gtarget, 1.0); // rung 3 rebuilds the baseline
     }
 
-    // Rung 3: source stepping through the devices' attempt(lambda), with an
-    // adaptive step: grow 1.5x on success, halve on failure and retry from
-    // the last good lambda and x. The holds scale with the sources, as
+    // Rung 3: source stepping through §9.15 `$simparam("sourceScaleFactor")`,
+    // with an adaptive step: grow 1.5x on success, halve on failure and retry
+    // from the last good lambda and x. The holds scale with the sources, as
     // ngspice's cktload.c multiplies each `.ic` by CKTsrcFact.
     coldStart(ckt, x);
     {
@@ -239,15 +256,13 @@ fn afterPlain(
         var lambda_good: f64 = -1.0; // none converged yet
         var delta: f64 = 0.25;
         var solves: u32 = 0;
-        while (solves < 100) : (solves += 1) {
-            ckt.applyAttempt(lambda);
+        while (solves < max_ladder_solves) : (solves += 1) {
             ckt.setHomotopy(options.tol.gmin, lambda);
             try ckt.rebuildBaseline();
             for (scaled, hold) |*s, h| s.value = h.value * lambda;
-            const sr = newtonRun(ckt, ws, x, options.tol, scaled, 0.0, &.{}, options.tol.itl2, lambda_good < 0.0) catch |e| switch (e) {
+            var sr = newtonRun(ckt, ws, x, options.tol, scaled, 0.0, &.{}, options.tol.itl2, lambda_good < 0.0) catch |e| switch (e) {
                 error.SingularMatrix => failed,
-                else => { // else: only a singular Jacobian is a failed step; the rest unwinds the models
-                    ckt.restoreModels();
+                else => { // else: only a singular Jacobian is a failed step; the rest unwinds the sources
                     ckt.setHomotopy(options.tol.gmin, 1.0);
                     try ckt.rebuildBaseline();
                     return e;
@@ -256,6 +271,13 @@ fn afterPlain(
             total_iter +|= sr.iterations;
             if (ws.knobs.opdbg)
                 std.debug.print("ladder: src lambda={e:.3} conv={} it={d}\n", .{ lambda, sr.converged, sr.iterations });
+            if (!sr.converged and lambda_good < 0.0) {
+                sr.converged = sourcesOffGmin(ckt, ws, x, options, scaled, &total_iter) catch |e| {
+                    ckt.setHomotopy(options.tol.gmin, 1.0);
+                    try ckt.rebuildBaseline();
+                    return e;
+                };
+            }
             if (sr.converged) {
                 if (lambda >= 1.0) break; // full sources reached
                 lambda_good = lambda;
@@ -273,7 +295,6 @@ fn afterPlain(
             }
         }
     }
-    ckt.restoreModels();
     ckt.setHomotopy(options.tol.gmin, 1.0);
     try ckt.rebuildBaseline();
 
@@ -305,6 +326,53 @@ fn afterPlain(
     return result;
 }
 
+/// Solves at most per stepping rung. ngspice has no cap (each rung ends on
+/// its step floor); 100 ended chain_bsim4_100k's gmin stepping at 1.35e-6
+/// while every step still converged.
+const max_ladder_solves = 1000;
+
+/// The next gmin step factor after a step that converged in `iterations`
+/// of a Newton `budget` (cktop.c:207-222): an easy step (a quarter of the
+/// budget or less) accelerates, capped at 10; a hard one (over three
+/// quarters) slows down before it fails, floored at 1.00005. ngspice
+/// compares with itl2 (50) while NIiter raises the budget to 100, so steps
+/// of 13-37 iterations never moved the factor; the thresholds here are the
+/// budget's.
+pub fn gminFactor(factor: f64, iterations: u16, budget: u16) f64 {
+    if (iterations <= budget / 4) return @min(factor * @sqrt(factor), 10.0);
+    if (iterations > 3 * (budget / 4)) return @max(@sqrt(factor), 1.00005);
+    return factor;
+}
+
+/// ngspice gillespie_src's second try at the sources-off start: when the
+/// plain solve at lambda = 0 fails, solve it again under a diagonal gmin
+/// from 1e10 times the deck's gmin down to the deck's, a decade per solve,
+/// each from the last. True when all eleven converge; `x` then holds the
+/// last, the start source stepping raises from. Without it a circuit whose
+/// supplies-off state is floating (every MOSFET off, as on
+/// chain_bsim4_100k) failed its whole source-stepping rung at lambda = 0.
+fn sourcesOffGmin(ckt: *root.Circuit, ws: *converger.Workspace, x: []f64, options: Options, hold: []const converger.Force, total_iter: *u16) !bool {
+    if (!(options.tol.gmin > 0)) return false; // no gmin to step down to
+    const gpa = ws.slv.gpa;
+    // The planes hold the failed lambda = 0 assembly: the twins' values.
+    const stamps = try gminStamps(ckt, gpa);
+    defer gpa.free(stamps);
+    coldStart(ckt, x);
+    var g = options.tol.gmin * 1e10;
+    for (0..11) |i| {
+        const r = newtonRun(ckt, ws, x, options.tol, hold, g, stamps, options.tol.itl2, i == 0) catch |e| switch (e) {
+            error.SingularMatrix => failed,
+            else => return e, // else: only a singular Jacobian is a failed step
+        };
+        total_iter.* +|= r.iterations;
+        if (ws.knobs.opdbg)
+            std.debug.print("ladder: src-off gmin={e:.3} conv={} it={d}\n", .{ g, r.converged, r.iterations });
+        if (!r.converged) return false;
+        g /= 10;
+    }
+    return true;
+}
+
 /// Rung 5, ngspice OPtran (optran.c): a real transient with full sources
 /// held at their t = 0 values (optran.c runs its own clock and leaves
 /// CKTtime at 0), steps of at most 10 ns out to 1 µs, no ramp and no extra
@@ -314,8 +382,9 @@ fn afterPlain(
 /// a false success (stress/scaling_inverter_chain_4k). Under
 /// `needs_tran_op` with no holds, the settled state supplies the
 /// capacitor-only nodes, which that Newton holds there (`floatingHolds`).
-/// ngspice 44.2 runs this rung only when `optran` is given (cktop.c:94-97). The transient commits device state at every step, so it
-/// runs between a save and a restore: only `x` leaves it, and no timer,
+/// ngspice 44.2 runs this rung only when `optran` is given (cktop.c:94-97).
+/// The transient commits device state at every step, so it runs between a
+/// save and a restore: only `x` leaves it, and no timer,
 /// event or delay history runs ahead of the operating point's t = 0.
 fn transientOp(ckt: *root.Circuit, ws: *converger.Workspace, x: []f64, options: Options, hold: []const converger.Force) !converger.Result {
     const opa = ws.slv.gpa;
@@ -439,9 +508,7 @@ pub fn solveLanes(
     std.debug.assert(g >= 1 and g <= W and xs.len == g and out.len == g);
     const c0 = ckts[0];
     const held = if (options.tran_op) ic else &.{};
-    const pin = c0.knobs.newton.pin;
-    const laned = W > 1 and g > 1 and nodeset.len == 0 and !(c0.needs_tran_op and held.len == 0) and
-        (pin == .auto or pin == .direct) and !root.Circuit.certify;
+    const laned = W > 1 and g > 1 and nodeset.len == 0 and !(c0.needs_tran_op and held.len == 0) and lanesAllowed(c0);
     if (!laned) {
         for (ckts, xs, out) |c, x, *o| o.* = solve(c, x, options, nodeset, ic);
         return;
@@ -455,9 +522,7 @@ pub fn solveLanes(
     for (&lanes, &wss, 0..) |*c, *w, l| {
         c.* = ckts[if (l < g) l else 0];
         if (l < g) {
-            c.*.setSimState(.{ .kind = if (options.tran_op) .ic else .dc, .initial_step = true });
-            if (!options.warm_start) coldStart(c.*, xs[l]);
-            try c.*.computeBaseline();
+            try beginSolve(c.*, xs[l], options);
             w.* = try c.*.workspace();
         } else w.* = wss[0];
     }
@@ -491,15 +556,92 @@ pub fn solveLanes(
             o.* = e;
             continue;
         };
-        // As `solve` ends.
-        if (r.converged) _ = c.stateCtl(.commit);
-        c.setSimState(.{ .kind = if (options.tran_op) .ic else .dc });
+        endSolve(c, r.converged, options);
         o.* = r;
     }
 }
 
 /// One lane's `solve` outcome.
 pub const LaneOutcome = root.ErrorOf(solve)!converger.Result;
+
+/// Whether `c`'s Newton may run W lanes wide: a JFNK pin and `-Dcertify`
+/// both need each lane's own scalar `converger.run`. Shared by every
+/// lane-batched analysis (`.op`, `.dc`, the sweep lanes).
+pub fn lanesAllowed(c: *const root.Circuit) bool {
+    const pin = c.knobs.newton.pin;
+    return (pin == .auto or pin == .direct) and !root.Circuit.certify;
+}
+
+/// `solveLanes` for any number of lanes with every lane's plain rung on the
+/// GPU (06 6.9): one device Newton from INITFIX, as `solve` runs it; a lane
+/// it leaves unconverged, singular or with a flipped latch takes its own
+/// ladder from rung 2 on the host, from the device state it started with.
+/// Within tolerance of `solveLanes`, not bitwise: the device replays one
+/// LU pivot order. A batch the device cannot take (nodesets, `.ic` holds,
+/// a floating start, a JFNK pin, `-Dcertify`, `gpu_lanes.staticRefusal`, a
+/// driver error) runs `solveLanes` W lanes at a time.
+pub fn solveGpuLanes(
+    comptime W: usize,
+    ckts: []const *root.Circuit,
+    xs: []const []f64,
+    options: Options,
+    nodeset: []const Ic,
+    ic: []const Ic,
+    out: []LaneOutcome,
+) !void {
+    std.debug.assert(xs.len == ckts.len and out.len == ckts.len);
+    if (ckts.len == 0) return;
+    const c0 = ckts[0];
+    const held = if (options.tran_op) ic else &.{};
+    const why: ?[]const u8 = if (ckts.len < 2 or nodeset.len != 0 or held.len != 0 or c0.needs_tran_op)
+        "nodesets, holds or a floating start"
+    else if (!lanesAllowed(c0))
+        "a JFNK pin or certify"
+    else
+        gpu_lanes.staticRefusal(c0);
+    if (why == null) {
+        if (solveOnDevice(ckts, xs, options, out)) return else |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => if (c0.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: op lanes declined ({s})\n", .{@errorName(e)}),
+        }
+    } else if (c0.knobs.gpu_stats != .off) std.debug.print("gpu-lanes: op lanes on the CPU: {s}\n", .{why.?});
+    var i: usize = 0;
+    while (i < ckts.len) : (i += W) {
+        const end = @min(ckts.len, i + W);
+        try solveLanes(W, ckts[i..end], xs[i..end], options, nodeset, ic, out[i..end]);
+    }
+}
+
+/// `solveGpuLanes`' device half. Fails before any lane's outcome is set
+/// (a driver error or `GpuLanes` refusal) or with out of memory.
+fn solveOnDevice(ckts: []const *root.Circuit, xs: []const []f64, options: Options, out: []LaneOutcome) !void {
+    const gpa = ckts[0].gpa;
+    for (ckts, xs) |c, x| try beginSolve(c, x, options);
+    const res = try gpa.alloc(gpu_lanes.LaneNewton, ckts.len);
+    defer gpa.free(res);
+    {
+        const dev = try gpu_lanes.GpuLanes.initStatic(gpa, ckts, xs);
+        defer dev.deinit();
+        dev.prof.on = ckts[0].knobs.gpu_stats != .off;
+        var copts = converger.optionsFromTolerances(options.tol, null);
+        copts.gmin = 0;
+        copts.init_fix = !options.warm_start;
+        try dev.solveStatic(xs, copts, res);
+        // `deinit` copies back the device state of the lanes it settled;
+        // the rest keep the host's start.
+        for (res, dev.detached) |r, *d| d.* = !(r.result.converged and !r.singular and !r.reject);
+    }
+    for (ckts, xs, out, res) |c, x, *o, r| {
+        const plain: ?converger.Result = if (r.singular) null else if (r.reject) .{ .converged = false, .iterations = r.result.iterations } else r.result;
+        o.* = blk: {
+            const ws = c.workspace() catch |e| break :blk e;
+            // Rung 2 reads the plain rung's last assembly off the planes.
+            if (plain == null or !plain.?.converged) c.evalNewton(x, 0);
+            break :blk afterPlain(c, ws, x, options, &.{}, plain);
+        };
+        endSolve(c, if (o.*) |rr| rr.converged else |_| false, options);
+    }
+}
 
 /// Contract entry: the executor's solved ctx.x_op, one point per probe.
 pub fn run(ctx: *const root.RunCtx, _: Options) !root.Result {

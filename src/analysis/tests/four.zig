@@ -1,7 +1,7 @@
 //! Fourier post-processing unit tests. Oracles: `interpolate` below (binary
 //! search, clamped) for the cursor interpolation, and closed forms for the
-//! spectra: a pure cosine's zero THD, a square wave's 48.3 %, a known
-//! amplitude, phase and DC offset.
+//! spectra: a pure cosine's zero THD, a square wave band-limited to the
+//! 9th harmonic (42.9 %), a known amplitude, phase and DC offset.
 
 const impl = @import("../post/four.zig");
 const analyze = impl.analyze;
@@ -104,7 +104,7 @@ test "four: DC offset is reported correctly" {
     try testing.expectApproxEqAbs(@as(f64, 1.0), result.harmonics[0].mag, 1e-10);
 }
 
-test "four: square wave THD ~ 48.3%" {
+test "four: band-limited square wave THD ~ 42.9%" {
     // An ideal square wave has THD = sqrt(1/9 + 1/25 + 1/49 + ...) ~= 48.3%.
     // This one is band-limited to the 9th harmonic, so only 3, 5, 7, 9 count.
     const allocator = testing.allocator;
@@ -130,7 +130,7 @@ test "four: square wave THD ~ 48.3%" {
     // 3rd harmonic = (4/pi)/3 = 0.4244
     try testing.expectApproxEqAbs(@as(f64, 4.0 / (3.0 * math.pi)), result.harmonics[2].mag, 1e-3);
 
-    // sqrt((1/3)^2 + (1/5)^2 + (1/7)^2 + (1/9)^2) * 100 ~= 43.5%
+    // sqrt((1/3)^2 + (1/5)^2 + (1/7)^2 + (1/9)^2) * 100 ~= 42.9%
     const expected_thd = @sqrt(1.0 / 9.0 + 1.0 / 25.0 + 1.0 / 49.0 + 1.0 / 81.0) * 100.0;
     try testing.expectApproxEqAbs(expected_thd, result.thd_percent, 1.0);
 }

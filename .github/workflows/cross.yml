@@ -1,0 +1,51 @@
+# Every release target, compiled and not run: a foreign binary cannot run on
+# this runner, but a platform break shows here before release.yml meets it.
+# `install` builds espice and libespice.a, every artifact a release ships.
+name: cross
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: cross-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cross:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # tools/release-targets.json
+        target: [x86_64-linux-gnu.2.28, aarch64-linux-gnu.2.28, x86_64-macos, aarch64-macos]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # configure walks tests/conformance for the corpus catalog
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+        with:
+          name: omarsiwy
+          skipPush: true
+      - name: Build every artifact for ${{ matrix.target }}
+        run: >
+          nix develop .#ci -c zig build -Dtarget=${{ matrix.target }}
+          -Doptimize=ReleaseSafe -Dgpu=false -Dcuda-arch=none -Dhip-arch=none
+          -j2 --summary failures --prefix out
+      # The release's .deb, .rpm and Arch packages, built from this tree and
+      # installed in clean distro containers on every change (as release.yml does).
+      - name: Distro packages, smoked in Ubuntu, Debian, Fedora, openSUSE and Arch
+        if: matrix.target == 'x86_64-linux-gnu.2.28'
+        run: |
+          version=$(python3 -c "import sys; sys.path.insert(0, 'tools'); import release; print(release.version())")
+          cp README.md LICENSE CHANGELOGS.md out/ # as release.yml's archive step
+          bash tools/package.sh espice out "$version" amd64 dist
+          bash tools/distro_smoke.sh dist "$version" amd64 tests/conformance/tests/netlist

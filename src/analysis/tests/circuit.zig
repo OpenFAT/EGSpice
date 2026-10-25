@@ -160,7 +160,7 @@ test "a Newton stamp seeded from the baseline equals a full stamp" {
     try expectClose(g, ckt.g_vals[0..nnz]);
 }
 
-test "threaded stamps equal the serial stamp bit for bit at every lane count" {
+test "threaded stamps equal serial" {
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
     var prepared = try ladder(&lib, 6);
@@ -204,6 +204,12 @@ test "threaded stamps equal the serial stamp bit for bit at every lane count" {
     // Serial charge-only stamp: bit for bit what `eval` left.
     ckt.evalQ(x, 0);
     try t.expectEqualSlices(f64, full.q, ckt.q_vec[0..n]);
+    // The scalar accepted-point path fuses charge and state work; it must
+    // use the same cache arithmetic as evalQ and the threaded path.
+    ckt.land_rejects = true;
+    defer ckt.land_rejects = false;
+    _ = ckt.updateStates(x);
+    try t.expectEqualSlices(f64, full.q, ckt.q_vec[0..n]);
 
     // 0 asks for one lane; 24 is more lanes than the 19 instances. Every
     // pass twice, so a position left stale by the last pass would show.
@@ -220,6 +226,8 @@ test "threaded stamps equal the serial stamp bit for bit at every lane count" {
             try take.expectSame(newton, &ckt);
             @memset(ckt.q_vec, std.math.nan(f64));
             ckt.evalQ(x, 0);
+            try t.expectEqualSlices(f64, full.q, ckt.q_vec[0..n]);
+            _ = ckt.updateStates(x);
             try t.expectEqualSlices(f64, full.q, ckt.q_vec[0..n]);
         }
     }
@@ -266,12 +274,6 @@ test "linearize reuses the planes only for the same x_op until a writer runs" {
     try t.expect(!ckt.lin.valid);
     ckt.linearize(y);
     try ckt.recomputeType(ckt.batch_types[0]);
-    try t.expect(!ckt.lin.valid);
-    ckt.linearize(y);
-    ckt.applyAttempt(0.5);
-    try t.expect(!ckt.lin.valid);
-    ckt.linearize(y);
-    ckt.restoreModels();
     try t.expect(!ckt.lin.valid);
     ckt.linearize(y);
     ckt.beginSolve();
@@ -406,6 +408,9 @@ test "every allocation in circuit setup can fail without a leak" {
     defer lib.deinit();
     var prepared = try ladder(&lib, 2);
     defer prepared.deinit();
+    // The first workspace fills the template's shared column order; fill it
+    // now so every run below allocates the same.
+    try setUpEverything(t.allocator, &prepared);
     try t.checkAllAllocationFailures(@import("core").testing.fixed_growth, setUpEverything, .{&prepared});
 }
 

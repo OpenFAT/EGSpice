@@ -22,7 +22,10 @@
 // Based on: HSPICE W element [HSPICE Signal Integrity User Guide, Modeling
 //   coupled transmission lines using the W element]; VAMS-2023 §4.5.11.4.
 //
-// wline_2..4 define W_N and include this file.
+// wline_2..4 are this file with W_N defined (build.zig model_variants).
+
+`include "constants.vams"
+
 `include "disciplines.vams"
 
 `ifndef W_N

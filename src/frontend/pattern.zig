@@ -60,28 +60,24 @@ pub fn rewrite(arena: std.mem.Allocator, lines: [][]const u8) Error!void {
         if (!std.mem.startsWith(u8, line, ".pat ")) continue;
         const toks = try tokens(arena, line[5..]);
         if (toks.len < 3 or !std.mem.eql(u8, toks[1], "=")) return error.InvalidPattern;
-        const def = group(arena, toks[2..], defs) catch |err| {
-            if (!@import("builtin").is_test) switch (err) {
-                error.InvalidPattern => std.log.warn("pattern: cannot read '{s}'", .{line}),
-                error.UnsupportedPattern => std.log.err("pattern: '{s}': a Z (high-impedance) state is not supported", .{line}),
-                error.OutOfMemory => {},
-            };
-            return err;
-        };
+        const def = group(arena, toks[2..], defs) catch |err| return refuse(line, err);
         try defs.put(arena, toks[0], def);
     }
     for (lines) |*line| {
         if (line.len == 0 or (line.*[0] != 'v' and line.*[0] != 'i')) continue;
         const at = keyword(line.*) orelse continue;
-        line.* = source(arena, line.*, at, defs) catch |err| {
-            if (!@import("builtin").is_test) switch (err) {
-                error.InvalidPattern => std.log.warn("pattern: cannot read '{s}'", .{line.*}),
-                error.UnsupportedPattern => std.log.err("pattern: '{s}': a Z (high-impedance) state is not supported", .{line.*}),
-                error.OutOfMemory => {},
-            };
-            return err;
-        };
+        line.* = source(arena, line.*, at, defs) catch |err| return refuse(line.*, err);
     }
+}
+
+/// Logs why `line` was refused, outside tests, and returns `err`.
+fn refuse(line: []const u8, err: Error) Error {
+    if (!@import("builtin").is_test) switch (err) {
+        error.InvalidPattern => std.log.warn("pattern: cannot read '{s}'", .{line}),
+        error.UnsupportedPattern => std.log.err("pattern: '{s}': a Z (high-impedance) state is not supported", .{line}),
+        error.OutOfMemory => {},
+    };
+    return err;
 }
 
 /// Offset of the `pat` word in a card, past its name and two nodes. Reads
@@ -89,7 +85,6 @@ pub fn rewrite(arena: std.mem.Allocator, lines: [][]const u8) Error!void {
 fn keyword(line: []const u8) ?usize {
     var it: Words = .{ .text = line };
     for (0..3) |_| _ = it.next() orelse return null;
-    if (it.peek() == null) return null;
     while (it.next()) |t| {
         if (std.mem.eql(u8, t, "pat") or std.mem.startsWith(u8, t, "pat(")) return t.ptr - line.ptr;
     }
@@ -201,11 +196,6 @@ fn sequence(arena: std.mem.Allocator, toks: []const []const u8, i: *usize, defs:
 const Words = struct {
     text: []const u8,
     pos: usize = 0,
-
-    fn peek(w: Words) ?[]const u8 {
-        var copy = w;
-        return copy.next();
-    }
 
     fn next(w: *Words) ?[]const u8 {
         const text = w.text;

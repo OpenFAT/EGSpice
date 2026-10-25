@@ -5,8 +5,6 @@
 //   ngspice: Copyright Regents of the University of California and others,
 //   modified BSD license.
 //
-// Spec: dev/tline-and-switch.md §1.2 (FSM), §3 (sw_update_state, sw_eval).
-//
 // Only variables assigned inside an event block persist across evaluations
 // (LRM §5.10), so the state is split in two:
 //   OUTSIDE the band the position is a pure function of the control value and
@@ -16,6 +14,10 @@
 //   `@(initial_step)` and the `@(cross(...))` edges.
 // Codes follow §1.2: 2 = HYST_OFF, 3 = HYST_ON, ON = code > 2.5. swload.c's
 // REALLY_* states are not stored; outside the band `u` recomputes them.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module vswitch(p, n, cp, cn);
     inout p, n, cp, cn;
     electrical p, n, cp, cn;

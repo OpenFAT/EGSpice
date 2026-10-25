@@ -17,6 +17,10 @@
 // single-pole ddt lowpasses on internal nodes ntgs/ntgd (gate traps,
 // tau = taug) and ntp (dissipated power, tau = taud). ddt() is gated by
 // analysis("tran") because the reference uses h = 0 in DC and AC.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 module jfet2(d, g, s);
     inout d, g, s;
     electrical d, g, s;

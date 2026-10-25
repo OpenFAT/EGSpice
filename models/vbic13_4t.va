@@ -1,3 +1,7 @@
+
+`include "constants.vams"
+`include "disciplines.vams"
+
 `define VERSION     1
 `define SUBVERSION  3
 `define REVISION    0
