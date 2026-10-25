@@ -61,7 +61,7 @@ test "separately compiled statuses decode to consumer-local errors" {
         try t.expectEqual(@intFromError(error.OutOfMemory), @intFromError(err));
         try t.expectEqualStrings("OutOfMemory", @errorName(err));
         if (@sizeOf(usize) > 4) {
-            const too_many: *const fn () ir.DeviceResult(ir.Batch) = @ptrCast(testTooManyInstances());
+            const too_many: *const fn () ir.DeviceResult(ir.Batch) = @ptrCast(@alignCast(testTooManyInstances()));
             try t.expectError(error.TooManyInstances, too_many().unwrap());
         }
         return;

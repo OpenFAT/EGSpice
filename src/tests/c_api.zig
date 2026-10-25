@@ -1169,7 +1169,10 @@ fn expectDiagnostic(h: *c.espice_problem, want: []const u8) !void {
 }
 
 /// Resident set size of this process, bytes (Linux /proc/self/statm).
+/// Elsewhere the peak RSS (`ru_maxrss`, bytes on macOS), which a leak still grows.
 fn residentBytes() !usize {
+    if (@import("builtin").os.tag.isDarwin())
+        return @intCast(std.posix.getrusage(std.posix.rusage.SELF).maxrss);
     var buf: [128]u8 = undefined;
     const text = try std.Io.Dir.cwd().readFile(std.testing.io, "/proc/self/statm", &buf);
     var fields = std.mem.tokenizeScalar(u8, text, ' ');

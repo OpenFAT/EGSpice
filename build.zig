@@ -89,6 +89,9 @@ pub fn build(b: *Build) void {
     });
     exe.root_module.link_libc = true;
     exe.rdynamic = true; // dlopen'd VPI apps resolve vpi_* against the exe
+    // Zig's Mach-O linker dead-strips an executable's unreferenced exports
+    // despite rdynamic, so the VPI apps found no vpi_* on macOS.
+    if (target.result.os.tag.isDarwin()) exe.link_gc_sections = false;
     for (g.objs) |o| exe.root_module.addObject(o);
     b.installArtifact(exe);
     for ([_]struct { Build.LazyPath, []const u8 }{

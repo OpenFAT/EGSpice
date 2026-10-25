@@ -286,6 +286,13 @@ pub fn fitLine(arena: Allocator, p: Rlgc, sections: usize) Error!Line {
         // this costs ~1e-5 of P in band (G·Z0·l/2 of extra loss); a corner
         // further down needs a wider band and more sections.
         const lossy = rm[mi] != 0 or gm[mi] != 0 or rsm[mi] != 0 or gdm[mi] != 0;
+        // Lossless: Yc = 1/Z0 and P = 1 exactly. Fitting 1 − P would fit its
+        // roundoff, which differs with each platform's libm.
+        if (!lossy) {
+            const exact: Rational = .{ .d = 1, .num = &.{}, .den = &.{}, .rel_err = 0 };
+            line.modes[mi] = .{ .z0 = z0, .tau = tau, .yc = exact, .h = exact };
+            continue;
+        }
         const r_floor = if (lossy) @max(0, 2 * std.math.pi * lo * lm[mi] - rm[mi]) else 0;
         const g_floor = if (lossy) @max(0, 2 * std.math.pi * lo * cm[mi] - gm[mi]) else 0;
         const yc_re = try arena.alloc(f64, freq.len);
