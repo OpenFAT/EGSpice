@@ -661,11 +661,10 @@ made larger, where failures are common, and extrapolates back:
   Monte Carlo statistics of that analysis, the table `scale trials
   failures`, then `P_f(1)`, its 95 % interval and the equivalent sigma
   Φ⁻¹(1 − P_f).
-- The interval is statistical only. The model's own error at s = 1 is not
-  in it; on a margin linear in Gaussians it puts ln P_f about 0.2 low,
-  which only a very large `MONTE` makes visible. The extrapolation is
-  long, so the interval is wide: a factor of tens to hundreds at 1000
-  trials per scale.
+- The interval is statistical only: the model's own error at s = 1 is not
+  in it. The extrapolation is long, so the interval is wide. On
+  `docs/examples/monte_sss.sp` (1000 trials at each of five scales, true
+  P_f = Q(5) = 2.9e-7) it prints P_f(1) = 4.7e-6 in [1.7e-11, 1.0].
 - Fewer than three such scales is refused, naming the scales where none or
   all trials failed: the run's exit status is an error. `--measures`
   writes the same numbers as `{"kind": "sss", ...}`.
