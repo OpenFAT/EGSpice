@@ -356,13 +356,20 @@ pub const OpVar = struct {
     /// Index into the batch's `Hooks.op_vars`; null for a terminal quantity.
     own: ?u32 = null,
     quantity: Quantity = .id,
+    /// Whether the card is p-type (`pmos`), which flips the sign of its
+    /// terminal currents and voltages.
+    pmos: bool = false,
 
     /// A MOSFET's terminal quantities, after ngspice's names, from its
     /// static currents and charges with its internal nodes eliminated
-    /// (`analysis.opvars`). Terminals are d, g, s, b; currents flow into
-    /// the device; `c<x><y>` is -∂Q_x/∂V_y, `cgg` is ∂Q_g/∂V_g; `ft` is
-    /// gm / (2π cgg). `ids` is BSIM-CMG's name for `id`. A model's own
-    /// variable of the same name wins.
+    /// (`analysis.opvars`). Terminals are d, g, s, b. Currents and
+    /// voltages are in ngspice's frame, type × the current into the
+    /// terminal and type × the voltage (type +1 n, -1 p), so a saturated
+    /// pfet's `id` and `vgs` are positive, as ngspice's MOS1 and BSIM4
+    /// report them; `c<x><y>` is -∂Q_x/∂V_y, `cgg` is ∂Q_g/∂V_g, overlap
+    /// included; `ft` is gm / (2π cgg) of that terminal `cgg` even where
+    /// the model's own `cgg` shadows it. `ids` is BSIM-CMG's name for `id`.
+    /// A model's own variable of the same name wins.
     pub const Quantity = enum(u8) { id, ids, ig, is, ib, gm, gds, gmbs, cgg, cgd, cgs, cgb, ft, vgs, vds, vbs };
 };
 

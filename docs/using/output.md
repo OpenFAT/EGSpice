@@ -153,13 +153,22 @@ A device has its model's own variables: each module-scope variable with a
 leaves `$mfactor` to the host, and does not say which variables scale with
 it (the CMC models mark that with `multiplicity`, which it does not read).
 BSIM4 (`bsim4va`, sky130's model) has `vth` and `vdsat`, ngspice's `von`
-and `vdsat` from b4ld.c, in the n-type frame. A MOSFET also has `id` (`ids`), `ig`,
+and `vdsat` from b4ld.c, in the n-type frame, and `cgg`, ngspice's
+intrinsic `cggb`: ∂Q_g/∂V_g of the channel's gate charge, without the
+overlap. A MOSFET also has `id` (`ids`), `ig`,
 `is`, `ib`, `gm`, `gds`, `gmbs`, `cgg`, `cgd`, `cgs`, `cgb`, `ft`, `vgs`,
 `vds` and `vbs`, where the model has none of that name, with `m=` applied.
 These come from
-its terminals (d, g, s, b) with its internal nodes eliminated: currents
-flow into the device, `cgg` is ∂Q_g/∂V_g, `cgd` is -∂Q_g/∂V_d (and so on),
-both with the overlap charges, and `ft` is gm / (2π·cgg). An unknown name refuses the deck and lists the
+its terminals (d, g, s, b) with its internal nodes eliminated. Currents
+and voltages are in ngspice's frame: type × the current into the
+terminal and type × the voltage, type +1 for `nmos` and -1 for `pmos`,
+so a saturated pfet's `id` and `vgs` are positive, as ngspice reports
+them (`--emir` keeps the plain current into each terminal). `gm`, `gds`
+and `gmbs` are positive at either polarity. `cgg` is ∂Q_g/∂V_g, `cgd`
+is -∂Q_g/∂V_d (and so on), with the overlap charges. So `cgg` follows the
+model: intrinsic for BSIM4, as ngspice's, and the total gate capacitance
+for a model without its own. `ft` is gm / (2π·Cgg) of the total, overlap
+included, either way. An unknown name refuses the deck and lists the
 device's variables. A `.dc` that sweeps the temperature or a device of the
 same type is not supported yet (#236).
 

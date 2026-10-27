@@ -1162,6 +1162,66 @@ test "Spectre's save nm1:gm and HSPICE's .probe op are columns with the square l
     try t.expectError(error.MissingColumn, column(op, "@r1[id]"));
 }
 
+test "a saturated level-1 pfet's @m1[id], is, vgs and vds are positive in ngspice's frame; cgg and ft its overlaps' (#236)" {
+    // Oracles: level 1's square law by hand at V_SG = 1.2 V, V_SD = 1.8 V
+    // (W/L = 2, |VTO| = 0.5, KP = 1e-4, LAMBDA = 0.02): |I_D| = KP/2 W/L
+    // (V_SG - |VTO|)^2 (1 + LAMBDA V_SD) = 5.0764e-5 A, gm = 1.4504e-4 S;
+    // ngspice's MOS1 and BSIM4 report type × the drain current and
+    // voltages, so id and vgs are positive, as is i(vm), which KCL at the
+    // drain makes id apart from the device's evaluation. With no TOX there
+    // is no Meyer charge, so cgg = (CGSO + CGDO) W = 4e-16 F and ft =
+    // gm / (2π cgg). 1e-6 on the currents: the drain junction's gmin
+    // carries 1.8e-12 A.
+    const text = "pfet opvar\nvs ss 0 1.8\nvg g 0 0.6\nvm d 0 0\nm1 d g ss ss pm w=2u l=1u\n.model pm pmos level=1 vto=-0.5 kp=1e-4 lambda=0.02 cgso=1e-10 cgdo=1e-10\n" ++
+        ".save i(vm) @m1[id] @m1[is] @m1[gm] @m1[vgs] @m1[vds] @m1[cgg] @m1[ft]\n.op\n.end\n";
+    const p = try create(text);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .op));
+    const gm: f64 = 1e-4 * 2 * 0.7 * (1 + 0.02 * 1.8);
+    try t.expectApproxEqRel(0.5 * 0.7 * gm, try column(r, "@m1[id]"), 1e-6);
+    try t.expectApproxEqRel(try column(r, "i(vm)"), try column(r, "@m1[id]"), 1e-6);
+    try t.expectApproxEqRel(-(try column(r, "@m1[id]")), try column(r, "@m1[is]"), 1e-6);
+    try t.expectApproxEqRel(gm, try column(r, "@m1[gm]"), 1e-9);
+    try t.expectApproxEqRel(@as(f64, 1.2), try column(r, "@m1[vgs]"), 1e-12);
+    try t.expectApproxEqRel(@as(f64, 1.8), try column(r, "@m1[vds]"), 1e-12);
+    try t.expectApproxEqRel(@as(f64, 4e-16), try column(r, "@m1[cgg]"), 1e-12);
+    try t.expectApproxEqRel(gm / (2 * std.math.pi * 4e-16), try column(r, "@m1[ft]"), 1e-9);
+}
+
+test "BSIM4's own @m[cgg] is its intrinsic dQg/dVg, without the overlap ft keeps (#236)" {
+    // Oracles, at both polarities: with every overlap and fringe zero the
+    // gate charge is the intrinsic one alone, so the model's cgg (its
+    // ddx) equals the terminal Cgg the eval's charge Jacobian gives, read
+    // back as gm / (2π ft). A metamorphic relation then: CGSO = CGDO = 1e-10
+    // F/m adds 2 CGSO W = 2e-15 F of linear overlap (CGSL = CGDL = 0) to
+    // the terminal Cgg and leaves the DC point and the intrinsic cgg alone,
+    // as ngspice's BSIM4cggb. And KCL at each drain: id is type × the
+    // current into it, the drain source's current with ngspice's sign.
+    const body = "bsim4 cgg\nvdn dn 0 1\nvgn gn 0 1.2\nvdp dp 0 -1\nvgp gp 0 -1.2\nmn dn gn 0 0 nm l=1u w=10u\nmp dp gp 0 0 pm l=1u w=10u\n" ++
+        ".model nm nmos(level=54 cf=0 cgbo=0 cgso={s} cgdo={s})\n.model pm pmos(level=54 cf=0 cgbo=0 cgso={s} cgdo={s})\n" ++
+        ".save i(vdn) i(vdp) @mn[id] @mn[cgg] @mn[gm] @mn[ft] @mp[id] @mp[cgg] @mp[gm] @mp[ft]\n.op\n.end\n";
+    var intrinsic: [2]f64 = undefined;
+    for ([_][]const u8{ "0", "1e-10" }, [_]f64{ 0, 2e-15 }, 0..) |cgso, overlap, k| {
+        var buf: [512]u8 = undefined;
+        const p = try create(try std.fmt.bufPrint(&buf, body, .{ cgso, cgso, cgso, cgso }));
+        defer p.deinit();
+        try p.run_all();
+        const r = try p.result(try find(p, .op));
+        try t.expectApproxEqRel(-(try column(r, "i(vdn)")), try column(r, "@mn[id]"), 1e-6);
+        try t.expectApproxEqRel(try column(r, "i(vdp)"), try column(r, "@mp[id]"), 1e-6);
+        for ([_][]const u8{ "mn", "mp" }, &intrinsic) |dev, *own| {
+            var names: [3][32]u8 = undefined;
+            const cgg = try column(r, try std.fmt.bufPrint(&names[0], "@{s}[cgg]", .{dev}));
+            const gm = try column(r, try std.fmt.bufPrint(&names[1], "@{s}[gm]", .{dev}));
+            const ft = try column(r, try std.fmt.bufPrint(&names[2], "@{s}[ft]", .{dev}));
+            try t.expect(cgg > 0);
+            try t.expectApproxEqRel(cgg + overlap, gm / (2 * std.math.pi * ft), 1e-9);
+            if (k == 0) own.* = cgg else try t.expectApproxEqRel(own.*, cgg, 1e-12);
+        }
+    }
+}
+
 /// Creates `body` at `values[0]` with `name` live, then for each later
 /// value sets it and runs one more `.op`, checking it against a fresh
 /// Problem parsed at that value (the re-parse oracle). Returns how many

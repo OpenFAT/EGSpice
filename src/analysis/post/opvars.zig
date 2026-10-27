@@ -93,11 +93,13 @@ fn value(b: abi.Batch, v: core.OpVar, x: []const f64, reals: []f64, ints: []u32)
     const t: Terminals = .{ .n = n, .g = ev.g, .c = ev.c, .in = in[0..n_in], .work = reals[off..], .piv = ints[2 * n ..][0..n] };
     const bulk = ports > 3;
     const nan = std.math.nan(f64);
+    // ngspice's frame: type × each current and voltage (core.OpVar.Quantity).
+    const sign: f64 = if (v.pmos) -1 else 1;
     return switch (v.quantity) {
-        .id, .ids => ev.f[0],
-        .ig => ev.f[1],
-        .is => ev.f[2],
-        .ib => if (bulk) ev.f[3] else nan,
+        .id, .ids => sign * ev.f[0],
+        .ig => sign * ev.f[1],
+        .is => sign * ev.f[2],
+        .ib => if (bulk) sign * ev.f[3] else nan,
         .gm => t.partial(0, 1)[0],
         .gds => t.partial(0, 0)[0],
         .gmbs => if (bulk) t.partial(0, 3)[0] else nan,
@@ -105,10 +107,11 @@ fn value(b: abi.Batch, v: core.OpVar, x: []const f64, reals: []f64, ints: []u32)
         .cgd => -t.partial(1, 0)[1],
         .cgs => -t.partial(1, 2)[1],
         .cgb => if (bulk) -t.partial(1, 3)[1] else nan,
+        // The terminal cgg, overlap included, never a model's own `cgg`.
         .ft => t.partial(0, 1)[0] / (2 * std.math.pi * t.partial(1, 1)[1]),
-        .vgs => ev.x[1] - ev.x[2],
-        .vds => ev.x[0] - ev.x[2],
-        .vbs => if (bulk) ev.x[3] - ev.x[2] else nan,
+        .vgs => sign * (ev.x[1] - ev.x[2]),
+        .vds => sign * (ev.x[0] - ev.x[2]),
+        .vbs => if (bulk) sign * (ev.x[3] - ev.x[2]) else nan,
     };
 }
 

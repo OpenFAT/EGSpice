@@ -550,12 +550,19 @@ fn opVars(
     };
     if (names.count() == 0 and !nl.deck.probe_op) return .{ .vars = &.{}, .probes = &.{}, .labels = &.{} };
     // The terminal quantities are a MOSFET's (d, g, s, b), whose letter a
-    // Spectre card's name need not carry.
-    var mosfets: std.StringHashMapUnmanaged(void) = .empty;
-    for (nl.bucket('m')) |e| try mosfets.put(scratch, nl.device(e).name, {});
+    // Spectre card's name need not carry; each maps to whether its card
+    // is p-type, as `.mosra` reads it.
+    // ponytail: the card kind only; a `type=-1` on an nmos or Verilog-A
+    // module card reads as n-type. Read the bound model's polarity if a
+    // deck spells it that way.
+    var mosfets: std.StringHashMapUnmanaged(bool) = .empty;
+    for (nl.bucket('m')) |e| {
+        const d = nl.device(e);
+        try mosfets.put(scratch, d.name, if (d.model) |m| std.ascii.eqlIgnoreCase(m.kind, "pmos") else false);
+    }
     var list: std.ArrayList(core.OpVar) = .empty;
     for (names.keys()) |name| try list.append(sim_arena, try opVar(sim_arena, lib, circuit, cards, &mosfets, name));
-    if (nl.deck.probe_op) for (cards) |ref| try probeAll(sim_arena, lib, circuit, ref, mosfets.contains(ref.name), &names, &list);
+    if (nl.deck.probe_op) for (cards) |ref| try probeAll(sim_arena, lib, circuit, ref, mosfets.get(ref.name), &names, &list);
     const vars = list.items;
     var rows: std.ArrayList(u32) = .empty;
     try rows.appendSlice(sim_arena, probes);
@@ -632,9 +639,10 @@ const OpVarName = struct {
     }
 };
 
-/// `name`, an `OpVarName`, resolved to its instance; `mosfets` holds the
-/// MOSFETs' card names. See `opVars` for the refusals.
-fn opVar(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, cards: []const requests.CardRef, mosfets: *const std.StringHashMapUnmanaged(void), name: []const u8) !core.OpVar {
+/// `name`, an `OpVarName`, resolved to its instance; `mosfets` maps the
+/// MOSFETs' card names to whether each is p-type. See `opVars` for the
+/// refusals.
+fn opVar(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, cards: []const requests.CardRef, mosfets: *const std.StringHashMapUnmanaged(bool), name: []const u8) !core.OpVar {
     const split = OpVarName.of(name) orelse {
         if (!@import("builtin").is_test) std.log.err("netlist: {s}: a device operating-point variable is @<device>[<variable>], <device>:<variable>, or lx1-lx4, lx7-lx9, lx18, lv9 or lv10 (<device>)", .{name});
         return error.UnsupportedCard;
@@ -645,18 +653,18 @@ fn opVar(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const d
         if (!@import("builtin").is_test) std.log.err("netlist: {s}: no device {s}", .{ name, split.device });
         return error.UnsupportedCard;
     };
-    return opVarOf(arena, lib, circuit, ref, mosfets.contains(ref.name), name, split.variable);
+    return opVarOf(arena, lib, circuit, ref, mosfets.get(ref.name), name, split.variable);
 }
 
-/// `variable` of instance `ref`, published as `label`; `mosfet_card` when
-/// its card is a MOSFET's.
-fn opVarOf(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, ref: requests.CardRef, mosfet_card: bool, label: []const u8, variable: []const u8) !core.OpVar {
+/// `variable` of instance `ref`, published as `label`; `pmos_card` is null
+/// unless its card is a MOSFET's, and then whether it is p-type.
+fn opVarOf(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, ref: requests.CardRef, pmos_card: ?bool, label: []const u8, variable: []const u8) !core.OpVar {
     const batch = std.mem.indexOfScalar(core.DeviceType, circuit.batch_types, ref.type).?;
     const hooks = circuit.batches[batch].hooks;
     const ports = lib.vtable(ref.type).num_ports;
-    const mosfet = mosfet_card and ports >= 3;
+    const mosfet = pmos_card != null and ports >= 3;
     if (hooks.local_eval == null) return refuseOpVar(arena, label, ref.name, variable, &.{}, false);
-    var v: core.OpVar = .{ .label = try arena.dupe(u8, label), .batch = @intCast(batch), .index = ref.index, .ports = ports };
+    var v: core.OpVar = .{ .label = try arena.dupe(u8, label), .batch = @intCast(batch), .index = ref.index, .ports = ports, .pmos = pmos_card orelse false };
     // The model's own variable first: BSIM-CMG's `ids` is its own.
     for (hooks.op_vars, 0..) |own, k| {
         if (std.ascii.eqlIgnoreCase(own, variable)) {
@@ -672,17 +680,17 @@ fn opVarOf(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const
 
 /// Appends to `list` every operating-point variable of instance `ref`
 /// that `names` does not hold, as `@<card>[<variable>]` (HSPICE `.probe
-/// op`): the model's own, then for a MOSFET the terminal quantities it
-/// does not shadow, without the alias `ids` and, with three terminals,
-/// the bulk ones.
-fn probeAll(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, ref: requests.CardRef, mosfet: bool, names: *const std.StringArrayHashMapUnmanaged(void), list: *std.ArrayList(core.OpVar)) !void {
+/// op`): the model's own, then for a MOSFET (`pmos_card`, as `opVarOf`
+/// reads it) the terminal quantities it does not shadow, without the
+/// alias `ids` and, with three terminals, the bulk ones.
+fn probeAll(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, ref: requests.CardRef, pmos_card: ?bool, names: *const std.StringArrayHashMapUnmanaged(void), list: *std.ArrayList(core.OpVar)) !void {
     const hooks = circuit.batches[std.mem.indexOfScalar(core.DeviceType, circuit.batch_types, ref.type).?].hooks;
     if (hooks.local_eval == null) return;
     const ports = lib.vtable(ref.type).num_ports;
     const bulk = [_]core.OpVar.Quantity{ .ib, .gmbs, .cgb, .vbs };
     var all: std.ArrayList([]const u8) = .empty;
     try all.appendSlice(arena, hooks.op_vars);
-    if (mosfet and ports >= 3) for (std.enums.values(core.OpVar.Quantity)) |q| {
+    if (pmos_card != null and ports >= 3) for (std.enums.values(core.OpVar.Quantity)) |q| {
         if (q == .ids or (ports == 3 and std.mem.indexOfScalar(core.OpVar.Quantity, &bulk, q) != null)) continue;
         for (hooks.op_vars) |own| {
             if (std.ascii.eqlIgnoreCase(own, @tagName(q))) break;
@@ -691,7 +699,7 @@ fn probeAll(arena: std.mem.Allocator, lib: *const device.Library, circuit: *cons
     for (all.items) |variable| {
         const label = try arena.print("@{s}[{s}]", .{ ref.name, variable });
         if (names.contains(std.ascii.lowerString(label, label))) continue;
-        try list.append(arena, try opVarOf(arena, lib, circuit, ref, mosfet, label, variable));
+        try list.append(arena, try opVarOf(arena, lib, circuit, ref, pmos_card, label, variable));
     }
 }
 
