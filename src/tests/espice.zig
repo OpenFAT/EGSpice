@@ -2697,9 +2697,11 @@ test "release_points: a Problem run batch after batch keeps a few KB per release
     const table = p.prepared.deck.variants;
     try t.expectEqual(@as(u32, live.len * rows.len), table.count());
     try t.expectEqual(table.count(), table.base);
-    // Its two query rows, with the slack of the tables' doubling; an
-    // unreleased point keeps its circuit and waveform, tens of KB.
-    try t.expect(per_point < 1024);
+    // Its two query rows, with the slack of the tables' doubling: 469 B
+    // measured (ReleaseSafe, x86_64, 2026-10-27; 904-949 B before #225
+    // freed the variant row). An unreleased point keeps its circuit and
+    // waveform, tens of KB.
+    try t.expect(per_point < 520);
     // The query workers' share of that, as the Problem counts it.
     const mem = p.queryMemory();
     try t.expect(mem.peak > 0 and mem.live <= mem.peak and mem.live <= @as(usize, @intCast(live[live.len - 1])));
