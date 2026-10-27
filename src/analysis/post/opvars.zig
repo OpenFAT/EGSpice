@@ -214,7 +214,7 @@ test "a collapsed unknown's row and column fold into its node" {
     var f = [_]f64{ 0, -1, 1 };
     var q = [_]f64{ 0, 0, 0 };
     var g = [9]f64{ 0, 0, 0, 0, 4, -4, 0, -4, 4 };
-    var c = [_]f64{0} ** 9;
+    var c: [9]f64 = @splat(0);
     var root = [_]u32{ 0, 1, 0 };
     merge(3, .{ .x = &x, .f = &f, .q = &q, .g = &g, .c = &c, .root = &root });
     try std.testing.expectEqualSlices(f64, &.{ 1, -1 }, &.{ f[0], f[1] });
