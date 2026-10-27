@@ -555,6 +555,22 @@ pub const Executor = struct {
         return 4096 * (@as(usize, topology.n) + @as(usize, topology.nnz) / 4) + 64 * 1024;
     }
 
+    /// Device bytes one GPU lane holds in `GpuLanes.init`, over-estimated
+    /// where its sizes are known only later: 36 n-vectors (the planes and
+    /// iterates, gear 6's history ring, a probe ring over every unknown), 6
+    /// nnz-planes (G, C, A and an LU fill of three times nnz), each batch's
+    /// packed rows and 4 KiB of per-lane scalars and reports.
+    // ponytail: the transient lane state only; HB's harmonic planes are not
+    // counted.
+    fn gpuLaneDeviceBytes(topology: *const Circuit) usize {
+        var bytes: usize = 8 * (36 * (@as(usize, topology.n) + 1) + 6 * (@as(usize, topology.nnz) + 1)) + 4096;
+        for (topology.batches) |b| if (b.hooks.gpu_payload) |payload| {
+            const p = payload(b.ctx);
+            bytes += p.models.len + 4 * p.model_of.len + p.instances.len + p.states.len + 8 * p.lim_x.len;
+        };
+        return bytes;
+    }
+
     /// The host bytes a GPU batch's wave may hold (`gpuLaneBytes` each).
     // ponytail: a fixed 4 GiB; size it from the machine's memory if decks
     // with tens of thousands of large lanes need more per wave.
@@ -570,9 +586,15 @@ pub const Executor = struct {
         const g = members.len;
         // Waves bound the host: each member's circuit, run and solver state
         // exist only for its wave, and one nothing reads afterwards is freed
-        // with it. One wave unless the lanes would pass `gpu_wave_bytes`.
+        // with it. One wave unless the lanes would pass `gpu_wave_bytes`, or
+        // the device budget, which binds only where the wave would not fit
+        // the device, and then over the host's `gpu_wave_min`.
         const per_lane = gpuLaneBytes(self.topology);
-        const wave = @max(gpu_wave_min, @min(g, gpu_wave_bytes / per_lane));
+        const host_wave = @max(gpu_wave_min, @min(g, gpu_wave_bytes / per_lane));
+        const devices = @import("gpu/devices.zig");
+        const device_wave = devices.waveLanes(devices.table(), gpuLaneDeviceBytes(self.topology));
+        const wave = @min(host_wave, device_wave);
+        if (self.config.knobs.gpu_stats != .off and wave < g) std.debug.print("gpu-lanes: {d} lanes in waves of {d} (host {d}, device {d})\n", .{ g, wave, host_wave, device_wave });
         const live = try self.work.allocator().alloc(usize, @min(g, wave));
         var first: usize = 0;
         while (first < g) : (first += wave) {
