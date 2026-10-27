@@ -937,6 +937,29 @@ const Frame = struct {
     models_mark: u32 = 0,
 };
 
+/// A subcircuit body card as `readDevice` first read it, for the instances
+/// after (#229): what the line's text alone decides, which is the same under
+/// every frame. A name, an expression and a model are frame-dependent and are
+/// re-read from their position in card order, so every scope lookup runs as
+/// it would have.
+const Replay = struct {
+    nodes: []const []const u8,
+    /// The model or subcircuit word, null on a fixed-pin card without one.
+    model: ?[]const u8,
+    fields: []const ReplayField,
+};
+
+/// A value field past the nodes and model, in card order.
+const ReplayField = struct {
+    /// A `key=value` field's key, or a positional value's first token.
+    word: []const u8,
+    keyed: bool,
+    /// A keyed literal's value (`literalValue`); null re-reads from `pos`.
+    num: ?f64,
+    /// Just past the `=`, or past `word` for a positional.
+    pos: usize,
+};
+
 /// A subcircuit's port names to their first position.
 const PortIndex = std.StringHashMapUnmanaged(u32);
 
@@ -1148,6 +1171,9 @@ fn Reader(comptime S: type) type {
         pins: std.ArrayList(VertexId) = .empty,
         positional: std.ArrayList(Value) = .empty,
         card_kv: std.ArrayList(Kv) = .empty,
+        /// Per `lines` row, the body card's `Replay` once one instance read
+        /// it; sized on the first `expand`.
+        replays: []?*const Replay = &.{},
         scratch: expr.Scratch = .{},
         /// Parameter and function texts compiled once each (`compiledText`).
         compiled_texts: std.StringHashMapUnmanaged(*const expr.Scratch) = .empty,
@@ -1305,7 +1331,7 @@ fn Reader(comptime S: type) type {
             };
             try r.binOptions();
 
-            for (top_devices.items) |i| try r.readDevice(r.lines.items[i], r.kindOf(i), &top);
+            for (top_devices.items) |i| try r.readDevice(r.lines.items[i], r.kindOf(i), &top, null);
             // The passes below read no one card.
             r.card = "";
             try r.shunts();
@@ -2825,16 +2851,7 @@ fn Reader(comptime S: type) type {
             // HSPICE reads a brace as a name byte, so `{...}` is a word there
             // and goes to the bare-value rules (#203).
             if ((rest[0] == '{' and !F.isWord(rest)) or rest[0] == '\'') return r.readValue(f, frame, true, geometry);
-            // A lone number literal (`w=0.5u`) needs no compile; nor does
-            // ngspice's `r=10%3`, which it reads as 10 (`junkNumber`, #200).
-            if (std.ascii.isDigit(rest[0]) or rest[0] == '.') {
-                const save = f.pos;
-                const w = f.next().?;
-                const lone = expr.numberLen(w) == w.len or (r.dialect == .ngspice and junkNumber(w));
-                if (lone and !expr.isOperator(f.nextByte() orelse ' '))
-                    return .{ .num = S.parseNum(w) orelse return error.ParseError };
-                f.pos = save;
-            }
+            if (try r.literalValue(f)) |n| return .{ .num = n };
             const mark = r.scratch.mark();
             defer r.scratch.reset(mark);
             const start = f.pos;
@@ -2844,6 +2861,21 @@ fn Reader(comptime S: type) type {
             if (ops.len == 1 and ops[0].code == .num) return .{ .num = r.scratch.consts.items[ops[0].a] };
             if (ops.len == 1 and ops[0].code == .ident) return r.nameValue(r.scratch.names.items[ops[0].a], frame, geometry);
             return r.fold(mark.ops, frame, geometry);
+        }
+
+        /// The value after `key=` when it is a lone number literal (`w=0.5u`),
+        /// which needs no compile, or ngspice's `r=10%3`, read as 10
+        /// (`junkNumber`, #200): `f` moves past it. Null, `f` unmoved, for
+        /// anything else. The line's text alone decides it, never a scope.
+        fn literalValue(r: *const R, f: *F) Error!?f64 {
+            const rest = f.rest();
+            if (rest.len == 0 or !(std.ascii.isDigit(rest[0]) or rest[0] == '.')) return null;
+            const save = f.pos;
+            const w = f.next().?;
+            const lone = expr.numberLen(w) == w.len or (r.dialect == .ngspice and junkNumber(w));
+            if (lone and !expr.isOperator(f.nextByte() orelse ' ')) return S.parseNum(w) orelse return error.ParseError;
+            f.pos = save;
+            return null;
         }
 
         /// Whether ngspice reads field `w` as one number token whose rest it
@@ -3490,7 +3522,9 @@ fn Reader(comptime S: type) type {
 
         /// Reads device card `line`; `kind` is its letter when its name does
         /// not carry it (`kindOf`), else 0.
-        fn readDevice(r: *R, line: []const u8, kind: u8, frame: *const Frame) Error!void {
+        /// `row` is its `lines` row when it is a subcircuit body card: the
+        /// first read keeps a `Replay` there and later instances read it.
+        fn readDevice(r: *R, line: []const u8, kind: u8, frame: *const Frame, row: ?usize) Error!void {
             r.card = line;
             const arena = r.arena;
             const port_card = r.dialect == .hspice and std.ascii.toLower(line[0]) == 'p';
@@ -3506,12 +3540,13 @@ fn Reader(comptime S: type) type {
             // for `.lin` (`P1 in 0 port=1 z0=50`). A Spectre card's letter
             // is its master's, kept beside it.
             const letter = if (port_card) 'v' else if (kind != 0) kind else std.ascii.toLower(head[0]);
+            if (row) |i| if (r.replays[i]) |rp| return r.replay(rp, line, head, letter, frame);
             // HSPICE reads these letters as IBIS buffers and lumped lines,
             // neither of which is built.
             if (r.dialect == .hspice and std.mem.indexOfScalar(u8, "bu", letter) != null)
                 return r.unsupported(line, "unsupported HSPICE element");
             if (r.dialect == .hspice and (letter == 's' or letter == 'w')) return r.readDataElement(head, letter, &f, frame);
-            if (letter == 'r' and r.dialect == .ngspice) if (try r.behaviouralResistor(line)) |b| return r.readDevice(b, 0, frame);
+            if (letter == 'r' and r.dialect == .ngspice) if (try r.behaviouralResistor(line)) |b| return r.readDevice(b, 0, frame, null);
             if (std.mem.indexOfScalar(u8, "efgh", letter) != null) {
                 var probe = f;
                 _ = probe.next();
@@ -3530,7 +3565,7 @@ fn Reader(comptime S: type) type {
                             if (u.len > buf.len or (behavioural.get(std.ascii.lowerString(&buf, u)) orelse .refused) != .kind) break;
                             _ = probe.next();
                         }
-                        return r.readDevice(try std.mem.concat(r.arena, u8, &.{ line[0..at], " ", probe.line[probe.pos..] }), letter, frame);
+                        return r.readDevice(try std.mem.concat(r.arena, u8, &.{ line[0..at], " ", probe.line[probe.pos..] }), letter, frame, null);
                     }
                     // HSPICE: VCR and VCCAP are G-element forms only (#75).
                     if ((form == .vcr or form == .vccap) and letter != 'g') return r.unsupported(line, "VCR or VCCAP on a card other than G");
@@ -3541,6 +3576,12 @@ fn Reader(comptime S: type) type {
             r.positional.clearRetainingCapacity();
             r.card_kv.clearRetainingCapacity();
             var kv_text: std.ArrayList([]const u8) = .empty;
+            // An X card expands and an HSPICE P card reads a rewritten line:
+            // neither replays.
+            // ponytail: a positional literal (`R1 a b 1k`) is re-read too.
+            const slot: ?usize = if (port_card or letter == 'x') null else row;
+            var model_word: ?[]const u8 = null;
+            var fields: std.ArrayList(ReplayField) = .empty;
 
             if ((f.nextByte() orelse return error.ParseError) == '(') {
                 _ = f.next();
@@ -3554,6 +3595,7 @@ fn Reader(comptime S: type) type {
                 const model = f.next() orelse return error.ParseError;
                 if (!F.isWord(model)) return error.ParseError;
                 if (letter != 'x') try r.refuseOperatorField(line, model);
+                model_word = model;
                 try r.positional.append(arena, try r.nameValue(model, frame, false));
             } else if (fixedPins(letter)) |fixed| {
                 const count = if (port_card and mixedPort(f)) 3 else fixed;
@@ -3591,6 +3633,7 @@ fn Reader(comptime S: type) type {
                 if (letter == 'x' and r.dialect == .ngspice and r.nodes.items.len > 0 and std.mem.eql(u8, r.nodes.items[r.nodes.items.len - 1], "params:")) _ = r.nodes.pop();
                 const model = r.nodes.pop() orelse return error.ParseError;
                 if (letter != 'x') try r.refuseOperatorField(line, model);
+                model_word = model;
                 try r.positional.append(arena, try r.nameValue(model, frame, false));
             }
 
@@ -3606,14 +3649,47 @@ fn Reader(comptime S: type) type {
                     const start = f.pos;
                     try r.card_kv.append(arena, .{ .key = t, .value = try r.kvValue(&f, frame, false) });
                     if (letter == 'x') try kv_text.append(arena, std.mem.trim(u8, f.line[start..f.pos], " \t"));
+                    if (slot != null) {
+                        // `kvValue` read it as a literal exactly when this does.
+                        var probe = f;
+                        probe.pos = start;
+                        try fields.append(arena, .{ .word = t, .keyed = true, .num = try r.literalValue(&probe), .pos = start });
+                    }
                 } else {
                     if (letter != 'x') try r.refuseOperatorField(line, t);
+                    const at = f.pos;
                     try r.positional.append(arena, try r.valueAt(t, &f, frame, true, false));
+                    if (slot != null) try fields.append(arena, .{ .word = t, .keyed = false, .num = null, .pos = at });
                 }
             }
             if (letter == 'x') return r.expand(head, frame, kv_text.items);
+            if (slot) |i| {
+                const rp = try arena.create(Replay);
+                rp.* = .{ .nodes = try arena.dupe([]const u8, r.nodes.items), .model = model_word, .fields = fields.items };
+                r.replays[i] = rp;
+            }
             // A D card's third node is its thermal node `tj` when a model
             // name follows it (ngspice-syntax.md §3.2, #121).
+            if (letter == 'q' or letter == 'm' or letter == 'd') try r.splitTerminals();
+            return r.commit(head, letter, frame);
+        }
+
+        /// Reads body card `line` from the `Replay` its first read kept: the
+        /// nodes and literals reused, every other field re-read under `frame`
+        /// in card order, then split and committed as `readDevice` does.
+        fn replay(r: *R, rp: *const Replay, line: []const u8, head: []const u8, letter: u8, frame: *const Frame) Error!void {
+            const arena = r.arena;
+            r.nodes.clearRetainingCapacity();
+            r.positional.clearRetainingCapacity();
+            r.card_kv.clearRetainingCapacity();
+            try r.nodes.appendSlice(arena, rp.nodes);
+            if (rp.model) |m| try r.positional.append(arena, try r.nameValue(m, frame, false));
+            var f = F.init(line);
+            for (rp.fields) |field| {
+                f.pos = field.pos;
+                const value: Value = if (field.num) |n| .{ .num = n } else if (field.keyed) try r.kvValue(&f, frame, false) else try r.valueAt(field.word, &f, frame, true, false);
+                if (field.keyed) try r.card_kv.append(arena, .{ .key = field.word, .value = value }) else try r.positional.append(arena, value);
+            }
             if (letter == 'q' or letter == 'm' or letter == 'd') try r.splitTerminals();
             return r.commit(head, letter, frame);
         }
@@ -4046,6 +4122,10 @@ fn Reader(comptime S: type) type {
                 .models_mark = @intCast(r.instance_models.items.len),
             };
             defer r.instance_models.shrinkRetainingCapacity(child.models_mark);
+            if (r.replays.len == 0) {
+                r.replays = try arena.alloc(?*const Replay, r.lines.items.len);
+                @memset(r.replays, null);
+            }
             // Models first, as ngspice reads every `.model` before any
             // device: the ones under a branch this instance keeps.
             const locals = r.local_models.items[sub.models_lo..sub.models_hi];
@@ -4072,7 +4152,7 @@ fn Reader(comptime S: type) type {
             var nested: u32 = 0;
             for (r.lines.items[sub.first..sub.end], sub.first..) |line, i| {
                 if (line[0] != '.') {
-                    if (nested == 0 and branches.active()) try r.readDevice(line, r.kindOf(i), &child);
+                    if (nested == 0 and branches.active()) try r.readDevice(line, r.kindOf(i), &child, i);
                     continue;
                 }
                 if (!sub.has_cond and !sub.has_nested) continue;

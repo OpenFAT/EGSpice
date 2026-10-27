@@ -320,6 +320,55 @@ test "the seed decks hold every oracle in every dialect" {
     for (seeds) |text| for (std.enums.values(Dialect)) |d| try check(std.testing.allocator, &src, text, d);
 }
 
+test "a body card replayed per instance digests as the same card read once per copy" {
+    // Oracle: a metamorphic relation. Each instance reading its own copy of
+    // the body reads every card once, so none replays (#229); the instance
+    // parameters, defaults and `.param` globals they shadow must give the
+    // same devices either way.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one = try instancedDeck(a, false);
+    const copies = try instancedDeck(a, true);
+    const shared = outcome(std.testing.allocator, one, .ngspice);
+    try std.testing.expect(shared == .digest);
+    try expectSame("one body copy per instance", shared, outcome(std.testing.allocator, copies, .ngspice), one, copies);
+}
+
+/// Three `outer` instances of two `inner` instances each, whose cards read
+/// literals, instance parameters, defaults and shadowed globals. `copies`
+/// gives every instance its own textual copy of its subcircuit.
+fn instancedDeck(a: std.mem.Allocator, copies: bool) ![]const u8 {
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a, "replay\n.param w=5u l=1u\n.model nch nmos level=1\n");
+    const sides: []const []const u8 = if (copies) &.{ "a", "b" } else &.{""};
+    const outers: usize = if (copies) 3 else 1;
+    for (0..outers) |k| {
+        const o: []const u8 = if (copies) try a.print("{d}", .{k}) else "";
+        for (sides) |side| try src.print(a,
+            \\.subckt inner{s}{s} d g s w=2u
+            \\m1 d g s s nch w={{w}} l=0.5u nf=2 ad=1p
+            \\r1 d s {{l*2}}
+            \\c1 d s 1p
+            \\e1 d s g s 2
+            \\.ends
+            \\
+        , .{ o, side });
+        try src.print(a,
+            \\.subckt outer{s} a b l=3
+            \\xi1 a b 0 inner{s}{s} w={{l*1e-6}}
+            \\xi2 b a 0 inner{s}{s}
+            \\r2 a b l
+            \\.ends
+            \\
+        , .{ o, o, sides[0], o, sides[sides.len - 1] });
+    }
+    for ([_][]const u8{ "n1 n2", "n2 n3", "n3 n1" }, [_][]const u8{ "", " l=7", " l=1" }, 0..) |nets, params, k|
+        try src.print(a, "x{d} {s} outer{s}{s}\n", .{ k, nets, if (copies) try a.print("{d}", .{k}) else "", params });
+    try src.appendSlice(a, "v1 n1 0 1\n.end\n");
+    return src.items;
+}
+
 // The generator. `src` is a `*Smith` or a `*Seeded`. Writes past `deck_max`
 // are dropped (`.fixed` refuses them), which only truncates the deck.
 
