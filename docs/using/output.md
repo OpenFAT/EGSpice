@@ -138,7 +138,7 @@ point, along a `.dc` sweep and in a `.tran`. Save or measure them by name:
 ```
 
 A device has its model's own variables: each module-scope variable with a
-`desc` attribute (OSDI's operating-point variables), such as `vth`,
+`desc` or `units` attribute (the LRM's output variables, §3.2.1), such as `vth`,
 `vdsat` or `region`, without `m=`. A MOSFET also has `id` (`ids`), `ig`,
 `is`, `ib`, `gm`, `gds`, `gmbs`, `cgg`, `cgd`, `cgs`, `cgb`, `ft`, `vgs`,
 `vds` and `vbs`, where the model has none of that name. These come from

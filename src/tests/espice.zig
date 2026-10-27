@@ -910,13 +910,14 @@ test "@m1[id] along a .dc is the 0 V ammeter's current, @m1[gm] and @m1[gds] its
     try expectOpvarsAsAmmeter(try std.fmt.bufPrint(&buf, body, .{".dc vd 0.8 1.6 0.1"}), "@m1[gds]");
 }
 
-test "a Verilog-A model's own desc variables are @n1[...] vectors with their hand values (#236)" {
+test "a Verilog-A model's own desc and units variables are @n1[...] vectors with their hand values (#236)" {
     // Oracles: va_opvars's own equations by hand at V_GS = 1.2 V (ids =
     // k (V_GS - vt)^2 = 4.9e-5 A, gm = 2 k (V_GS - vt) = 1.4e-4 S, vth = vt,
-    // region 2), and the 0 V ammeter's current, which KCL makes ids.
+    // region 2, vgs the gate source's 1.2 V), and the 0 V ammeter's
+    // current, which KCL makes ids.
     const body = "va opvars\n.hdl \"opvars.assets/va_opvars.va\"\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nn1 d g 0 va_opvars\n.save {s}\n.op\n.end\n";
     var buf: [512]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, body, .{"i(vm) @n1[ids] @n1[gm] @n1[vth] @n1[region]"});
+    const text = try std.fmt.bufPrint(&buf, body, .{"i(vm) @n1[ids] @n1[gm] @n1[vth] @n1[region] @n1[vgs]"});
     const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = text, .origin = "src/tests/opvars.cir" } } });
     defer p.deinit();
     try p.run_all();
@@ -926,7 +927,9 @@ test "a Verilog-A model's own desc variables are @n1[...] vectors with their han
     try t.expectApproxEqRel(@as(f64, 1.4e-4), try column(r, "@n1[gm]"), 1e-12);
     try t.expectEqual(@as(f64, 0.5), try column(r, "@n1[vth]"));
     try t.expectEqual(@as(f64, 2), try column(r, "@n1[region]"));
-    // `vov` has no `desc`, and an N card has no terminal quantities.
+    // `units` alone makes `vgs` one (LRM 3.2.1).
+    try t.expectEqual(@as(f64, 1.2), try column(r, "@n1[vgs]"));
+    // `vov` has neither `desc` nor `units`, and an N card has no terminal quantities.
     var other: [512]u8 = undefined;
     for ([_][]const u8{ "@n1[vov]", "@n1[gds]" }) |name| {
         const refused = try std.fmt.bufPrint(&other, body, .{name});

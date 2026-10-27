@@ -1,8 +1,9 @@
 // Test device for a model's own operating-point variables (#236), after
 // the VAMS suite's output_variables_desc_reported.va: a square-law channel
 // whose `desc` variables have hand values. Above threshold ids = k vov^2,
-// gm = d(ids)/dV(g) = 2 k vov, region 2; vth is the parameter vt. `vov`
-// has no `desc`, so it is no operating-point variable.
+// gm = d(ids)/dV(g) = 2 k vov, region 2; vth is the parameter vt. `vgs`
+// carries `units` alone, which LRM 3.2.1 counts as an operating-point
+// variable; `vov` carries neither attribute, so it is none.
 `include "disciplines.vams"
 module va_opvars(d, g, s);
     inout d, g, s;
@@ -13,11 +14,13 @@ module va_opvars(d, g, s);
     (* desc = "Transconductance", units = "S" *) real gm;
     (* desc = "Threshold voltage", units = "V" *) real vth;
     (* desc = "Bias region" *) integer region;
+    (* units = "V" *) real vgs;
     real vov;
 
     analog begin
         vth = vt;
-        vov = V(g, s) - vt;
+        vgs = V(g, s);
+        vov = vgs - vt;
         if (vov > 0) begin
             ids = k * vov * vov;
             region = 2;
