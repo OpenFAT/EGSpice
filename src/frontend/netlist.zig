@@ -891,18 +891,35 @@ fn cardOf(head: []const u8) ?Card {
 /// an arena: nothing is freed piecewise. Fails per `Error`; partial
 /// results stay in the arena.
 pub fn parse(arena: Allocator, src: []const u8, dialect: Dialect) Error!Netlist {
-    return parseLive(arena, src, dialect, &.{}) catch |err| switch (err) {
+    return parseWith(arena, src, dialect, .{});
+}
+
+/// How a parse reads its device cards. Every choice gives the same netlist,
+/// byte for byte.
+pub const ParseOptions = struct {
+    /// Threads that scan the top-level device cards' fields before the
+    /// cards are read in line order (#230); null takes the CPU count, at
+    /// most 16. 0 scans nothing: every card is read whole.
+    threads: ?u32 = null,
+    /// Fewest top-level device cards the scan runs for; a smaller deck
+    /// reads every card whole.
+    scan_min: u32 = 16 * 1024,
+};
+
+/// `parse`, reading device cards per `opts`.
+pub fn parseWith(arena: Allocator, src: []const u8, dialect: Dialect, opts: ParseOptions) Error!Netlist {
+    return parseLive(arena, src, dialect, &.{}, opts) catch |err| switch (err) {
         error.UnknownParameter => unreachable,
         else => |e| return e,
     };
 }
 
-/// `parse`, with the global `.param` names in `live` kept live as a
+/// `parseWith`, with the global `.param` names in `live` kept live as a
 /// swept name is (`Netlist.tunable`), so a later `setLive` can move them.
 /// `UnknownParameter` for a name no global `.param` defines.
-pub fn parseLive(arena: Allocator, src: []const u8, dialect: Dialect, live: []const []const u8) (Error || error{UnknownParameter})!Netlist {
+pub fn parseLive(arena: Allocator, src: []const u8, dialect: Dialect, live: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist {
     return switch (dialect) {
-        inline else => |d| Reader(lines.Syntax(d)).run(arena, src, d, live),
+        inline else => |d| Reader(lines.Syntax(d)).run(arena, src, d, live, opts),
     };
 }
 
@@ -1013,10 +1030,10 @@ const Frame = struct {
 };
 
 /// A subcircuit body card as `readDevice` first read it, for the instances
-/// after (#229): what the line's text alone decides, which is the same under
-/// every frame. A name, an expression and a model are frame-dependent and are
-/// re-read from their position in card order, so every scope lookup runs as
-/// it would have.
+/// after (#229), or a top-level card as `scan` read it (#230): what the
+/// line's text alone decides, which is the same under every frame. A name,
+/// an expression and a model are frame-dependent and are re-read from their
+/// position in card order, so every scope lookup runs as it would have.
 const Replay = struct {
     nodes: []const []const u8,
     /// The model or subcircuit word, null on a fixed-pin card without one.
@@ -1029,7 +1046,8 @@ const ReplayField = struct {
     /// A `key=value` field's key, or a positional value's first token.
     word: []const u8,
     keyed: bool,
-    /// A keyed literal's value (`literalValue`); null re-reads from `pos`.
+    /// A keyed literal's value (`literalValue`), or a scanned positional
+    /// literal's (`valueAt`'s `parseNum`); null re-reads from `pos`.
     num: ?f64,
     /// Just past the `=`, or past `word` for a positional.
     pos: usize,
@@ -1046,6 +1064,9 @@ const port_scan_max = 16;
 /// Nested `.subckt` definitions past this depth are refused; ngspice's
 /// syntax check warns past 10 (ngspice-syntax.md §4.1).
 const subckt_depth_max = 16;
+
+/// Most threads `scanCards` runs, each with its own arena.
+const scan_threads_max = 16;
 
 const Subckt = struct {
     name: []const u8,
@@ -1254,7 +1275,8 @@ fn Reader(comptime S: type) type {
         positional: std.ArrayList(Value) = .empty,
         card_kv: std.ArrayList(Kv) = .empty,
         /// Per `lines` row, the body card's `Replay` once one instance read
-        /// it; sized on the first `expand`.
+        /// it, or the top-level card's `scanCards` read; sized by
+        /// `scanCards` or on the first `expand`.
         replays: []?*const Replay = &.{},
         scratch: expr.Scratch = .{},
         /// Parameter and function texts compiled once each (`compiledText`).
@@ -1279,7 +1301,7 @@ fn Reader(comptime S: type) type {
             return r;
         }
 
-        fn run(arena: Allocator, src: []const u8, dialect: Dialect, live_params: []const []const u8) (Error || error{UnknownParameter})!Netlist {
+        fn run(arena: Allocator, src: []const u8, dialect: Dialect, live_params: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist {
             var line_hint: usize = undefined;
             const text: []const u8 = if (S.fold_case) blk: {
                 const buf = try arena.alloc(u8, src.len);
@@ -1415,7 +1437,10 @@ fn Reader(comptime S: type) type {
             };
             try r.binOptions();
 
-            for (top_devices.items) |i| try r.readDevice(r.lines.items[i], r.kindOf(i), &top, null);
+            var scan_arenas: [scan_threads_max]std.heap.ArenaAllocator = undefined;
+            const scanned = try r.scanCards(top_devices.items, opts, &scan_arenas);
+            defer for (scan_arenas[0..scanned]) |s| s.deinit();
+            for (top_devices.items) |i| try r.readDevice(r.lines.items[i], r.kindOf(i), &top, if (scanned > 0) i else null);
             // The passes below read no one card.
             r.card = "";
             try r.shunts();
@@ -3086,14 +3111,18 @@ fn Reader(comptime S: type) type {
         /// read, as do X cards and dot cards. tests/frontend/lower.zig
         /// `element` refuses the same fields.
         fn refuseOperatorField(r: *R, line: []const u8, t: []const u8) Error!void {
-            if (!F.isWord(t)) return;
+            if (r.operatorLed(t)) return r.unsupported(line, "an operator where a name or value belongs");
+        }
+
+        /// Whether `refuseOperatorField` refuses field `t`.
+        fn operatorLed(r: *const R, t: []const u8) bool {
+            if (!F.isWord(t)) return false;
             const leads: []const u8 = switch (r.dialect) {
                 .ngspice => "%\\*/^|&?",
                 .hspice => "%\\",
                 .spectre => "",
             };
-            if (std.mem.indexOfScalar(u8, leads, t[0]) == null) return;
-            return r.unsupported(line, "an operator where a name or value belongs");
+            return std.mem.indexOfScalar(u8, leads, t[0]) != null;
         }
 
         /// A bare name: substituted when a scope defines it.
@@ -3782,8 +3811,9 @@ fn Reader(comptime S: type) type {
 
         /// Reads device card `line`; `kind` is its letter when its name does
         /// not carry it (`kindOf`), else 0.
-        /// `row` is its `lines` row when it is a subcircuit body card: the
-        /// first read keeps a `Replay` there and later instances read it.
+        /// `row` is its `lines` row when it is a subcircuit body card (the
+        /// first read keeps a `Replay` there and later instances read it)
+        /// or a top-level card `scanCards` scanned (it reads that `Replay`).
         fn readDevice(r: *R, line: []const u8, kind: u8, frame: *const Frame, row: ?usize) Error!void {
             r.card = line;
             const arena = r.arena;
@@ -3836,65 +3866,28 @@ fn Reader(comptime S: type) type {
             r.positional.clearRetainingCapacity();
             r.card_kv.clearRetainingCapacity();
             var kv_text: std.ArrayList([]const u8) = .empty;
-            // An X card expands and an HSPICE P card reads a rewritten line:
-            // neither replays.
+            // An X card expands, an HSPICE P card reads a rewritten line and
+            // a top-level card is read once: none replays.
             // ponytail: a positional literal (`R1 a b 1k`) is re-read too.
-            const slot: ?usize = if (port_card or letter == 'x') null else row;
-            var model_word: ?[]const u8 = null;
+            const slot: ?usize = if (port_card or letter == 'x' or frame.sub == null) null else row;
             var fields: std.ArrayList(ReplayField) = .empty;
 
-            if ((f.nextByte() orelse return error.ParseError) == '(') {
-                _ = f.next();
-                while (true) {
-                    const t = f.next() orelse return error.ParseError;
-                    if (t[0] == ')') break;
-                    if (t[0] == ',') continue;
-                    if (!F.isWord(t)) return error.ParseError;
-                    try r.nodes.append(arena, t);
-                }
-                const model = f.next() orelse return error.ParseError;
-                if (!F.isWord(model)) return error.ParseError;
+            const model_word = try r.cardNodes(arena, &f, letter, port_card, &r.nodes);
+            if (model_word) |model| {
                 if (letter != 'x') try r.refuseOperatorField(line, model);
-                model_word = model;
                 try r.positional.append(arena, try r.nameValue(model, frame, false));
-            } else if (fixedPins(letter)) |fixed| {
-                const count = if (port_card and mixedPort(f)) 3 else fixed;
-                try r.nodes.ensureUnusedCapacity(arena, count);
-                for (0..count) |_| {
-                    const t = f.next() orelse return error.ParseError;
-                    if (!F.isWord(t)) return error.ParseError;
-                    r.nodes.appendAssumeCapacity(t);
+            } else if (letter == 'b') {
+                const out = f.next() orelse return error.ParseError;
+                const eq = f.next() orelse return error.ParseError;
+                if (!F.isWord(out) or eq[0] != '=') return error.ParseError;
+                try r.card_kv.append(arena, .{ .key = out, .value = try r.exprValue(try r.exprRest(&f), frame, false) });
+                // A braced expression may be followed by instance
+                // parameters (`i={...} tc1=1m reciproctc=1`).
+                while (f.next()) |t| {
+                    if (!F.isWord(t) or !f.takeEq()) return error.ParseError;
+                    try r.card_kv.append(arena, .{ .key = t, .value = try r.kvValue(&f, frame, false) });
                 }
-                if (letter == 'b') {
-                    const out = f.next() orelse return error.ParseError;
-                    const eq = f.next() orelse return error.ParseError;
-                    if (!F.isWord(out) or eq[0] != '=') return error.ParseError;
-                    try r.card_kv.append(arena, .{ .key = out, .value = try r.exprValue(try r.exprRest(&f), frame, false) });
-                    // A braced expression may be followed by instance
-                    // parameters (`i={...} tc1=1m reciproctc=1`).
-                    while (f.next()) |t| {
-                        if (!F.isWord(t) or !f.takeEq()) return error.ParseError;
-                        try r.card_kv.append(arena, .{ .key = t, .value = try r.kvValue(&f, frame, false) });
-                    }
-                    return r.commit(head, letter, frame);
-                }
-            } else {
-                // Variable-terminal cards end their word list with the model/subcircuit name.
-                while (true) {
-                    const save = f.pos;
-                    const t = f.next() orelse break;
-                    if (!F.isWord(t) or f.takeEq()) {
-                        f.pos = save;
-                        break;
-                    }
-                    try r.nodes.append(arena, t);
-                }
-                // ngspice reads `X1 a b sub params: p=1` (numparam's subcircuit call).
-                if (letter == 'x' and r.dialect == .ngspice and r.nodes.items.len > 0 and std.mem.eql(u8, r.nodes.items[r.nodes.items.len - 1], "params:")) _ = r.nodes.pop();
-                const model = r.nodes.pop() orelse return error.ParseError;
-                if (letter != 'x') try r.refuseOperatorField(line, model);
-                model_word = model;
-                try r.positional.append(arena, try r.nameValue(model, frame, false));
+                return r.commit(head, letter, frame);
             }
 
             // A third node makes a mixed-mode (balanced) port, not built.
@@ -3902,26 +3895,7 @@ fn Reader(comptime S: type) type {
                 var probe = f;
                 if (probe.next()) |t| if (F.isWord(t) and !probe.takeEq()) return r.unsupported(line, "mixed-mode P element");
             }
-            while (f.next()) |t| {
-                if (t[0] == ',') {
-                    continue;
-                } else if (F.isWord(t) and f.takeEq()) {
-                    const start = f.pos;
-                    try r.card_kv.append(arena, .{ .key = t, .value = try r.kvValue(&f, frame, false) });
-                    if (letter == 'x') try kv_text.append(arena, std.mem.trim(u8, f.line[start..f.pos], " \t"));
-                    if (slot != null) {
-                        // `kvValue` read it as a literal exactly when this does.
-                        var probe = f;
-                        probe.pos = start;
-                        try fields.append(arena, .{ .word = t, .keyed = true, .num = try r.literalValue(&probe), .pos = start });
-                    }
-                } else {
-                    if (letter != 'x') try r.refuseOperatorField(line, t);
-                    const at = f.pos;
-                    try r.positional.append(arena, try r.valueAt(t, &f, frame, true, false));
-                    if (slot != null) try fields.append(arena, .{ .word = t, .keyed = false, .num = null, .pos = at });
-                }
-            }
+            try readFields(false, r, arena, line, letter, &f, frame, if (slot != null) &fields else null, &kv_text);
             if (letter == 'x') return r.expand(head, frame, kv_text.items);
             if (slot) |i| {
                 const rp = try arena.create(Replay);
@@ -3934,7 +3908,7 @@ fn Reader(comptime S: type) type {
             return r.commit(head, letter, frame);
         }
 
-        /// Reads body card `line` from the `Replay` its first read kept: the
+        /// Reads card `line` from the `Replay` its first read or `scan` kept: the
         /// nodes and literals reused, every other field re-read under `frame`
         /// in card order, then split and committed as `readDevice` does.
         fn replay(r: *R, rp: *const Replay, line: []const u8, head: []const u8, letter: u8, frame: *const Frame) Error!void {
@@ -3952,6 +3926,183 @@ fn Reader(comptime S: type) type {
             }
             if (letter == 'q' or letter == 'm' or letter == 'd') try r.splitTerminals();
             return r.commit(head, letter, frame);
+        }
+
+        /// A card's nodes into `nodes`, `f` just past its head, and the
+        /// model or subcircuit word after them: the `(`-listed nodes and
+        /// the word after the `)`, the fixed pins and null, or the words
+        /// before the first value. Reads only the line (#230).
+        fn cardNodes(r: *const R, a: Allocator, f: *F, letter: u8, port_card: bool, nodes: *std.ArrayList([]const u8)) Error!?[]const u8 {
+            if ((f.nextByte() orelse return error.ParseError) == '(') {
+                _ = f.next();
+                while (true) {
+                    const t = f.next() orelse return error.ParseError;
+                    if (t[0] == ')') break;
+                    if (t[0] == ',') continue;
+                    if (!F.isWord(t)) return error.ParseError;
+                    try nodes.append(a, t);
+                }
+                const model = f.next() orelse return error.ParseError;
+                if (!F.isWord(model)) return error.ParseError;
+                return model;
+            }
+            if (fixedPins(letter)) |fixed| {
+                const count = if (port_card and mixedPort(f.*)) 3 else fixed;
+                try nodes.ensureUnusedCapacity(a, count);
+                for (0..count) |_| {
+                    const t = f.next() orelse return error.ParseError;
+                    if (!F.isWord(t)) return error.ParseError;
+                    nodes.appendAssumeCapacity(t);
+                }
+                return null;
+            }
+            // Variable-terminal cards end their word list with the model/subcircuit name.
+            while (true) {
+                const save = f.pos;
+                const t = f.next() orelse break;
+                if (!F.isWord(t) or f.takeEq()) {
+                    f.pos = save;
+                    break;
+                }
+                try nodes.append(a, t);
+            }
+            // ngspice reads `X1 a b sub params: p=1` (numparam's subcircuit call).
+            if (letter == 'x' and r.dialect == .ngspice and nodes.items.len > 0 and std.mem.eql(u8, nodes.items[nodes.items.len - 1], "params:")) _ = nodes.pop();
+            return nodes.pop() orelse return error.ParseError;
+        }
+
+        /// The value fields after a card's nodes and model, in card order,
+        /// each noted in `fields` when it is not null. Not `pure`, each value
+        /// is read into `positional` or `card_kv` as it comes, and an X
+        /// card's value texts into `kv_text`. `pure` reads only the line,
+        /// so threads may share `r` (#230): a literal is kept in `fields`,
+        /// and a field whose read would fold, allocate a group or refuse is
+        /// `error.Fallback`, for `readDevice` to read the card whole.
+        fn readFields(
+            comptime pure: bool,
+            r: if (pure) *const R else *R,
+            a: Allocator,
+            line: []const u8,
+            letter: u8,
+            f: *F,
+            frame: if (pure) void else *const Frame,
+            fields: ?*std.ArrayList(ReplayField),
+            kv_text: if (pure) void else *std.ArrayList([]const u8),
+        ) (if (pure) error{ OutOfMemory, Fallback } else Error)!void {
+            while (f.next()) |t| {
+                if (t[0] == ',') continue;
+                if (F.isWord(t) and f.takeEq()) {
+                    const start = f.pos;
+                    if (pure) {
+                        const n = (r.literalValue(f) catch return error.Fallback) orelse return error.Fallback;
+                        try fields.?.append(a, .{ .word = t, .keyed = true, .num = n, .pos = start });
+                    } else {
+                        try r.card_kv.append(a, .{ .key = t, .value = try r.kvValue(f, frame, false) });
+                        if (letter == 'x') try kv_text.append(a, std.mem.trim(u8, f.line[start..f.pos], " \t"));
+                        if (fields) |list| {
+                            // `kvValue` read it as a literal exactly when this does.
+                            var probe = f.*;
+                            probe.pos = start;
+                            try list.append(a, .{ .word = t, .keyed = true, .num = try r.literalValue(&probe), .pos = start });
+                        }
+                    }
+                } else {
+                    const at = f.pos;
+                    if (pure) {
+                        // `valueAt` reads a word as a number or a name, and
+                        // a brace or quote as an expression `replay` folds;
+                        // a `name(` group allocates.
+                        const bare = F.isWord(t);
+                        if (r.operatorLed(t) or (bare and f.nextByte() == '(') or (!bare and t[0] != '{' and !F.isQuote(t[0]))) return error.Fallback;
+                        try fields.?.append(a, .{ .word = t, .keyed = false, .num = if (bare) S.parseNum(t) else null, .pos = at });
+                    } else {
+                        if (letter != 'x') try r.refuseOperatorField(line, t);
+                        try r.positional.append(a, try r.valueAt(t, f, frame, true, false));
+                        if (fields) |list| try list.append(a, .{ .word = t, .keyed = false, .num = null, .pos = at });
+                    }
+                }
+            }
+        }
+
+        /// Top-level card `row` read as far as its text alone decides: the
+        /// `Replay` that `readDevice` reads it from in line order, to the
+        /// result a whole read gives. Null for a card whose read takes
+        /// another path, would refuse it, or holds a field `readFields`
+        /// cannot scan; `readDevice` reads that one whole.
+        /// Reads only the dialect, the lines and their letters, fixed before
+        /// any device is read, so threads may share `r` (#230). `nodes`
+        /// and `fields` are scratch.
+        fn scan(r: *const R, a: Allocator, row: usize, nodes: *std.ArrayList([]const u8), fields: *std.ArrayList(ReplayField)) ?*const Replay {
+            const line = r.lines.items[row];
+            // `readDevice` reads an HSPICE P card from a rewritten line.
+            if (r.dialect == .hspice and std.ascii.toLower(line[0]) == 'p') return null;
+            var f = F.init(line);
+            const head = f.next() orelse return null;
+            if (!F.isWord(head) or !std.ascii.isAlphabetic(head[0])) return null;
+            const kind = r.kindOf(row);
+            const letter = if (kind != 0) kind else std.ascii.toLower(head[0]);
+            // The letters `readDevice` reads apart from the plain path, and
+            // an ngspice R card that may be a B source (`behaviouralResistor`
+            // tests a part of the line).
+            if (std.mem.indexOfScalar(u8, "bxefgh", letter) != null) return null;
+            if (r.dialect == .hspice and std.mem.indexOfScalar(u8, "usw", letter) != null) return null;
+            if (letter == 'r' and r.dialect == .ngspice and bTransformationWanted(line)) return null;
+            nodes.clearRetainingCapacity();
+            fields.clearRetainingCapacity();
+            const model = r.cardNodes(a, &f, letter, false, nodes) catch return null;
+            if (model) |m| if (r.operatorLed(m)) return null;
+            readFields(true, r, a, line, letter, &f, {}, fields, {}) catch return null;
+            const rp = a.create(Replay) catch return null;
+            rp.* = .{
+                .nodes = a.dupe([]const u8, nodes.items) catch return null,
+                .model = model,
+                .fields = a.dupe(ReplayField, fields.items) catch return null,
+            };
+            return rp;
+        }
+
+        /// Scans top-level cards `rows` into `replays` before any is read
+        /// (#230), on `opts.threads` threads, each over a contiguous run of
+        /// `rows` with its own arena in `arenas`. A record depends only on
+        /// its line, and `readDevice` still reads every card in line order,
+        /// so every id and row comes out as without the scan. Returns the
+        /// arenas begun, which the caller ends once the cards are read; 0
+        /// when it scans nothing.
+        fn scanCards(r: *R, rows: []const u32, opts: ParseOptions, arenas: *[scan_threads_max]std.heap.ArenaAllocator) Error!usize {
+            if (rows.len == 0 or rows.len < opts.scan_min) return 0;
+            const want: usize = opts.threads orelse (std.Thread.getCpuCount() catch 1);
+            if (want == 0) return 0;
+            if (r.replays.len == 0) {
+                r.replays = try r.arena.alloc(?*const Replay, r.lines.items.len);
+                @memset(r.replays, null);
+            }
+            const k: usize = if (@import("builtin").single_threaded) 1 else @min(want, scan_threads_max, rows.len);
+            std.debug.assert(k >= 1);
+            std.debug.assert(k <= rows.len);
+            for (arenas[0..k]) |*s| s.* = .init(core.gpa);
+            const per = (rows.len + k - 1) / k;
+            var threads: [scan_threads_max - 1]std.Thread = undefined;
+            var spawned: usize = 0;
+            if (!@import("builtin").single_threaded) while (spawned + 1 < k) : (spawned += 1) {
+                const lo = @min((spawned + 1) * per, rows.len);
+                const hi = @min(lo + per, rows.len);
+                threads[spawned] = std.Thread.spawn(.{}, scanRun, .{ @as(*const R, r), &arenas[spawned + 1], rows[lo..hi], r.replays }) catch break;
+            };
+            // The calling thread scans the first run, then any run whose
+            // thread failed to start.
+            for (0..k) |j| if (j == 0 or j > spawned) {
+                const lo = @min(j * per, rows.len);
+                scanRun(r, &arenas[0], rows[lo..@min(lo + per, rows.len)], r.replays);
+            };
+            for (threads[0..spawned]) |t| t.join();
+            return k;
+        }
+
+        /// `scan` of each row in `part` into `out`, allocating from `s`.
+        fn scanRun(r: *const R, s: *std.heap.ArenaAllocator, part: []const u32, out: []?*const Replay) void {
+            var nodes: std.ArrayList([]const u8) = .empty;
+            var fields: std.ArrayList(ReplayField) = .empty;
+            for (part) |i| out[i] = r.scan(s.allocator(), i, &nodes, &fields);
         }
 
         /// An E/F/G/H card in a behavioural form, `f` just past the name. Value,

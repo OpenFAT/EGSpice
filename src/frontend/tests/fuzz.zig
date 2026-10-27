@@ -5,8 +5,10 @@
 //! no leak, no error outside the set; the same digest on a second parse
 //! (determinism); the same digest after a transform the grammar says
 //! changes nothing (a comment line inserted, the deck uppercased, a card
-//! split onto a `+` continuation); and an injected allocation failure that
-//! surfaces as `OutOfMemory`, never as a panic or another error.
+//! split onto a `+` continuation); the same raw tables, ids and order with
+//! the device cards scanned on 8 threads as read whole (#230); and an
+//! injected allocation failure that surfaces as `OutOfMemory`, never as a
+//! panic or another error.
 //! `fuzz_corpus/` holds the seed decks and every input a fuzz run found;
 //! plain `zig build test` replays it.
 const std = @import("std");
@@ -122,10 +124,106 @@ fn digest(nl: *const Netlist) u64 {
     return h.final();
 }
 
+/// `outcome` reading device cards per `opts`, digested by `exactDigest`.
+fn exactOutcome(gpa: std.mem.Allocator, src: []const u8, dialect: Dialect, opts: netlist.ParseOptions) Outcome {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const nl = netlist.parseWith(arena.allocator(), src, dialect, opts) catch |err| return .{ .err = err };
+    return .{ .digest = exactDigest(&nl) };
+}
+
+/// Hashes the raw tables a parse builds, ids and row order included: the
+/// name pool, each net's name id, each device's columns and pin vertex
+/// ids, the value, key-value, op and constant rows, the models and the
+/// live tables. `digest` hashes pins by net name, so it cannot tell two
+/// parses that number the same nets differently apart (#230).
+fn exactDigest(nl: *const Netlist) u64 {
+    var h: std.hash.Wyhash = .init(0);
+    const D = struct {
+        fn int(hh: *std.hash.Wyhash, x: u64) void {
+            hh.update(std.mem.asBytes(&x));
+        }
+        fn blob(hh: *std.hash.Wyhash, b: []const u8) void {
+            int(hh, b.len);
+            hh.update(b);
+        }
+        fn val(hh: *std.hash.Wyhash, v: Value) void {
+            int(hh, @backingInt(std.meta.activeTag(v)));
+            switch (v) {
+                .num => |x| int(hh, @bitCast(x)),
+                .name => |s| blob(hh, s),
+                .expr => |span| {
+                    int(hh, span.start);
+                    int(hh, span.len);
+                },
+                .group => |g| {
+                    int(hh, g.items.len);
+                    for (g.items) |item| val(hh, item);
+                },
+            }
+        }
+        fn kvs(hh: *std.hash.Wyhash, items: []const netlist.Kv) void {
+            int(hh, items.len);
+            for (items) |kv| {
+                blob(hh, kv.key);
+                val(hh, kv.value);
+            }
+        }
+    };
+    const edges = &nl.graph.edges;
+    D.blob(&h, nl.pool.bytes.items);
+    D.blob(&h, std.mem.sliceAsBytes(nl.pool.offs.items));
+    D.blob(&h, std.mem.sliceAsBytes(nl.graph.vertices.items(.name)));
+    D.blob(&h, edges.items(.kind));
+    D.blob(&h, std.mem.sliceAsBytes(edges.items(.name)));
+    D.blob(&h, std.mem.sliceAsBytes(edges.items(.model)));
+    D.blob(&h, std.mem.sliceAsBytes(edges.items(.positional)));
+    D.blob(&h, std.mem.sliceAsBytes(edges.items(.kv)));
+    D.blob(&h, std.mem.sliceAsBytes(edges.items(.subckt_instance)));
+    D.blob(&h, std.mem.sliceAsBytes(nl.graph.offsets));
+    D.blob(&h, std.mem.sliceAsBytes(nl.graph.members));
+    D.blob(&h, std.mem.sliceAsBytes(nl.order));
+    D.blob(&h, std.mem.asBytes(&nl.kind_starts));
+    D.int(&h, nl.values.len);
+    for (nl.values) |v| D.val(&h, v);
+    D.kvs(&h, nl.kvs);
+    D.int(&h, nl.ops.len);
+    for (nl.ops) |op| {
+        D.int(&h, @backingInt(op.code));
+        D.int(&h, op.a);
+        D.int(&h, op.b);
+    }
+    D.blob(&h, std.mem.sliceAsBytes(nl.consts));
+    D.int(&h, nl.models.len);
+    for (nl.models) |m| {
+        D.blob(&h, m.name);
+        D.blob(&h, m.kind);
+        D.kvs(&h, m.kv);
+    }
+    D.int(&h, nl.live.slots.len);
+    for (nl.live.slots) |at| {
+        D.int(&h, at.row);
+        D.int(&h, at.arg);
+        D.int(&h, @backingInt(at.table));
+    }
+    D.blob(&h, std.mem.sliceAsBytes(nl.live.ops));
+    D.blob(&h, std.mem.sliceAsBytes(nl.live.scale));
+    D.blob(&h, std.mem.sliceAsBytes(nl.live.site_ops));
+    D.blob(&h, std.mem.sliceAsBytes(nl.live.site_keys));
+    D.blob(&h, std.mem.sliceAsBytes(nl.live.pool_rows));
+    D.blob(&h, std.mem.sliceAsBytes(nl.live.bins.edges));
+    D.blob(&h, std.mem.sliceAsBytes(nl.live.bins.rows));
+    return h.final();
+}
+
 /// The full oracle on one deck. `src` drives the transforms' choices.
 fn check(gpa: std.mem.Allocator, src: anytype, deck_text: []const u8, dialect: Dialect) !void {
     const base = outcome(gpa, deck_text, dialect);
     try expectSame("a second parse", base, outcome(gpa, deck_text, dialect), deck_text, deck_text);
+    // Every card read whole is the oracle of the scan (#230): on 8 threads
+    // it must build the same tables, ids and order.
+    const whole = exactOutcome(gpa, deck_text, dialect, .{ .threads = 0 });
+    try expectSame("device cards scanned on 8 threads", whole, exactOutcome(gpa, deck_text, dialect, .{ .threads = 8, .scan_min = 0 }), deck_text, deck_text);
     var buf: [transformed_max]u8 = undefined;
     if (withComment(src, deck_text, dialect, &buf)) |t|
         try expectSame("an inserted comment line", base, outcome(gpa, t, dialect), deck_text, t);
@@ -367,6 +465,61 @@ fn instancedDeck(a: std.mem.Allocator, copies: bool) ![]const u8 {
         try src.print(a, "x{d} {s} outer{s}{s}\n", .{ k, pins, if (copies) try a.print("{d}", .{k}) else "", extra });
     try src.appendSlice(a, "v1 n1 0 1\n.end\n");
     return src.items;
+}
+
+test "device cards scanned on 1 or 8 threads build the tables a whole read builds" {
+    // Oracle: a second implementation. With `threads = 0` `readDevice`
+    // reads every card whole, as before the scan (#230); a scan on 1 or 8
+    // threads must leave every table, id and row order as that read does.
+    // The cards mix scanned forms (literals, braces, names, `(` nodes,
+    // terminals `splitTerminals` moves) with ones the scan leaves whole
+    // (a named kv value, a group, X, B, E, a behavioural R), and `cv` is
+    // swept, so the read of each scanned card still appends ops.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a,
+        \\scan
+        \\.param rv=2k cv=1p
+        \\.model nch nmos level=1
+        \\.model rm r
+        \\.model dm d
+        \\.model qm npn
+        \\.subckt cell p q
+        \\r1 p q 1k
+        \\.ends
+        \\
+    );
+    for (0..300) |k| try text.print(a,
+        \\r{[k]d} na{[k]d} nb{[k]d} 1k
+        \\rb{[k]d} nb{[k]d} 0 {{rv*2}}
+        \\rc{[k]d} nb{[k]d} 0 rv
+        \\rd{[k]d} nb{[k]d} 0 2k rm
+        \\ry{[k]d} nb{[k]d} 0 {{1000*(1+v(na{[k]d}))}}
+        \\c{[k]d} na{[k]d} 0 cv m=2
+        \\m{[k]d} nd{[k]d} na{[k]d} 0 0 nch w=1u l=0.18u
+        \\mb{[k]d} nd{[k]d} na{[k]d} 0 nch w=2u
+        \\mc{[k]d} nd{[k]d} na{[k]d} 0 0 0 nch
+        \\me{[k]d} nd{[k]d} na{[k]d} 0 0 nch w=wp
+        \\d{[k]d} na{[k]d} 0 dm
+        \\q{[k]d} (nc{[k]d} na{[k]d} 0) qm area=2
+        \\l{[k]d} na{[k]d} 0 1u
+        \\k{[k]d} l{[k]d} l{[k]d} 0.5
+        \\v{[k]d} na{[k]d} 0 dc 1 pulse(0 1 0 1n 1n 5n 10n)
+        \\i{[k]d} 0 na{[k]d} 1m
+        \\x{[k]d} na{[k]d} nb{[k]d} cell
+        \\b{[k]d} na{[k]d} 0 i={{v(na{[k]d})*0.001}}
+        \\e{[k]d} na{[k]d} 0 nb{[k]d} 0 2
+        \\
+    , .{ .k = k });
+    try text.appendSlice(a, ".step param cv list 1p 2p\n.tran 1n 10n\n.end\n");
+    const whole = exactOutcome(std.testing.allocator, text.items, .ngspice, .{ .threads = 0 });
+    try std.testing.expect(whole == .digest);
+    for ([_]u32{ 1, 8 }) |threads| {
+        const got = exactOutcome(std.testing.allocator, text.items, .ngspice, .{ .threads = threads, .scan_min = 0 });
+        try expectSame("device cards scanned", whole, got, "(threads = 0)", text.items);
+    }
 }
 
 // The generator. `src` is a `*Smith` or a `*Seeded`. Writes past `deck_max`

@@ -312,7 +312,7 @@ pub const Problem = struct {
         errdefer self.library.deinit();
         self.library.toolchain = try toolchainFromEnv(a, options.hdl_toolchain);
         self.library.vpi = options.vpi;
-        const ast = try frontend.prepare(io, scratch, options.source, options.dialect, options.live_params);
+        const ast = try frontend.prepare(io, scratch, options.source, options.dialect, options.live_params, parseFromEnv());
         try frontend.loadModels(io, &self.library, scratch, ast, self.origin, options.vpi_apps);
         timingLap(io, &lap, "frontend (source, parsing, HDL)");
         self.prepared = try frontend.build(&self.library, a, scratch, ast);
@@ -2608,6 +2608,14 @@ fn raiseJitCache() void {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
     }.setenv;
     _ = setenv("CUDA_CACHE_MAXSIZE", "4294967296", 0);
+}
+
+/// `ESPICE_PARSE_THREADS=N`: N threads scan the device cards of every
+/// deck, however small, and 0 reads every card whole (#230); for A/B runs,
+/// which must give the same bytes. Unset or unparsable keeps the default.
+fn parseFromEnv() frontend.ParseOptions {
+    const v = std.mem.span(getenv("ESPICE_PARSE_THREADS") orelse return .{});
+    return .{ .threads = std.fmt.parseInt(u32, v, 10) catch return .{}, .scan_min = 0 };
 }
 
 /// The developer switches (`analysis.Knobs`), read from the environment once

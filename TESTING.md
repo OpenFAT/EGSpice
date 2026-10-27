@@ -33,6 +33,7 @@ and differential oracles come first; coverage and fuzzing alone cannot see it.
 | Wrong integrator order | observed order `log2(e_h / e_{h/2})` on RC and RLC | convergence order | `src/analysis/tests/transient.zig` |
 | Engine depends on node names, element order, impedance scale | rename, reorder, split, scale by k, 0 A source | metamorphic | `tests/metamorphic.zig` (in `test`) |
 | Parser panic, leak, undeclared error | no panic, no leak, error from the declared set; same digest on reparse and after no-op rewrites | fuzz (`std.testing.fuzz`, structured and raw) | `src/frontend/tests/{fuzz,expr,measure,source,spectre,sparam,vec}.zig`; corpus replay in `test`, `--fuzz` nightly |
+| A device card scanned on a thread (#230) reads differently from its whole read | the same deck with every card read whole (`ParseOptions.threads = 0`), its raw tables, ids and row order (`exactDigest`); 1 and 8 threads | differential, determinism | `src/frontend/tests/fuzz.zig` (every fuzzed and seeded deck, and a 5700-card deck) |
 | Expression folding wrong | recursive reference evaluator | differential fuzz | `src/frontend/tests/expr.zig` |
 | Swallowed out-of-memory | `checkAllAllocationFailures`: each allocation fails once | fault injection | 38 files under `src/` |
 | SIMD lane differs from scalar | the `W == 1` instantiation of the same kernel, bitwise | differential | `src/solver/lane/`, `src/analysis/tests/` lane tests |

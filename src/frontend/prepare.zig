@@ -63,6 +63,9 @@ const NO_NODE = analyses.NO_NODE;
 /// The netlist syntax a deck is read in: ngspice, HSPICE or Spectre.
 pub const Dialect = netlist.Dialect;
 
+/// How `prepare` reads device cards (#230).
+pub const ParseOptions = netlist.ParseOptions;
+
 /// Where a deck comes from.
 pub const Source = union(enum) {
     /// Path of the deck file.
@@ -202,8 +205,9 @@ test "detectDialect: no false positive over the corpus" {
 /// and reads no data files. Fails with `UnknownParameter` for a `live`
 /// name no global `.param` defines, with the file error of an
 /// unreadable deck, include, data or `soalimits` file, and with
-/// `InvalidSoaLimits` for a `soalimits` file `soaRatings` refuses.
-pub fn prepare(io: std.Io, session: std.mem.Allocator, input: Source, dialect: Dialect, live: []const []const u8) !netlist.Netlist {
+/// `InvalidSoaLimits` for a `soalimits` file `soaRatings` refuses. `parse`
+/// says how the device cards are read; every choice gives the same netlist.
+pub fn prepare(io: std.Io, session: std.mem.Allocator, input: Source, dialect: Dialect, live: []const []const u8, parse: ParseOptions) !netlist.Netlist {
     const origin = switch (input) {
         .file => |path| path,
         .bytes => |bytes| bytes.origin,
@@ -213,10 +217,10 @@ pub fn prepare(io: std.Io, session: std.mem.Allocator, input: Source, dialect: D
         .bytes => |bytes| try session.dupe(u8, bytes.data),
     };
     if (dialect == .spectre) {
-        return netlist.parseLive(session, try netlist.source.expandSpectre(io, session, origin, raw), dialect, live);
+        return netlist.parseLive(session, try netlist.source.expandSpectre(io, session, origin, raw), dialect, live, parse);
     }
     const runs = try netlist.source.splitAlters(session, raw);
-    var nl = try netlist.parseLive(session, try netlist.source.expand(io, std.heap.page_allocator, session, origin, runs[0]), dialect, live);
+    var nl = try netlist.parseLive(session, try netlist.source.expand(io, std.heap.page_allocator, session, origin, runs[0]), dialect, live, parse);
     const alters = try session.alloc([]const u8, runs.len - 1);
     for (alters, runs[1..]) |*text, run| text.* = try netlist.source.expand(io, std.heap.page_allocator, session, origin, run);
     nl.deck.alters = alters;
