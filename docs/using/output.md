@@ -203,6 +203,9 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
   ],
   "statistics": [
     {"name": "ph", "analysis": "ac", "kind": "monte", "n": 30, "failed": 0, "mean": -1.66, "sigma": 0.02, "min": -1.71, "max": -1.61}
+  ],
+  "soa": [
+    {"instance": "x1.mn3", "quantity": "vds", "key": "vds_max", "limit": 1.95, "peak": 2.03, "from": 1.2e-6, "to": 1.31e-6, "analysis": "tran", "variant": {"kind": "nominal"}}
   ]
 }
 ```
@@ -229,6 +232,11 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
   scale, the `scales` and `failures` lists, then `p`, `lo`, `hi` (the 95 %
   interval) and `sigma`; these four are null with an `error` when the fit
   is refused ([analyses](analyses.md#scaled-sigma)).
+- `soa` holds, under `.option soa`, every excursion past a model-card
+  limit ([analyses](analyses.md#soa)), `maxwarns` aside: the instance, the
+  quantity and the card key of its limit, the limit, the peak, and the
+  window `from` and `to` (both null at an operating point; `to` null when
+  the excursion lasts to the last point).
 
 ### Terminal currents as JSON
 

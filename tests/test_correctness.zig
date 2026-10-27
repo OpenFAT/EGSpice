@@ -380,6 +380,7 @@ fn runCase(a: Allocator, io: Io, app: []const u8, path: []const u8, expected: []
     const plots = try parseRaw(a, bytes);
     try compare(a, oracle.expect, plots);
     for (oracle.expect.checks) |check| if (try checkKind(check) == .measure) try measureLine(result.stdout, check);
+    for (oracle.expect.checks) |check| if (try checkKind(check) == .soa) try soaLines(result.stderr, check);
     for (oracle.expect.checks) |check| {
         if (!equal(try string(try field(check, "kind")), "repeatability")) continue;
         // Remove the first output so a missing second result cannot reuse it.
@@ -853,14 +854,14 @@ fn sample(p: Plot, axis: usize, col: usize, t: f64, rtol: f64, atol: f64) !Compl
     return .init(x.re + fraction * (y.re - x.re), x.im + fraction * (y.im - x.im));
 }
 
-const Check = enum { selected_values, fourier_thd, sample_moments, repeatability, pole_zero_sets, axis_bounds, time_weighted_moments, oscillation, measure };
+const Check = enum { selected_values, fourier_thd, sample_moments, repeatability, pole_zero_sets, axis_bounds, time_weighted_moments, oscillation, measure, soa };
 fn checkKind(check: Json) !Check {
     const kinds = std.StaticStringMap(Check).initComptime(.{
         .{ "selected_values", .selected_values },             .{ "fourier_thd", .fourier_thd },
         .{ "sample_moments", .sample_moments },               .{ "repeatability", .repeatability },
         .{ "pole_zero_sets", .pole_zero_sets },               .{ "axis_bounds", .axis_bounds },
         .{ "time_weighted_moments", .time_weighted_moments }, .{ "oscillation", .oscillation },
-        .{ "measure", .measure },
+        .{ "measure", .measure },                             .{ "soa", .soa },
     });
     return kinds.get(try string(try field(check, "kind"))) orelse error.UnknownCheck;
 }
@@ -885,6 +886,43 @@ fn measureLine(stdout: []const u8, check: Json) !void {
     diagnostic("  measure {s} not printed\n", .{name});
     return error.MissingMeasure;
 }
+/// The `.option soa` excursion lines on stderr (#238), `soa: <instance>
+/// <quantity> = ... from <t1> to <t2>|the end ...`, against `excursions`
+/// in order: the same instance and quantity names, each window edge within
+/// `atol`, a null `to` for one lasting to the last point. The deck sets
+/// `maxwarns` high enough to print every one.
+fn soaLines(stderr: []const u8, check: Json) !void {
+    const want = try array(try field(check, "excursions"));
+    const atol = try nfield(check, "atol");
+    try tolerance(0, atol);
+    var k: usize = 0;
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |text| {
+        if (!std.mem.startsWith(u8, text, "soa: ") or std.mem.indexOf(u8, text, " > ") == null) continue;
+        if (k == want.len) {
+            diagnostic("  unexpected {s}\n", .{text});
+            return error.SoaMismatch;
+        }
+        const w = want[k];
+        k += 1;
+        var words = std.mem.tokenizeScalar(u8, text["soa: ".len..], ' ');
+        const names_match = equal(words.next() orelse "", try string(try field(w, "instance"))) and
+            equal(words.next() orelse "", try string(try field(w, "quantity")));
+        var window = std.mem.tokenizeScalar(u8, text[(std.mem.indexOf(u8, text, " from ") orelse text.len)..], ' ');
+        _ = window.next(); // from
+        const from = std.fmt.parseFloat(f64, window.next() orelse "") catch std.math.nan(f64);
+        _ = window.next(); // to
+        const end = window.next() orelse "";
+        const want_to = try field(w, "to");
+        const to_match = if (want_to == .null) equal(end, "the") else close(.init(std.fmt.parseFloat(f64, end) catch std.math.nan(f64), 0), .init(try number(want_to) * perturb, 0), 0, atol);
+        if (names_match and to_match and close(.init(from, 0), .init(try nfield(w, "from") * perturb, 0), 0, atol)) continue;
+        diagnostic("  soa excursion {d}: {s}\n", .{ k, text });
+        return error.SoaMismatch;
+    }
+    if (k == want.len) return;
+    diagnostic("  soa: {d} of {d} excursions printed\n", .{ k, want.len });
+    return error.SoaMismatch;
+}
 fn nfield(value: Json, key: []const u8) !f64 {
     return number(try field(value, key));
 }
@@ -905,7 +943,7 @@ fn measured(name: []const u8, got: f64, expected: f64, rtol: f64) !void {
 
 fn compareCheck(a: Allocator, check: Json, plots: []const Plot) !void {
     const kind = try checkKind(check);
-    if (kind == .measure) return; // runCase reads it off stdout.
+    if (kind == .measure or kind == .soa) return; // runCase reads them off stdout and stderr.
     if (kind == .repeatability) {
         if ((try field(check, "same_netlist")) != .bool or !(try field(check, "same_netlist")).bool or
             !equal(try string(try field(check, "comparison")), "bitwise_numeric_results")) return error.InvalidOracle;
@@ -913,7 +951,7 @@ fn compareCheck(a: Allocator, check: Json, plots: []const Plot) !void {
     }
     const p = try findPlot(plots, if (kind == .fourier_thd) "Fourier Analysis" else try string(try field(check, "plot")));
     switch (kind) {
-        .repeatability, .measure => unreachable,
+        .repeatability, .measure, .soa => unreachable,
         .axis_bounds => {
             const col = try p.column(try string(try field(check, "axis")));
             const minimum = try nfield(check, "minimum");
@@ -1186,6 +1224,26 @@ test "statistical checks measure samples and reject biased output" {
     biased.data = &.{ 1, 2, 3 };
     try std.testing.expectError(error.StatisticMismatch, compareCheck(a, check, &.{biased}));
     try std.testing.expectError(error.UnknownCheck, checkKind(try std.json.parseFromSliceLeaky(Json, a, "{\"kind\":\"typo\"}", .{})));
+}
+
+// Oracle: hand-written `soa:` stderr lines against a hand-written check.
+test "soa check matches excursion names and windows in order, and nothing else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const check = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"kind": "soa", "atol": 1e-8, "excursions": [
+        \\  {"instance": "m1", "quantity": "vds", "from": 1e-6, "to": 2e-6},
+        \\  {"instance": "m1", "quantity": "vds", "from": 3e-6, "to": null}]}
+    , .{});
+    const two = "soa: m1 vds = 2.0000 V > vds_max 1.5 V from 1.000e-6 to 2.000e-6 s (tran)\n" ++
+        "soa: m1 vds = 2.0000 V > vds_max 1.5 V from 3.000e-6 to the end s (tran)\nsoa: 2 excursions on 1 instances\n";
+    try soaLines(two, check);
+    try std.testing.expectError(error.SoaMismatch, soaLines(two[0 .. std.mem.indexOfScalar(u8, two, '\n').? + 1], check));
+    try std.testing.expectError(error.SoaMismatch, soaLines(try std.mem.replaceOwned(u8, a, two, "1.000e-6", "1.100e-6"), check));
+    try std.testing.expectError(error.SoaMismatch, soaLines(try std.mem.replaceOwned(u8, a, two, "to the end", "to 4.000e-6"), check));
+    try std.testing.expectError(error.SoaMismatch, soaLines(try std.mem.replaceOwned(u8, a, two, "m1 vds", "m2 vds"), check));
+    try std.testing.expectError(error.SoaMismatch, soaLines(try std.mem.concat(a, u8, &.{ two, two }), check));
 }
 
 // Oracle: hand-written stderr and exit codes with a known category.

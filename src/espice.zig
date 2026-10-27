@@ -1355,7 +1355,11 @@ pub const Problem = struct {
     /// `espice-measures/1` (#235): `deck`, the `results` in the printed
     /// order, each with its analysis, its `variant` (`output.writeVariantJson`)
     /// and the `from`/`to`/`at` its line prints, a failed one with a null
-    /// `value` and an `error`; then the Monte Carlo `statistics`.
+    /// `value` and an `error`; then the Monte Carlo `statistics`; then
+    /// under `.option soa` every excursion `print_soa` counts (#238), as
+    /// `instance`, `quantity`, `key`, `limit`, `peak`, its window `from` and
+    /// `to` (null at an operating point, `to` null past the last point), and
+    /// its result's `analysis` and `variant`.
     /// `error.MeasuresJsonOff` without `Options.measures_json`.
     pub fn write_measures_json(self: *Problem, out: *std.Io.Writer, deck: []const u8) !void {
         const results = if (self.measure_json) |*j| j.written() else return error.MeasuresJsonOff;
@@ -1367,7 +1371,15 @@ pub const Problem = struct {
         defer stats.deinit();
         try self.writeStatistics(&stats.writer, true);
         const s = stats.written();
-        try out.print("{s}\n  ]\n}}\n", .{if (s.len == 0) "" else s[1..]});
+        try out.print("{s}\n  ],\n  \"soa\": [", .{if (s.len == 0) "" else s[1..]});
+        var soa: std.Io.Writer.Allocating = .init(self.allocator);
+        defer soa.deinit();
+        var tally: SoaTally = .{ .gpa = self.allocator, .json = &soa.writer };
+        defer tally.instances.deinit(self.allocator);
+        try tally.session(&self.session);
+        for (self.runs) |*run| try tally.session(&run.session);
+        const e = soa.written();
+        try out.print("{s}\n  ]\n}}\n", .{if (e.len == 0) "" else e[1..]});
     }
 
     /// Writes `--emir`'s document `k` (#237), `espice-emir/1`, and returns
@@ -1915,14 +1927,15 @@ pub const Problem = struct {
     }
 };
 
-/// The index of the `.meas` card named `name` (case-insensitive), the first
-/// when several share it.
 /// `Problem.print_soa`'s running count: the excursions, the instances they
 /// happened on, and the (limit, result) pairs a missing column skipped.
+/// Each excursion prints to `out` while `max_warns` allows, and with `json`
+/// is also a JSON object there, led by `,\n` (`write_measures_json`).
 const SoaTally = struct {
     gpa: std.mem.Allocator,
-    out: *std.Io.Writer,
-    max_warns: u32,
+    out: ?*std.Io.Writer = null,
+    json: ?*std.Io.Writer = null,
+    max_warns: u32 = 0,
     excursions: u64 = 0,
     instances: std.StringHashMapUnmanaged(void) = .empty,
     skipped: u64 = 0,
@@ -1932,20 +1945,19 @@ const SoaTally = struct {
     fn session(tally: *SoaTally, s: *const analysis.session.Session) !void {
         for (s.outputs.items) |id| {
             const info = try s.info(id);
-            switch (info.kind) {
-                .op, .dc, .tran => {},
-                else => continue, // else: only these publish the accepted points
-            }
-            if (info.status != .complete or s.released(id)) continue;
-            const res = try s.result(id);
-            const label = if (variantOf(try s.query(id))) |v| s.deck.variants.labels[v] else "";
-            for (s.deck.soa.limits) |lim| try tally.scan(lim, res, info.kind, label);
+            if (!soaChecked(info.kind) or info.status != .complete or s.released(id)) continue;
+            try tally.result(s, try s.query(id), info.kind, try s.result(id));
         }
+    }
+
+    /// Every SOA limit of `s`'s deck over `res`, the result of `job`.
+    fn result(tally: *SoaTally, s: *const analysis.session.Session, job: Query, kind: requests.Kind, res: Result) !void {
+        for (s.deck.soa.limits) |lim| try tally.scan(lim, res, s, job, kind);
     }
 
     /// `lim` over every row of `res`; `kind` says what column 0 is: a
     /// transient's time, a DC sweep's value, nothing for an operating point.
-    fn scan(tally: *SoaTally, lim: core.SoaLimit, res: Result, kind: requests.Kind, label: []const u8) !void {
+    fn scan(tally: *SoaTally, lim: core.SoaLimit, res: Result, s: *const analysis.session.Session, job: Query, kind: requests.Kind) !void {
         const w = res.varnames.len;
         if (res.data.len != res.npoints * w) {
             tally.skipped += 1;
@@ -1971,20 +1983,39 @@ const SoaTally = struct {
                 peak = if (from == null) v else @max(peak, v);
                 if (from == null) from = at;
             } else if (from) |f| {
-                try tally.excursion(lim, peak, f, at, kind, label);
+                try tally.excursion(lim, peak, f, at, s, job, kind);
                 from = null;
             }
         }
-        if (from) |f| try tally.excursion(lim, peak, f, null, kind, label);
+        if (from) |f| try tally.excursion(lim, peak, f, null, s, job, kind);
     }
 
     /// Counts one excursion, `from` to `to` (null: past the last row) at
-    /// `peak`, and prints it while `max_warns` allows.
-    fn excursion(tally: *SoaTally, lim: core.SoaLimit, peak: f64, from: f64, to: ?f64, kind: requests.Kind, label: []const u8) !void {
+    /// `peak`, prints it while `max_warns` allows and writes it to `json`.
+    fn excursion(tally: *SoaTally, lim: core.SoaLimit, peak: f64, from: f64, to: ?f64, s: *const analysis.session.Session, job: Query, kind: requests.Kind) !void {
         tally.excursions += 1;
         try tally.instances.put(tally.gpa, lim.name, {});
+        const row = variantOf(job);
+        if (tally.json) |j| {
+            const nan = std.math.nan(f64);
+            const windowed = kind != .op;
+            try j.writeAll(",\n    {\"instance\": ");
+            try std.json.Stringify.encodeJsonString(lim.name, .{}, j);
+            try j.print(", \"quantity\": \"{s}\", \"key\": \"{s}\", \"limit\": ", .{ lim.quantity, lim.key });
+            try output.writeJsonNumber(j, lim.limit);
+            try j.writeAll(", \"peak\": ");
+            try output.writeJsonNumber(j, peak);
+            try j.writeAll(", \"from\": ");
+            try output.writeJsonNumber(j, if (windowed) from else nan);
+            try j.writeAll(", \"to\": ");
+            try output.writeJsonNumber(j, if (windowed) (to orelse nan) else nan);
+            try j.print(", \"analysis\": \"{t}\", \"variant\": ", .{kind});
+            try output.writeVariantJson(j, s.deck.variants, row, tempOf(job));
+            try j.writeAll("}");
+        }
+        const out = tally.out orelse return;
         if (tally.excursions > tally.max_warns) return;
-        const out = tally.out;
+        const label = if (row) |v| s.deck.variants.labelAt(v) else "";
         try out.print("soa: {s} {s} = {d:.4} V > {s} {d} V", .{ lim.name, lim.quantity, peak, lim.key, lim.limit });
         if (kind != .op) {
             try out.print(" from {e:.3}", .{from});
@@ -1995,6 +2026,14 @@ const SoaTally = struct {
     }
 };
 
+/// Whether `.option soa` reads a `kind` result: only these publish the
+/// accepted points.
+fn soaChecked(kind: requests.Kind) bool {
+    return kind == .op or kind == .dc or kind == .tran;
+}
+
+/// The index of the `.meas` card named `name` (case-insensitive), the first
+/// when several share it.
 fn measureIndex(measures: []const core.Measure, name: []const u8) ?u32 {
     for (measures, 0..) |m, k| if (std.ascii.eqlIgnoreCase(m.name, name)) return @as(u32, @intCast(k));
     return null;
@@ -2176,7 +2215,15 @@ fn printQueryMeasures(gpa: std.mem.Allocator, session: *const analysis.session.S
     }
     const sink: ?output.MeasureJson = if (json) |j| .{ .out = j, .head = head.written() } else null;
     if (info.status == .complete) {
-        try output.printMeasures(out, err, measures, info.kind, try block(session, id, 0), point, sink);
+        var res = try block(session, id, 0);
+        // `soa_count()` (#238): this result's excursions, when none was skipped.
+        if (session.deck.soa.limits.len != 0 and soaChecked(info.kind)) {
+            var tally: SoaTally = .{ .gpa = gpa };
+            defer tally.instances.deinit(gpa);
+            try tally.result(session, job, info.kind, res);
+            if (tally.skipped == 0) res.soa_count = @floatFromInt(tally.excursions);
+        }
+        try output.printMeasures(out, err, measures, info.kind, res, point, sink);
     } else if (point) |p| if (info.status.terminal()) try output.printFailedMeasures(out, measures, info.kind, p, sink);
 }
 

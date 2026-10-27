@@ -577,7 +577,7 @@ pub const Stream = struct {
         if (col.ops.len > passes.Program.max) return null;
         for (col.ops, p.ops[0..col.ops.len]) |op, *o| o.* = switch (op) {
             .num => |x| .{ .code = .num, .num = x },
-            .measure => .{ .code = .nan },
+            .measure, .soa_count => .{ .code = .nan },
             .vector => |name| blk: {
                 // `Sample.leaf`'s column: every name resolved when the
                 // waveform was made.
@@ -1024,7 +1024,7 @@ fn evaluate(out: *Writer, m: core.Measure, w: Wave) EvalError!f64 {
             return hi - lo;
         },
         .param => {
-            const v = try defined(paramValue(m.expr, w.values));
+            const v = try defined(paramValue(m.expr, w.values, w.result.soa_count));
             try out.print("{s:<20}=  {f}\n", .{ m.name, sci(v, 5) });
             try w.record(m.name, v, .{});
             return v;
@@ -1124,7 +1124,7 @@ fn crossing(x0: f64, y0: f64, x1: f64, y1: f64, level: f64) f64 {
 fn resolve(c: Clause, values: []const f64) !Clause {
     var r = c;
     for (c.refs) |ref| {
-        const v = try defined(paramValue(ref.expr, values));
+        const v = try defined(paramValue(ref.expr, values, nan));
         switch (ref.field) {
             .val => r.val = v,
             .td => r.td = v,
@@ -1233,30 +1233,33 @@ fn fftFigure(mag: Column, freq: Column, n: usize, c: Clause, func: core.MeasureF
     };
 }
 
-/// Folds a PARAM card's postfix over the results in `values`; NaN when a
-/// result it reads is missing or it reads a vector.
-fn paramValue(ops: []const core.MeasureOp, values: []const f64) f64 {
+/// Folds a PARAM card's postfix over the results in `values`, `soa_count()`
+/// reading `soa`; NaN when a result it reads is missing or it reads a
+/// vector.
+fn paramValue(ops: []const core.MeasureOp, values: []const f64, soa: f64) f64 {
     return fold(ops, struct {
         values: []const f64,
+        soa: f64,
         fn leaf(s: @This(), op: core.MeasureOp, _: usize) f64 {
             return switch (op) {
                 .num => |x| x,
                 .measure => |k| if (k < s.values.len) s.values[k] else nan,
+                .soa_count => s.soa,
                 .vector, .neg, .add, .sub, .mul, .div, .pow => nan,
             };
         }
-    }{ .values = values });
+    }{ .values = values, .soa = soa });
 }
 
-/// Folds measure postfix; `leaves.leaf(op, v)` values each `num`, `measure`
-/// and `vector` op, `v` counting the vector ops before it. NaN on a stack
+/// Folds measure postfix; `leaves.leaf(op, v)` values each `num`, `measure`,
+/// `soa_count` and `vector` op, `v` counting the vector ops before it. NaN on a stack
 /// overflow or underflow, or a malformed tail.
 fn fold(ops: []const core.MeasureOp, leaves: anytype) f64 {
     var stack: [32]f64 = undefined;
     var n: usize = 0;
     var vectors: usize = 0;
     for (ops) |op| switch (op) {
-        .num, .measure, .vector => {
+        .num, .measure, .vector, .soa_count => {
             if (n == stack.len) return nan;
             stack[n] = leaves.leaf(op, vectors);
             vectors += @intFromBool(op == .vector);
@@ -1277,7 +1280,7 @@ fn fold(ops: []const core.MeasureOp, leaves: anytype) f64 {
                 .mul => x.* * b,
                 .div => x.* / b,
                 .pow => std.math.pow(f64, x.*, b),
-                .num, .measure, .vector, .neg => unreachable,
+                .num, .measure, .vector, .soa_count, .neg => unreachable,
             };
         },
     };
@@ -1339,7 +1342,7 @@ const Sample = struct {
                 const c: Column = .{ .data = p.data, .stride = p.stride, .offset = k * @as(usize, if (p.complex) 2 else 1), .complex = p.complex, .vectype = p.vectype };
                 break :blk c.get(s.i);
             },
-            .measure => nan,
+            .measure, .soa_count => nan,
             .neg, .add, .sub, .mul, .div, .pow => unreachable,
         };
     }

@@ -48,6 +48,10 @@ pub const Result = struct {
     /// A transient's device terminal currents under `PointOptions.emir`
     /// (#237); no terminals without it.
     emir: Emir = .{},
+    /// The excursions `.option soa` found over this result's rows (#238),
+    /// which a `.meas` PARAM `soa_count()` reads; NaN where none was
+    /// counted (no limit, or a result the check does not read).
+    soa_count: f64 = std.math.nan(f64),
 };
 
 /// `--emir` (#237): the window a transient's terminal currents were read

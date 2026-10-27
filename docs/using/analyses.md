@@ -614,6 +614,29 @@ limit whose terminal `.save` leaves out is not checked, and the count of
 such checks is printed. `.biaschk` stays for expressions a rating table
 cannot state.
 
+A kit whose model cards state no limits can name them in a file:
+
+```text
+.option soa=1 soalimits="sky130_soa.json"
+```
+
+```json
+{"sky130_fd_pr__nfet_01v8": {"vds_max": 1.95, "vgs_max": 1.95}}
+```
+
+Each name rates the models it equals or starts with (so a binned model's
+`name.1`, `name.2`, ...); the longest such name wins. The file reaches
+only a model card that states none of its device's limits, so a card
+value is never shadowed. The path is relative to the deck. A file that is
+not one such object of finite numbers under the keys above refuses the
+deck, naming the file.
+
+The counts are measurable: `.meas tran soa_n param='soa_count()'` is the
+number of excursions in the result the card reads (each `.step` point its
+own); it has no value where a limit was not checked. Under
+`--measures` ([output](output.md#measurements-as-json)) each excursion is
+also an object under `soa`.
+
 ## Runs over variants
 
 These wrap other analyses rather than being analyses themselves; see the

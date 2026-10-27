@@ -383,6 +383,7 @@ pub const Planner = struct {
         const label = try std.fmt.allocPrint(p.sim, "alter={d}", .{k});
         const alt = try p.scratch.create(Netlist);
         alt.* = try netlist.parse(p.scratch, text, p.nl.deck.dialect);
+        alt.soa_ratings = p.nl.soa_ratings;
         if (!own and sameCards(p.nl, alt)) {
             var arena = std.heap.ArenaAllocator.init(core.gpa);
             defer arena.deinit();

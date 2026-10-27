@@ -365,6 +365,10 @@ const data_file_keys = std.StaticStringMap(void).initComptime(.{
 /// A `ForeignKind.data` file's contents, read by `prepare`.
 pub const DataFile = struct { path: []const u8, bytes: []const u8 };
 
+/// One limit of the `.options soalimits=` file (#238): SOA key `key`
+/// (`vds_max`) at `limit` for every model named `model` or starting with it.
+pub const SoaRating = struct { model: []const u8, key: []const u8, limit: f64 };
+
 /// Deck data: everything that is not circuit topology.
 pub const Deck = struct {
     /// The first line as written, original case.
@@ -388,6 +392,9 @@ pub const Deck = struct {
     /// `.options vpi="app.so"` paths as written (relative to the deck): VPI
     /// applications to load (LRM 12.33, #197).
     vpi_apps: []const []const u8 = &.{},
+    /// `.options soalimits="file.json"` as written (relative to the deck),
+    /// the last one given; empty without one (#238).
+    soa_file: []const u8 = "",
     /// `.meas` cards; their strings borrow the parse arena.
     measures: []const core.Measure,
     /// `.step` cards in deck order; the last varies fastest.
@@ -464,6 +471,8 @@ pub const Netlist = struct {
     tunable: []const u32 = &.{},
     /// The `ForeignKind.data` files, as `prepare` read them.
     files: []const DataFile = &.{},
+    /// The `.options soalimits=` file's limits, as `prepare` read them.
+    soa_ratings: []const SoaRating = &.{},
 
     /// A card as the builder reads it.
     pub const View = struct {
@@ -1165,6 +1174,7 @@ fn Reader(comptime S: type) type {
         appendmodels: std.ArrayList(AppendModel) = .empty,
         foreign: std.ArrayList(Foreign) = .empty,
         vpi_apps: std.ArrayList([]const u8) = .empty,
+        soa_file: []const u8 = "",
         measures: std.ArrayList(core.Measure) = .empty,
         instances: u32 = 1,
         /// `.data` and `.variation` blocks: first and one-past-last line.
@@ -1422,6 +1432,7 @@ fn Reader(comptime S: type) type {
                     .probe_op = r.probe_op,
                     .foreign = r.foreign.items,
                     .vpi_apps = r.vpi_apps.items,
+                    .soa_file = r.soa_file,
                     .measures = r.measures.items,
                     .steps = r.steps.items,
                     .data = r.data.items,
@@ -2100,19 +2111,21 @@ fn Reader(comptime S: type) type {
             return "";
         }
 
-        /// A `.options` card that sets `vpi=` (ESPice's, #197): each
-        /// `vpi="app.so"` names a VPI application (LRM 12.33) for `vpi_apps`,
-        /// path case kept; the card's other options read as any `.options`.
-        fn readVpiOptions(r: *R, line: []const u8) Error!void {
+        /// A `.options` card that names a file, path case kept: each
+        /// `vpi="app.so"` (ESPice's, #197) a VPI application (LRM 12.33) for
+        /// `vpi_apps`, `soalimits="file.json"` (#238) the SOA limits for
+        /// `soa_file`. The card's other options read as any `.options`.
+        fn readFileOptions(r: *R, line: []const u8) Error!void {
             var f = F.init(line);
             _ = f.next(); // the card
             var rest: std.ArrayList(u8) = .empty;
             try rest.appendSlice(r.arena, ".options");
             while (f.next()) |t| {
-                if (std.mem.eql(u8, t, "vpi")) {
+                if (std.mem.eql(u8, t, "vpi") or std.mem.eql(u8, t, "soalimits")) {
                     const eq = f.next() orelse return r.failed(line, error.ParseError);
                     if (eq[0] != '=') return r.failed(line, error.ParseError);
-                    try r.vpi_apps.append(r.arena, r.pathOf(&f) catch |err| return r.failed(line, err));
+                    const path = r.pathOf(&f) catch |err| return r.failed(line, err);
+                    if (t[0] == 'v') try r.vpi_apps.append(r.arena, path) else r.soa_file = path;
                     continue;
                 }
                 try rest.append(r.arena, ' ');
@@ -2148,7 +2161,7 @@ fn Reader(comptime S: type) type {
             // schedule for an OS-level restore [CR .STORE]; the results do not
             // depend on it.
             if (c == .store) return std.log.warn("netlist: .store: checkpoints are not written; the run is not restartable", .{});
-            if (c == .options and setsKey(line, "vpi")) return r.readVpiOptions(line);
+            if (c == .options and (setsKey(line, "vpi") or setsKey(line, "soalimits"))) return r.readFileOptions(line);
             // `FAIL='expr'` keeps its text: `readArgs` would fold it before
             // the `.meas` cards it names are read.
             const fail = if (c == .analysis and setsKey(line, "fail")) try r.cutFail(line, &f) else "";
@@ -3266,7 +3279,8 @@ fn Reader(comptime S: type) type {
 
         /// A `PARAM=` or `par()` measure expression in postfix: names of
         /// earlier `.meas` cards read their results, global parameters fold
-        /// to numbers, `v(a[,b])` and `i(x)` read result vectors. Arithmetic
+        /// to numbers, `v(a[,b])` and `i(x)` read result vectors, and
+        /// `soa_count()` the result's SOA excursions (#238). Arithmetic
         /// only; anything else is a ParseError. The ops live in the arena.
         pub fn measureExpr(r: *R, text: []const u8) Error![]const core.MeasureOp {
             const body = if (text.len > 0 and (text[0] == '{' or F.isQuote(text[0]))) F.body(text) else text;
@@ -3297,6 +3311,7 @@ fn Reader(comptime S: type) type {
                 .mul => .mul,
                 .div => .div,
                 .pow => .pow,
+                .ucall => if (op.b == 0 and std.ascii.eqlIgnoreCase(names[op.a], "soa_count")) .soa_count else return error.ParseError,
                 else => return error.ParseError,
             });
             return out.items;

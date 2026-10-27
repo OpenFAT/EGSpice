@@ -771,17 +771,30 @@ test "an R reading v() is ngspice's B source: pow() takes |x|, tc divides, m mul
     try t.expectApproxEqRel(@as(f64, -0.5 * 2 / (1017.28 * 1.035178)), i, 1e-12);
 }
 
-/// What `print_soa` writes once `source` runs as the CLI runs it: a final
+/// `source`, read as the deck at `origin`, run as the CLI runs it: a final
 /// plan with `auto_point`, which streams, trims and releases every
-/// waveform no reader claims. The caller frees it.
-fn soaText(source: []const u8) ![]u8 {
+/// waveform no reader claims. The caller deinits it.
+fn soaRun(source: []const u8, origin: []const u8) !*api.Problem {
     const p = try api.Problem.init(t.allocator, t.io, .{
-        .source = .{ .bytes = .{ .data = source, .origin = "soa.cir" } },
+        .source = .{ .bytes = .{ .data = source, .origin = origin } },
         .backend = .{ .final_plan = true },
         .auto_point = true,
     });
-    defer p.deinit();
+    errdefer p.deinit();
     try p.run_all();
+    return p;
+}
+
+/// What `print_soa` writes once `source` runs (`soaRun`). The caller
+/// frees it.
+fn soaText(source: []const u8) ![]u8 {
+    return soaTextAt(source, "soa.cir");
+}
+
+/// `soaText` of the deck at `origin`.
+fn soaTextAt(source: []const u8, origin: []const u8) ![]u8 {
+    const p = try soaRun(source, origin);
+    defer p.deinit();
     var text: std.Io.Writer.Allocating = .init(t.allocator);
     defer text.deinit();
     try p.print_soa(&text.writer);
@@ -832,6 +845,123 @@ test ".option soa: a ramp crossing vgs_max twice is two excursions; maxwarns pri
     try t.expect(to >= 1.5e-6 and to <= 1.52e-6);
     try t.expectEqualStrings("soa: 2 excursions on 1 instances", lines.next().?);
     try t.expectEqualStrings("", lines.rest());
+}
+
+test ".option soa: BJT vce_max, diode bv_max, R and C bv_max held at the limit report nothing, 1 mV past it one excursion (#238)" {
+    // Oracle: as for vgs_max, each limit is the solved terminal voltage of
+    // the same deck checked against a limit far above it, and no SOA key
+    // binds to a model field. The diode's bv_max holds its reverse voltage
+    // v(k) - v(a), here v(k) with the anode grounded.
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "soa q\nV1 c 0 2\nV2 b 0 0.6\nQ1 c b 0 qn\n.model qn npn vce_max={e}\n.option soa=1\n.op\n.end\n", "v(c)", "soa: q1 vce = " },
+        .{ "soa d\nV1 k 0 3\nD1 0 k dm\n.model dm d bv_max={e}\n.option soa=1\n.op\n.end\n", "v(k)", "soa: d1 vr = " },
+        .{ "soa r\nV1 a 0 1.5\nR1 a 0 1k rm\n.model rm r bv_max={e}\n.option soa=1\n.op\n.end\n", "v(a)", "soa: r1 v = " },
+        .{ "soa c\nV1 a 0 2.5\nC1 a 0 1p cm\n.model cm c bv_max={e}\n.option soa=1\n.op\n.end\n", "v(a)", "soa: c1 v = " },
+    };
+    var buf: [256]u8 = undefined;
+    // Inline: each deck is a format string.
+    inline for (cases) |c| {
+        const v = try opValue(try std.fmt.bufPrint(&buf, c[0], .{@as(f64, 1e3)}), c[1]);
+        const at = try soaText(try std.fmt.bufPrint(&buf, c[0], .{v}));
+        defer t.allocator.free(at);
+        try t.expectEqualStrings("", at);
+        const over = try soaText(try std.fmt.bufPrint(&buf, c[0], .{v - 1e-3}));
+        defer t.allocator.free(over);
+        try t.expect(std.mem.startsWith(u8, over, c[2]));
+        try t.expect(std.mem.endsWith(u8, over, " (op)\nsoa: 1 excursions on 1 instances\n"));
+        try t.expectEqual(@as(usize, 2), std.mem.count(u8, over, "\n"));
+    }
+}
+
+test ".option soa: a DC sweep's excursion is windowed by sweep values; at the limit nothing (#238)" {
+    // Oracle: V2 sweeps v(g) over 0, 0.5, ..., 2 V. Held to the solved v(g)
+    // at 2 V no point exceeds it; 1 mV under that, the last point alone
+    // does: one excursion from 2 to the end of the sweep.
+    const body = "soa dc\nV1 d 0 1\nV2 g 0 0\nM1 d g 0 0 nm\n.model nm nmos level=1 vgs_max={e}\n.option soa=1\n.dc V2 0 2 0.5\n.end\n";
+    var buf: [256]u8 = undefined;
+    const p = try create(try std.fmt.bufPrint(&buf, body, .{@as(f64, 1e3)}));
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .dc));
+    try t.expectEqual(@as(usize, 5), r.npoints);
+    const vg = r.data[(r.npoints - 1) * r.varnames.len + try columnIndex(r, "v(g)")];
+    const at = try soaText(try std.fmt.bufPrint(&buf, body, .{vg}));
+    defer t.allocator.free(at);
+    try t.expectEqualStrings("", at);
+    const over = try soaText(try std.fmt.bufPrint(&buf, body, .{vg - 1e-3}));
+    defer t.allocator.free(over);
+    try t.expect(std.mem.startsWith(u8, over, "soa: m1 vgs = "));
+    try t.expect(std.mem.endsWith(u8, over, " from 2.000e0 to the end (dc)\nsoa: 1 excursions on 1 instances\n"));
+}
+
+test ".option soa: under .step only the point past the limit reports, labelled with its point (#238)" {
+    // Oracle: v(g) is the stepped vg. The limit is the solved v(g) of the
+    // deck at vg=2, so the vg=1 point is under it and the vg=2 point at it,
+    // or 1 mV past it.
+    const body = "soa step\n.param vg=2\nV1 d 0 1\nV2 g 0 {{vg}}\nM1 d g 0 0 nm\n.model nm nmos level=1 vgs_max={e}\n.option soa=1\n{s}.op\n.end\n";
+    var buf: [256]u8 = undefined;
+    const vg = try opValue(try std.fmt.bufPrint(&buf, body, .{ @as(f64, 1e3), "" }), "v(g)");
+    const at = try soaText(try std.fmt.bufPrint(&buf, body, .{ vg, ".step param vg list 1 2\n" }));
+    defer t.allocator.free(at);
+    try t.expectEqualStrings("", at);
+    const over = try soaText(try std.fmt.bufPrint(&buf, body, .{ vg - 1e-3, ".step param vg list 1 2\n" }));
+    defer t.allocator.free(over);
+    try t.expect(std.mem.startsWith(u8, over, "soa: m1 vgs = "));
+    try t.expect(std.mem.endsWith(u8, over, " (op vg=2)\nsoa: 1 excursions on 1 instances\n"));
+}
+
+test ".option soalimits: models whose cards state no limit take the file's, by the longest name prefix; a card's own are never shadowed (#238)" {
+    // Oracle: v(g) = 2 V and v(d) = 1 V at every MOSFET (V2, V1). The file
+    // rates `nch` at vgs_max 1.5 and `nch_a` at vds_max 0.5. M1 (nch_a)
+    // takes the longer name's vds_max only, M3 (nch_c) the shorter's
+    // vgs_max, and M2's card states vds_max=5, so no file limit reaches it.
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const origin = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/soa.cir", .{tmp.sub_path});
+    defer t.allocator.free(origin);
+    const body = "soa file\nV1 d 0 1\nV2 g 0 2\nM1 d g 0 0 nch_a\nM2 d g 0 0 nch_b\nM3 d g 0 0 nch_c\n" ++
+        ".model nch_a nmos level=1\n.model nch_b nmos level=1 vds_max=5\n.model nch_c nmos level=1\n.option soa=1 soalimits=\"limits.json\"\n.op\n.end\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "limits.json", .data = "{\"nch\": {\"vgs_max\": 1.5}, \"nch_a\": {\"vds_max\": 0.5}}" });
+    const text = try soaTextAt(body, origin);
+    defer t.allocator.free(text);
+    try t.expectEqualStrings("soa: m1 vds = 1.0000 V > vds_max 0.5 V (op)\nsoa: m3 vgs = 2.0000 V > vgs_max 1.5 V (op)\nsoa: 2 excursions on 2 instances\n", text);
+    // The trust boundary: each file below refuses the deck, a missing one
+    // with its file error.
+    const refused = [_][]const u8{
+        "not json",
+        "{\"nch\": {\"vgs_mx\": 1.5}}", // no SOA limit
+        "{\"nch\": {\"vgs_max\": \"nan\"}}", // no finite number
+        "{\"nch\": {\"vgs_max\": 1e999}}",
+        "{\"nch\": {\"vgs_max\": 1}, \"nch\": {\"vds_max\": 1}}", // the name twice
+        "[1.5]",
+    };
+    for (refused) |json| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "limits.json", .data = json });
+        try t.expectError(error.InvalidSoaLimits, api.Problem.init(t.allocator, io, .{ .source = .{ .bytes = .{ .data = body, .origin = origin } } }));
+    }
+    try tmp.dir.deleteFile(io, "limits.json");
+    try t.expectError(error.FileNotFound, api.Problem.init(t.allocator, io, .{ .source = .{ .bytes = .{ .data = body, .origin = origin } } }));
+}
+
+test ".meas param='soa_count()' is its result's excursion count: the ramp crossing twice counts 2 (#238)" {
+    // Oracle: the ramp of the maxwarns test, past vgs_max on two windows
+    // only, and print_soa's own count of the same run.
+    const p = try soaRun("soa ramp\nV1 d 0 1\nV2 g 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)\nM1 d g 0 0 nm\n" ++
+        ".model nm nmos level=1 vgs_max=1\n.option soa=1\n.meas tran soa_n param='soa_count()'\n.tran 10n 4u\n.end\n", "soa.cir");
+    defer p.deinit();
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var errors: std.Io.Writer.Allocating = .init(t.allocator);
+    defer errors.deinit();
+    try p.print_measures(&text.writer, &errors.writer);
+    const line = text.written()[std.mem.indexOf(u8, text.written(), "soa_n").?..];
+    var fields = std.mem.tokenizeAny(u8, line["soa_n".len..], " =\n");
+    try t.expectEqual(@as(f64, 2), try std.fmt.parseFloat(f64, fields.next().?));
+    var soa: std.Io.Writer.Allocating = .init(t.allocator);
+    defer soa.deinit();
+    try p.print_soa(&soa.writer);
+    try t.expect(std.mem.endsWith(u8, soa.written(), "soa: 2 excursions on 1 instances\n"));
 }
 
 test "Monte Carlo: a B source reads the trial's draw of a sampled .param, as a resistor does (#133)" {
@@ -1864,6 +1994,40 @@ test "--measures (#235): a .step deck's JSON is its printed .meas lines, each la
     defer again.deinit();
     try p.write_measures_json(&again.writer, "deck.sp");
     try t.expectEqualStrings(json.written(), again.written());
+}
+
+test "--measures (#238): each SOA excursion is an object with its instance, limit, peak, window and variant; soa_count() per point" {
+    // Oracle: V2 sweeps v(g) over 0..2 V at v(d) = vd. vgs passes 1.5 V at
+    // the 2 V point alone, at both steps; vds = 2 V passes 1.5 V at every
+    // point of the vd=2 step only. So 1 excursion at vd=1, 2 at vd=2, each
+    // open at the sweep's end.
+    const source: api.Source = .{ .bytes = .{ .data = "soa json\n.param vd=1\nV1 d 0 {vd}\nV2 g 0 0\nM1 d g 0 0 nm\n" ++
+        ".model nm nmos level=1 vgs_max=1.5 vds_max=1.5\n.option soa=1\n.step param vd list 1 2\n.dc V2 0 2 0.5\n" ++
+        ".meas dc n param='soa_count()'\n.end\n", .origin = "soa.cir" } };
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(source, .ngspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    const results = jsonResults(parsed);
+    try t.expectEqual(@as(usize, 2), results.len);
+    for (results, [_]f64{ 1, 2 }) |r, n| try t.expectEqual(n, jsonFloat(r.object.get("value").?));
+    const soa = parsed.value.object.get("soa").?.array.items;
+    try t.expectEqual(@as(usize, 3), soa.len);
+    const want = [_]struct { []const u8, f64, f64 }{ .{ "vgs", 1, 2 }, .{ "vgs", 2, 2 }, .{ "vds", 2, 0 } };
+    for (soa, want) |e, w| {
+        const o = e.object;
+        try t.expectEqualStrings("m1", o.get("instance").?.string);
+        try t.expectEqualStrings(w[0], o.get("quantity").?.string);
+        try t.expectEqual(@as(f64, 1.5), jsonFloat(o.get("limit").?));
+        try t.expectApproxEqAbs(@as(f64, 2), jsonFloat(o.get("peak").?), 1e-9);
+        try t.expectEqual(w[2], jsonFloat(o.get("from").?));
+        try t.expect(o.get("to").? == .null);
+        try t.expectEqualStrings("dc", o.get("analysis").?.string);
+        try t.expectEqual(w[1], jsonFloat(o.get("variant").?.object.get("params").?.object.get("vd").?));
+    }
 }
 
 test "--measures (#235): an .alter deck labels the nominal run and the altered one" {
