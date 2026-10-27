@@ -866,8 +866,56 @@ test "Monte Carlo: a B source reads the trial's draw of a sampled .param, as a r
 
 /// Column `name` of `r`'s first point.
 fn column(r: api.Result, name: []const u8) !f64 {
-    for (r.varnames, 0..) |v, i| if (std.mem.eql(u8, v, name)) return r.data[i];
+    return r.data[try columnIndex(r, name)];
+}
+
+/// The index of column `name` of `r`.
+fn columnIndex(r: api.Result, name: []const u8) !usize {
+    for (r.varnames, 0..) |v, i| if (std.mem.eql(u8, v, name)) return i;
     return error.MissingColumn;
+}
+
+/// Runs the `.dc` of `text` and checks that at each point `@m1[id]` is the
+/// 0 V ammeter `vm`'s current, and at each inner point that `slope` is that
+/// current's central difference over the swept value.
+fn expectOpvarsAsAmmeter(text: []const u8, slope: []const u8) !void {
+    const p = try create(text);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .dc));
+    const w = r.varnames.len;
+    const im = try columnIndex(r, "i(vm)");
+    const id = try columnIndex(r, "@m1[id]");
+    const s = try columnIndex(r, slope);
+    try t.expect(r.npoints >= 3);
+    for (0..r.npoints) |k| {
+        const row = r.data[k * w ..][0..w];
+        try t.expectApproxEqRel(row[im], row[id], 1e-6);
+        if (k == 0 or k + 1 == r.npoints) continue;
+        const prev = r.data[(k - 1) * w ..][0..w];
+        const next = r.data[(k + 1) * w ..][0..w];
+        try t.expectApproxEqRel((next[im] - prev[im]) / (next[0] - prev[0]), row[s], 1e-6);
+    }
+}
+
+test "@m1[id] along a .dc is the 0 V ammeter's current, @m1[gm] and @m1[gds] its central differences (#236)" {
+    // Oracles: KCL at the drain, which the ammeter's branch current meets
+    // apart from the device's own evaluation, and level 1's saturated square
+    // law, quadratic in V_GS and linear in V_DS, where a central difference
+    // is exact.
+    const body = "opvar\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n.save i(vm) @m1[id] @m1[gm] @m1[gds]\n{s}\n.end\n";
+    var buf: [512]u8 = undefined;
+    try expectOpvarsAsAmmeter(try std.fmt.bufPrint(&buf, body, .{".dc vg 0.8 1.6 0.1"}), "@m1[gm]");
+    try expectOpvarsAsAmmeter(try std.fmt.bufPrint(&buf, body, .{".dc vd 0.8 1.6 0.1"}), "@m1[gds]");
+}
+
+test "an operating-point variable no MOSFET of the deck has refuses the deck (#236)" {
+    // Before #236 `.save` dropped these silently.
+    for ([_][]const u8{ "@m1[nonexistent]", "@m9[gm]", "@r1[gm]", "@m1gm" }) |name| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "opvar\nv1 d 0 1\nr1 d g 1k\nm1 d g 0 0 nm\n.model nm nmos level=1\n.save {s}\n.op\n.end\n", .{name});
+        try t.expectError(error.UnsupportedCard, create(text));
+    }
 }
 
 /// Creates `body` at `values[0]` with `name` live, then for each later

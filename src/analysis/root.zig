@@ -50,6 +50,7 @@ test {
     _ = @import("tests/jacobian.zig");
     _ = @import("tests/certify.zig");
     _ = @import("post/mosra.zig");
+    _ = @import("post/opvars.zig");
     _ = @import("Circuit.zig");
     _ = @import("par_eval.zig");
     _ = @import("session.zig");

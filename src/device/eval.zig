@@ -1003,6 +1003,56 @@ fn RecordSink(comptime Inner: type) type {
     };
 }
 
+/// `Hooks.local_eval`'s sink: one instance's stamps in its own unknowns
+/// (`rhsRow` is the local row), on `inst_`, a copy of its Instance. Ground
+/// unknowns keep their rows and columns.
+fn LocalSink(comptime D: type) type {
+    const n_u: usize = comptime contract.nU(D);
+    return struct {
+        batch: *const DeviceBatch(D),
+        xs: []const f64,
+        inst_: *D.Instance,
+        out: ir.LocalEval,
+
+        pub const skip_g = false;
+        pub const skip_c = false;
+        pub const on_device = false;
+        pub const skip_tape = true;
+        const Ls = @This();
+
+        pub inline fn x(s: *const Ls, gi: u32) f64 {
+            return s.xs[gi];
+        }
+        pub inline fn gath(s: *const Ls, id: u32, u: usize) u32 {
+            return s.batch.gath[@as(usize, id) * n_u + u];
+        }
+        pub inline fn rhsRow(_: *const Ls, _: u32, ru: usize) u32 {
+            return @intCast(ru);
+        }
+        pub inline fn lim(s: *const Ls, id: u32, comptime u: usize) f64 {
+            return s.xs[s.gath(id, u)];
+        }
+        pub inline fn model(s: *const Ls, id: u32) *const D.Model {
+            return s.batch.model(id);
+        }
+        pub inline fn inst(s: *const Ls, _: u32) *D.Instance {
+            return s.inst_;
+        }
+        pub inline fn scatterRes(s: *const Ls, row: u32, val: f64) void {
+            s.out.f[row] += val;
+        }
+        pub inline fn scatterJac(s: *const Ls, _: u32, comptime ru: usize, comptime cu: usize, val: f64) void {
+            s.out.g[ru * n_u + cu] += val;
+        }
+        pub inline fn scatterQ(s: *const Ls, row: u32, qv: f64) void {
+            s.out.q[row] += qv;
+        }
+        pub inline fn scatterQJac(s: *const Ls, _: u32, comptime ru: usize, comptime cu: usize, val: f64) void {
+            s.out.c[ru * n_u + cu] += val;
+        }
+    };
+}
+
 /// The host pads each value's lanes to a power of two. Callgrind Ir per
 /// instance, dense exact / sparse pow2, 100-instance DC sweeps:
 /// hisimhv_va 23.7M/6.8M, hisim2_va 37.1M/13.7M, bsimsoi_va 7.36M/3.95M,
@@ -1962,6 +2012,7 @@ pub fn DeviceBatch(comptime D: type) type {
             .next_breakpoint = if (@hasDecl(D, "nextBreakpoint") or walksPending(D)) nextBreakpointFn else null,
             .status = if (@hasDecl(D, "status_sites")) statusFn else null,
             .say = if (@hasDecl(D, "say")) sayFn else null,
+            .local_eval = localEvalFn,
             .collect_params = collectParams,
             .param_layout = paramLayout,
             .write_params = writeParams,
@@ -2447,6 +2498,27 @@ pub fn DeviceBatch(comptime D: type) type {
             D.say(Real, &lx, self.model(id), &self.instances[id], self.sim, &out);
             std.debug.assert(out.len <= buf.len);
             contract.formatSay(D, &out, name, w) catch {}; // a failed writer drops the text
+        }
+
+        /// `Hooks.local_eval`: instance `id` alone at x on the wide basis,
+        /// unlimited, into `out`, on a copy of its Instance.
+        fn localEvalFn(ctx: *anyopaque, x: []const f64, id: u32, out: ir.LocalEval) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            std.debug.assert(id < self.count);
+            std.debug.assert(out.x.len == n_u and out.f.len == n_u and out.q.len == n_u and out.root.len == n_u);
+            std.debug.assert(out.g.len == n_u * n_u and out.c.len == n_u * n_u);
+            for ([_][]f64{ out.f, out.q, out.g, out.c }) |p| @memset(p, 0);
+            var inst = self.instances[id];
+            var sink: LocalSink(D) = .{ .batch = self, .xs = x, .inst_ = &inst, .out = out };
+            evalRange(D, false, host_pad, &sink, id, id + 1, self.sim, false);
+            out.x[0..n_u].* = self.localX(x, id);
+            for (out.root, 0..) |*r, u| r.* = @intCast(u);
+            if (comptime @hasDecl(D, "collapse")) {
+                const col = D.collapse(Real, self.model(id), &self.instances[id]);
+                inline for (D.num_ports..n_u) |u| if (col[u]) |target| {
+                    out.root[u] = @intCast(target);
+                };
+            }
         }
 
         /// `Hooks.status`. Reads the host Instance copy; for a resident batch

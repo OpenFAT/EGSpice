@@ -127,6 +127,25 @@ dropped from the results.
 ```
 
 Without `.save`, every node voltage and branch current is written.
+
+A MOSFET's operating-point variables are vectors too, at the operating
+point, along a `.dc` sweep and in a `.tran`. Save or measure them by name:
+
+```text
+.save @m1[gm] @m.x1.mn1[vds] all
+.meas op gm1 find @m1[gm]
+```
+
+The variables are `id` (`ids`), `ig`, `is`, `ib`, `gm`, `gds`, `gmbs`,
+`cgg`, `cgd`, `cgs`, `cgb`, `ft`, `vgs`, `vds` and `vbs`. They come from
+the device's terminals (d, g, s, b) with its internal nodes eliminated:
+currents flow into the device, `cgg` is ∂Q_g/∂V_g, `cgd` is -∂Q_g/∂V_d
+(and so on), and `ft` is gm / (2π·cgg). An unknown name refuses the deck
+and lists them. A model's own variables (`vth`, `vdsat`, `region`), other
+device types, a `.dc` that sweeps the temperature or a device of the same
+type, HSPICE's `.probe op` and Spectre's `save m1:gm` are not supported
+yet (#236).
+
 `.print`, `.plot`, `.probe` and `.graph` are accepted and ignored for the
 same reason. In the HSPICE dialect `.save` has HSPICE's meaning: it writes
 the operating point as a loadable `.nodeset` or `.ic` file, beside the

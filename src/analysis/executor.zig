@@ -13,6 +13,7 @@ const types = @import("types.zig");
 const op = @import("dc/op.zig");
 const sweep_lanes = @import("sweep/lanes.zig");
 const tran = @import("tran/tran.zig");
+const opvars_post = @import("post/opvars.zig");
 const gpu = @import("gpu/context.zig");
 const gpu_lu = @import("gpu/lu.zig");
 const ParEval = @import("par_eval.zig").ParEval;
@@ -280,13 +281,20 @@ pub const Executor = struct {
             if (source.topology != topology or source.operatingPoint() == null)
                 return error.InvalidOperatingPoint;
         }
+        // Device operating-point variables come from the recorded rows
+        // (`label`), so a transient keeps every row they read.
+        var own = job;
+        if (deck.opvars.len != 0 and own == .tran) {
+            own.tran.point.measures_only = false;
+            own.tran.point.early_stop = false;
+        }
         const self = try allocator.create(Executor);
         self.* = .{
             .allocator = allocator,
             .io = io,
             .topology = topology,
             .deck = deck,
-            .job = job,
+            .job = own,
             .config = config,
             .circuit = undefined,
             .work = std.heap.ArenaAllocator.init(allocator),
@@ -979,11 +987,12 @@ pub const Executor = struct {
     }
 
     fn runCtx(self: *Executor) types.RunCtx {
+        const opvars = self.recordsOpvars();
         return .{
             .circuit = &self.circuit,
             .x_op = self.x.?,
-            .probes = self.deck.probes,
-            .probe_labels = self.deck.probe_labels,
+            .probes = if (opvars) self.deck.opvar_probes else self.deck.probes,
+            .probe_labels = if (opvars) self.deck.opvar_labels else self.deck.probe_labels,
             .source_node = self.deck.source_node,
             .source_branch = self.deck.source_branch,
             .nodeset = self.deck.nodeset,
@@ -996,9 +1005,17 @@ pub const Executor = struct {
         };
     }
 
-    /// Names a finished result after the query's temperature and variant.
+    /// Whether this query records the instance rows `Deck.opvars` read,
+    /// which `label` turns into their columns (#236).
+    fn recordsOpvars(self: *const Executor) bool {
+        return self.deck.opvars.len != 0 and (self.job == .op or self.job == .dc or self.job == .tran);
+    }
+
+    /// Names a finished result after the query's temperature and variant,
+    /// with its device operating-point variables (`post/opvars.zig`).
     fn label(self: *Executor, result_in: types.Result) !types.Result {
         var res = result_in;
+        if (self.recordsOpvars()) res = try opvars_post.publish(self.results.allocator(), self.allocator, &self.circuit, self.deck, res);
         // Copies of one card at several temperatures keep apart by name.
         if (queryTemp(self.job)) |temp| res.plotname = try self.results.allocator().print("{s} (temp={d})", .{ res.plotname, temp });
         if (queryVariant(self.job)) |v| res.plotname = try self.results.allocator().print("{s} ({s})", .{ res.plotname, self.deck.variants.labelAt(v) });

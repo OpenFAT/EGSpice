@@ -322,6 +322,33 @@ pub const Deck = struct {
     stims: []const Stim = &.{},
     /// The safe-operating-area check; no limits without `.option soa=1`.
     soa: Soa = .{},
+    /// Device operating-point variables the deck saves or measures, one
+    /// column each after the probes of an `.op`, `.dc` or `.tran` result.
+    opvars: []const OpVar = &.{},
+    /// `probes`, then the rows of every instance `opvars` reads: what those
+    /// analyses record before `analysis.opvars` turns the extra columns
+    /// into the `opvars` columns. `opvar_labels` is parallel to it. Empty
+    /// without `opvars`.
+    opvar_probes: []const u32 = &.{},
+    opvar_labels: []const []const u8 = &.{},
+};
+
+/// One device operating-point variable (ngspice `@m1[gm]`, #236): `quantity`
+/// of instance `index` of circuit batch `batch`, a device with `ports`
+/// terminals, published as `label`.
+pub const OpVar = struct {
+    label: []const u8,
+    batch: u32,
+    index: u32,
+    ports: u32,
+    quantity: Quantity,
+
+    /// A MOSFET's terminal quantities, after ngspice's names, from its
+    /// static currents and charges with its internal nodes eliminated
+    /// (`analysis.opvars`). Terminals are d, g, s, b; currents flow into
+    /// the device; `c<x><y>` is -∂Q_x/∂V_y, `cgg` is ∂Q_g/∂V_g; `ft` is
+    /// gm / (2π cgg). `ids` is BSIM-CMG's name for `id`.
+    pub const Quantity = enum(u8) { id, ids, ig, is, ib, gm, gds, gmbs, cgg, cgd, cgs, cgb, ft, vgs, vds, vbs };
 };
 
 /// What a `.meas` card computes, after ngspice com_measure2.c, plus the

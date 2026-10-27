@@ -1238,11 +1238,12 @@ pub const Problem = struct {
 
     /// What `openStream` asks of the whole run before any plot streams: a
     /// final plan, nothing that reads results after the run, and a probe
-    /// label per column.
+    /// label per column, with no device operating-point variable computed
+    /// from the finished rows.
     fn sidesAllowed(self: *const Problem) bool {
         const deck = &self.prepared.deck;
         return self.session.config.final_plan and self.save_path == null and deck.stims.len == 0 and
-            self.prepared.tuner == null and deck.soa.limits.len == 0 and deck.probe_labels.len == deck.probes.len;
+            self.prepared.tuner == null and deck.soa.limits.len == 0 and deck.probe_labels.len == deck.probes.len and deck.opvars.len == 0;
     }
 
     /// `Session.stream_opener`: a transient or AC plot that no `.meas` card
@@ -1600,6 +1601,7 @@ pub const Problem = struct {
         @memset(labels, "");
         deck.probes = probes;
         deck.probe_labels = labels;
+        deck.opvars = &.{};
         var session = analysis.session.Session.init(self.workerAllocator(), self.io, &self.prepared.circuit, &deck, self.session.config);
         defer session.deinit();
         var id: [1]QueryId = undefined;

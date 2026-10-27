@@ -1548,9 +1548,12 @@ fn countParams(allocator: std.mem.Allocator, topology: *const Circuit, comptime 
 /// running it.
 pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *const Deck, query: requests.Query) !core.QuerySchema {
     const columns: usize = switch (query) {
-        .op, .dcinc => deck.probes.len,
+        // Device operating-point variables after the probes (`post/opvars.zig`).
+        .op => deck.probes.len + deck.opvars.len,
+        .dc => deck.probes.len + deck.opvars.len + 1,
+        .dcinc => deck.probes.len,
         // HSPICE `.op <time>` publishes the `.op` layout, with no time column.
-        .tran => |o| deck.probes.len + @intFromBool(!o.snapshot),
+        .tran => |o| deck.probes.len + deck.opvars.len + @intFromBool(!o.snapshot),
         .tran_noise => |o| deck.probes.len + 1 + @intFromBool(o.sde),
         .tf => 3,
         .lstb => |o| if (o.margins) 5 else 8,

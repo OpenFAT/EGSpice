@@ -423,6 +423,7 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         if (!@import("builtin").is_test) std.log.err("netlist: .mosra needs a .tran to stress the devices: {s}", .{nl.deck.mosra.?.line});
         return error.UnsupportedCard;
     };
+    const ov = try opVars(sim_arena, parse_arena, lib, &circuit, cards, out.probes, out.probe_labels, nl, queries);
     return .{ .rebuilds = plan.rebuilds, .prepared = .{ .circuit = circuit, .tuner = tuner, .tuning = tuning, .deck = .{
         .probes = out.probes,
         .probe_labels = out.probe_labels,
@@ -453,7 +454,100 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         } else null,
         .stims = try stims(sim_arena, nl.deck.stims),
         .soa = if (deck_opts.soa) .{ .max_warns = deck_opts.max_warns, .limits = try soaLimits(sim_arena, nl, &nb, &circuit) } else .{},
+        .opvars = ov.vars,
+        .opvar_probes = ov.probes,
+        .opvar_labels = ov.labels,
     } } };
+}
+
+/// The device operating-point variables (`@m1[gm]`, #236) the deck's
+/// `.save` and `.meas` cards name, and what records them: `probes` and
+/// `labels`, then each named instance's rows, unlabeled. A name that is not
+/// `@<card>[<variable>]` of a MOSFET in the deck is `UnsupportedCard`,
+/// logged with the variables there are. So is one under a `.dc` that sweeps
+/// the temperature or a device of its type: the instance would be
+/// evaluated at the sweep's last state.
+// ponytail: MOSFET terminal quantities only (`core.OpVar.Quantity`); a
+// Verilog-A module's own `desc` variables need VerA to export their values.
+fn opVars(
+    sim_arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    lib: *const device.Library,
+    circuit: *const device.Circuit,
+    cards: []const requests.CardRef,
+    probes: []const u32,
+    labels: []const []const u8,
+    nl: *const netlist.Netlist,
+    queries: []const Job,
+) !struct { vars: []const core.OpVar, probes: []const u32, labels: []const []const u8 } {
+    var names: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (nl.deck.opvar_saves) |s| try names.put(scratch, s, {});
+    for (nl.deck.measures) |m| for ([_]core.MeasureClause{ m.first, m.second }) |c| {
+        for ([_][]const u8{ c.vec, c.vec2 }) |v| if (v.len != 0 and v[0] == '@') try names.put(scratch, v, {});
+        for ([_][]const core.MeasureOp{ c.ops, c.ops2 }) |ops| for (ops) |op| if (op == .vector and op.vector.len != 0 and op.vector[0] == '@') {
+            try names.put(scratch, op.vector, {});
+        };
+    };
+    if (names.count() == 0) return .{ .vars = &.{}, .probes = &.{}, .labels = &.{} };
+    const vars = try sim_arena.alloc(core.OpVar, names.count());
+    var rows: std.ArrayList(u32) = .empty;
+    try rows.appendSlice(sim_arena, probes);
+    var row_labels: std.ArrayList([]const u8) = .empty;
+    try row_labels.appendSlice(sim_arena, labels);
+    for (names.keys(), vars) |name, *v| {
+        v.* = try opVar(sim_arena, lib, circuit, cards, name);
+        const b = circuit.batches[v.batch];
+        for (b.hooks.scatter_tapes(b.ctx).rows[@as(usize, v.index) * b.n_u ..][0..b.n_u]) |row| {
+            // A ground unknown's row is `n`.
+            if (row >= circuit.n or std.mem.indexOfScalar(u32, rows.items[probes.len..], row) != null) continue;
+            try rows.append(sim_arena, row);
+            try row_labels.append(sim_arena, "");
+        }
+    }
+    for (queries) |q| if (q == .dc) for ([_]?requests.Dc.SweepTarget{ q.dc.target, q.dc.target2 }) |target| {
+        const swept = target orelse continue;
+        for (vars) |v| if (swept == .temp or swept.device.type == circuit.batch_types[v.batch]) {
+            if (!@import("builtin").is_test) std.log.err("netlist: {s} along a .dc that sweeps the temperature or a device of its type is not supported (#236)", .{v.label});
+            return error.UnsupportedCard;
+        };
+    };
+    return .{ .vars = vars, .probes = rows.items, .labels = row_labels.items };
+}
+
+/// `core.OpVar.Quantity`'s names, for the error that lists them.
+const opvar_names = blk: {
+    var s: []const u8 = "";
+    for (@typeInfo(core.OpVar.Quantity).@"enum".field_names) |n| s = s ++ " " ++ n;
+    break :blk s[1..];
+};
+
+/// `name`, an `@<card>[<variable>]` label, resolved to its instance; see
+/// `opVars` for the refusals.
+fn opVar(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, cards: []const requests.CardRef, name: []const u8) !core.OpVar {
+    const open = std.mem.indexOfScalar(u8, name, '[') orelse 0;
+    if (open < 2 or name[name.len - 1] != ']') {
+        if (!@import("builtin").is_test) std.log.err("netlist: {s}: a device operating-point variable is @<device>[<variable>]", .{name});
+        return error.UnsupportedCard;
+    }
+    const card = name[1..open];
+    const variable = name[open + 1 .. name.len - 1];
+    const ref = for (cards) |c| {
+        if (std.ascii.eqlIgnoreCase(c.name, card)) break c;
+    } else {
+        if (!@import("builtin").is_test) std.log.err("netlist: {s}: no device {s}", .{ name, card });
+        return error.UnsupportedCard;
+    };
+    const batch = std.mem.indexOfScalar(core.DeviceType, circuit.batch_types, ref.type).?;
+    const ports = lib.vtable(ref.type).num_ports;
+    if (std.ascii.toLower(card[0]) != 'm' or ports < 3 or circuit.batches[batch].hooks.local_eval == null) {
+        if (!@import("builtin").is_test) std.log.err("netlist: {s}: only a MOSFET publishes operating-point variables yet (#236)", .{name});
+        return error.UnsupportedCard;
+    }
+    const quantity = std.meta.stringToEnum(core.OpVar.Quantity, variable) orelse {
+        if (!@import("builtin").is_test) std.log.err("netlist: {s}: {s} has no variable '{s}'; its variables are {s}", .{ name, card, variable, opvar_names });
+        return error.UnsupportedCard;
+    };
+    return .{ .label = try arena.dupe(u8, name), .batch = @intCast(batch), .index = ref.index, .ports = ports, .quantity = quantity };
 }
 
 /// `.stim` cards with their strings copied out of the parse arena.

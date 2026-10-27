@@ -41,6 +41,7 @@ pub const MosraModel = deck.MosraModel;
 pub const Stim = deck.Stim;
 pub const Soa = deck.Soa;
 pub const SoaLimit = deck.SoaLimit;
+pub const OpVar = deck.OpVar;
 pub const measure_unset = deck.measure_unset;
 pub const measure_last = deck.measure_last;
 pub const measure_no_at = deck.measure_no_at;

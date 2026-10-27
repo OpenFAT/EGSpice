@@ -6,6 +6,7 @@ Newest first.
 
 - `--measures=FILE` also writes every `.meas` result as JSON, labelled with its analysis and variant (`.step`, `SWEEP DATA`, `.alter`, Monte Carlo trial, `.temp` entry), a failed one as `null` with its error; `--measures=-` puts it on stdout (#235).
 - `.option soa=1` (ngspice `warn=1`) checks every accepted point of an operating point, DC sweep and transient against the model-card SOA limits (`vds_max`, `vbe_max`, `bv_max`, ...), one line per excursion, `maxwarns` of them, then the count (#238).
+- `.save @m1[gm]` and `.meas ... find @m1[id]`: MOSFET operating-point variables (terminal currents, gm, gds, gmbs, capacitances, ft, terminal voltages) at the operating point, along `.dc` and in `.tran`; an unknown name refuses the deck instead of being dropped (#236).
 - `espice --version` prints the ESPice and VerA versions and the GPU backends built in.
 - `-I DIR` / `--include=DIR` adds a search directory for `.hdl` includes.
 - `espice_release_points` also frees each point's parameter row and label (#225).

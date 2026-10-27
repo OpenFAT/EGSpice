@@ -366,6 +366,9 @@ pub const Deck = struct {
     /// `.save` outputs as lowercased `v(net)`/`i(name)` labels. Empty: save
     /// everything, as with no `.save` card or a `.save all`.
     saves: []const []const u8,
+    /// `.save` device operating-point variables (`@m1[gm]`, #236),
+    /// lowercased, `.save all` or not.
+    opvar_saves: []const []const u8 = &.{},
     foreign: []const Foreign,
     /// `.options vpi="app.so"` paths as written (relative to the deck): VPI
     /// applications to load (LRM 12.33, #197).
@@ -1124,6 +1127,7 @@ fn Reader(comptime S: type) type {
         /// The formals of the user functions `subst` is inside, innermost last.
         bindings: std.ArrayList(Binding) = .empty,
         saves: std.ArrayList([]const u8) = .empty,
+        opvar_saves: std.ArrayList([]const u8) = .empty,
         save_all: bool = false,
         save_op: ?core.SaveOp = null,
         stims: std.ArrayList(core.Stim) = .empty,
@@ -1384,6 +1388,7 @@ fn Reader(comptime S: type) type {
                     .ic = try nodeValues(arena, r.ic_cards.items, nets),
                     .nodeset = try nodeValues(arena, r.nodeset_cards.items, nets),
                     .saves = if (r.save_all) &.{} else r.saves.items,
+                    .opvar_saves = r.opvar_saves.items,
                     .foreign = r.foreign.items,
                     .vpi_apps = r.vpi_apps.items,
                     .measures = r.measures.items,
@@ -2138,6 +2143,13 @@ fn Reader(comptime S: type) type {
                     },
                     .name => |n| if (std.ascii.eqlIgnoreCase(n, "all")) {
                         r.save_all = true;
+                    } else if (n[0] == '@') {
+                        // A device operating-point variable (`@m1[gm]`, #236);
+                        // `prepare` resolves it or refuses the deck.
+                        const label = try r.arena.dupe(u8, n);
+                        try r.opvar_saves.append(r.arena, std.ascii.lowerString(label, label));
+                        // Holds `saves` non-empty, so the probes narrow.
+                        try r.saves.append(r.arena, label);
                     },
                     else => {},
                 },
