@@ -1227,6 +1227,8 @@ pub const Tuning = struct {
         t.starts = .{ .items = starts, .capacity = starts.len };
         t.refs = .{ .items = refs, .capacity = refs.len };
         t.write_values = .{ .items = values, .capacity = values.len };
+        // The deck's kinds live in the planner's arena; appended rows have none.
+        t.kinds = t.kinds[@min(k, t.kinds.len)..];
         // Before the first drop the old rows stay in the session arena.
         _ = arenas[t.table_at].reset(.free_all);
         t.table_at = ~t.table_at;

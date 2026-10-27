@@ -185,10 +185,10 @@ pub fn writeNumber(out: *Writer, x: f64) Writer.Error!void {
 /// are the row's own f64s.
 pub fn writeVariant(out: *Writer, variants: core.Variants, row: ?u32, temp_c: ?f64) Writer.Error!void {
     if (row) |v| {
-        const kind: core.Variants.Kind = if (v < variants.kinds.len) variants.kinds[v] else .step;
+        const kind = variants.kindAt(v);
         try out.print("{{\"kind\": \"{t}\"", .{kind});
         var params = false;
-        var pairs = std.mem.splitSequence(u8, variants.labels[v], ", ");
+        var pairs = std.mem.splitSequence(u8, variants.labelAt(v), ", ");
         while (pairs.next()) |pair| {
             const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
             const name = pair[0..eq];

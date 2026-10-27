@@ -130,6 +130,13 @@ pub const Variants = struct {
         return self.axis[self.row(v)];
     }
 
+    /// What made variant `v`; a row past `kinds` reads `.step`. Asserts
+    /// that it was not dropped.
+    pub fn kindAt(self: Variants, v: u32) Kind {
+        const r = self.row(v);
+        return if (r < self.kinds.len) self.kinds[r] else .step;
+    }
+
     /// Where variant `v` sits in the columns. Asserts that it was not dropped.
     fn row(self: Variants, v: u32) u32 {
         assert(v >= self.base);
