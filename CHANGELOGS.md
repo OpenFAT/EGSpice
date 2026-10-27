@@ -7,6 +7,7 @@ Newest first.
 - `--measures=FILE` also writes every `.meas` result as JSON, labelled with its analysis and variant (`.step`, `SWEEP DATA`, `.alter`, Monte Carlo trial, `.temp` entry), a failed one as `null` with its error; `--measures=-` puts it on stdout (#235).
 - `espice --version` prints the ESPice and VerA versions and the GPU backends built in.
 - `-I DIR` / `--include=DIR` adds a search directory for `.hdl` includes.
+- `espice_release_points` also frees each point's parameter row and label (#225).
 - `.pz` on circuits above 1000 unknowns returns the 20 poles and 20 zeros nearest s = 0 (the plot is named "partial").
 - A `.tran ... uic` run no longer solves an operating point it does not use: a 100k-transistor chain started in seconds instead of hours.
 - Operating points: gmin stepping and source stepping follow ngspice more closely; a few decks that needed them converge with slightly different iteration counts.

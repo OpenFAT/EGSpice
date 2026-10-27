@@ -70,8 +70,12 @@ pub const AcOverride = struct {
 /// `refs[i]` (an index into the circuit's `collectParams` list) for every
 /// `i` in `starts[v]..starts[v + 1]`, then runs at `temp_c[v]` when that is
 /// set. A query runs variant `Tolerances.variant`; the rows are SoA and
-/// `starts` has one entry more than `labels`.
+/// `starts` has one entry more than `labels`. Rows below `base` were
+/// dropped (`Tuning.drop`): the columns start at row `base`, and nothing
+/// reads a dropped row, so read rows through `count`, `writes`,
+/// `labelAt`, `tempAt` and `axisAt`.
 pub const Variants = struct {
+    base: u32 = 0,
     /// Plot-name suffix without parentheses: `p=1.5`, `alter=2`, `monte=3`.
     labels: []const []const u8 = &.{},
     /// Circuit temperature in °C, or null for the deck's.
@@ -90,24 +94,46 @@ pub const Variants = struct {
     /// trial, an `.alter` run.
     pub const Kind = enum { step, data, monte, alter };
 
-    /// Number of variants (rows). Asserts that a non-empty table has one
-    /// `starts` entry more than rows.
+    /// Number of variants (rows), dropped ones included. Asserts that a
+    /// non-empty table has one `starts` entry more than rows.
     pub fn count(self: Variants) u32 {
         if (self.labels.len != 0) assert(self.starts.len == self.labels.len + 1);
-        return @intCast(self.labels.len);
+        return self.base + @as(u32, @intCast(self.labels.len));
     }
 
     /// The parameter writes of variant `v`: `.{ refs, values }`, slices of
-    /// the table's own columns. Asserts that `starts` holds row `v`, that
-    /// `refs` and `values` have equal lengths, and that the row's range is
-    /// not reversed.
+    /// the table's own columns. Asserts that `v` was not dropped, that
+    /// `starts` holds row `v`, that `refs` and `values` have equal lengths,
+    /// and that the row's range is not reversed.
     pub fn writes(self: Variants, v: u32) struct { []const u32, []const f64 } {
-        assert(v + 1 < self.starts.len);
+        const r = self.row(v);
+        assert(r + 1 < self.starts.len);
         assert(self.refs.len == self.values.len);
-        const lo = self.starts[v];
-        const hi = self.starts[v + 1];
+        const lo = self.starts[r];
+        const hi = self.starts[r + 1];
         assert(lo <= hi);
         return .{ self.refs[lo..hi], self.values[lo..hi] };
+    }
+
+    /// Variant `v`'s label. Asserts that it was not dropped.
+    pub fn labelAt(self: Variants, v: u32) []const u8 {
+        return self.labels[self.row(v)];
+    }
+
+    /// Variant `v`'s temperature. Asserts that it was not dropped.
+    pub fn tempAt(self: Variants, v: u32) ?f64 {
+        return self.temp_c[self.row(v)];
+    }
+
+    /// Variant `v`'s axis value. Asserts that it was not dropped.
+    pub fn axisAt(self: Variants, v: u32) f64 {
+        return self.axis[self.row(v)];
+    }
+
+    /// Where variant `v` sits in the columns. Asserts that it was not dropped.
+    fn row(self: Variants, v: u32) u32 {
+        assert(v >= self.base);
+        return v - self.base;
     }
 };
 
@@ -423,6 +449,15 @@ test "Variants slice each row's writes out of the shared columns" {
     // A row may write nothing and only move the temperature or the axis.
     try t.expectEqual(@as(usize, 0), v.writes(2)[0].len);
     try t.expectEqual(@as(u32, 0), (Variants{}).count());
+    // The same rows 1 and 2 after row 0 is dropped: absolute numbers still
+    // reach them.
+    const kept: Variants = .{ .base = 1, .labels = v.labels[1..], .temp_c = v.temp_c[1..], .axis = v.axis[1..], .starts = &.{ 0, 2, 2 }, .refs = v.refs[1..], .values = v.values[1..] };
+    try t.expectEqual(@as(u32, 3), kept.count());
+    try t.expectEqualSlices(u32, row1[0], kept.writes(1)[0]);
+    try t.expectEqualSlices(f64, row1[1], kept.writes(1)[1]);
+    try t.expectEqualStrings("p=3", kept.labelAt(2));
+    try t.expectEqual(@as(?f64, 50), kept.tempAt(1));
+    try t.expectEqual(@as(f64, 3), kept.axisAt(2));
 }
 
 test "goalError weighs the miss against the goal, floored at MINVAL, and is zero while a bound holds" {

@@ -1826,19 +1826,26 @@ test "release_points: a Problem run batch after batch keeps a few KB per release
     var live: [30]isize = undefined;
     var values: [rows.len]f64 = undefined;
     var why: [rows.len]api.Problem.Reason = undefined;
-    for (&live) |*l| {
+    var batch0: [rows.len]f64 = undefined;
+    for (&live, 0..) |*l, b| {
         const first = try p.append_points(&rows, rows.len, .{ .measures_only = true, .early_stop = true });
         try p.run_all();
         try p.point_measures(first, &.{"tpd"}, &values, &why);
+        // The same points every batch: a batch whose rows came after
+        // earlier ones were dropped runs at its own values (1% apart).
+        if (b == 0) batch0 = values else for (batch0, values) |want, got| try t.expectApproxEqRel(want, got, 1e-6);
         try p.release_points(first, rows.len);
         l.* = counting.live.load(.monotonic);
     }
     const per_point = @divTrunc(live[live.len - 1] - live[9], 20 * rows.len);
     std.debug.print("release_points: {d} B live after batch 10, {d} B after 30, {d} B per point\n", .{ live[9], live[live.len - 1], per_point });
-    // Its two query rows, the copied query and its variant row, with the
-    // slack of the tables' doubling; an unreleased point keeps its circuit
-    // and waveform, tens of KB.
-    try t.expect(per_point < 4096);
+    // Every point's variant row went with it.
+    const table = p.prepared.deck.variants;
+    try t.expectEqual(@as(u32, live.len * rows.len), table.count());
+    try t.expectEqual(table.count(), table.base);
+    // Its two query rows, with the slack of the tables' doubling; an
+    // unreleased point keeps its circuit and waveform, tens of KB.
+    try t.expect(per_point < 1024);
     // The query workers' share of that, as the Problem counts it.
     const mem = p.queryMemory();
     try t.expect(mem.peak > 0 and mem.live <= mem.peak and mem.live <= @as(usize, @intCast(live[live.len - 1])));

@@ -305,7 +305,7 @@ pub const Executor = struct {
     fn movesTemp(self: *const Executor) bool {
         if (queryTemp(self.job) != null) return true;
         const v = queryVariant(self.job) orelse return false;
-        return self.deck.variants.temp_c[v] != null;
+        return self.deck.variants.tempAt(v) != null;
     }
 
     /// The circuit copy, variant and AC overrides `create` deferred, built
@@ -349,7 +349,7 @@ pub const Executor = struct {
     /// temperature touches nothing.
     fn installVariant(self: *Executor) !void {
         const variant = queryVariant(self.job);
-        const variant_temp = if (variant) |v| self.deck.variants.temp_c[v] else null;
+        const variant_temp = if (variant) |v| self.deck.variants.tempAt(v) else null;
         const temp = queryTemp(self.job) orelse variant_temp orelse self.deck.deck_temp;
         if (variant) |v| {
             const refs, const values = self.deck.variants.writes(v);
@@ -979,7 +979,7 @@ pub const Executor = struct {
         var res = result_in;
         // Copies of one card at several temperatures keep apart by name.
         if (queryTemp(self.job)) |temp| res.plotname = try self.results.allocator().print("{s} (temp={d})", .{ res.plotname, temp });
-        if (queryVariant(self.job)) |v| res.plotname = try self.results.allocator().print("{s} ({s})", .{ res.plotname, self.deck.variants.labels[v] });
+        if (queryVariant(self.job)) |v| res.plotname = try self.results.allocator().print("{s} ({s})", .{ res.plotname, self.deck.variants.labelAt(v) });
         return res;
     }
 

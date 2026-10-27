@@ -1039,6 +1039,13 @@ pub const Session = struct {
         return true;
     }
 
+    /// True when every row is terminal, so no worker reads its copy of the
+    /// deck (`Problem.release_points` then moves the variant table).
+    pub fn idle(self: *Session) bool {
+        self.advanceDone();
+        return self.done_rows == self.rows.len;
+    }
+
     /// Moves `done_rows` and `done_outputs` past the rows and outputs that
     /// have ended; a terminal row stays terminal. O(rows ended since).
     fn advanceDone(self: *Session) void {

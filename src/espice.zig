@@ -218,6 +218,12 @@ pub const Problem = struct {
     /// Each transient appended with `PointOptions.tangent_step`: the step
     /// of each live parameter its tangent rows took (`point_tangents`).
     tangent_steps: std.AutoHashMapUnmanaged(QueryId, []const f64) = .empty,
+    /// Bit v of `point_rows`: `append_points` made variant row v for a
+    /// point (its own row or a tangent row), so nothing else reads it. Of
+    /// `freed_rows`: nothing reads row v again (its point was released, or
+    /// its call failed). `release_points` drops the table's freed prefix.
+    point_rows: std.DynamicBitSetUnmanaged = .{},
+    freed_rows: std.DynamicBitSetUnmanaged = .{},
     /// `Options.measures`, how far `run_all` has printed to it, and the
     /// first error printing there, which `print_measures` returns.
     measures_to: ?MeasureWriters = null,
@@ -468,6 +474,8 @@ pub const Problem = struct {
         const a = self.allocator;
         for (self.runs) |*run| run.session.deinit();
         self.released.deinit(a);
+        self.point_rows.deinit(a);
+        self.freed_rows.deinit(a);
         self.session.deinit();
         self.gpu_driver.deinit();
         self.sides.deinit(a);
@@ -644,6 +652,14 @@ pub const Problem = struct {
         // rows appended later keep theirs.
         const current = self.session.template;
         defer self.session.template = current;
+        // Room to mark every row this call makes, a point's own and its
+        // tangent rows, before it makes any; a failed call's rows are freed.
+        const rows_before = deck.variants.count();
+        const rows_most = rows_before + count * (1 + if (tangent) p else 0);
+        if (self.point_rows.bit_length < rows_most) try self.point_rows.resize(self.allocator, rows_most, false);
+        if (self.freed_rows.bit_length < rows_most) try self.freed_rows.resize(self.allocator, rows_most, false);
+        var appended = false;
+        errdefer if (!appended) self.freed_rows.setRangeValue(.{ .start = rows_before, .end = deck.variants.count() }, true);
         for (0..count) |i| {
             try self.session.templates.ensureUnusedCapacity(self.session.allocator, 1);
             refused[i] = null;
@@ -684,6 +700,8 @@ pub const Problem = struct {
         }
         const ids = try a.alloc(QueryId, jobs.len);
         _ = try self.session.appendAt(jobs, templates, ids);
+        appended = true;
+        self.point_rows.setRangeValue(.{ .start = rows_before, .end = deck.variants.count() }, true);
         for (refused, 0..) |r, i| if (r) |err| for (ids[i * j ..][0..j]) |id| self.session.refuse(id, err) catch unreachable;
         // A point owns its OP: nothing appended later reads either.
         for (ids) |id| self.session.markFinal(id) catch unreachable;
@@ -886,10 +904,14 @@ pub const Problem = struct {
     /// stays the same size. Each query keeps its id and status;
     /// `result`, `point_measures` and `point_tangents` then fail with
     /// `error.ResultUnavailable`, and nothing publishes it. A point already
-    /// released is left alone. Errors as `point_measures`.
-    // ponytail: each query's row (a few hundred bytes) and the point's
-    // variant row (its label and parameter writes) stay until `deinit`;
-    // drop a released prefix of both if sessions reach billions of points.
+    /// released is left alone. The variant rows of `append_points` points
+    /// go too, at a call made while no query runs; a query appended with
+    /// one of them (`tol.variant`) must not outlive its point, and is
+    /// refused once it is gone. Errors as `point_measures`.
+    // ponytail: each query's row (a few hundred bytes) stays until `deinit`;
+    // drop a released prefix of them if sessions reach billions of points.
+    // Rows drop as a prefix: a `set_params` row is never freed, so no row
+    // after it is dropped.
     pub fn release_points(self: *Problem, first: QueryId, count: usize) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -902,6 +924,30 @@ pub const Problem = struct {
             try self.session.release(outputs[k]);
             _ = self.tangent_steps.remove(outputs[k]);
         }
+        for (outputs[ends[0]..ends[count]]) |id| {
+            const job = try self.session.query(id);
+            if (variantOf(job)) |v| self.freeRow(v);
+            if (job == .tran) for (job.tran.tangents) |v| self.freeRow(v);
+        }
+        self.dropFreedRows();
+    }
+
+    /// Marks variant row `v` freed when `append_points` made it.
+    fn freeRow(self: *Problem, v: u32) void {
+        if (v < self.point_rows.bit_length and self.point_rows.isSet(v)) self.freed_rows.set(v);
+    }
+
+    /// Drops the variant table's prefix of freed rows when no query runs
+    /// (a running one reads its own copy of the table) and the prefix is at
+    /// least as long as the rows kept, so each row moves O(1) times. A
+    /// table that cannot move keeps its rows.
+    fn dropFreedRows(self: *Problem) void {
+        const tuning = self.prepared.tuning orelse return;
+        const rows = &self.prepared.deck.variants;
+        var below = rows.base;
+        while (below < self.freed_rows.bit_length and self.freed_rows.isSet(below)) below += 1;
+        if (below == rows.base or below - rows.base < rows.count() - below or !self.session.idle()) return;
+        rows.* = tuning.drop(self.allocator, below) catch return;
     }
 
     /// Most points the executor runs together as one lane batch on this
@@ -1869,7 +1915,7 @@ fn printQueryMeasures(gpa: std.mem.Allocator, session: *const analysis.session.S
     if (session.released(id)) return;
     const job = try session.query(id);
     const row = variantOf(job);
-    const point: ?output.MeasurePoint = if (row) |v| .{ .row = v, .label = session.deck.variants.labels[v] } else null;
+    const point: ?output.MeasurePoint = if (row) |v| .{ .row = v, .label = session.deck.variants.labelAt(v) } else null;
     // The fields every JSON result of the block shares (#235).
     var head: std.Io.Writer.Allocating = .init(gpa);
     defer head.deinit();
