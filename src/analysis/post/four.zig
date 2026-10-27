@@ -45,10 +45,12 @@ const Column = tran.Column;
 /// period or the period holds fewer than two samples. `allocator` backs one
 /// 2·n_fft scratch block, freed before return.
 pub fn analyze(waveform: *const tran.Waveform, differential: bool, f_fund: f64, n_harmonics: usize, allocator: std.mem.Allocator) !Spectrum {
-    // Both series are borrowed columns of the recording, never copied.
-    const times = waveform.column(0);
-    const values = waveform.column(1);
+    return analyzeColumns(waveform.column(0), waveform.column(1), if (differential) waveform.column(2) else null, f_fund, n_harmonics, allocator);
+}
 
+/// `analyze` over `values`, less `neg` when given, sampled at `times`.
+pub fn analyzeColumns(times: Column, values: Column, neg: ?Column, f_fund: f64, n_harmonics: usize, allocator: std.mem.Allocator) !Spectrum {
+    // Every series is a borrowed column of a recording, never copied.
     if (times.len < 2) return error.InsufficientData;
 
     const period = 1.0 / f_fund;
@@ -76,13 +78,13 @@ pub fn analyze(waveform: *const tran.Waveform, differential: bool, f_fund: f64, 
     // resampled columns is the resampled difference.
     const win_times = times.from(start_idx);
     const win_vals = values.from(start_idx);
-    const neg_vals = if (differential) waveform.column(2).from(start_idx) else win_vals;
+    const neg_vals = if (neg) |c| c.from(start_idx) else win_vals;
     var cursor: usize = 0;
     var neg_cursor: usize = 0;
     for (re[0..n_fft], 0..) |*r, k| {
         const t_target = t_start + period * @as(f64, @floatFromInt(k)) / n_fft_f;
         r.* = interpolateAt(win_times, win_vals, t_target, &cursor);
-        if (differential) r.* -= interpolateAt(win_times, neg_vals, t_target, &neg_cursor);
+        if (neg != null) r.* -= interpolateAt(win_times, neg_vals, t_target, &neg_cursor);
     }
 
     fft_mod.fft(re[0..n_fft], im);
@@ -91,7 +93,8 @@ pub fn analyze(waveform: *const tran.Waveform, differential: bool, f_fund: f64, 
 }
 
 /// Contract entry: a transient from the operating point (opts.tran_opts, or
-/// five periods at 200 steps per period), then the harmonic table. Real, one
+/// five periods at 200 steps per period), or the rows `ctx.source` holds of
+/// that same transient, then the harmonic table. Real, one
 /// row per harmonic with row 0 the DC term, columns
 /// (harmonic, frequency, magnitude, phase_deg). The THD goes in the plotname.
 /// Returns error.TransientFailed when the transient stops early.
@@ -108,7 +111,9 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
         .dt_max = 1.0 / (200.0 * opts.f_fundamental),
     };
 
-    const spec = blk: {
+    const spec = if (sourceColumns(ctx, opts.output_node, opts.output_neg)) |c|
+        try analyzeColumns(c.times, c.pos, c.neg, opts.f_fundamental, opts.n_harmonics, scratch)
+    else blk: {
         const probes = [_]u32{ opts.output_node, opts.output_neg };
         const n_probes: u32 = if (opts.output_neg == 0) 1 else 2;
         var waveform = try tran.Waveform.init(scratch, n_probes, tran.initialCapacity(tran_opts));
@@ -144,6 +149,25 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
         .is_complex = false,
         .npoints = npoints,
         .data = data,
+    };
+}
+
+/// A recording's time column, an output and, for `v(a,b)`, its reference.
+pub const Columns = struct { times: Column, pos: Column, neg: ?Column };
+
+/// The time, `pos` and (unless `neg` is ground) `neg` columns of
+/// `ctx.source`, the rows of the `.tran` that ran this query's own
+/// transient (#231), borrowed; null to run that transient.
+pub fn sourceColumns(ctx: *const root.RunCtx, pos: u32, neg: u32) ?Columns {
+    const src = ctx.source orelse return null;
+    const ncols = ctx.probes.len + 1;
+    if (src.npoints == 0 or src.varnames.len != ncols or src.data.len != src.npoints * ncols) return null;
+    const p = std.mem.indexOfScalar(u32, ctx.probes, pos) orelse return null;
+    const n: ?usize = if (neg == root.GROUND) null else (std.mem.indexOfScalar(u32, ctx.probes, neg) orelse return null);
+    return .{
+        .times = .{ .base = src.data, .stride = ncols, .len = src.npoints },
+        .pos = .{ .base = src.data[1 + p ..], .stride = ncols, .len = src.npoints },
+        .neg = if (n) |k| Column{ .base = src.data[1 + k ..], .stride = ncols, .len = src.npoints } else null,
     };
 }
 

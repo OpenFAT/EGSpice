@@ -1218,3 +1218,100 @@ test "floor retry: forced capacitor scalar and CPU lanes complete with identical
     try t.expect(batched > 0);
     for (rows[0], rows[1]) |scalar, lane| try t.expectEqualSlices(u64, @ptrCast(scalar), @ptrCast(lane));
 }
+
+test "a .four and .fft read a matching .tran's rows bitwise as their own runs, and run their own beside any other .tran (#231)" {
+    // Oracle: each reader's own transient, the query appended alone, which
+    // is the path a read result replaces.
+    var lib = try Library.init(t.allocator);
+    defer lib.deinit();
+    var b = try Builder.init(t.allocator, &lib);
+    const vin = try b.addNode();
+    const mid = try b.addNode();
+    const out = try b.addNode();
+    // A half-wave rectifier: harmonics for the .four, a spectrum for the .fft.
+    try b.addDevice(models.vsource, "", &.{ .dc = 0, .waveform = 2, .sin_vo = 0, .sin_va = 1, .sin_freq = 1e3 }, &.{}, .{ vin, GROUND });
+    try b.addDevice(models.resistor, "", &.{ .r = 1e3 }, &.{}, .{ vin, mid });
+    try b.addDevice(models.diode, "", &.{ .is = 1e-14, .cjo = 1e-12 }, &.{}, .{ mid, out });
+    try b.addDevice(models.resistor, "", &.{ .r = 1e4 }, &.{}, .{ out, GROUND });
+    try b.addDevice(models.capacitor, "", &.{ .c = 1e-8 }, &.{}, .{ out, GROUND });
+    var prepared = try b.compile();
+    defer prepared.deinit();
+    const every = bareDeck(&.{ vin, mid, out }, &.{ "v(in)", "v(mid)", "v(out)" });
+    const no_mid = bareDeck(&.{ vin, out }, &.{ "v(in)", "v(out)" });
+    const base: requests.Tran = .{ .t_stop = 3e-3, .dt_init = 1e-5 };
+    var uic = base;
+    uic.uic = true;
+    var other = base;
+    other.xmu = 0.4; // the same OP, another integration
+    var tighter = base;
+    tighter.tol.reltol = 1e-4; // another OP
+    var measured = base;
+    measured.point.measures_only = true;
+    // `reads`: whether each reader must read the `.tran`; null leaves it
+    // open (`Query.uic` misses `.fft`, so a `uic` `.fft` has an OP row).
+    const Case = struct { tran: requests.Tran, own: requests.Tran, deck: *const Deck, reads: [2]?bool };
+    const cases = [_]Case{
+        .{ .tran = base, .own = base, .deck = &every, .reads = .{ true, true } },
+        .{ .tran = uic, .own = uic, .deck = &every, .reads = .{ true, null } },
+        .{ .tran = other, .own = base, .deck = &every, .reads = .{ false, false } },
+        .{ .tran = tighter, .own = base, .deck = &every, .reads = .{ false, false } },
+        .{ .tran = measured, .own = base, .deck = &every, .reads = .{ false, false } },
+        // v(mid), the .four's reference, is no column of the .tran.
+        .{ .tran = base, .own = base, .deck = &no_mid, .reads = .{ false, true } },
+    };
+    for (cases) |c| {
+        const readers = [_]requests.Query{
+            .{ .four = .{ .f_fundamental = 1e3, .output_node = out, .output_neg = mid, .tran_opts = c.own } },
+            .{ .fft = .{ .tran = c.own, .out_pos = out, .start = 1e-3, .stop = 3e-3, .np = 256, .label = "v(out)" } },
+        };
+        var alone: [readers.len][]f64 = undefined;
+        for (readers, &alone) |q, *want| {
+            var s = Session.init(t.allocator, t.io, &prepared, c.deck, .{});
+            defer s.deinit();
+            var ids: [1]requests.QueryId = undefined;
+            _ = try s.append(&.{q}, &ids);
+            try s.runAll(.{ .quantum = .completion });
+            want.* = try t.allocator.dupe(f64, (try s.result(ids[0])).data);
+        }
+        defer for (alone) |a| t.allocator.free(a);
+        for ([_]bool{ false, true }) |by_advance| {
+            var s = Session.init(t.allocator, t.io, &prepared, c.deck, .{});
+            defer s.deinit();
+            var ids: [3]requests.QueryId = undefined;
+            _ = try s.append(&.{ .{ .tran = c.tran }, readers[0], readers[1] }, &ids);
+            if (by_advance) {
+                // Last first: advancing a reader advances its `.tran` first.
+                var k: usize = ids.len;
+                while (k != 0) {
+                    k -= 1;
+                    while (!(try s.info(ids[k])).status.terminal()) _ = try s.advance(ids[k]);
+                }
+            } else try s.runAll(.{ .max_parallel = 2, .quantum = .completion });
+            try t.expectEqual(null, s.failure());
+            for (ids[1..], c.reads, alone) |id, reads, want| {
+                const i = @backingInt(id);
+                const read = s.rows.items(.executor)[i].?.source != null;
+                try t.expectEqual(read, s.rows.items(.reads)[i] == ids[0]);
+                if (reads) |r| try t.expectEqual(r, read);
+                try t.expectEqualSlices(u64, @ptrCast(want), @ptrCast((try s.result(id)).data));
+            }
+        }
+    }
+    // A .tran that fails leaves its readers to fail as their own runs do.
+    var short = base;
+    short.max_steps = 4;
+    var failing = Session.init(t.allocator, t.io, &prepared, &every, .{});
+    defer failing.deinit();
+    var fail_ids: [3]requests.QueryId = undefined;
+    _ = try failing.append(&.{
+        .{ .tran = short },
+        .{ .four = .{ .f_fundamental = 1e3, .output_node = out, .output_neg = mid, .tran_opts = short } },
+        .{ .fft = .{ .tran = short, .out_pos = out, .start = 1e-3, .stop = 3e-3, .np = 256, .label = "v(out)" } },
+    }, &fail_ids);
+    try failing.runAll(.{ .quantum = .completion });
+    try t.expectEqual(Status.failed, (try failing.info(fail_ids[0])).status);
+    for (fail_ids[1..]) |id| {
+        try t.expectEqual(fail_ids[0], failing.rows.items(.reads)[@backingInt(id)]);
+        try t.expectEqual(error.TransientFailed, (try failing.info(id)).failure.?);
+    }
+}

@@ -1213,7 +1213,8 @@ pub const Problem = struct {
         if (!self.sidesAllowed() or self.next_output != 0 or self.streaming != null) return;
         if (self.session.outputs.items.len == 0) return;
         const id = self.session.outputs.items[0];
-        if ((try self.session.info(id)).status != .pending) return;
+        // A `.four`/`.fft` reads a `.tran`'s rows after it ends (#231).
+        if ((try self.session.info(id)).status != .pending or self.session.resultRead(id)) return;
         const job = try self.session.query(id);
         for (deck.measures) |m| if (m.analysis == job) return;
         const schema = try analysis.schemaOf(self.allocator, &self.prepared.circuit, deck, job);
@@ -1259,7 +1260,7 @@ pub const Problem = struct {
             .ac => {},
             else => return null, // else: only a transient or AC sweep streams its rows
         }
-        if (self.streaming == id or self.tangent_steps.contains(id)) return null;
+        if (self.streaming == id or self.tangent_steps.contains(id) or self.session.resultRead(id)) return null;
         for (self.prepared.deck.measures) |m| if (m.analysis == job) return null;
         self.sides.ensureUnusedCapacity(self.allocator, 1) catch return null;
         const s = (self.delivery.beginSide(self.io) catch return null) orelse return null;

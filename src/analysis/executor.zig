@@ -246,6 +246,9 @@ pub const Executor = struct {
     built: bool = false,
     /// `RunCtx.stream` for this query.
     stream: ?*std.Io.Writer = null,
+    /// The completed `.tran` whose result a `.four`/`.fft` reads
+    /// (`RunCtx.source`, #231); `Session` keeps it alive while this runs.
+    source: ?*const Executor = null,
     /// Queries this one runs as the other lanes of its batch, on its own
     /// worker (`Session` groups them); empty for a lone query.
     peers: []const *Executor = &.{},
@@ -1002,6 +1005,7 @@ pub const Executor = struct {
             .scratch_allocator = self.allocator,
             .stream = self.stream,
             .measures = self.deck.measures,
+            .source = if (self.source) |s| s.result() else null,
         };
     }
 

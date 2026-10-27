@@ -37,6 +37,7 @@ and differential oracles come first; coverage and fuzzing alone cannot see it.
 | Swallowed out-of-memory | `checkAllAllocationFailures`: each allocation fails once | fault injection | 38 files under `src/` |
 | SIMD lane differs from scalar | the `W == 1` instantiation of the same kernel, bitwise | differential | `src/solver/lane/`, `src/analysis/tests/` lane tests |
 | Batch or lane leaks into a neighbour | each lane bitwise equal to its run alone, NaN and failing lanes included | differential | `src/analysis/tests/` "lane batches" tests |
+| A `.four`/`.fft` reading a `.tran`'s result (#231) differs from its own run | the reader appended alone, bitwise; a `.tran` with other options, OP, columns or measures is not read | differential | `src/analysis/tests/session.zig` "read a matching .tran" |
 | Parallel nondeterminism | `--jobs=1` against N and permuted ready sets: byte-identical | determinism | `src/analysis/tests/session.zig`; whole corpus nightly: `tools/determinism.sh` |
 | Crash, hang or blow-up on huge or deep input | exit 0 or a diagnostic, never a signal or a timeout, under an 8 GB cap | adversarial sizes | `tools/adversarial.py`; nightly |
 | C ABI misuse | model of valid states under random call sequences, forged handles | stateful fuzz | `src/c_api.zig` |

@@ -54,7 +54,8 @@ fn besselI0(x: f64) f64 {
     return sum;
 }
 
-/// Contract entry: the transient, then the spectrum. Complex, NP/2 + 1 rows
+/// Contract entry: the transient (or the rows `ctx.source` holds of it),
+/// then the spectrum. Complex, NP/2 + 1 rows
 /// (frequency, output). Bin k >= 1 holds 2·X[k]/Σw rotated to a sine
 /// reference, so a bin-centred A·sin(2πft + φ) reads A∠φ under any window;
 /// DC and Nyquist hold X[k]/Σw. FORMAT=NORM divides every bin by the
@@ -70,24 +71,29 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const differential = opts.out_neg != root.GROUND;
     const probes = [_]u32{ opts.out_pos, opts.out_neg };
     const n_probes: u32 = if (differential) 2 else 1;
-    var wf = try tran.Waveform.init(scratch, n_probes, tran.initialCapacity(opts.tran));
+    // The matching `.tran`'s rows (#231), else a transient of its own.
+    const source = four.sourceColumns(ctx, opts.out_pos, opts.out_neg);
+    var wf = try tran.Waveform.init(scratch, n_probes, if (source == null) tran.initialCapacity(opts.tran) else 1);
     defer wf.deinit();
-    const sim = try tran.simulate(ctx.circuit, x, probes[0..n_probes], &wf, opts.tran, scratch);
-    if (!sim) return error.TransientFailed;
+    const cols: four.Columns = source orelse blk: {
+        const sim = try tran.simulate(ctx.circuit, x, probes[0..n_probes], &wf, opts.tran, scratch);
+        if (!sim) return error.TransientFailed;
+        break :blk .{ .times = wf.column(0), .pos = wf.column(1), .neg = if (differential) wf.column(2) else null };
+    };
 
     const re = try scratch.alloc(f64, 2 * np);
     defer scratch.free(re);
     const im = re[np..];
     @memset(im, 0);
-    const times = wf.column(0);
+    const times = cols.times;
     const dt = (opts.stop - opts.start) / @as(f64, @floatFromInt(np));
     var cursor_p: usize = 0;
     var cursor_n: usize = 0;
     var w_sum: f64 = 0;
     for (re[0..np], 0..) |*r, k| {
         const t = opts.start + dt * @as(f64, @floatFromInt(k));
-        var v = four.interpolateAt(times, wf.column(1), t, &cursor_p);
-        if (differential) v -= four.interpolateAt(times, wf.column(2), t, &cursor_n);
+        var v = four.interpolateAt(times, cols.pos, t, &cursor_p);
+        if (cols.neg) |neg| v -= four.interpolateAt(times, neg, t, &cursor_n);
         const w = window(opts.window, k, np, opts.alfa);
         w_sum += w;
         r.* = v * w;
