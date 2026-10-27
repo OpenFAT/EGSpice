@@ -7,6 +7,7 @@ A run produces three kinds of output:
 | stderr | one summary line per deck and per result (`AC Analysis: 41 points, 4 variables`), warnings and errors |
 | stdout | `.meas` results, Monte Carlo statistics, and `--plan` / `--print-dag` graphs |
 | `--rawfile FILE` | the results themselves, in the `--format` you choose |
+| `--measures FILE` | the `.meas` results as JSON, labelled with analysis and variant |
 
 Without `--rawfile`, results stay in memory and nothing is written.
 
@@ -145,6 +146,49 @@ They are printed whether or not `--rawfile` is given. Over Monte Carlo
 trials ESPice also prints the mean, sigma, min and max of each
 measurement. [Chapter 7](../learn/measure.md) and the
 [reference](reference.md#meas) cover the syntax.
+
+### Measurements as JSON
+
+`espice deck.sp --measures=meas.json` writes every `.meas` result of the
+run to `meas.json` as well as to stdout, which is unchanged. The file is
+written atomically when the run ends, as `-r` is. `--measures=-` writes the
+JSON to stdout in place of the text blocks. The shape (values abridged):
+
+```json
+{
+  "format": "espice-measures/1",
+  "deck": "ota.sp",
+  "results": [
+    {"name": "gain", "analysis": "ac", "variant": {"kind": "nominal"}, "value": 144.242},
+    {"name": "ugf", "analysis": "ac", "variant": {"kind": "step", "params": {"ib": 9e-6}}, "value": 30304900},
+    {"name": "irms", "analysis": "tran", "variant": {"kind": "alter", "index": 2}, "value": 6.27185e-4, "from": 0, "to": 3e-6},
+    {"name": "ph", "analysis": "ac", "variant": {"kind": "monte", "trial": 17}, "value": -1.667081},
+    {"name": "off", "analysis": "dc", "variant": {"kind": "nominal"}, "value": null, "error": "out of interval"}
+  ],
+  "statistics": [
+    {"name": "ph", "analysis": "ac", "kind": "monte", "n": 30, "failed": 0, "mean": -1.66, "sigma": 0.02, "min": -1.71, "max": -1.61}
+  ]
+}
+```
+
+- `variant` names what produced the point: `nominal`, `step` (a `.step`
+  or card `SWEEP` point, its parameter values in `params`), `data` (a
+  `SWEEP DATA` row, its columns in `params`), `alter` (the run's `index`),
+  `monte` (the `trial`), `temp` (an HSPICE `.temp` list entry, in `temp`).
+  A point inside an `.alter` run also carries `alter`, and any point run at
+  a `.temp` entry carries `temp`.
+- `from`, `to` and `at` carry the window and position the stdout line
+  prints.
+- Numbers are the shortest text that reads back as the same f64, parameter
+  values included.
+- A failed measure has `"value": null` and an `error` string (`out of
+  interval`, `no such vector`, or `analysis failed` for a sweep point whose
+  analysis failed), never a sentinel number.
+- Results keep the stdout order, so the JSON and the text agree line for
+  line; a `_CONT` card's events are `name[1]`, `name[2]`, ... as printed.
+- `statistics` holds, per card and Monte Carlo analysis, the trial count
+  `n`, the trials the card `failed` in, and its mean, sigma (Bessel's
+  correction), min and max.
 
 HSPICE's `.stim` writes transient signals as PWL sources or a `.data`
 table, and `.save` (HSPICE dialect) writes the operating point; both go

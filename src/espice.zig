@@ -105,6 +105,9 @@ pub const Options = struct {
     /// come first. The same bytes in the same order as `print_measures`
     /// alone, at any `max_parallel`. Both writers must outlive the Problem.
     measures: ?MeasureWriters = null,
+    /// Also keep every `.meas` result printed, as JSON, for
+    /// `write_measures_json` (the CLI's `--measures=FILE`, #235).
+    measures_json: bool = false,
 };
 
 /// `Options.measures`: the `.meas` values and the cards' error lines.
@@ -220,6 +223,9 @@ pub const Problem = struct {
     measures_to: ?MeasureWriters = null,
     measure_cursor: MeasureCursor = .{},
     measure_error: ?anyerror = null,
+    /// `Options.measures_json`: each result printed so far as a JSON
+    /// object, each led by `,\n`.
+    measure_json: ?std.Io.Writer.Allocating = null,
     /// The outputs `run_all` has checked for failures, and the first it
     /// found, which every later call returns too.
     checked_outputs: usize = 0,
@@ -338,6 +344,8 @@ pub const Problem = struct {
         }
         execution.display = options.display;
         self.measures_to = options.measures;
+        // Allocates on its first write only, so no errdefer.
+        if (options.measures_json) self.measure_json = .init(allocator);
         self.session = analysis.session.Session.init(self.workerAllocator(), io, &self.prepared.circuit, &self.prepared.deck, execution);
         errdefer self.session.deinit();
         // An optimization's sessions run before this one; nothing after it
@@ -468,6 +476,7 @@ pub const Problem = struct {
         self.delivery.deinit();
         self.prepared.deinit();
         self.library.deinit();
+        if (self.measure_json) |*j| j.deinit();
         if (self.parse_arena) |*arena| arena.deinit();
         self.arena.deinit();
         a.destroy(self);
@@ -1273,23 +1282,52 @@ pub const Problem = struct {
     /// With `Options.measures`, it writes only what `run_all` has not
     /// printed there, and returns the first error printing there.
     pub fn print_measures(self: *Problem, out: *std.Io.Writer, err: *std.Io.Writer) !void {
-        const measures = self.prepared.deck.measures;
         if (self.measures_to != null) {
             if (self.measure_error) |e| return e;
             try self.printMeasuresFrom(&self.measure_cursor, out, err, false);
         } else {
+            // Each call prints every block again, so the JSON starts over.
+            if (self.measure_json) |*j| j.clearRetainingCapacity();
             var cursor: MeasureCursor = .{};
             try self.printMeasuresFrom(&cursor, out, err, false);
         }
+        try self.writeStatistics(out, false);
+    }
+
+    /// Writes every `.meas` result `print_measures` (or `run_all`, with
+    /// `Options.measures`) has printed as one JSON document,
+    /// `espice-measures/1` (#235): `deck`, the `results` in the printed
+    /// order, each with its analysis, its `variant` (`output.writeVariantJson`)
+    /// and the `from`/`to`/`at` its line prints, a failed one with a null
+    /// `value` and an `error`; then the Monte Carlo `statistics`.
+    /// `error.MeasuresJsonOff` without `Options.measures_json`.
+    pub fn write_measures_json(self: *Problem, out: *std.Io.Writer, deck: []const u8) !void {
+        const results = if (self.measure_json) |*j| j.written() else return error.MeasuresJsonOff;
+        try out.writeAll("{\n  \"format\": \"espice-measures/1\",\n  \"deck\": ");
+        try std.json.Stringify.encodeJsonString(deck, .{}, out);
+        // Each object is led by `,\n`; the first one's comma goes.
+        try out.print(",\n  \"results\": [{s}\n  ],\n  \"statistics\": [", .{if (results.len == 0) "" else results[1..]});
+        var stats: std.Io.Writer.Allocating = .init(self.allocator);
+        defer stats.deinit();
+        try self.writeStatistics(&stats.writer, true);
+        const s = stats.written();
+        try out.print("{s}\n  ]\n}}\n", .{if (s.len == 0) "" else s[1..]});
+    }
+
+    /// The `.meas` statistics over the Monte Carlo trials of each tran, AC
+    /// and DC card, as text or as JSON objects.
+    fn writeStatistics(self: *const Problem, out: *std.Io.Writer, json: bool) !void {
+        const measures = self.prepared.deck.measures;
         if (measures.len == 0) return;
-        // Statistics over the Monte Carlo trials of each analysis kind.
         var trials: std.ArrayList(Result) = .empty;
         defer trials.deinit(self.allocator);
         inline for (.{ .tran, .ac, .dc }) |kind| {
             trials.clearRetainingCapacity();
             try monteTrials(self.allocator, &self.session, kind, &trials);
             for (self.runs) |*run| try monteTrials(self.allocator, &run.session, kind, &trials);
-            if (trials.items.len != 0) try output.printMeasureStatistics(out, measures, kind, trials.items);
+            if (trials.items.len != 0) {
+                if (json) try output.writeMeasureStatistics(out, measures, kind, trials.items) else try output.printMeasureStatistics(out, measures, kind, trials.items);
+            }
         }
     }
 
@@ -1335,7 +1373,7 @@ pub const Problem = struct {
     /// The optimization summaries, then each session's `.meas` blocks in
     /// request order (`printQueryMeasures`) from `cursor` on; with `wait`,
     /// it stops at the first result still running, else it skips those.
-    fn printMeasuresFrom(self: *const Problem, cursor: *MeasureCursor, out: *std.Io.Writer, err: *std.Io.Writer, wait: bool) !void {
+    fn printMeasuresFrom(self: *Problem, cursor: *MeasureCursor, out: *std.Io.Writer, err: *std.Io.Writer, wait: bool) !void {
         const measures = self.prepared.deck.measures;
         if (!cursor.headed) {
             for (self.optimization, 0..) |*lm, k| try printOptimization(out, lm, &self.prepared.tuner.?, k, measures);
@@ -1351,7 +1389,7 @@ pub const Problem = struct {
             while (cursor.next < session.outputs.items.len) : (cursor.next += 1) {
                 const id = session.outputs.items[cursor.next];
                 if (wait and !(try session.info(id)).status.terminal()) return;
-                try printQueryMeasures(session, id, out, err, measures);
+                try printQueryMeasures(self.allocator, session, id, out, err, if (self.measure_json) |*j| &j.writer else null, measures);
             }
         }
     }
@@ -1822,17 +1860,34 @@ fn block(session: *const analysis.session.Session, id: QueryId, k: usize) !Resul
 /// card can read; a transient's own run, not its tangent blocks. A sweep
 /// point's block names its row and label, and prints NaN for each card
 /// without a value, a failed point's for all.
-fn printQueryMeasures(session: *const analysis.session.Session, id: QueryId, out: *std.Io.Writer, err: *std.Io.Writer, measures: []const core.Measure) !void {
+fn printQueryMeasures(gpa: std.mem.Allocator, session: *const analysis.session.Session, id: QueryId, out: *std.Io.Writer, err: *std.Io.Writer, json: ?*std.Io.Writer, measures: []const core.Measure) !void {
     const info = try session.info(id);
     switch (info.kind) {
         .op, .tran, .ac, .dc, .fft, .tran_noise, .dcmatch, .acmatch, .lstb, .phasenoise, .pnoise, .sp => {},
         else => return,
     }
     if (session.released(id)) return;
-    const point: ?output.MeasurePoint = if (variantOf(try session.query(id))) |v| .{ .row = v, .label = session.deck.variants.labels[v] } else null;
+    const job = try session.query(id);
+    const row = variantOf(job);
+    const point: ?output.MeasurePoint = if (row) |v| .{ .row = v, .label = session.deck.variants.labels[v] } else null;
+    // The fields every JSON result of the block shares (#235).
+    var head: std.Io.Writer.Allocating = .init(gpa);
+    defer head.deinit();
+    if (json != null) {
+        try head.writer.print("\"analysis\": \"{t}\", \"variant\": ", .{info.kind});
+        try output.writeVariantJson(&head.writer, session.deck.variants, row, tempOf(job));
+    }
+    const sink: ?output.MeasureJson = if (json) |j| .{ .out = j, .head = head.written() } else null;
     if (info.status == .complete) {
-        try output.printMeasures(out, err, measures, info.kind, try block(session, id, 0), point);
-    } else if (point) |p| if (info.status.terminal()) try output.printFailedMeasures(out, measures, info.kind, p);
+        try output.printMeasures(out, err, measures, info.kind, try block(session, id, 0), point, sink);
+    } else if (point) |p| if (info.status.terminal()) try output.printFailedMeasures(out, measures, info.kind, p, sink);
+}
+
+/// The HSPICE `.temp` list entry `job` runs at; null at the deck's.
+fn tempOf(job: Query) ?f64 {
+    return switch (job) {
+        inline else => |o| o.tol.temp_c,
+    };
 }
 
 /// The optimizer's summary, after HSPICE's: one line per accepted

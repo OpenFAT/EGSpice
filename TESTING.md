@@ -41,6 +41,7 @@ and differential oracles come first; coverage and fuzzing alone cannot see it.
 | Crash, hang or blow-up on huge or deep input | exit 0 or a diagnostic, never a signal or a timeout, under an 8 GB cap | adversarial sizes | `tools/adversarial.py`; nightly |
 | C ABI misuse | model of valid states under random call sequences, forged handles | stateful fuzz | `src/c_api.zig` |
 | Output corruption | round trip of every f64 bit pattern | round trip | `src/output/` tests |
+| `--measures` JSON disagrees with the printed `.meas` or mislabels a variant | the printed text line for line; the deck's own `.step`/`.data` values bit for bit; RC closed forms | differential | `src/output/measure.zig`, `src/tests/espice.zig` "--measures" tests |
 | Browser build differs from native | the native espice at the same lane width, within 1e-9 | differential | `tools/playground/compare.js` (`pages.yml`) |
 | A target or OS stops building | the compiler for every release target | cross compile | `cross.yml`; the gate on Linux and macOS |
 | GPU differs from CPU | the CPU result of the same deck | differential | `zig build test -- --backend cuda --jobs 1` (local; no GPU runner) |

@@ -55,6 +55,7 @@ pub fn main(init: std.process.Init) !u8 {
     var show_plan = false;
     var plan_only = false;
     var timing_in_depth = false;
+    var measures_path: ?[]const u8 = null;
     var point: problem.requests.PointOptions = .{};
     var tangents: std.ArrayList([]const u8) = .empty;
     defer tangents.deinit(init.gpa);
@@ -68,6 +69,7 @@ pub fn main(init: std.process.Init) !u8 {
                 \\  -b, --batch                 Run all queries (default)
                 \\  -r, --rawfile=FILE          Result destination
                 \\      --format=FMT            binary|ascii|csv|touchstone|psf|fsdb|sst2|citi|print
+                \\      --measures=FILE         Also write every .meas result, labelled, as JSON (- for stdout)
                 \\      --backend=BE            cpu|auto|cuda|hip (default auto with GPU kernels, else cpu)
                 \\      --gpu                   Require an available GPU
                 \\      --jobs=N|auto           Maximum parallel queries (default auto: one per CPU)
@@ -137,6 +139,8 @@ pub fn main(init: std.process.Init) !u8 {
             point.abort_measure = value orelse return usageFail();
         } else if (optionValue(arg, "-r", "--rawfile", &args)) |value| {
             selection.path = value orelse return usageFail();
+        } else if (optionValue(arg, "", "--measures", &args)) |value| {
+            measures_path = value orelse return usageFail();
         } else if (optionValue(arg, "", "--format", &args)) |value| {
             selection.format = problem.parseFormat(value orelse return usageFail()) orelse return usageFail();
         } else if (optionValue(arg, "", "--backend", &args)) |value| {
@@ -159,6 +163,12 @@ pub fn main(init: std.process.Init) !u8 {
         } else try paths.append(init.gpa, arg);
     }
     if (paths.items.len == 0) return usageFail();
+    // One file holds one deck's results; `-` writes one document per deck.
+    const json_stdout = if (measures_path) |m| std.mem.eql(u8, m, "-") else false;
+    if (measures_path != null and !json_stdout and paths.items.len > 1) {
+        std.debug.print("Error: --measures=FILE takes one netlist\n", .{});
+        return usageFail();
+    }
     // With kernels in the build the default is `auto`, which prices each
     // query and stays on the CPU, silently, unless the GPU pays.
     const backend: problem.Request = backend_arg orelse if (problem.gpu_available) .auto else .cpu;
@@ -182,6 +192,10 @@ pub fn main(init: std.process.Init) !u8 {
             continue;
         };
         defer init.gpa.free(text);
+        // `--measures=-`: the JSON takes the text blocks' place on stdout.
+        var discard_buf: [256]u8 = undefined;
+        var discard: std.Io.Writer.Discarding = .init(&discard_buf);
+        const meas_out = if (json_stdout) &discard.writer else &stdout.interface;
         const deck_dialect = dialect orelse detected: {
             const d = problem.detectDialect(text);
             if (d != .ngspice) std.debug.print("{s}: reading as {t} (--tokenizer to override)\n", .{ path, d });
@@ -208,7 +222,8 @@ pub fn main(init: std.process.Init) !u8 {
             .point = point,
             .auto_point = !full_waveforms and !plan_only, // --plan solves nothing, not even the warm OP
             .live_params = tangents.items,
-            .measures = .{ .out = &stdout.interface, .err = &stderr.interface },
+            .measures = .{ .out = meas_out, .err = &stderr.interface },
+            .measures_json = measures_path != null,
             .vpi_apps = vpi_apps.items,
             .vpi = vpi,
             .hdl_toolchain = .{ .include_dirs = include_dirs.items },
@@ -227,10 +242,19 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
             if (p.output_error()) |delivery| std.debug.print("Output error: {s}\n", .{@errorName(delivery)});
             failed = true;
+            // The blocks printed as their points ended, a failed point's
+            // as NaN: the JSON still records them.
+            if (measures_path) |file| writeMeasures(init.io, p, file, path, &stdout.interface) catch |e|
+                std.debug.print("Error: {s}: --measures={s}: {s}\n", .{ path, file, @errorName(e) });
             continue;
         };
-        try p.print_measures(&stdout.interface, &stderr.interface);
-        try p.print_tangents(&stdout.interface);
+        try p.print_measures(meas_out, &stderr.interface);
+        // Tangents are no `.meas` result: on stderr when stdout is JSON.
+        try p.print_tangents(if (json_stdout) &stderr.interface else &stdout.interface);
+        if (measures_path) |file| writeMeasures(init.io, p, file, path, &stdout.interface) catch |e| {
+            std.debug.print("Error: {s}: --measures={s}: {s}\n", .{ path, file, @errorName(e) });
+            failed = true;
+        };
         try stdout.interface.flush();
         try stderr.interface.flush();
         std.debug.print("{s}: {d} devices\n", .{ p.title(), p.device_count() });
@@ -245,6 +269,22 @@ pub fn main(init: std.process.Init) !u8 {
         for (runs) |result| std.debug.print("  {s}: {d} points, {d} variables\n", .{ result.plotname, result.npoints, result.varnames.len });
     }
     return if (failed) 1 else 0;
+}
+
+/// `--measures=FILE`: `p`'s `.meas` results as JSON, on `stdout` for `-`,
+/// else replacing `file` atomically, as `-r` does.
+fn writeMeasures(io: std.Io, p: *problem.Problem, file: []const u8, deck: []const u8, stdout: *std.Io.Writer) !void {
+    if (std.mem.eql(u8, file, "-")) {
+        try p.write_measures_json(stdout, deck);
+        return stdout.flush();
+    }
+    var atomic = try std.Io.Dir.cwd().createFileAtomic(io, file, .{ .replace = true });
+    defer atomic.deinit(io);
+    var buf: [4096]u8 = undefined;
+    var fw = atomic.file.writer(io, &buf);
+    try p.write_measures_json(&fw.interface, deck);
+    try fw.interface.flush();
+    try atomic.replace(io);
 }
 
 /// `--jobs=auto`: one query per CPU.

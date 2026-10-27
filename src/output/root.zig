@@ -21,6 +21,14 @@ pub const printFailedMeasures = @import("measure").printFailed;
 pub const MeasurePoint = @import("measure").Point;
 /// `.meas` statistics over Monte Carlo trials.
 pub const printMeasureStatistics = @import("measure").printStatistics;
+/// Where `printMeasures` also writes its results as JSON (#235).
+pub const MeasureJson = @import("measure").Json;
+/// `printMeasureStatistics` as JSON objects.
+pub const writeMeasureStatistics = @import("measure").writeStatistics;
+/// A result's JSON `variant` object: what row of `core.Variants` made it.
+pub const writeVariantJson = @import("measure").writeVariant;
+/// An f64 as the shortest JSON number that reads back as it; `null` when not finite.
+pub const writeJsonNumber = @import("measure").writeNumber;
 /// Every `.meas` card's value over one result; see `measure.evaluateAll`.
 pub const measureValues = @import("measure").evaluateAll;
 /// `measureValues`, also flagging cards that name a missing vector.

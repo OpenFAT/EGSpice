@@ -5,7 +5,8 @@
 //! alone, live `set_params` against a fresh parse, a `.data` sweep against
 //! the points API, the CPU against the GPU lanes), `checkAllAllocationFailures`
 //! for leaks, closed forms (4kTR noise, dividers, the B-source deck's own
-//! algebra), and the named error each misuse must get.
+//! algebra), the printed `.meas` text for its JSON (#235), and the named
+//! error each misuse must get.
 const std = @import("std");
 const api = @import("espice");
 const t = std.testing;
@@ -1551,6 +1552,187 @@ test "Options.measures: run_all prints each point's .meas block as it ends, the 
         try p.print_measures(&got.writer, &got.writer);
         try t.expectEqualStrings(want.written(), got.written());
     }
+}
+
+/// Runs `source` as `espice --measures` does, each `.meas` block printed to
+/// `text` as its point ends, then writes the JSON document to `json`.
+fn measuresJson(source: api.Source, dialect: api.Dialect, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
+    var errors: std.Io.Writer.Allocating = .init(t.allocator);
+    defer errors.deinit();
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = dialect, .max_parallel = 4, .measures = .{ .out = &text.writer, .err = &errors.writer }, .measures_json = true });
+    defer p.deinit();
+    try p.run_all();
+    try p.print_measures(&text.writer, &errors.writer);
+    try p.write_measures_json(&json.writer, "deck.sp");
+}
+
+/// `json` parsed and checked against `text`, which the oracle is: each
+/// value line of a `.meas` block is the next result, with its name and,
+/// to the printed digits, its value; a `NaN` line is a null result with an
+/// error. Holds for a deck whose cards fail only at sweep points, which
+/// print a line for the failure.
+fn expectSameResults(text: []const u8, json: []const u8) !std.json.Parsed(std.json.Value) {
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    errdefer parsed.deinit();
+    try t.expectEqualStrings("espice-measures/1", parsed.value.object.get("format").?.string);
+    const results = parsed.value.object.get("results").?.array.items;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var k: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "Monte Carlo statistics") != null) break;
+        if (std.mem.indexOf(u8, line, "Measurements for") != null) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const r = results[k].object;
+        k += 1;
+        try t.expectEqualStrings(std.mem.trim(u8, line[0..eq], " "), r.get("name").?.string);
+        var fields = std.mem.tokenizeScalar(u8, line[eq + 1 ..], ' ');
+        const printed = fields.next().?;
+        if (std.mem.eql(u8, printed, "NaN")) {
+            try t.expect(r.get("value").? == .null);
+            try t.expect(r.get("error").? == .string);
+        } else try t.expectApproxEqRel(try std.fmt.parseFloat(f64, printed), jsonFloat(r.get("value").?), 1e-5);
+    }
+    try t.expect(k > 0);
+    try t.expectEqual(results.len, k);
+    return parsed;
+}
+
+/// A parsed JSON number as an f64; NaN for anything else.
+fn jsonFloat(v: std.json.Value) f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => std.math.nan(f64), // else: null and the non-numbers have no value
+    };
+}
+
+/// The result objects of a parsed `write_measures_json` document.
+fn jsonResults(parsed: std.json.Parsed(std.json.Value)) []const std.json.Value {
+    return parsed.value.object.get("results").?.array.items;
+}
+
+test "--measures (#235): a .step deck's JSON is its printed .meas lines, each labelled with its point, streamed or printed at the end" {
+    const source: api.Source = .{ .file = "docs/examples/step_param.sp" };
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(source, .ngspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    const results = jsonResults(parsed);
+    try t.expectEqual(@as(usize, 3), results.len);
+    // Oracle: the deck's `.step param rval list 1k 2k 4k`, exactly.
+    for (results, [_]f64{ 1e3, 2e3, 4e3 }) |r, rval| {
+        try t.expectEqualStrings("ac", r.object.get("analysis").?.string);
+        const variant = r.object.get("variant").?.object;
+        try t.expectEqualStrings("step", variant.get("kind").?.string);
+        try t.expectEqual(rval, jsonFloat(variant.get("params").?.object.get("rval").?));
+    }
+    // Printed at the end instead, twice: the same document, nothing doubled.
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .measures_json = true });
+    defer p.deinit();
+    try p.run_all();
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    for (0..2) |_| try p.print_measures(&sink.writer, &sink.writer);
+    var again: std.Io.Writer.Allocating = .init(t.allocator);
+    defer again.deinit();
+    try p.write_measures_json(&again.writer, "deck.sp");
+    try t.expectEqualStrings(json.written(), again.written());
+}
+
+test "--measures (#235): an .alter deck labels the nominal run and the altered one" {
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(.{ .file = "docs/examples/hspice_alter.sp" }, .hspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    const results = jsonResults(parsed);
+    try t.expectEqual(@as(usize, 2), results.len);
+    var nominal: f64 = std.math.nan(f64);
+    var altered: f64 = std.math.nan(f64);
+    for (results) |r| {
+        const variant = r.object.get("variant").?.object;
+        const kind = variant.get("kind").?.string;
+        if (std.mem.eql(u8, kind, "nominal")) {
+            nominal = jsonFloat(r.object.get("value").?);
+        } else {
+            try t.expectEqualStrings("alter", kind);
+            try t.expectEqual(@as(f64, 1), jsonFloat(variant.get("index").?));
+            altered = jsonFloat(r.object.get("value").?);
+        }
+    }
+    // Analytic: t50 = RC ln 2 past a 10 ps edge, and the .alter doubles R.
+    try t.expectApproxEqRel(2.0, (altered - 5e-12) / (nominal - 5e-12), 1e-2);
+}
+
+test "--measures (#235): Monte Carlo trials are labelled by trial, and the statistics are the results'" {
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(.{ .file = "docs/examples/monte_tran.sp" }, .hspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    var seen: [51]bool = @splat(false);
+    var sum: f64 = 0;
+    var trials: usize = 0;
+    for (jsonResults(parsed)) |r| {
+        const variant = r.object.get("variant").?.object;
+        if (std.mem.eql(u8, variant.get("kind").?.string, "nominal")) continue;
+        try t.expectEqualStrings("monte", variant.get("kind").?.string);
+        const trial: usize = @intFromFloat(jsonFloat(variant.get("trial").?));
+        try t.expect(trial >= 1 and trial <= 50 and !seen[trial]);
+        seen[trial] = true;
+        sum += jsonFloat(r.object.get("value").?);
+        trials += 1;
+    }
+    try t.expectEqual(@as(usize, 50), trials);
+    const stats = parsed.value.object.get("statistics").?.array.items;
+    try t.expectEqual(@as(usize, 1), stats.len);
+    const s = stats[0].object;
+    try t.expectEqualStrings("tc", s.get("name").?.string);
+    try t.expectEqual(@as(f64, 50), jsonFloat(s.get("n").?));
+    try t.expectEqual(@as(f64, 0), jsonFloat(s.get("failed").?));
+    // Oracle: the plain mean of the trials' own results (Welford is
+    // another summation order), and RC ln 2 = 693 ns within the 3 % spread.
+    try t.expectApproxEqRel(sum / 50, jsonFloat(s.get("mean").?), 1e-12);
+    try t.expectApproxEqRel(1e-6 * @log(2.0), jsonFloat(s.get("mean").?), 2e-2);
+}
+
+test "--measures (#235): SWEEP DATA rows carry their columns, and a failed WHEN is null with its error" {
+    var swept: std.ArrayList(u8) = .empty;
+    defer swept.deinit(t.allocator);
+    const rows = [_][2]f64{ .{ 1e3, 0.5e-12 }, .{ 2e3, 0.5e-12 }, .{ 4e3, 1e-12 }, .{ 1e6, 1e-12 } };
+    try swept.appendSlice(t.allocator, points_body ++ ".data pts rv cv\n");
+    for (rows) |row| try swept.print(t.allocator, "+ {e} {e}\n", .{ row[0], row[1] });
+    // The last row's RC = 1 us never reaches 0.5 V in 40 ns.
+    try swept.appendSlice(t.allocator, ".enddata\n.tran 10p 40n sweep data=pts\n.meas tran tw when v(out)=0.5 rise=1\n" ++ points_meas);
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(.{ .bytes = .{ .data = swept.items, .origin = "data.sp" } }, .hspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    const results = jsonResults(parsed);
+    // Three cards per row: tw, tpd, e.
+    try t.expectEqual(@as(usize, rows.len * 3), results.len);
+    for (results, 0..) |r, k| {
+        const variant = r.object.get("variant").?.object;
+        try t.expectEqualStrings("data", variant.get("kind").?.string);
+        // Oracle: the row's own values, bit for bit.
+        const params = variant.get("params").?.object;
+        try t.expectEqual(rows[k / 3][0], jsonFloat(params.get("rv").?));
+        try t.expectEqual(rows[k / 3][1], jsonFloat(params.get("cv").?));
+    }
+    const tw = results[(rows.len - 1) * 3].object;
+    try t.expectEqualStrings("tw", tw.get("name").?.string);
+    try t.expect(tw.get("value").? == .null);
+    try t.expectEqualStrings("out of interval", tw.get("error").?.string);
+    try t.expect(results[(rows.len - 2) * 3].object.get("value").? != .null);
 }
 
 test "Options.point.tangent_step with live parameters: the deck's own transient prints the tangents append_points gives" {

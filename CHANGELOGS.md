@@ -4,6 +4,7 @@ Newest first.
 
 ## Unreleased
 
+- `--measures=FILE` also writes every `.meas` result as JSON, labelled with its analysis and variant (`.step`, `SWEEP DATA`, `.alter`, Monte Carlo trial, `.temp` entry), a failed one as `null` with its error; `--measures=-` puts it on stdout (#235).
 - `espice --version` prints the ESPice and VerA versions and the GPU backends built in.
 - `-I DIR` / `--include=DIR` adds a search directory for `.hdl` includes.
 - `.pz` on circuits above 1000 unknowns returns the 20 poles and 20 zeros nearest s = 0 (the plot is named "partial").

@@ -59,6 +59,8 @@ pub const Point = struct {
     /// Monte Carlo trial, whose draws answer the distribution calls and
     /// the `DEV`/`LOT`/`.variation` rows.
     trial: ?Trial = null,
+    /// What the row is (`core.Variants.kinds`).
+    kind: core.Variants.Kind = .step,
 };
 
 /// A card's primary value for one point, by card name.
@@ -154,7 +156,7 @@ pub fn plan(p: *Planner) !Plan {
         if (!own) fanout.global.count = p.count() - fanout.global.first;
     }
     if (p.prefix.len != 0 and p.count() == 0) {
-        try p.closeRow(p.prefix, 0, null);
+        try p.closeRow(p.prefix, 0, null, .alter);
         fanout.global = .{ .first = 0, .count = 1, .nominal = false };
     }
     _ = try nl.setLive(p.scratch, &p.stack, nl.live.nominal, null);
@@ -184,6 +186,7 @@ pub const Planner = struct {
     labels: std.ArrayList([]const u8) = .empty,
     temps: std.ArrayList(?f64) = .empty,
     axes: std.ArrayList(f64) = .empty,
+    kinds: std.ArrayList(core.Variants.Kind) = .empty,
     starts: std.ArrayList(u32) = .empty,
     write_refs: std.ArrayList(u32) = .empty,
     write_values: std.ArrayList(f64) = .empty,
@@ -300,6 +303,7 @@ pub const Planner = struct {
             .starts = try p.sim.dupe(u32, p.starts.items),
             .refs = try p.sim.dupe(u32, p.write_refs.items),
             .values = try p.sim.dupe(f64, p.write_values.items),
+            .kinds = try p.sim.dupe(core.Variants.Kind, p.kinds.items),
         };
     }
 
@@ -326,7 +330,9 @@ pub const Planner = struct {
 
     /// One `.data` row.
     fn addRow(p: *Planner, data: netlist.Data, row: []const f64) !void {
-        try p.add(try p.pointOf(data.columns, data.labels, row));
+        var pt = try p.pointOf(data.columns, data.labels, row);
+        pt.kind = .data;
+        try p.add(pt);
     }
 
     /// The point setting `targets[i]` to `values[i]`, labelled
@@ -356,6 +362,7 @@ pub const Planner = struct {
             .axis = @floatFromInt(trial),
             .live = p.nl.live.nominal,
             .trial = .{ .sampler = sampler, .trial = trial, .index = index },
+            .kind = .monte,
         });
     }
 
@@ -373,7 +380,7 @@ pub const Planner = struct {
             defer c.deinit();
             if (sameTopology(p.nominal, &c)) {
                 try p.diff(try collect(arena.allocator(), &c));
-                return p.closeRow(label, @floatFromInt(k), null);
+                return p.closeRow(label, @floatFromInt(k), null, .alter);
             }
         }
         try p.rebuilds.append(p.scratch, .{ .nl = alt, .run = .{ .prefix = label } });
@@ -385,7 +392,7 @@ pub const Planner = struct {
         const label = if (p.prefix.len == 0) try p.sim.dupe(u8, pt.label) else try std.fmt.allocPrint(p.sim, "{s}, {s}", .{ p.prefix, pt.label });
         if (try p.load(pt, label) == .circuit) return p.addRun(label, pt);
         try p.pointWrites(pt);
-        try p.closeRow(label, pt.axis, pt.temp);
+        try p.closeRow(label, pt.axis, pt.temp, pt.kind);
     }
 
     const Load = enum { row, circuit };
@@ -534,11 +541,12 @@ pub const Planner = struct {
         return .{ .refs = refs.items, .slots = slots.items, .values = values.items };
     }
 
-    fn closeRow(p: *Planner, label: []const u8, axis: f64, temp: ?f64) !void {
+    fn closeRow(p: *Planner, label: []const u8, axis: f64, temp: ?f64, kind: core.Variants.Kind) !void {
         for (p.write_refs.items[p.starts.items[p.starts.items.len - 1]..]) |r| p.row_at[r] = netlist.none;
         try p.labels.append(p.scratch, label);
         try p.axes.append(p.scratch, axis);
         try p.temps.append(p.scratch, temp);
+        try p.kinds.append(p.scratch, kind);
         try p.starts.append(p.scratch, @intCast(p.write_refs.items.len));
     }
 
@@ -891,7 +899,7 @@ pub const Tuner = struct {
         const p = &t.planner;
         p.nominal = nominal;
         p.sim = arena;
-        inline for (.{ &p.labels, &p.temps, &p.axes, &p.write_refs, &p.write_values }) |list| list.clearRetainingCapacity();
+        inline for (.{ &p.labels, &p.temps, &p.axes, &p.kinds, &p.write_refs, &p.write_values }) |list| list.clearRetainingCapacity();
         p.starts.shrinkRetainingCapacity(1);
         const b = t.bases[base];
         const live = try arena.dupe(f64, b.live);
@@ -973,6 +981,8 @@ pub const Tuning = struct {
     starts: std.ArrayList(u32) = .empty,
     refs: std.ArrayList(u32) = .empty,
     write_values: std.ArrayList(f64) = .empty,
+    /// The deck's rows' kinds; the rows a call appends read `.step`.
+    kinds: []const core.Variants.Kind = &.{},
 
     /// What one call changed: the whole variant table, whose last row is
     /// the call's, the template that row runs on (0 for the nominal
@@ -1155,6 +1165,7 @@ pub const Tuning = struct {
         try t.starts.appendSlice(p.sim, if (current.starts.len == 0) &.{0} else current.starts);
         try t.refs.appendSlice(p.sim, current.refs);
         try t.write_values.appendSlice(p.sim, current.values);
+        t.kinds = current.kinds;
         t.seeded = true;
     }
 
@@ -1166,6 +1177,7 @@ pub const Tuning = struct {
             .starts = t.starts.items,
             .refs = t.refs.items,
             .values = t.write_values.items,
+            .kinds = t.kinds,
         };
     }
 

@@ -16,6 +16,7 @@ Usage: espice [OPTION]... FILE...
   -b, --batch                 Run all queries (default)
   -r, --rawfile=FILE          Result destination
       --format=FMT            binary|ascii|csv|touchstone|psf|fsdb|sst2|citi|print
+      --measures=FILE         Also write every .meas result, labelled, as JSON (- for stdout)
       --backend=BE            cpu|auto|cuda|hip (default cpu)
       --gpu                   Require an available GPU
       --jobs=N|auto           Maximum parallel queries (default auto: one per CPU)
@@ -62,6 +63,16 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
   `ascii`, `csv`, `print` (`text`), `touchstone` (`snp`, `s2p`), `citi`
   (`citifile`), `psf`, `fsdb`, `sst2` (`hspice`). An unknown name is a usage
   error.
+
+`--measures=FILE`
+: Also write every `.meas` result of the run to `FILE` as JSON, each
+  labelled with its analysis and the variant that produced it (`.step`
+  point, `SWEEP DATA` row, `.alter` run, Monte Carlo trial, `.temp` entry).
+  stdout is unchanged. The file is replaced atomically when the run ends,
+  as `-r` is, and also when a sweep point fails. `--measures=-` writes the
+  JSON to stdout in place of the text blocks (`--tangents` lines then go to
+  stderr). `FILE` takes one netlist; `-` writes one document per netlist.
+  See [Output](output.md#measurements-as-json).
 
 `--tokenizer=FMT`
 : The netlist dialect: `ngspice` (alias `ng`), `hspice` (`hs`) or

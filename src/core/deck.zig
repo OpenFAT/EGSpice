@@ -82,6 +82,13 @@ pub const Variants = struct {
     starts: []const u32 = &.{},
     refs: []const u32 = &.{},
     values: []const f64 = &.{},
+    /// What made each row, parallel to `labels` as far as it reaches; a
+    /// row past its end (a live point a caller appended) reads `.step`.
+    kinds: []const Kind = &.{},
+
+    /// A `.step` or card `SWEEP` point, a `SWEEP DATA` row, a Monte Carlo
+    /// trial, an `.alter` run.
+    pub const Kind = enum { step, data, monte, alter };
 
     /// Number of variants (rows). Asserts that a non-empty table has one
     /// `starts` entry more than rows.
