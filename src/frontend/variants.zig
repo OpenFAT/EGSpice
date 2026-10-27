@@ -224,6 +224,8 @@ pub const Planner = struct {
     /// Per parameter, its write's index in the open row, or `none`.
     row_at: []u32 = &.{},
     targets: ?Targets = null,
+    /// The site key of each group the last `siteVariations` returned.
+    site_groups: std.ArrayList(u64) = .empty,
 
     const Targets = struct { starts: []const u32, ords: []const u32, keys: []const u64 };
 
@@ -667,7 +669,8 @@ pub const Planner = struct {
     /// mismatch (`agauss` in its model cards). A site that moves no
     /// parameter (sky130's `mc_mm_switch=0`) is no group, and no group at
     /// all is an empty table, never the unit-variance fallback. The live
-    /// values are nominal again on return.
+    /// values are nominal again on return, and `site_groups` holds each
+    /// group's site key.
     pub fn siteVariations(p: *Planner) !core.query.Variations {
         const live = p.nl.live;
         std.debug.assert(live.site_keys.len == live.site_ops.len);
@@ -678,6 +681,7 @@ pub const Planner = struct {
         var params: std.ArrayList(u32) = .empty;
         var steps: std.ArrayList(f64) = .empty;
         try starts.append(p.sim, 0);
+        p.site_groups.clearRetainingCapacity();
         if (p.fast == .untested) p.fast = try p.probeIdentity();
         // The steps are taken from every draw at its nominal, which under
         // `.option seed` is not the circuit's own state.
@@ -729,9 +733,11 @@ pub const Planner = struct {
             const card = names.get(r.type, r.index) orelse "?";
             try labels.append(p.sim, try std.fmt.allocPrint(p.sim, "{s}@{s}", .{ card, r.param_name }));
             try starts.append(p.sim, @intCast(params.items.len));
+            try p.site_groups.append(p.scratch, key);
         };
         _ = try p.nl.setLive(p.scratch, &p.stack, live.nominal, null);
         std.debug.assert(starts.items.len == labels.items.len + 1);
+        std.debug.assert(p.site_groups.items.len == labels.items.len);
         return .{ .labels = labels.items, .starts = starts.items, .params = params.items, .sigmas = steps.items };
     }
 
@@ -944,6 +950,115 @@ pub const Tuner = struct {
         out.refs = refs.items;
         out.values = values.items;
         return out;
+    }
+};
+
+/// Turns `.wcd` points in standard-normal space into variant rows (#240):
+/// coordinate i is draw key `keys[i]`, which a `.variation`/`DEV`/`LOT` row
+/// draws under (one per device, or one per model and parameter) or a
+/// distribution site that moves a parameter; z = 0 is every draw at its
+/// nominal, also under `.option seed`. Each point is a fixed-z trial
+/// through `Planner.add`, as `Tuner.rows`' points are. Lives in the parse
+/// arena, with the netlist it re-evaluates.
+pub const WorstCase = struct {
+    planner: Planner,
+    spec: netlist.Wcd,
+    keys: []const u64,
+    /// `<card>@<param>` or `<model>@<param>`, as the mismatch groups.
+    labels: []const []const u8,
+    /// One search per `.step` point, or the nominal one
+    /// (`Planner.basePoints`); `stepped` when they are `.step` points,
+    /// whose queries run variant row b.
+    bases: []const Point,
+    stepped: bool,
+    /// The trial's sampler, which only a `limit` that moves nothing reads.
+    sampler: *Sampler,
+    /// The point `rows` sets, by key.
+    z: std.AutoHashMapUnmanaged(u64, f64) = .empty,
+
+    /// A worst-case search over the planner of the deck's main run.
+    /// Asserts that the deck has a `.wcd`; `UnsupportedCard` with `.alter`
+    /// (each run is its own circuit), without any statistical parameter,
+    /// or when one is a `limit` or a multiplier draw, which no single
+    /// normal coordinate moves smoothly.
+    pub fn init(planner: Planner) !WorstCase {
+        var p = planner;
+        const nl = p.nl;
+        const spec = nl.deck.wcd.?;
+        if (nl.deck.alters.len != 0) return p.refuse(spec.line, ".wcd together with .alter");
+        var keys: std.ArrayList(u64) = .empty;
+        var labels: std.ArrayList([]const u8) = .empty;
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        const targets = try p.variationTargets();
+        const names = try core.query.CardNames.init(p.scratch, p.cards);
+        for (nl.deck.variations, 0..) |v, i| {
+            const lo = targets.starts[i];
+            const hi = targets.starts[i + 1];
+            for (targets.ords[lo..hi], targets.keys[lo..hi]) |ord, key| {
+                if (v.dist == .limit) return p.refuse(spec.line, ".wcd over a limit variation");
+                if ((try seen.getOrPut(p.scratch, key)).found_existing) continue;
+                const r = p.refs.at(ord);
+                try keys.append(p.scratch, key);
+                try labels.append(p.scratch, try std.fmt.allocPrint(p.scratch, "{s}@{s}", .{ if (v.per_device) names.get(r.type, r.index) orelse "?" else v.model, v.param }));
+            }
+        }
+        if (nl.live.site_keys.len != 0) {
+            const groups = try p.siteVariations();
+            var refused: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            try refused.ensureTotalCapacity(p.scratch, @intCast(nl.live.site_keys.len));
+            _ = try nl.setLive(p.scratch, &p.stack, nl.live.nominal, Shapes{ .refused = &refused });
+            _ = try nl.setLive(p.scratch, &p.stack, nl.live.nominal, null);
+            for (groups.labels, p.site_groups.items) |label, site| {
+                if (refused.contains(site)) return p.refuse(spec.line, ".wcd over a limit() or a multiplier draw");
+                // The key `TrialDraw` draws a site's first call under.
+                const key = netlist.siteKey(site, 0);
+                if ((try seen.getOrPut(p.scratch, key)).found_existing) continue;
+                try keys.append(p.scratch, key);
+                try labels.append(p.scratch, label);
+            }
+        }
+        if (keys.items.len == 0) return p.refuse(spec.line, ".wcd with no statistical parameter: no .variation, DEV/LOT or distribution call moves a device");
+        const sampler = try p.scratch.create(Sampler);
+        sampler.* = try .init(p.scratch, nl.deck.config, 1);
+        const bases = try p.basePoints();
+        return .{ .planner = p, .spec = spec, .keys = keys.items, .labels = labels.items, .bases = bases, .stepped = nl.deck.steps.len != 0, .sampler = sampler };
+    }
+
+    /// One row per point of `points` (`keys.len` coordinates each) on top
+    /// of `bases[base]`, allocated in `arena`, as `Tuner.rows` makes them;
+    /// `UnsupportedCard` for a point that changes the topology. `nominal`
+    /// is the prepared circuit the rows write into.
+    pub fn rows(w: *WorstCase, arena: std.mem.Allocator, nominal: *const device.Circuit, points: []const f64, base: usize) !core.Variants {
+        const p = &w.planner;
+        p.nominal = nominal;
+        p.sim = arena;
+        inline for (.{ &p.labels, &p.temps, &p.axes, &p.kinds, &p.write_refs, &p.write_values }) |list| list.clearRetainingCapacity();
+        p.starts.shrinkRetainingCapacity(1);
+        const b = w.bases[base];
+        const d = w.keys.len;
+        std.debug.assert(points.len % d == 0);
+        var at: usize = 0;
+        while (at < points.len) : (at += d) {
+            for (w.keys, points[at..][0..d]) |key, x| try w.z.put(p.scratch, key, x);
+            try p.add(.{ .label = "", .axis = 0, .live = b.live, .temp = b.temp, .cards = b.cards, .trial = .{ .sampler = w.sampler, .trial = 1, .index = 0, .z = &w.z } });
+            if (p.rebuilds.items.len != 0) return p.refuse(w.spec.line, "a .wcd point that changes the topology");
+        }
+        return p.table();
+    }
+};
+
+/// Answers every distribution call with its nominal, and marks each site
+/// whose call is a `limit` or carries a multiplier above 1, as
+/// `TrialDraw` reads them (`WorstCase.init`). `refused` has room for every site.
+const Shapes = struct {
+    refused: *std.AutoHashMapUnmanaged(u64, void),
+
+    /// Asserts that `args` holds at least the nominal value.
+    pub fn sample(self: Shapes, site: u64, f: expr.Fn, args: []const f64) f64 {
+        std.debug.assert(args.len >= 1);
+        const mult_at: usize = if (f == .agauss or f == .gauss) 3 else 2;
+        if (f == .limit or (args.len > mult_at and args[mult_at] >= 2)) self.refused.putAssumeCapacity(site, {});
+        return args[0];
     }
 };
 
@@ -1714,22 +1829,28 @@ pub const Trial = struct {
     index: u32,
     /// `SIGMA_SCALE` (#239): every draw's sigma times this.
     scale: f64 = 1,
+    /// `.wcd` (#240): each site's standard normal coordinate, fixed; a site
+    /// it lacks sits at 0, its nominal. The sampler then answers only a
+    /// `limit`, which `WorstCase` refuses wherever it moves a parameter.
+    z: ?*const std.AutoHashMapUnmanaged(u64, f64) = null,
 
     fn uniform(t: Trial, site: u64) f64 {
         return t.sampler.uniform(site, t.trial, t.index);
     }
 
     /// The standard normal coordinate of `site` times the sigma scale; at
-    /// scale 1 the bits of `normalQuantile(uniform)`.
+    /// scale 1 the bits of `normalQuantile(uniform)`. Under `z`, its entry.
     fn normal(t: Trial, site: u64) f64 {
+        if (t.z) |z| return z.get(site) orelse 0;
         return t.scale * core.numerics.normalQuantile(t.uniform(site));
     }
 
     /// The uniform of `site` through the scaled normal, Φ(s·Φ⁻¹(u)): the
     /// scale acts in the standard-normal space, so a uniform's mass moves
-    /// to its edges. At scale 1 it is `uniform`, bit for bit.
+    /// to its edges. At scale 1 it is `uniform`, bit for bit. Under `z`,
+    /// Φ of its entry (Rosenblatt's map).
     fn unit(t: Trial, site: u64) f64 {
-        return if (t.scale == 1) t.uniform(site) else core.numerics.normalCdf(t.normal(site));
+        return if (t.scale == 1 and t.z == null) t.uniform(site) else core.numerics.normalCdf(t.normal(site));
     }
 };
 

@@ -283,7 +283,9 @@ On any analysis card, HSPICE's `SWEEP` tail runs the card once per point:
 `MONTE=` work without the word `SWEEP`. ESPice adds
 `SWEEP MONTE=n SIGMA_SCALE=s1,s2,... FAIL='expr'` on `.tran`, `.ac` and a
 `.dc` with a sweep: scaled-sigma sampling of a rare failure, see
-[analyses](analyses.md#scaled-sigma).
+[analyses](analyses.md#scaled-sigma). `.wcd m1 '>= L1' m2 '<= L2' ...
+[MAXITER=20] [TOL=0.01] [TOP=5]` finds each spec's worst-case distance
+over the same statistical parameters, see [analyses](analyses.md#wcd).
 
 The `OPT` model takes HSPICE's optimizer options with HSPICE's defaults.
 `PARMIN` (default 0.1) floors the parameter scale, so the finite-difference

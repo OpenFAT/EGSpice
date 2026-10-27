@@ -654,6 +654,7 @@ These wrap other analyses rather than being analyses themselves; see the
   aged circuit.
 - `SWEEP MONTE=n SIGMA_SCALE=... FAIL=...` estimates a failure rate too
   rare to count (below).
+- `.wcd` finds each spec's worst-case distance in sigmas (below).
 
 ### Scaled-sigma sampling { #scaled-sigma }
 
@@ -695,3 +696,52 @@ made larger, where failures are common, and extrapolates back:
   `sampling_method=lhs` (its counts are not binomial), `.alter`, an
   HSPICE `.temp` list, a second `MONTE` card of the same analysis,
   `MONTE=list(...)`, and a bare `.dc MONTE=n`.
+
+### Worst-case distance { #wcd }
+
+Design centering measures each spec's margin as its worst-case distance
+β_w: the distance in sigmas from the nominal point to the nearest failing
+point in the space of the statistical parameters, with partial yield
+Φ(β_w) (Antreich, Graeb, Wieser, IEEE TCAD 13(1), 1994). It reaches 6σ
+statements without 10⁹ samples:
+
+```spice
+--8<-- "examples/wcd_ota.sp"
+```
+
+- `.wcd m1 'op L1' m2 'op L2' ... [MAXITER=20] [TOL=0.01] [TOP=5]`: each
+  named `.meas` card with its bound is a spec. `op` is `>=`, `>`, `<=` or
+  `<` (the same for a continuous measure); `L` is a number or a `.param`
+  expression.
+- The statistical parameters are the ones `SWEEP MONTE` draws: each
+  `.variation` local row per device, each global row and `LOT` per model
+  and parameter, each `DEV` per device, and each `agauss`/`gauss`/`unif`/
+  `aunif` call that moves a device parameter, a kit's mismatch included.
+  Each is one standard-normal coordinate, 0 at its nominal; a uniform
+  enters through Φ.
+- The search is FORM by iHL-RF (Zhang and Der Kiureghian, 1995): at the
+  current point, the gradient of the margin from forward differences of
+  0.1σ, a step to the nearest point of the linearized boundary, then a
+  line search on the merit ½‖z‖² + c|g| with real simulations. It stops
+  when β would change by less than `TOL` and the boundary is nearer than
+  `TOL`, both in sigmas.
+- A `.dc` or `.tran` spec takes its gradient from tangent rows of one run
+  (as `SWEEP OPTIMIZE` does); other analyses, and a `.tran` the tangents
+  cannot follow (`uic`, Gear above order 2, a GPU backend), run one
+  simulation per coordinate, `--jobs` at a time. `sims` counts the real
+  simulations. Every operating point starts cold, so the report is the
+  same at any `--jobs`.
+- The report, after the `.meas` results, has one line per spec: its
+  bound, β_w (positive when the nominal point passes), Φ(β_w), the
+  gradient rounds, the simulations and the `TOP` coordinates of the
+  worst-case point by size, `name +2.90s`. Under `.step`, one table per
+  point. A search that does not converge in `MAXITER` rounds says so and
+  prints the β of its last simulated point, never a predicted one; a
+  measure no parameter moves has no β. `--measures` writes each as
+  `{"kind": "wcd", ...}`.
+- β_w is local: a spec that fails on both sides (an offset's magnitude)
+  has a design point on each; write one spec per side.
+- Refused: `.alter`, `SWEEP OPTIMIZE`, an HSPICE `.temp` list, a `limit`
+  or a multiplier draw that moves a parameter, a deck with no statistical
+  parameter, a point that changes the topology (a parameter a B source
+  reads), and a spec whose analysis runs only under a `SWEEP DATA` card.

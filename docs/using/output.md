@@ -231,7 +231,12 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
   object instead, `"kind": "sss"`: its `fail` text, the `trials` per
   scale, the `scales` and `failures` lists, then `p`, `lo`, `hi` (the 95 %
   interval) and `sigma`; these four are null with an `error` when the fit
-  is refused ([analyses](analyses.md#scaled-sigma)).
+  is refused ([analyses](analyses.md#scaled-sigma)). A `.wcd` card adds
+  one `"kind": "wcd"` object per spec and `.step` point: `spec`, `bound`,
+  `corner` (the `.step` label, `""` without), `beta` and `yield` (null
+  when no parameter moves the measure), `converged`, `status`,
+  `iterations`, `sims`, and `point`, a list of `{"name", "z"}` per
+  statistical parameter ([analyses](analyses.md#wcd)).
 - `soa` holds, under `.option soa`, every excursion past a model-card
   limit ([analyses](analyses.md#soa)), `maxwarns` aside: the instance, the
   quantity and the card key of its limit, the limit, the peak, and the

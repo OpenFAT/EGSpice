@@ -202,6 +202,36 @@ pub const Optimize = struct {
     grid: []const f64,
 };
 
+/// ESPice `.wcd m1 'op L1' m2 'op L2' ... [MAXITER=n] [TOL=x] [TOP=n]`
+/// (#240): each `.meas` card with its bound is a spec, whose worst-case
+/// distance FORM finds over the statistical parameters (`core.form`).
+pub const Wcd = struct {
+    specs: []const WcdSpec,
+    maxiter: u32 = 20,
+    tol: f64 = 0.01,
+    /// The coordinates the report names per spec.
+    top: u32 = 5,
+    /// The card as written, for diagnostics.
+    line: []const u8 = "",
+};
+
+/// One `.wcd` spec: card `measure` (its index in `Deck.measures`) passes
+/// while its value is at least (`above`) or at most `limit`; `>` and `<`
+/// mean the same for a continuous measure.
+pub const WcdSpec = struct {
+    measure: u32,
+    above: bool,
+    limit: f64,
+    /// The bound as written, `>= 60`.
+    bound: []const u8,
+
+    /// The signed margin of `value`: at least 0 where the spec passes,
+    /// NaN when `value` is.
+    pub fn margin(s: WcdSpec, value: f64) f64 {
+        return if (s.above) value - s.limit else s.limit - value;
+    }
+};
+
 /// An inline `.data` table: one target per column, `values` row-major.
 pub const Data = struct {
     name: []const u8,
@@ -406,6 +436,8 @@ pub const Deck = struct {
     variations: []const Variation = &.{},
     /// The optimization of the deck's one `SWEEP OPTIMIZE=` card.
     optimize: ?Optimize = null,
+    /// The deck's one `.wcd` card (#240).
+    wcd: ?Wcd = null,
     /// Each `.alter` run's full source, cumulative, expanded; set by
     /// `prepare`.
     alters: []const []const u8 = &.{},
@@ -695,7 +727,7 @@ pub fn nameIndex(names: []const []const u8, target: []const u8) ?usize {
 
 /// `ignored`: a card that only shapes printed output, which ESPice writes
 /// in full anyway.
-const Card = union(enum) { end, ends, subckt, param, func, model, include, osdi_include, pre_osdi, verilog, control, endc, options, ic, nodeset, global, connect, save, store, sample, meas, ignored, mosra, appendmodel, step, data, enddata, variation, end_variation, analysis: Kind, cond: CondCard };
+const Card = union(enum) { end, ends, subckt, param, func, model, include, osdi_include, pre_osdi, verilog, control, endc, options, ic, nodeset, global, connect, save, store, sample, meas, ignored, mosra, appendmodel, step, data, enddata, variation, end_variation, wcd, analysis: Kind, cond: CondCard };
 
 const CondCard = enum { @"if", elseif, @"else", endif };
 
@@ -770,9 +802,9 @@ const cards = std.StaticStringMap(Card).initComptime(.{
     .{ "unprotect", .ignored },      .{ "prot", .ignored },              .{ "unprot", .ignored },
 });
 
-/// Sweep and variation cards (frontend/variants.zig).
+/// Sweep and variation cards (frontend/variants.zig), and `.wcd` (#240).
 const variant_cards = std.StaticStringMap(Card).initComptime(.{
-    .{ "step", .step }, .{ "data", .data }, .{ "enddata", .enddata }, .{ "variation", .variation }, .{ "end_variation", .end_variation },
+    .{ "step", .step }, .{ "data", .data }, .{ "enddata", .enddata }, .{ "variation", .variation }, .{ "end_variation", .end_variation }, .{ "wcd", .wcd },
 });
 
 /// A behavioural E/F/G/H form, named by the word in the first control-node
@@ -1156,6 +1188,8 @@ fn Reader(comptime S: type) type {
         ic_cards: std.ArrayList([]const Value) = .empty,
         nodeset_cards: std.ArrayList([]const Value) = .empty,
         meas_lines: std.ArrayList([]const u8) = .empty,
+        /// The `.wcd` card, read once the `.meas` cards it names are.
+        wcd_line: ?[]const u8 = null,
         /// `.global` names: one net at every subcircuit level.
         global_nets: std.StringHashMapUnmanaged(void) = .empty,
         /// Per `lines` row, the device letter `spectre.translate` gave a
@@ -1207,6 +1241,7 @@ fn Reader(comptime S: type) type {
         /// `Deck.draw_seed`.
         draw_seed: bool = false,
         optimize: ?Optimize = null,
+        wcd: ?Wcd = null,
         site_ops: std.ArrayList(u32) = .empty,
         site_keys: std.ArrayList(u64) = .empty,
         /// Key of the text whose distribution calls are being emitted, and
@@ -1325,7 +1360,8 @@ fn Reader(comptime S: type) type {
             // (#100). ngspice draws agauss/gauss/unif/aunif on every run, and
             // a seed makes that one reproducible sample. `.dcmatch`,
             // `.acmatch` and `.dcsens` without a `.variation` block read the
-            // mismatch off the calls (`variants.Planner.siteVariations`).
+            // mismatch off the calls (`variants.Planner.siteVariations`), as
+            // `.wcd` (#240) does.
             // ponytail: a top-level `.param` read in walk 1 stays nominal;
             // the PDK distributions sit in model cards and subcircuit params.
             var monte_card = false;
@@ -1334,6 +1370,7 @@ fn Reader(comptime S: type) type {
             for (directive_lines.items) |i| {
                 const line = r.lines.items[i];
                 seed = seed or seedOption(line);
+                mismatch = mismatch or isWcd(line);
                 const kind = analysisOf(line) orelse continue;
                 monte_card = monte_card or setsKey(line, "monte");
                 mismatch = mismatch or kind == .dcmatch or kind == .acmatch or kind == .dcsens;
@@ -1384,6 +1421,7 @@ fn Reader(comptime S: type) type {
             try r.shunts();
             try r.readMeasures();
             try r.compileFails();
+            if (r.wcd_line) |line| r.wcd = try r.readWcd(line);
             var live = try r.resolveLive();
             live.conds = try r.liveConds();
             const scale = try r.arena.alloc(f64, live.slots.len);
@@ -1443,6 +1481,7 @@ fn Reader(comptime S: type) type {
                     .data = r.data.items,
                     .variations = r.variations.items,
                     .optimize = r.optimize,
+                    .wcd = r.wcd,
                     .save_op = r.save_op,
                     .stims = r.stims.items,
                     .sample = r.sample,
@@ -2154,6 +2193,13 @@ fn Reader(comptime S: type) type {
             return c == .step;
         }
 
+        /// True for a `.wcd` directive line.
+        fn isWcd(line: []const u8) bool {
+            var f = F.init(line);
+            const c = cardOf(f.next().?[1..]) orelse return false;
+            return c == .wcd;
+        }
+
         fn readDirective(r: *R, line: []const u8) Error!void {
             r.card = line;
             var f = F.init(line);
@@ -2162,6 +2208,11 @@ fn Reader(comptime S: type) type {
             // takes the last one.
             if (card != null and card.? == .meas) return r.meas_lines.append(r.arena, line);
             const c = card orelse return r.unsupported(line, "unsupported card");
+            if (c == .wcd) {
+                if (r.wcd_line != null) return r.unsupported(line, "a second .wcd card");
+                r.wcd_line = line;
+                return;
+            }
             if (c == .ignored) {
                 if (r.dialect != .ngspice and std.ascii.startsWithIgnoreCase(line, ".probe")) try r.readProbe(line);
                 return;
@@ -3084,6 +3135,53 @@ fn Reader(comptime S: type) type {
                 fail.ops = ops;
                 fail.consts = try r.arena.dupe(f64, r.scratch.consts.items);
             }
+        }
+
+        /// The `.wcd` card `line` (#240), now that every `.meas` card is
+        /// read: `name 'op number'` pairs, op one of `>=`, `>`, `<=`, `<`
+        /// and the number as a `.meas` value, then `MAXITER=`, `TOL=` and
+        /// `TOP=`. Refuses a name of no `.meas` card, a card named twice,
+        /// SWEEP OPTIMIZE (whose variant table it would share) and an
+        /// HSPICE `.temp` list (one value per spec and point).
+        fn readWcd(r: *R, line: []const u8) Error!Wcd {
+            r.card = line;
+            if (r.optimize != null) return r.unsupported(line, ".wcd together with SWEEP OPTIMIZE");
+            for (r.config.items) |c| if (c.temp and c.args.len > 1) return r.unsupported(line, ".wcd with a .temp list");
+            var w: Wcd = .{ .specs = &.{}, .line = r.written(line) };
+            var specs: std.ArrayList(WcdSpec) = .empty;
+            var f = F.init(line);
+            _ = f.next(); // the card
+            while (f.next()) |t| {
+                if (!F.isWord(t)) return r.failed(line, error.ParseError);
+                if (f.takeEq()) {
+                    const v = S.parseNum(f.next() orelse return r.failed(line, error.ParseError)) orelse return r.failed(line, error.ParseError);
+                    const count = v >= 1 and v <= 1e6 and v == @floor(v);
+                    if (std.mem.eql(u8, t, "maxiter") and count) {
+                        w.maxiter = @intFromFloat(v);
+                    } else if (std.mem.eql(u8, t, "top") and (count or v == 0)) {
+                        w.top = @intFromFloat(v);
+                    } else if (std.mem.eql(u8, t, "tol") and v > 0 and v < std.math.inf(f64)) {
+                        w.tol = v;
+                    } else return r.failed(line, error.ParseError);
+                    continue;
+                }
+                const card: u32 = for (r.measures.items, 0..) |m, k| {
+                    if (std.mem.eql(u8, m.name, t)) break @intCast(k);
+                } else return r.unsupported(line, "a .wcd spec that names no .meas card");
+                for (specs.items) |s| if (s.measure == card) return r.unsupported(line, "a .meas card named twice in .wcd");
+                const q = f.next() orelse return r.failed(line, error.ParseError);
+                if (!F.isQuote(q[0]) and q[0] != '{') return r.failed(line, error.ParseError);
+                const rel = std.mem.trim(u8, F.body(q), " \t");
+                const above = rel.len != 0 and rel[0] == '>';
+                if (!above and !(rel.len != 0 and rel[0] == '<')) return r.failed(line, error.ParseError);
+                const op_len: usize = if (rel.len > 1 and rel[1] == '=') 2 else 1;
+                const limit = r.measureValue(std.mem.trim(u8, rel[op_len..], " \t")) catch |err| return r.failed(line, err);
+                if (!std.math.isFinite(limit)) return r.failed(line, error.ParseError);
+                try specs.append(r.arena, .{ .measure = card, .above = above, .limit = limit, .bound = rel });
+            }
+            if (specs.items.len == 0) return r.failed(line, error.ParseError);
+            w.specs = specs.items;
+            return w;
         }
 
         /// Parses the `.meas` cards in deck order. ngspice reports a bad one

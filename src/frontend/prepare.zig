@@ -18,6 +18,8 @@ pub const Library = device.Library;
 pub const Tuner = variants.Tuner;
 /// A SIGMA_SCALE card, for counting its trials' failures (#239).
 pub const Sss = variants.Sss;
+/// `.wcd`: FORM's points to variant rows (#240, variants.zig).
+pub const WorstCase = variants.WorstCase;
 const Ic = core.Ic;
 const GROUND = core.GROUND;
 
@@ -42,6 +44,9 @@ pub const Prepared = struct {
     tuning: ?*variants.Tuning = null,
     /// The deck's SIGMA_SCALE cards (#239), in the session arena.
     sss: []const variants.Sss = &.{},
+    /// The deck's `.wcd` (#240), on the main run only. It borrows the parse
+    /// arena, which must then outlive the Prepared.
+    wcd: ?variants.WorstCase = null,
 
     /// Releases this run's circuit and every nested run's, and the tuning's
     /// templates. The deck slices stay with the session arena. Leaves
@@ -342,7 +347,8 @@ fn ErrorOf(comptime f: anytype) type {
 }
 
 /// `build` for one run of the deck in `nl`, which must outlive the result
-/// when the deck has an HSPICE optimization (`Prepared.tuner` borrows it).
+/// when the deck has an HSPICE optimization or a `.wcd` (`Prepared.tuner`
+/// and `Prepared.wcd` borrow it).
 /// A `run.point` sets `nl`'s live values first; they are nominal again
 /// when a run with rebuilt points returns.
 fn buildRun(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: *netlist.Netlist, run: variants.Run) BuildError!Prepared {
@@ -450,9 +456,11 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         if (nl.deck.optimize != null) tuner = try variants.Tuner.init(planner);
         break :blk planned;
     } else .{};
+    // A planner of its own: the plan's left the live values nominal.
+    const wcd = if (nl.deck.wcd != null and run.point == null and run.prefix.len == 0) try variants.WorstCase.init(try variants.Planner.init(lib, sim_arena, parse_arena, nl, &circuit, cards, "")) else null;
     const tuning = if (nl.tunable.len != 0 and run.point == null and run.prefix.len == 0) try variants.Tuning.init(core.gpa, lib, sim_arena, parse_arena, nl, &circuit, cards) else null;
     errdefer if (tuning) |t| t.deinit();
-    if (plan.variants.refs.len != 0 or tuning != null) try circuit.countParams();
+    if (plan.variants.refs.len != 0 or tuning != null or wcd != null) try circuit.countParams();
     card_opts.sample = nl.deck.sample;
     card_opts.card_names = card_names;
     const queries = try analyses.queries(sim_arena, cards_rows, circuit.n, false, out.bindings, cards, card_opts, plan.fanout);
@@ -463,7 +471,7 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         return error.UnsupportedCard;
     };
     const ov = try opVars(sim_arena, parse_arena, lib, &circuit, cards, out.probes, out.probe_labels, nl, queries);
-    return .{ .rebuilds = plan.rebuilds, .prepared = .{ .circuit = circuit, .tuner = tuner, .tuning = tuning, .sss = try variants.sssCards(sim_arena, nl.deck), .deck = .{
+    return .{ .rebuilds = plan.rebuilds, .prepared = .{ .circuit = circuit, .tuner = tuner, .tuning = tuning, .wcd = wcd, .sss = try variants.sssCards(sim_arena, nl.deck), .deck = .{
         .probes = out.probes,
         .probe_labels = out.probe_labels,
         .source_node = out.source_node,

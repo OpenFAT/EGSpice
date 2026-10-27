@@ -4,6 +4,7 @@ Newest first.
 
 ## Unreleased
 
+- `.wcd m1 '>= L1' m2 '<= L2' ...` finds each spec's worst-case distance β_w over the statistical parameters `SWEEP MONTE` draws, by FORM (iHL-RF, tangent rows for `.dc` and `.tran`), and reports it with Φ(β_w), the iterations, the simulations and the worst-case point; an unconverged search says so and never prints a guess; `--measures` writes it as `"kind": "wcd"` (#240).
 - `.four` and `.fft` read the deck's `.tran` result instead of integrating the same transient again, where that run keeps its waveform with the same options and operating point (CPU backend); the values are bit for bit the same (#231).
 - `--emir=FILE` writes each device terminal's and independent source's average, EM_AVG, RMS and peak current over the deck's first `.tran` (or `--emir-window=T1:T2`), else its `.op`/`.dc` point, as JSON with each instance's `.model` name, one file per `.step`/`.alter`/sweep variant; a Spectre analysis's `emirformat`/`emirfile` sets it (#237).
 - A mixed batch (some instances fully collapsed) no longer names its instances, `@m[...]` variables or swept parameters by add order: cards are renumbered to the frozen batch order (#237).

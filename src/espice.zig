@@ -204,6 +204,9 @@ pub const Problem = struct {
     /// `.model OPT` says.
     optimization: []core.lm.Lm = &.{},
     bisection: []core.bisect.Bisect = &.{},
+    /// The finished `.wcd` searches (#240), once `worstCase` has run: one
+    /// per `WorstCase.bases` entry and spec, base-major.
+    worst_case: []WcdRun = &.{},
     /// The MOSRA degradation table, once `age` has run.
     degradation: ?Result = null,
     /// Whether a query of this Problem brought the GPU driver up, which every
@@ -244,6 +247,10 @@ pub const Problem = struct {
 
     /// A variant run's queries and its next result to publish.
     const Run = struct { session: analysis.session.Session, next_output: usize = 0 };
+
+    /// One `.wcd` search and the real simulations it ran (a tangent row is
+    /// none).
+    const WcdRun = struct { form: core.form.Form, sims: u32 };
 
     /// The next `.meas` block to print: whether the optimization summaries
     /// are out, the session (0 the main one, k the k-th run's) and its output.
@@ -418,7 +425,7 @@ pub const Problem = struct {
             _ = try run.session.append(try withPoint(scratch, prep.deck.queries, point), try scratch.alloc(QueryId, prep.deck.queries.len));
         }
         timingLap(io, &lap, "query graph and output setup");
-        keep_parse = self.prepared.tuner != null or self.prepared.tuning != null;
+        keep_parse = self.prepared.tuner != null or self.prepared.tuning != null or self.prepared.wcd != null;
         return self;
     }
 
@@ -598,9 +605,9 @@ pub const Problem = struct {
     /// takes its new bin, and the circuit is rebuilt only when parameter
     /// writes cannot express the point (dev/analysis/variants.md §5).
     ///
-    /// The first call also runs the deck's pending `.model OPT` optimization
-    /// and MOSRA stress run, so it can take as long as they do and fail with
-    /// their errors.
+    /// The first call also runs the deck's pending `.model OPT`
+    /// optimization, MOSRA stress run and `.wcd` searches, so it can take
+    /// as long as they do and fail with their errors.
     ///
     /// All-or-nothing. Fails with `error.UnknownParameter` for a name not
     /// in `Options.live_params` (nor a `.step` name), `error.InvalidArgument`
@@ -616,6 +623,7 @@ pub const Problem = struct {
         // run before rows are appended to it.
         try self.optimize();
         try self.age();
+        try self.worstCase();
         try self.session.templates.ensureUnusedCapacity(self.session.allocator, 1);
         const change = try tuning.set(&self.prepared.circuit, self.prepared.deck.variants, names, values);
         if (change.built) |c| self.session.addTemplate(c) catch unreachable;
@@ -634,7 +642,7 @@ pub const Problem = struct {
     /// failed with `TopologyChanged` (a topology change or a flipped
     /// top-level `.if`), `ModelBinNotFound`, `NonFiniteParameter` or, for
     /// any other error building its circuit, `PointRefused`. The
-    /// first call also runs the deck's `.model OPT` and MOSRA runs.
+    /// first call also runs the deck's `.model OPT`, MOSRA and `.wcd` runs.
     ///
     /// All-or-nothing. `error.NoLiveParameters` without
     /// `Options.live_params`, `error.SweptTemplate` for a deck whose
@@ -660,6 +668,7 @@ pub const Problem = struct {
         };
         try self.optimize();
         try self.age();
+        try self.worstCase();
         const template_jobs = if (deck.queries.len == 0) &[_]Query{.{ .op = .{ .tol = deck.deck_tol } }} else deck.queries;
         try self.checkOutput(&self.prepared, template_jobs);
         const tangent = options.tangent_step > 0;
@@ -1060,10 +1069,11 @@ pub const Problem = struct {
     /// `delivery_error`. `error.InvalidQuery` for an ID outside
     /// `0..query_count()`. The first of `advance`, `advance_ready`,
     /// `run_all` and `set_params` also runs the deck's `.model OPT`
-    /// optimization and MOSRA stress run.
+    /// optimization, MOSRA stress run and `.wcd` searches (#240).
     pub fn advance(self: *Problem, id: QueryId) !Advance {
         try self.optimize();
         try self.age();
+        try self.worstCase();
         var event = try self.session.advance(id);
         self.deliverFrom(&self.session, &self.next_output);
         self.finishWhenDone();
@@ -1090,6 +1100,7 @@ pub const Problem = struct {
     fn stepReady(self: *Problem, ids: []const QueryId, limits: Limits, events: []Advance) !usize {
         try self.optimize();
         try self.age();
+        try self.worstCase();
         const n = try self.session.advanceReady(ids, limits, events);
         self.deliverFrom(&self.session, &self.next_output);
         return n;
@@ -1118,6 +1129,7 @@ pub const Problem = struct {
         defer timingLap(self.io, &lap, "run total (analysis, scheduling, output)");
         try self.optimize();
         try self.age();
+        try self.worstCase();
         try self.openStream();
         if (self.sidesAllowed()) self.session.stream_opener = .{ .ctx = self, .open = openSide };
         // Whole-query quanta: nothing here reads intermediate progress,
@@ -1352,7 +1364,8 @@ pub const Problem = struct {
     /// transient noise, AC, DC, FFT, S-parameter, mismatch, loop stability,
     /// phase and periodic noise), in request order, as ngspice prints them,
     /// then the Monte Carlo statistics of each tran, AC and DC card, or its
-    /// SIGMA_SCALE report (#239). Cards that cannot be measured are
+    /// SIGMA_SCALE report (#239), then the `.wcd` worst-case distances
+    /// (#240). Cards that cannot be measured are
     /// reported on `err`; a refused SIGMA_SCALE fit fails with
     /// `error.TooFewScales` or `error.Singular` once everything is printed.
     /// With `Options.measures`, it writes only what `run_all` has not
@@ -1439,8 +1452,9 @@ pub const Problem = struct {
 
     /// The `.meas` statistics over the Monte Carlo trials of each tran, AC
     /// and DC card, as text or as JSON objects; for a SIGMA_SCALE card's
-    /// analysis, its scaled-sigma report instead (#239). As text, a refused
-    /// fit fails with its error once everything is written.
+    /// analysis, its scaled-sigma report instead (#239); then the `.wcd`
+    /// report (#240). As text, a refused fit fails with its error once
+    /// everything is written.
     fn writeStatistics(self: *const Problem, out: *std.Io.Writer, json: bool) !void {
         const measures = self.prepared.deck.measures;
         if (measures.len == 0) return;
@@ -1460,6 +1474,7 @@ pub const Problem = struct {
                 if (json) try output.writeMeasureStatistics(out, measures, kind, trials.items) else try output.printMeasureStatistics(out, measures, kind, trials.items);
             }
         }
+        if (self.prepared.wcd) |*w| try writeWorstCase(self.allocator, out, json, w, self.worst_case, measures);
         if (refused) |e| if (!json) return e;
     }
 
@@ -1699,6 +1714,71 @@ pub const Problem = struct {
         try self.delivery.publish(self.io, .{ .title = deck.title, .result = aged.table });
     }
 
+    /// `.wcd` (#240), once before any query advances: per base point and
+    /// spec, FORM (`core.form`) over the deck's statistical parameters. Each
+    /// batch of points is one session of the nominal queries of the spec's
+    /// analysis, a variant row per point (`WorstCase.rows`). A gradient
+    /// round of DC or transient queries runs only its point and takes the
+    /// neighbours from tangent rows; otherwise each point is a simulation,
+    /// `max_parallel` at a time. Every operating point starts cold, so the
+    /// result is the same at any `max_parallel`. `UnsupportedCard` for a
+    /// spec whose analysis runs no nominal query (a `SWEEP DATA` card).
+    /// ponytail: each round re-simulates the line point it starts from, and
+    /// every spec simulates its own z = 0 round; share them when sims count.
+    fn worstCase(self: *Problem) !void {
+        const w = if (self.prepared.wcd) |*wcd| wcd else return;
+        if (self.worst_case.len != 0) return;
+        const a = self.arena.allocator();
+        const gpa = self.allocator;
+        const deck = &self.prepared.deck;
+        const specs = w.spec.specs;
+        const d = w.keys.len;
+        const runs = try a.alloc(WcdRun, w.bases.len * specs.len);
+        var template: std.ArrayList(Query) = .empty;
+        defer template.deinit(gpa);
+        var values: std.ArrayList(f64) = .empty;
+        defer values.deinit(gpa);
+        var margins: std.ArrayList(f64) = .empty;
+        defer margins.deinit(gpa);
+        for (runs, 0..) |*run, k| {
+            const base = k / specs.len;
+            const spec = specs[k % specs.len];
+            const kind = deck.measures[spec.measure].analysis;
+            const variant: ?u32 = if (w.stepped) @intCast(base) else null;
+            template.clearRetainingCapacity();
+            for (deck.queries) |job| switch (job) {
+                inline else => |o| {
+                    const nominal = if (variant) |v| o.tol.variant == v else o.tol.variant == null;
+                    if (nominal and @as(requests.Kind, job) == kind) try template.append(gpa, job);
+                },
+            };
+            if (template.items.len == 0) {
+                if (!@import("builtin").is_test) std.log.err(".wcd: {s}: no nominal {t} analysis runs the card", .{ deck.measures[spec.measure].name, kind });
+                return error.UnsupportedCard;
+            }
+            const direct = !self.session.config.knobs.no_tangents and for (template.items) |job| {
+                if (!self.tangentable(job)) break false;
+            } else true;
+            run.* = .{ .form = try core.form.Form.init(a, @intCast(d), .{ .maxiter = w.spec.maxiter, .tol = w.spec.tol }), .sims = 0 };
+            const form = &run.form;
+            while (form.points().len != 0) {
+                const points = form.points();
+                const count = points.len / d;
+                const batched = direct and form.batched();
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                try values.resize(gpa, count * deck.measures.len);
+                try self.evaluateRows(try w.rows(arena.allocator(), &self.prepared.circuit, points, base), template.items, batched, &.{}, values.items, null);
+                const sims: u32 = if (batched) 1 else @intCast(count);
+                run.sims += sims;
+                try margins.resize(gpa, count);
+                for (margins.items, 0..) |*g, p| g.* = spec.margin(values.items[p * deck.measures.len + spec.measure]);
+                form.feed(margins.items);
+            }
+        }
+        self.worst_case = runs;
+    }
+
     /// Feeds `solver` (`core.lm.Lm` or `core.bisect.Bisect`) the residuals
     /// of the points it asks for until it stops.
     /// A Levenberg-Marquardt point's operating point starts from the one of
@@ -1736,23 +1816,45 @@ pub const Problem = struct {
 
     /// Residuals of each point of `points` (the optimized parameters'
     /// values, n per point, on top of `t.bases[base]`) into `out`, m per
-    /// point: the RESULTS cards'
-    /// goal errors over the `template` queries run at that point, NaN where
-    /// a query failed or a card found no value. Every operating point
-    /// starts from `guess` (cold when empty); `first` takes the one row 0's
-    /// first query solved, empty when it has none. With `direct` (a
-    /// batched round of `tangentable` queries) only row 0 runs, and the
-    /// other points' results are its runs' first-order predictions of them
-    /// (`Dc.tangents`, `Tran.tangents`, dev/analysis/optimize.md "Direct
-    /// sensitivities").
+    /// point: the RESULTS cards' goal errors over the `template` queries
+    /// run at that point (`evaluateRows`, which says what `direct`, `guess`
+    /// and `first` do), NaN where a query failed or a card found no value.
     fn evaluatePoints(self: *Problem, t: *frontend.Tuner, template: []const Query, base: usize, points: []const f64, direct: bool, guess: []const f64, out: []f64, first: *std.ArrayList(f64)) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const count = points.len / t.spec.live.len;
         std.debug.assert(!direct or count == t.spec.live.len + 1);
+        const measures = self.prepared.deck.measures;
+        const values = try a.alloc(f64, count * measures.len);
+        try self.evaluateRows(try t.rows(a, &self.prepared.circuit, points, base), template, direct, guess, values, first);
+        const m = t.results.len;
+        for (0..count) |p| for (t.results, out[p * m ..][0..m]) |card, *r| {
+            // Never null: Tuner.init refuses a RESULTS card without GOAL=
+            // (`goalError(0) != null`), and only the goal decides null.
+            r.* = measures[card].goalError(values[p * measures.len + card]).?;
+        };
+    }
+
+    /// Every `.meas` card's value at each row of `rows` into `values`,
+    /// `measures.len` per row: each card over the `template` queries of its
+    /// analysis run at that row, NaN where a query failed or a card found
+    /// no value. Every operating point starts from `guess` (cold when
+    /// empty); `first`, when given, takes the one row 0's first query
+    /// solved, empty when it has none. With `direct` (a batched round of
+    /// `tangentable` queries) only row 0 runs, and the other rows' results
+    /// are its runs' first-order predictions of them (`Dc.tangents`,
+    /// `Tran.tangents`, dev/analysis/optimize.md "Direct sensitivities").
+    fn evaluateRows(self: *Problem, rows: core.Variants, template: []const Query, direct: bool, guess: []const f64, values: []f64, first: ?*std.ArrayList(f64)) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const count = rows.count();
         var deck = self.prepared.deck;
-        deck.variants = try t.rows(a, &self.prepared.circuit, points, base);
+        const cards = deck.measures.len;
+        std.debug.assert(count >= 1);
+        std.debug.assert(values.len == count * cards);
+        deck.variants = rows;
         deck.op_guess = guess;
         const runs = if (direct) 1 else count;
         const tangents = try a.alloc(u32, if (direct) count - 1 else 0);
@@ -1774,11 +1876,12 @@ pub const Problem = struct {
         const ids = try a.alloc(QueryId, jobs.len);
         _ = try session.append(jobs, ids);
         try session.runAll(.{ .max_parallel = self.limits.max_parallel, .quantum = .completion });
-        first.clearRetainingCapacity();
-        if (try session.operatingPoint(ids[0])) |x| try first.appendSlice(self.allocator, x);
-        const values = try a.alloc(f64, deck.measures.len);
-        const m = t.results.len;
-        @memset(out, std.math.nan(f64));
+        if (first) |f| {
+            f.clearRetainingCapacity();
+            if (try session.operatingPoint(ids[0])) |x| try f.appendSlice(self.allocator, x);
+        }
+        const card_values = try a.alloc(f64, cards);
+        @memset(values, std.math.nan(f64));
         for (0..count) |p| for (ids[(if (direct) 0 else p) * template.len ..][0..template.len]) |id| {
             const info = try session.info(id);
             if (info.status != .complete) continue;
@@ -1799,12 +1902,9 @@ pub const Problem = struct {
                     res.data = res.data[p * res.npoints * res.varnames.len ..][0 .. res.npoints * res.varnames.len];
                 }
             }
-            output.measureValues(deck.measures, info.kind, res, values);
-            for (t.results, out[p * m ..][0..m]) |card, *r| {
-                const measure = deck.measures[card];
-                // Never null: Tuner.init refuses a RESULTS card without GOAL=
-                // (`goalError(0) != null`), and only the goal decides null.
-                if (measure.analysis == info.kind) r.* = measure.goalError(values[card]).?;
+            output.measureValues(deck.measures, info.kind, res, card_values);
+            for (deck.measures, card_values, values[p * cards ..][0..cards]) |measure, x, *v| {
+                if (measure.analysis == info.kind) v.* = x;
             }
         };
     }
@@ -2212,6 +2312,73 @@ fn writeSss(gpa: std.mem.Allocator, out: *std.Io.Writer, json: bool, measures: [
     // An error value returned as is would be this function's own error.
     _ = estimate catch |e| return @as(?core.sss.Error, e);
     return null;
+}
+
+/// The `.wcd` report (#240), once `worstCase` has run: per base point, a
+/// line per spec with its bound, β_w, the partial yield Φ(β_w), the
+/// gradient rounds, the real simulations and the `TOP` coordinates of the
+/// worst-case point by size, in sigmas. A search that stopped unconverged
+/// says why; its β is the last simulated point's, never a prediction, and
+/// a margin no coordinate moves has none. As JSON, one object per spec and
+/// base point led by `,\n`: `"kind": "wcd"`, `spec`, `bound`, `corner` (the
+/// `.step` label, "" without), `beta` and `yield` (null without β),
+/// `converged`, `status`, `iterations`, `sims`, and `point`, every
+/// coordinate as `{"name", "z"}` in coordinate order (names can repeat).
+fn writeWorstCase(gpa: std.mem.Allocator, out: *std.Io.Writer, json: bool, w: *const frontend.WorstCase, runs: []const Problem.WcdRun, measures: []const core.Measure) !void {
+    const specs = w.spec.specs;
+    const order = try gpa.alloc(u32, w.keys.len);
+    defer gpa.free(order);
+    for (runs, 0..) |*run, k| {
+        const base = w.bases[k / specs.len];
+        const spec = specs[k % specs.len];
+        const f = &run.form;
+        const name = measures[spec.measure].name;
+        const beta: ?f64 = if (f.status == .no_gradient) null else f.beta;
+        const partial = if (beta) |b| core.numerics.normalCdf(b) else std.math.nan(f64);
+        if (json) {
+            try out.writeAll(",\n    {\"kind\": \"wcd\", \"spec\": ");
+            try std.json.Stringify.encodeJsonString(name, .{}, out);
+            try out.writeAll(", \"bound\": ");
+            try std.json.Stringify.encodeJsonString(spec.bound, .{}, out);
+            try out.writeAll(", \"corner\": ");
+            try std.json.Stringify.encodeJsonString(base.label, .{}, out);
+            try out.writeAll(", \"beta\": ");
+            try output.writeJsonNumber(out, beta orelse std.math.nan(f64));
+            try out.writeAll(", \"yield\": ");
+            try output.writeJsonNumber(out, partial);
+            try out.print(", \"converged\": {s}, \"status\": \"{t}\", \"iterations\": {d}, \"sims\": {d}, \"point\": [", .{ if (f.converged()) "true" else "false", f.status, f.iterations, run.sims });
+            for (w.labels, f.z, 0..) |label, z, i| {
+                try out.writeAll(if (i == 0) "{\"name\": " else ", {\"name\": ");
+                try std.json.Stringify.encodeJsonString(label, .{}, out);
+                try out.writeAll(", \"z\": ");
+                try output.writeJsonNumber(out, z);
+                try out.writeAll("}");
+            }
+            try out.writeAll("]}");
+            continue;
+        }
+        // By |z| down, ties in coordinate order.
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sort(u32, order, @as([]const f64, f.z), struct {
+            fn greater(z: []const f64, i: u32, j: u32) bool {
+                return @abs(z[i]) > @abs(z[j]) or (@abs(z[i]) == @abs(z[j]) and i < j);
+            }
+        }.greater);
+        const top = order[0..@min(w.spec.top, order.len)];
+        if (k % specs.len == 0) try out.print("\n  Worst-case distances (.wcd){s}{s}\n  spec            bound        beta_w      yield(Phi)    iters  sims   worst-case point (top {d})\n", .{ if (base.label.len != 0) " at " else "", base.label, top.len });
+        try out.print("  {s:<15} {s:<12} ", .{ name, spec.bound });
+        if (beta) |b| try out.print("{d:<11.4} {d:<13.10} ", .{ b, partial }) else try out.writeAll("-           -             ");
+        try out.print("{d:<6} {d:<6}", .{ f.iterations, run.sims });
+        for (top, 0..) |i, n| try out.print("{s}{s} {s}{d:.2}s", .{ if (n == 0) " " else ", ", w.labels[i], if (f.z[i] >= 0) "+" else "", f.z[i] });
+        try out.writeAll(switch (f.status) {
+            .converged => "\n",
+            .maxiter => "  (not converged: MAXITER reached)\n",
+            .line_search => "  (not converged: no step along the linearized boundary lowered the merit)\n",
+            .no_gradient => "  (no statistical parameter moves this measure)\n",
+            .failed => "  (not converged: a point could not be simulated or measured)\n",
+            .running => unreachable, // `worstCase` runs every search to its end
+        });
+    }
 }
 
 /// Block `k` of query `id`'s result: its own run at 0, else the

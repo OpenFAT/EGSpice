@@ -2174,6 +2174,104 @@ test "SIGMA_SCALE (#239): a trial whose FAIL card has no value fails, and a fit 
     try t.expect(s.get("p").? == .null);
 }
 
+/// A margin linear in two unit Gaussians: v(out) = 1 + 0.6 z1 + 0.8 z2,
+/// read by `{s}` (`.dc` or `.tran`) at `{s}`. `m <= 6` passes nominally
+/// and fails 5 sigmas out; `m2 >= 6` is its mirror, failing nominally.
+const wcd_linear = "wcd linear\n.param z1=agauss(0,1,1) z2=agauss(0,1,1)\nv1 in 0 1\nr0 in 0 1k\nv2 out 0 {{1+0.6*z1+0.8*z2}}\nr1 out 0 1k\n{s}\n.meas {s} m find v(out) at={s}\n.meas {s} m2 find v(out) at={s}\n.wcd m '<= 6' m2 '>= 6'\n.end\n";
+
+/// Runs `source` in `dialect` at `max_parallel`, printing its `.meas`
+/// text into `text` and its `--measures` JSON into `json`.
+fn wcdRun(source: api.Source, dialect: api.Dialect, max_parallel: u16, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
+    var errors: std.Io.Writer.Allocating = .init(t.allocator);
+    defer errors.deinit();
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = dialect, .max_parallel = max_parallel, .measures_json = true });
+    defer p.deinit();
+    try p.run_all();
+    try p.print_measures(&text.writer, &errors.writer);
+    try p.write_measures_json(&json.writer, "wcd.cir");
+}
+
+/// The `"kind": "wcd"` object of spec `spec` in a parsed
+/// `write_measures_json` document.
+fn wcdObject(parsed: std.json.Parsed(std.json.Value), spec: []const u8) !std.json.ObjectMap {
+    for (parsed.value.object.get("statistics").?.array.items) |s| {
+        if (std.mem.eql(u8, s.object.get("kind").?.string, "wcd") and std.mem.eql(u8, s.object.get("spec").?.string, spec)) return s.object;
+    }
+    return error.NoWcdObject;
+}
+
+test ".wcd (#240): a margin linear in Gaussians gives the closed-form beta, signed, by tangent rows (.dc) and by a finite-difference batch (.tran uic), at any --jobs" {
+    // Oracle: the closed form. 1 + 0.6 z1 + 0.8 z2 reaches 6 at distance
+    // (6 - 1)/‖(0.6, 0.8)‖ = 5, at z* = (3, 4). The full step lands on the
+    // plane, so each search takes 2 gradient rounds and 1 line point: 3
+    // simulations with tangent rows, 2·(1 + 2) + 1 = 7 without. The two
+    // routes are a metamorphic pair: the same beta to TOL.
+    const tol = 0.01;
+    var betas: [2]f64 = undefined;
+    for ([_][3][]const u8{ .{ ".dc v1 1 2 1", "dc", "1" }, .{ ".tran 1n 2n uic", "tran", "1n" } }, [_]f64{ 3, 7 }, &betas) |c, sims, *beta| {
+        const src = try std.fmt.allocPrint(t.allocator, wcd_linear, .{ c[0], c[1], c[2], c[1], c[2] });
+        defer t.allocator.free(src);
+        var first: ?[]u8 = null;
+        defer if (first) |f| t.allocator.free(f);
+        for ([_]u16{ 1, 8 }) |jobs| {
+            var text: std.Io.Writer.Allocating = .init(t.allocator);
+            defer text.deinit();
+            var json: std.Io.Writer.Allocating = .init(t.allocator);
+            defer json.deinit();
+            try wcdRun(.{ .bytes = .{ .data = src, .origin = "wcd.cir" } }, .ngspice, jobs, &text, &json);
+            // Every operating point starts cold: the same bytes at any --jobs.
+            if (first) |f| try t.expectEqualStrings(f, text.written()) else first = try t.allocator.dupe(u8, text.written());
+            try t.expect(std.mem.indexOf(u8, text.written(), "Worst-case distances (.wcd)") != null);
+            const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+            defer parsed.deinit();
+            for ([_][]const u8{ "m", "m2" }, [_]f64{ 5, -5 }) |spec, want| {
+                const o = try wcdObject(parsed, spec);
+                try t.expect(o.get("converged").?.bool);
+                try t.expectApproxEqAbs(want, jsonFloat(o.get("beta").?), tol);
+                try t.expectEqual(@as(f64, 2), jsonFloat(o.get("iterations").?));
+                try t.expectEqual(sims, jsonFloat(o.get("sims").?));
+                // Both specs share the boundary, so the same point, z1 first.
+                const point = o.get("point").?.array.items;
+                try t.expectEqual(@as(usize, 2), point.len);
+                try t.expectApproxEqAbs(@as(f64, 3), jsonFloat(point[0].object.get("z").?), tol);
+                try t.expectApproxEqAbs(@as(f64, 4), jsonFloat(point[1].object.get("z").?), tol);
+            }
+            beta.* = jsonFloat((try wcdObject(parsed, "m")).get("beta").?);
+        }
+    }
+    try t.expectApproxEqAbs(betas[0], betas[1], tol);
+}
+
+test ".wcd (#240): the 5T OTA's output offset spec has the beta .dcmatch's sigma gives, within 2 %" {
+    // Oracle: `.dcmatch` (adjoint sensitivities at the operating point, an
+    // independent route): to first order the offset is Gaussian with sigma
+    // total_3sigma/3, so beta = (limit - v(out))/sigma. FORM finds the true
+    // boundary; the square-law pair and mirror bend it by well under 2 %
+    // at a few millivolts of vto shift.
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try wcdRun(.{ .file = "docs/examples/wcd_ota.sp" }, .hspice, 4, &text, &json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+    defer parsed.deinit();
+    var vo: f64 = std.math.nan(f64);
+    var s3: f64 = std.math.nan(f64);
+    for (jsonResults(parsed)) |r| {
+        const name = r.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "vo")) vo = jsonFloat(r.object.get("value").?);
+        if (std.mem.eql(u8, name, "s3")) s3 = jsonFloat(r.object.get("value").?);
+    }
+    try t.expect(s3 > 0);
+    const sigma = s3 / 3;
+    for ([_][]const u8{ "vo", "vo2" }, [_]f64{ (0.91 - vo) / sigma, (vo - 0.89) / sigma }) |spec, want| {
+        const o = try wcdObject(parsed, spec);
+        try t.expect(o.get("converged").?.bool);
+        try t.expect(want > 1);
+        try t.expectApproxEqRel(want, jsonFloat(o.get("beta").?), 0.02);
+    }
+}
+
 test "--measures (#235): SWEEP DATA rows carry their columns, and a failed WHEN is null with its error" {
     var swept: std.ArrayList(u8) = .empty;
     defer swept.deinit(t.allocator);
