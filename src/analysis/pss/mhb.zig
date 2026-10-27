@@ -760,9 +760,9 @@ const Newton = struct {
         try dcSeed(ckt, x_hat, x_sample, nf, options.tol);
         var fs = try FreqSolver.fromCircuit(allocator, ckt, x_sample);
         errdefer fs.deinit();
-        // Complex held factors on the host solve; the grouped and device
-        // drivers read stacked tapes.
-        fs.complex_held = fs.complex_lanes and single_gpu and ckt.gpu == null;
+        // Complex held factors for the single driver, host or device; the
+        // grouped driver factors stacked tapes on the device.
+        fs.complex_held = fs.complex_lanes and single_gpu;
         const restart: u32 = @intCast(@min(total, gmres_restart));
         var gmres = try Gcrodr.init(allocator, @intCast(total), restart, @min(gmres_recycle, restart / 4));
         errdefer gmres.deinit(allocator);

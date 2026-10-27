@@ -204,8 +204,8 @@ fn sweepKrylov(
     }
     var fs = try FreqSolver.fromPlanes(allocator, @intCast(n), lin.col_ptr, lin.row_idx, g0, c0);
     defer fs.deinit();
-    // Complex held factors on the host; a device provider reads stacked tapes.
-    fs.complex_held = fs.complex_lanes and ckt.gpu == null;
+    // Complex held factors, solved on the host or uploaded (`prepareHeld`).
+    fs.complex_held = fs.complex_lanes;
     var gpu_held: ?@import("../gpu/freq.zig").Held = null;
     defer if (gpu_held) |*held| held.deinit();
     var gpu_held_disabled = false;
