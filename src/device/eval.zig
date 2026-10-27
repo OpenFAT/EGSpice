@@ -1978,6 +1978,7 @@ pub fn DeviceBatch(comptime D: type) type {
             .scatter_tapes = scatterTapes,
             .q_tape = if (has_q) qTape else null,
             .charge_identity = if (has_q and lteSites(D).len > 0) chargeIdentity else null,
+            .original_ids = originalIds,
             .derivative_counts = derivativeCounts,
             .eval_q = if (has_q) evalQOnly else null,
             // Only where `update_state` is the hook that stages (not the
@@ -2127,6 +2128,11 @@ pub fn DeviceBatch(comptime D: type) type {
                 .wide_lanes = @intCast(comptime basisOf(D, false).w),
                 .narrow_lanes = if (narrowable) @intCast(comptime basisOf(D, true).w) else 0,
             };
+        }
+
+        fn originalIds(ctx: *anyopaque) []const u32 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.original_ids;
         }
 
         fn chargeIdentity(ctx: *anyopaque, index: usize) ir.ChargeIdentity {

@@ -392,11 +392,12 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
     for (cards) |*c| {
         c.name = try sim_arena.dupe(u8, c.name);
     }
-    const card_names = try requests.CardNames.init(sim_arena, cards);
     var perm: ?[]const u32 = null;
     var circuit = try b.compilePerm(&perm);
     compiled_ok = true;
     errdefer circuit.deinit();
+    try frozenIndices(parse_arena, cards, &circuit);
+    const card_names = try requests.CardNames.init(sim_arena, cards);
 
     var out = try nb.publish(sim_arena, &circuit, perm);
     if (nl.deck.saves.len > 0) try keepSaved(parse_arena, &out.probes, &out.probe_labels, nl.deck.saves);
@@ -497,6 +498,8 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         .opvar_labels = ov.labels,
         .emir_ports = try portCounts(sim_arena, lib, &circuit),
         .em_recovery = deck_opts.em_recovery,
+        .card_models = try cardModels(sim_arena, parse_arena, nl, cards),
+        .emir_file = if (nl.deck.emir_file) |f| try sim_arena.dupe(u8, f) else null,
     } } };
 }
 
@@ -689,6 +692,35 @@ fn refuseOpVar(arena: std.mem.Allocator, name: []const u8, card: []const u8, var
         std.log.err("netlist: {s}: {s} has no variable '{s}'; its variables are: {s}{s}{s}", .{ name, card, variable, listed, sep, if (mosfet) opvar_names else "" });
     }
     return error.UnsupportedCard;
+}
+
+/// Renumbers each card's `index` from its add ordinal to its instance's
+/// place in the frozen batch, which a mixed batch partitions
+/// (`Hooks.original_ids`): the index every tape, hook and `ParamRef` reads.
+fn frozenIndices(scratch: std.mem.Allocator, cards: []requests.CardRef, circuit: *const device.Circuit) !void {
+    for (circuit.batches, circuit.batch_types) |b, t| {
+        const ids: []const u32 = if (b.hooks.original_ids) |original| original(b.ctx) else &.{};
+        if (ids.len == 0) continue;
+        std.debug.assert(ids.len == b.count);
+        const at = try scratch.alloc(u32, ids.len);
+        for (ids, 0..) |id, k| at[id] = @intCast(k);
+        for (cards) |*c| if (c.type == t) {
+            c.index = at[c.index];
+        };
+    }
+}
+
+/// `Deck.card_models`: the `.model` card each card names, by its name, for
+/// `--emir` (#237). A binned card's is its bin's.
+fn cardModels(sim_arena: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const netlist.Netlist, cards: []const requests.CardRef) !requests.CardNames {
+    var by_name: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (nl.order) |e| {
+        const dev = nl.device(e);
+        if (dev.model) |m| try by_name.put(scratch, dev.name, m.name);
+    }
+    var named: std.ArrayList(requests.CardRef) = .empty;
+    for (cards) |c| if (by_name.get(c.name)) |m| try named.append(scratch, .{ .type = c.type, .index = c.index, .name = try sim_arena.dupe(u8, m) });
+    return requests.CardNames.init(sim_arena, named.items);
 }
 
 /// `Deck.emir_ports`: each batch's port count, from its type's vtable.

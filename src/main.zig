@@ -264,7 +264,7 @@ pub fn main(init: std.process.Init) !u8 {
             if (measures_path) |file| writeMeasures(init.io, p, file, path, &stdout.interface) catch |e|
                 std.debug.print("Error: {s}: --measures={s}: {s}\n", .{ path, file, @errorName(e) });
             // The variants that completed.
-            if (emir_path) |file| writeEmir(init.io, init.gpa, p, file, path) catch |e|
+            if (emir_path orelse p.emir_file()) |file| writeEmir(init.io, init.gpa, p, file, path) catch |e|
                 std.debug.print("Error: {s}: --emir={s}: {s}\n", .{ path, file, @errorName(e) });
             continue;
         };
@@ -284,7 +284,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("Error: {s}: --measures={s}: {s}\n", .{ path, file, @errorName(e) });
             failed = true;
         };
-        if (emir_path) |file| writeEmir(init.io, init.gpa, p, file, path) catch |e| {
+        if (emir_path orelse p.emir_file()) |file| writeEmir(init.io, init.gpa, p, file, path) catch |e| {
             std.debug.print("Error: {s}: --emir={s}: {s}\n", .{ path, file, @errorName(e) });
             failed = true;
         };
@@ -322,7 +322,7 @@ fn writeMeasures(io: std.Io, p: *problem.Problem, file: []const u8, deck: []cons
 
 /// `--emir=FILE`: each variant's document (`Problem.write_emir_json`), the
 /// first to `file` and the k-th to `file.k`, each replaced atomically, as
-/// `-r` writes a format that does not append. `error.NoTransient` when the
+/// `-r` writes a format that does not append. `error.NoCurrents` when the
 /// run has none.
 fn writeEmir(io: std.Io, gpa: std.mem.Allocator, p: *problem.Problem, file: []const u8, deck: []const u8) !void {
     var k: usize = 0;
@@ -340,7 +340,7 @@ fn writeEmir(io: std.Io, gpa: std.mem.Allocator, p: *problem.Problem, file: []co
         try fw.interface.flush();
         try atomic.replace(io);
     }
-    if (k == 0) return error.NoTransient;
+    if (k == 0) return error.NoCurrents;
 }
 
 /// `--emir-window=T1:T2`, seconds with 0 <= T1 < T2; null when malformed.

@@ -2261,7 +2261,8 @@ test "--emir (#237): a divider's terminal currents are Ohm's law, positive into 
     const terms = doc.get("terminals").?.array.items;
     try t.expectEqual(@as(usize, 6), terms.len);
     const sources = doc.get("sources").?.array.items;
-    try t.expectEqual(@as(usize, 1), sources.len);
+    // V1's p, then its n at ground.
+    try t.expectEqual(@as(usize, 2), sources.len);
     try t.expect(std.ascii.eqlIgnoreCase("in", sources[0].object.get("net").?.string));
     // Oracle: 3 V over 1k + 2k is 1 mA, into each resistor's p and out of
     // its n, none through the capacitor at DC; V1's p delivers it.
@@ -2342,6 +2343,152 @@ test "--emir (#237): each .step point writes its own document under its label, b
     defer four.deinit();
     try t.expectEqual(one.docs.items.len, four.docs.items.len);
     for (one.docs.items, four.docs.items) |a, b| try t.expectEqualStrings(a, b);
+}
+
+/// Oracle: Kirchhoff. At every net but ground, the `avg` of every terminal
+/// and source entry there sums to 0 within `tol`.
+fn expectKcl(doc: std.json.ObjectMap, tol: f64) !void {
+    var sums: std.StringArrayHashMapUnmanaged(f64) = .empty;
+    defer sums.deinit(t.allocator);
+    for ([_][]const u8{ "terminals", "sources" }) |key| for (doc.get(key).?.array.items) |entry| {
+        const net = entry.object.get("net").?.string;
+        if (std.mem.eql(u8, "0", net)) continue;
+        const sum = try sums.getOrPut(t.allocator, net);
+        if (!sum.found_existing) sum.value_ptr.* = 0;
+        sum.value_ptr.* += emirField(entry, "avg");
+    };
+    try t.expect(sums.count() != 0);
+    for (sums.values()) |v| try t.expectApproxEqAbs(@as(f64, 0), v, tol);
+}
+
+test "--emir (#237): without a .tran, the .op or the .dc's first point: every statistic |i|, the sign in avg, both terminals of each source" {
+    // V2 is a floating 0 V ammeter: Kirchhoff at mid2 needs its n terminal.
+    for ([_][]const u8{
+        "emir op\nV1 in 0 dc 3\nR1 in mid 1k\nV2 mid mid2 dc 0\nR2 mid2 0 2k\n.op\n.end\n",
+        // The sweep's first point, 3 V, not the 5 V operating point.
+        "emir dc\nV1 in 0 dc 5\nR1 in mid 1k\nV2 mid mid2 dc 0\nR2 mid2 0 2k\n.dc v1 3 4 1\n.end\n",
+    }, [_][]const u8{ "op", "dc" }) |source, kind| {
+        var r = try emirRun(source, 1, .{ 0, 0 });
+        defer r.deinit();
+        try t.expectEqual(@as(usize, 1), r.docs.items.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+        defer parsed.deinit();
+        const doc = parsed.value.object;
+        try t.expectEqualStrings(kind, doc.get("analysis").?.string);
+        try t.expect(doc.get("window").? == .null);
+        try t.expectEqual(@as(usize, 4), doc.get("terminals").?.array.items.len);
+        try t.expectEqual(@as(usize, 4), doc.get("sources").?.array.items.len);
+        for ([_][]const u8{ "terminals", "sources" }) |key| for (doc.get(key).?.array.items) |entry| {
+            const o = entry.object;
+            // Oracle: Ohm's law, 3 V over 3k: 1 mA into each resistor's p
+            // and V2's p, out of V1's p, which delivers it.
+            const into = std.mem.eql(u8, "p", o.get("terminal").?.string) != std.ascii.eqlIgnoreCase("v1", o.get("instance").?.string);
+            const avg = emirField(entry, "avg");
+            try t.expectApproxEqAbs(@as(f64, if (into) 1e-3 else -1e-3), avg, 1e-12);
+            // Oracle: the issue's static point, avg = em_avg = rms = peak = |i|.
+            for ([_][]const u8{ "em_avg", "rms", "peak" }) |stat| try t.expectEqual(@abs(avg), emirField(entry, stat));
+        };
+        try expectKcl(doc, 1e-12);
+    }
+}
+
+test "--emir (#237): a CMOS inverter driving C: the load's EM_AVG is C·V·f, so is the supply's mean, and the peak is the PMOS saturation current at the edge" {
+    // mn, with a drain resistance, is the first card and the only mos1
+    // instance not fully collapsed; a batch that narrows partitions its
+    // fully collapsed instances first, freezing mp before mn, and each
+    // terminal must still carry its own card's name, nets and model.
+    // tox=0 drops the Meyer capacitances and lambda is 0, so the load
+    // takes all the charge and a saturated PMOS a flat current.
+    const source =
+        \\emir inverter
+        \\.option em_recovery=0
+        \\vdd vdd 0 dc 1.8
+        \\vin in 0 pulse(0 1.8 1n 10p 10p 49.99n 100n)
+        \\mn out in 0 0 nmod w=5u l=1u
+        \\mp out in vdd vdd pmod w=10u l=1u
+        \\c1 out 0 1p
+        \\.model nmod nmos level=1 vto=0.7 kp=1e-4 tox=0 rd=10
+        \\.model pmod pmos level=1 vto=-0.7 kp=1e-4 tox=0
+        \\.tran 0.1n 301n
+        \\.end
+        \\
+    ;
+    // Three whole periods, from and to a settled output.
+    var r = try emirRun(source, 1, .{ 0.5e-9, 300.5e-9 });
+    defer r.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+    defer parsed.deinit();
+    const doc = parsed.value.object;
+    const window = doc.get("window").?.array.items;
+    const span = jsonFloat(window[1]) - jsonFloat(window[0]);
+    const c: f64 = 1e-12;
+    const vdd: f64 = 1.8;
+    var load: ?std.json.Value = null;
+    var mos: usize = 0;
+    for (doc.get("terminals").?.array.items) |term| {
+        const o = term.object;
+        const name = o.get("instance").?.string;
+        const port = o.get("terminal").?.string;
+        const net = o.get("net").?.string;
+        if (std.ascii.eqlIgnoreCase("c1", name)) {
+            try t.expect(o.get("model").? == .null);
+            if (std.mem.eql(u8, "p", port)) load = term;
+            continue;
+        }
+        // Oracle: the netlist's own cards.
+        const p_side = std.ascii.eqlIgnoreCase("mp", name);
+        try t.expect(p_side or std.ascii.eqlIgnoreCase("mn", name));
+        try t.expect(std.ascii.eqlIgnoreCase(if (p_side) "pmod" else "nmod", o.get("model").?.string));
+        const want: []const u8 = if (std.mem.eql(u8, "d", port)) "out" else if (std.mem.eql(u8, "g", port)) "in" else if (p_side) "vdd" else "0";
+        try t.expect(std.ascii.eqlIgnoreCase(want, net));
+        mos += 1;
+    }
+    try t.expectEqual(@as(usize, 8), mos);
+    const cap = load orelse return error.TestUnexpectedResult;
+    // Oracle: each charging edge moves C·Vdd into the load and each
+    // discharge takes it back, so with em_recovery = 0 its EM_AVG over three
+    // periods is 3·C·Vdd / span, C·V·f, within the integration's error; its
+    // mean is 0.
+    try t.expectApproxEqRel(3 * c * vdd / span, emirField(cap, "em_avg"), 5e-3);
+    try t.expectApproxEqAbs(@as(f64, 0), emirField(cap, "avg"), 1e-2 * c * vdd / 100e-9);
+    // Oracle: the input falls to 0 with the output still low, so the PMOS
+    // charges the load at its saturation current kp/2·W/L·(Vdd - |vto|)²
+    // until the output passes |vto|; the weaker NMOS discharges at half that.
+    try t.expectApproxEqRel(0.5 * 1e-4 * 10 * (vdd - 0.7) * (vdd - 0.7), emirField(cap, "peak"), 1e-3);
+    // Oracle: the supply delivers the load's charge, C·V·f, plus the
+    // crowbar charge of 10 ps edges (under 0.1 %).
+    const supply = for (doc.get("sources").?.array.items) |src| {
+        const o = src.object;
+        if (std.ascii.eqlIgnoreCase("vdd", o.get("instance").?.string) and std.mem.eql(u8, "p", o.get("terminal").?.string)) break src;
+    } else return error.TestUnexpectedResult;
+    try t.expectApproxEqRel(-3 * c * vdd / span, emirField(supply, "avg"), 1e-2);
+    try expectKcl(doc, 1e-9);
+}
+
+test "--emir (#237): a Spectre analysis's emirfile, or emirformat alone, turns it on and names the file" {
+    for ([_][]const u8{
+        "// emir spectre\nV1 (in 0) vsource dc=3\nR1 (in 0) resistor r=1k\ntran1 tran stop=10n emirfile=\"hot.emir\"\n",
+        "// emir spectre\nV1 (in 0) vsource dc=3\nR1 (in 0) resistor r=1k\nop1 dc emirformat=ascii\n",
+    }, [_][]const u8{ "hot.emir", "emir.emir.json" }, [_][]const u8{ "tran", "op" }) |source, file, kind| {
+        const p = try api.Problem.init(t.allocator, t.io, .{
+            .source = .{ .bytes = .{ .data = source, .origin = "emir.scs" } },
+            .dialect = .spectre,
+        });
+        defer p.deinit();
+        try t.expectEqualStrings(file, p.emir_file() orelse return error.TestUnexpectedResult);
+        try p.run_all();
+        var text: std.Io.Writer.Allocating = .init(t.allocator);
+        defer text.deinit();
+        try t.expect(try p.write_emir_json(&text.writer, "emir.scs", 0));
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, text.written(), .{});
+        defer parsed.deinit();
+        try t.expectEqualStrings(kind, parsed.value.object.get("analysis").?.string);
+        // Oracle: Ohm's law, 3 mA into R1's p.
+        for (parsed.value.object.get("terminals").?.array.items) |term| {
+            const sign: f64 = if (std.mem.eql(u8, "p", term.object.get("terminal").?.string)) 1 else -1;
+            try t.expectApproxEqAbs(sign * 3e-3, emirField(term, "avg"), 1e-12);
+        }
+    }
 }
 
 test "Options.point.tangent_step with live parameters: the deck's own transient prints the tangents append_points gives" {

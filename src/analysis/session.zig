@@ -1487,8 +1487,9 @@ fn sameTransient(reader: requests.Query, tran: requests.Tran) bool {
 /// became (`splitLanes`).
 fn batchable(job: requests.Query) bool {
     return switch (job) {
-        .op, .dc, .pss => true,
-        // `--emir` reads each transient's own host batches (#237).
+        .pss => true,
+        // `--emir` reads each query's own host batches (#237).
+        inline .op, .dc => |o| !o.emir,
         .tran => |o| !o.point.emir,
         inline .mc, .temp => |o| o.lane != null,
         else => execution.freqLaneKind(job),

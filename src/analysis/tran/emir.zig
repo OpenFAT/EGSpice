@@ -9,7 +9,9 @@
 //! terminals sum to its residual. The window reads samples as `.meas`
 //! FROM=/TO= do, and the average and EM_AVG halves fold as `.meas AVG` and
 //! `EM_AVG` fold them (output/scan.zig `Extremum`, output/measure.zig
-//! `EmAvg`), to the bit; the RMS is the trapezoid of i².
+//! `EmAvg`), to the bit; the RMS is the trapezoid of i². An operating or
+//! DC point is one sample (`atPoint`): every statistic its |i|, the sign
+//! kept in the average.
 const std = @import("std");
 const core = @import("core");
 const root = @import("../types.zig");
@@ -220,7 +222,9 @@ pub const Emir = struct {
     }
 
     /// The window's statistics, every terminal's in terminal order, in `a`.
+    /// A window of one sample publishes that sample.
     pub fn publish(e: *const Emir, a: std.mem.Allocator, ckt: *const root.Circuit) !core.Emir {
+        const one = e.from == e.to;
         const out = try a.alloc(core.EmirTerminal, e.sum.len);
         for (ckt.batches, e.ports, e.tbase[0..ckt.batches.len], 0..) |b, p, base, k| {
             const rows = b.hooks.scatter_tapes(b.ctx).rows;
@@ -231,8 +235,8 @@ pub const Emir = struct {
                     .instance = @intCast(id),
                     .port = @intCast(u),
                     .row = rows[id * b.n_u + u],
-                    .avg = e.sum[j] / e.span,
-                    .rms = @sqrt(e.sum2[j] / e.span),
+                    .avg = if (one) e.last[j] else e.sum[j] / e.span,
+                    .rms = if (one) e.peak[j] else @sqrt(e.sum2[j] / e.span),
                     .peak = e.peak[j],
                     .pos = e.pos[j],
                     .neg = e.neg[j],
@@ -242,6 +246,16 @@ pub const Emir = struct {
         return .{ .from = e.from, .to = e.to, .terminals = out };
     }
 };
+
+/// Every terminal's current at the static point `x` of `ctx.circuit` (an
+/// `.op`, a `.dc` point), at t = 0; no terminals when `ctx` has no ports.
+pub fn atPoint(ctx: *const root.RunCtx, x: []const f64) !core.Emir {
+    if (ctx.emir_ports.len != ctx.circuit.batches.len) return .{};
+    var e = try Emir.init(ctx.scratch_allocator, ctx.circuit, ctx.emir_ports, .backward_euler, .{ 0, 0 }, 0);
+    defer e.deinit();
+    e.start(ctx.circuit, x, true);
+    return e.publish(ctx.allocator, ctx.circuit);
+}
 
 /// The first `len` of `rest`, which then starts past them.
 fn cut(rest: *[]f64, len: usize) []f64 {

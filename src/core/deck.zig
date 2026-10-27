@@ -336,6 +336,12 @@ pub const Deck = struct {
     emir_ports: []const u32 = &.{},
     /// `.option em_recovery`, as `.meas EM_AVG` reads it; 1 when unset.
     em_recovery: f64 = 1,
+    /// Each card's `.model` card name, laid out as `card_names`; none for
+    /// a card without one (#237).
+    card_models: requests.CardNames = .empty,
+    /// `.options emirfile=` (a Spectre analysis's `emirfile`/`emirformat`):
+    /// write `--emir` to this file, `""` for `<deck stem>.emir.json` (#237).
+    emir_file: ?[]const u8 = null,
 };
 
 /// One device operating-point variable (ngspice `@m1[gm]`, #236) of

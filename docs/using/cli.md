@@ -79,7 +79,7 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
 `--emir=FILE`, `--emir-window=T1:T2`
 : Write the average, electromigration average, RMS and peak current of
   every device terminal and independent source over the deck's first
-  `.tran` to `FILE` as JSON; each `.step`, `.alter` or sweep variant writes
+  `.tran` (its `.op` or `.dc` point without one) to `FILE` as JSON; each `.step`, `.alter` or sweep variant writes
   its own file (`FILE`, `FILE.2`, ...). `--emir-window` limits the
   statistics to `[T1, T2]` seconds of the run. The transient runs to its
   end and on the CPU. `FILE` takes one netlist. See

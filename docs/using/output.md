@@ -240,8 +240,8 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
 
 ### Terminal currents as JSON
 
-`espice hot.sp --emir=hot.emir.json` writes, for the deck's first `.tran`,
-the current statistics of every device terminal and every independent
+`espice hot.sp --emir=hot.emir.json` writes, for the deck's first `.tran`
+(or, without one, its first `.op` or `.dc`), the current statistics of every device terminal and every independent
 source, for electromigration and IR-drop sign-off (values abridged):
 
 ```json
@@ -254,13 +254,14 @@ source, for electromigration and IR-drop sign-off (values abridged):
   "window": [1e-06, 3e-06],
   "em_recovery": 1,
   "terminals": [
-    {"instance": "x1.mn1", "device": "bsim4va", "terminal": "d", "net": "x1.out",
+    {"instance": "x1.mn1", "model": "sky130_fd_pr__nfet_01v8", "terminal": "d", "net": "x1.out",
      "avg": 1.21e-04, "em_avg": 1.21e-04, "rms": 1.53e-04, "peak": 4.10e-04},
-    {"instance": "x1.mn1", "device": "bsim4va", "terminal": "s", "net": "x1.tail",
+    {"instance": "x1.mn1", "model": "sky130_fd_pr__nfet_01v8", "terminal": "s", "net": "x1.tail",
      "avg": -1.21e-04, "em_avg": 1.21e-04, "rms": 1.53e-04, "peak": 4.10e-04}
   ],
   "sources": [
-    {"instance": "vdd", "net": "vdd", "avg": -5.49e-04, "em_avg": 5.49e-04, "rms": 6.27e-04, "peak": 1.14e-03}
+    {"instance": "vdd", "terminal": "p", "net": "vdd", "avg": -5.49e-04, "em_avg": 5.49e-04, "rms": 6.27e-04, "peak": 1.14e-03},
+    {"instance": "vdd", "terminal": "n", "net": "0", "avg": 5.49e-04, "em_avg": 5.49e-04, "rms": 6.27e-04, "peak": 1.14e-03}
   ]
 }
 ```
@@ -275,10 +276,19 @@ source, for electromigration and IR-drop sign-off (values abridged):
 - `window` holds the first and last accepted points read. `--emir-window=T1:T2`
   reads `[T1, T2]` as `.meas ... FROM=T1 TO=T2` does; the default is the
   whole run.
-- `instance` is the card's flattened name, `device` its model's device
-  type, `terminal` the device's port and `net` the node it connects to.
-  Internal nodes of a device are not terminals. A source reports its
-  positive terminal.
+- At an operating point or a `.dc` sweep's first point, `analysis` is `op`
+  or `dc`, `window` is null and `avg = em_avg = rms = peak = |i|` with the
+  sign kept in `avg`.
+- `instance` is the card's flattened name, `model` the `.model` card it
+  names (a binned card's bin; null for a card without one), `terminal` the
+  device's port and `net` the node it connects to. Internal nodes of a
+  device are not terminals. A source lists both of its terminals, so every
+  net's entries sum to zero.
+- In the Spectre dialect an analysis's `emirformat` or `emirfile`
+  parameter sets the flag: the file is `emirfile`, else
+  `<deck stem>.emir.json`, and JSON whatever the format names. In any
+  dialect `.options emirfile="FILE"` does the same; `--emir=FILE` names
+  the file over both.
 - Under `.step`, `.alter` or a sweep, each variant writes its own file
   (`FILE`, `FILE.2`, ...), the variant's label (the `--measures` object)
   under `variant`.

@@ -446,6 +446,10 @@ pub const Hooks = struct {
     q_tape: ?*const fn (*anyopaque) []const f64 = null,
     /// Maps a batch-local charge tape index without evaluating the device.
     charge_identity: ?*const fn (*anyopaque, usize) ChargeIdentity = null,
+    /// Per frozen instance, the add ordinal it was staged at: a mixed batch
+    /// partitions its fully collapsed instances to the front at the freeze.
+    /// Empty when the order is the add order.
+    original_ids: ?*const fn (*anyopaque) []const u32 = null,
     derivative_counts: ?*const fn (*anyopaque) DerivativeCounts = null,
     /// Restamps `q_vec` and `q_tape` for instances `[first, last)` at x,
     /// leaving the other planes alone. Null when the device has no `q`.
@@ -755,7 +759,9 @@ pub const GpuPayload = struct {
 // 37: `Hooks.local_eval` and `LocalEval`, one instance in its own unknowns,
 //     and `Hooks.op_vars` with `LocalEval.vars`, VerA's `op_vars`/`opVars`,
 //     for device operating-point variables (#236).
-pub const abi_version: u32 = 37;
+// 38: `Hooks.original_ids`, a partitioned batch's add order, so a card
+//     names its frozen instance (#237).
+pub const abi_version: u32 = 38;
 
 /// A device type's construction entry points, exported by each device object
 /// and by runtime-loaded `.so` devices.

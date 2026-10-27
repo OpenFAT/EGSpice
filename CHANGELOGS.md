@@ -5,7 +5,8 @@ Newest first.
 ## Unreleased
 
 - `.four` and `.fft` read the deck's `.tran` result instead of integrating the same transient again, where that run keeps its waveform with the same options and operating point (CPU backend); the values are bit for bit the same (#231).
-- `--emir=FILE` writes each device terminal's and independent source's average, EM_AVG, RMS and peak current over the deck's first `.tran` (or `--emir-window=T1:T2`) as JSON, one file per `.step`/`.alter`/sweep variant (#237).
+- `--emir=FILE` writes each device terminal's and independent source's average, EM_AVG, RMS and peak current over the deck's first `.tran` (or `--emir-window=T1:T2`), else its `.op`/`.dc` point, as JSON with each instance's `.model` name, one file per `.step`/`.alter`/sweep variant; a Spectre analysis's `emirformat`/`emirfile` sets it (#237).
+- A mixed batch (some instances fully collapsed) no longer names its instances, `@m[...]` variables or swept parameters by add order: cards are renumbered to the frozen batch order (#237).
 - `SWEEP MONTE=n SIGMA_SCALE=s1,... FAIL='expr'` (scaled-sigma sampling) runs n trials per sigma scale on `.tran`, `.ac` or a swept `.dc`, counts the trials whose `.meas` results fail, and extrapolates the failure probability to the real sigma with its 95 % interval and equivalent sigma; `--measures` writes it as `"kind": "sss"` (#239).
 - `--measures=FILE` also writes every `.meas` result as JSON, labelled with its analysis and variant (`.step`, `SWEEP DATA`, `.alter`, Monte Carlo trial, `.temp` entry), a failed one as `null` with its error; `--measures=-` puts it on stdout (#235).
 - `.option soalimits="file.json"` gives SOA limits, by model name or prefix, to the models whose cards state none; `.meas ... param='soa_count()'` counts a result's excursions, and `--measures` writes each as an object under `soa` (#238).

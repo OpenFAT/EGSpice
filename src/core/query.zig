@@ -283,6 +283,10 @@ pub const Op = struct {
     /// waveform sources evaluate at t = 0 instead of at their DC value. The
     /// engine sets it when the deck has a transient-family query.
     tran_op: bool = false,
+    /// Read every device terminal's current at the point into
+    /// `Result.emir` (`--emir` on a deck with no `.tran`, #237). Such an OP
+    /// joins no lane batch: it reads its own host batches.
+    emir: bool = false,
 };
 
 /// DC sweep of a source, a card parameter or the temperature (`.dc`), one
@@ -311,6 +315,9 @@ pub const Dc = struct {
     /// the sweep's own: the probes moved by -J⁻¹ (F(x, row) - F(x)) at each
     /// point, on the factorization at that point's solution.
     tangents: []const u32 = &.{},
+    /// Read every device terminal's current at the sweep's first point into
+    /// `Result.emir`, as `Op.emir` reads the OP's (#237).
+    emir: bool = false,
 
     /// The device parameter, or the temperature, a `.dc` sweep drives.
     pub const SweepTarget = union(enum) {
