@@ -1937,13 +1937,13 @@ test "print's JSON results: each printed line in order, the ramp's exact values,
     // Oracle: the text, whose `%e` digits `sci` matches C's, line for line.
     var lines = std.mem.splitScalar(u8, text.written(), '\n');
     var k: usize = 0;
-    while (lines.next()) |line| {
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        if (std.mem.startsWith(u8, line, "Error")) continue;
+    while (lines.next()) |text_line| {
+        const eq = std.mem.indexOfScalar(u8, text_line, '=') orelse continue;
+        if (std.mem.startsWith(u8, text_line, "Error")) continue;
         const r = results[k].object;
         k += 1;
-        try std.testing.expectEqualStrings(std.mem.trim(u8, line[0..eq], " "), r.get("name").?.string);
-        var fields = std.mem.tokenizeScalar(u8, line[eq + 1 ..], ' ');
+        try std.testing.expectEqualStrings(std.mem.trim(u8, text_line[0..eq], " "), r.get("name").?.string);
+        var fields = std.mem.tokenizeScalar(u8, text_line[eq + 1 ..], ' ');
         try std.testing.expectApproxEqRel(try std.fmt.parseFloat(f64, fields.next().?), jsonFloat(r.get("value").?), 1e-5);
     }
     try std.testing.expectEqual(@as(usize, 5), k);

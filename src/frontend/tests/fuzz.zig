@@ -363,8 +363,8 @@ fn instancedDeck(a: std.mem.Allocator, copies: bool) ![]const u8 {
             \\
         , .{ o, o, sides[0], o, sides[sides.len - 1] });
     }
-    for ([_][]const u8{ "n1 n2", "n2 n3", "n3 n1" }, [_][]const u8{ "", " l=7", " l=1" }, 0..) |nets, params, k|
-        try src.print(a, "x{d} {s} outer{s}{s}\n", .{ k, nets, if (copies) try a.print("{d}", .{k}) else "", params });
+    for ([_][]const u8{ "n1 n2", "n2 n3", "n3 n1" }, [_][]const u8{ "", " l=7", " l=1" }, 0..) |pins, extra, k|
+        try src.print(a, "x{d} {s} outer{s}{s}\n", .{ k, pins, if (copies) try a.print("{d}", .{k}) else "", extra });
     try src.appendSlice(a, "v1 n1 0 1\n.end\n");
     return src.items;
 }

@@ -1221,12 +1221,12 @@ pub const Tuning = struct {
         const axes = try a.dupe(f64, t.axes.items[k..]);
         const refs = try a.dupe(u32, t.refs.items[lo..]);
         const values = try a.dupe(f64, t.write_values.items[lo..]);
-        t.labels = .{ .items = labels, .capacity = labels.len };
-        t.temps = .{ .items = temps, .capacity = temps.len };
-        t.axes = .{ .items = axes, .capacity = axes.len };
-        t.starts = .{ .items = starts, .capacity = starts.len };
-        t.refs = .{ .items = refs, .capacity = refs.len };
-        t.write_values = .{ .items = values, .capacity = values.len };
+        t.labels = .fromOwnedSlice(labels);
+        t.temps = .fromOwnedSlice(temps);
+        t.axes = .fromOwnedSlice(axes);
+        t.starts = .fromOwnedSlice(starts);
+        t.refs = .fromOwnedSlice(refs);
+        t.write_values = .fromOwnedSlice(values);
         // The deck's kinds live in the planner's arena; appended rows have none.
         t.kinds = t.kinds[@min(k, t.kinds.len)..];
         // Before the first drop the old rows stay in the session arena.
