@@ -1331,8 +1331,10 @@ pub const Problem = struct {
     /// `.meas` results for every completed result a card can read (tran,
     /// transient noise, AC, DC, FFT, S-parameter, mismatch, loop stability,
     /// phase and periodic noise), in request order, as ngspice prints them,
-    /// then the Monte Carlo statistics of each tran, AC and DC card. Cards
-    /// that cannot be measured are reported on `err`.
+    /// then the Monte Carlo statistics of each tran, AC and DC card, or its
+    /// SIGMA_SCALE report (#239). Cards that cannot be measured are
+    /// reported on `err`; a refused SIGMA_SCALE fit fails with
+    /// `error.TooFewScales` or `error.Singular` once everything is printed.
     /// With `Options.measures`, it writes only what `run_all` has not
     /// printed there, and returns the first error printing there.
     pub fn print_measures(self: *Problem, out: *std.Io.Writer, err: *std.Io.Writer) !void {
@@ -1395,20 +1397,29 @@ pub const Problem = struct {
     }
 
     /// The `.meas` statistics over the Monte Carlo trials of each tran, AC
-    /// and DC card, as text or as JSON objects.
+    /// and DC card, as text or as JSON objects; for a SIGMA_SCALE card's
+    /// analysis, its scaled-sigma report instead (#239). As text, a refused
+    /// fit fails with its error once everything is written.
     fn writeStatistics(self: *const Problem, out: *std.Io.Writer, json: bool) !void {
         const measures = self.prepared.deck.measures;
         if (measures.len == 0) return;
         var trials: std.ArrayList(Result) = .empty;
         defer trials.deinit(self.allocator);
+        var refused: ?core.sss.Error = null;
         inline for (.{ .tran, .ac, .dc }) |kind| {
             trials.clearRetainingCapacity();
             try monteTrials(self.allocator, &self.session, kind, &trials);
             for (self.runs) |*run| try monteTrials(self.allocator, &run.session, kind, &trials);
-            if (trials.items.len != 0) {
+            const scaled = for (self.prepared.sss) |s| {
+                if (s.kind == kind) break s;
+            } else null;
+            if (scaled) |s| {
+                if (try writeSss(self.allocator, out, json, measures, s, trials.items)) |e| refused = refused orelse e;
+            } else if (trials.items.len != 0) {
                 if (json) try output.writeMeasureStatistics(out, measures, kind, trials.items) else try output.printMeasureStatistics(out, measures, kind, trials.items);
             }
         }
+        if (refused) |e| if (!json) return e;
     }
 
     /// With `Options.point.tangent_step`, writes d(card)/d(live parameter)
@@ -2091,6 +2102,42 @@ fn monteTrials(gpa: std.mem.Allocator, session: *const analysis.session.Session,
         const res = try session.result(id);
         if (std.mem.indexOf(u8, res.plotname, "(monte=") != null) try trials.append(gpa, res);
     }
+}
+
+/// Counts the failures of SIGMA_SCALE card `s` over its completed `trials`
+/// (#239), fits them and writes the report; returns the fit's refusal. A
+/// trial fails when FAIL holds or reads a card without a value. Counted by
+/// subtraction, so a trial with no completed result (no convergence,
+/// cancelled) fails too. ponytail: every trial's result stays until the
+/// end, as plain MONTE's do; reduce each to its `.meas` row on delivery if
+/// large runs need it.
+fn writeSss(gpa: std.mem.Allocator, out: *std.Io.Writer, json: bool, measures: []const core.Measure, s: frontend.Sss, trials: []const Result) !?core.sss.Error {
+    const m = s.monte;
+    const passed = try gpa.alloc(bool, m.n * m.scales.len);
+    defer gpa.free(passed);
+    @memset(passed, false);
+    const values = try gpa.alloc(f64, measures.len);
+    defer gpa.free(values);
+    for (trials) |res| {
+        const at = std.mem.indexOf(u8, res.plotname, "(monte=").? + "(monte=".len;
+        const tail = res.plotname[at..];
+        const trial = std.fmt.parseInt(u64, tail[0 .. std.mem.indexOfNone(u8, tail, "0123456789") orelse tail.len], 10) catch continue;
+        if (s.scaleOf(trial) == null) continue;
+        output.measureValues(measures, s.kind, res, values);
+        passed[@intCast(trial - m.first)] = !try s.fails(gpa, values);
+    }
+    const failures = try gpa.alloc(u64, m.scales.len);
+    defer gpa.free(failures);
+    const each = try gpa.alloc(u64, m.scales.len);
+    defer gpa.free(each);
+    @memset(each, m.n);
+    for (failures, 0..) |*k, j| k.* = m.n - std.mem.count(bool, passed[j * m.n ..][0..m.n], &.{true});
+    const estimate = core.sss.fit(m.scales, each, failures);
+    const report: output.Sss = .{ .fail = m.fail.text, .scales = m.scales, .trials = m.n, .failures = failures, .estimate = estimate };
+    if (json) try output.writeSss(out, s.kind, report) else try output.printSss(out, report);
+    // An error value returned as is would be this function's own error.
+    _ = estimate catch |e| return @as(?core.sss.Error, e);
+    return null;
 }
 
 /// Block `k` of query `id`'s result: its own run at 0, else the

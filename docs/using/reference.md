@@ -279,7 +279,10 @@ are read as measurements too:
 On any analysis card, HSPICE's `SWEEP` tail runs the card once per point:
 `SWEEP DATA=name`, `SWEEP MONTE=n [FIRSTRUN=k]`, `SWEEP MONTE=list(10 20:30)`,
 `SWEEP OPTIMIZE=name RESULTS=m1,m2 MODEL=optmod`. On `.dc`, `DATA=` and
-`MONTE=` work without the word `SWEEP`.
+`MONTE=` work without the word `SWEEP`. ESPice adds
+`SWEEP MONTE=n SIGMA_SCALE=s1,s2,... FAIL='expr'` on `.tran`, `.ac` and a
+`.dc` with a sweep: scaled-sigma sampling of a rare failure, see
+[analyses](analyses.md#scaled-sigma).
 
 The `OPT` model takes HSPICE's optimizer options with HSPICE's defaults.
 `PARMIN` (default 0.1) floors the parameter scale, so the finite-difference

@@ -850,6 +850,56 @@ pub fn writeStatistics(out: *Writer, measures: []const core.Measure, analysis: K
     }
 }
 
+/// A SIGMA_SCALE run's counts and fit (#239): `failures[j]` of `trials`
+/// failed at `scales[j]`.
+pub const Sss = struct {
+    /// FAIL as written.
+    fail: []const u8,
+    scales: []const f64,
+    trials: u64,
+    failures: []const u64,
+    estimate: core.sss.Error!core.sss.Estimate,
+};
+
+/// The scaled-sigma table, then P_f(1) with its 95 % interval and its
+/// equivalent sigma, or the refusal naming the scales the fit could not
+/// use (none or all of their trials failed).
+pub fn printSss(out: *Writer, s: Sss) Writer.Error!void {
+    try out.print("\n  Scaled-sigma sampling: FAIL = {s}\n  scale   trials  failures\n", .{s.fail});
+    for (s.scales, s.failures) |scale, k| try out.print("  {d:<6}  {d:<6}  {d}\n", .{ scale, s.trials, k });
+    const e = s.estimate catch |err| {
+        if (err == error.Singular) return out.writeAll("  refused: the scales cannot tell the three fit parameters apart\n");
+        try out.writeAll("  refused: fewer than three scales with some, but not all, trials failing; left out:");
+        for (s.scales, s.failures) |scale, k| if (k == 0 or k == s.trials) try out.print(" {d} ({d} failures)", .{ scale, k });
+        return out.writeAll("\n");
+    };
+    const iv = e.interval();
+    try out.print("  P_f(1) = {f}  [{f}, {f}]  ({d:.2} sigma)\n", .{ sci(e.p(), 1), sci(iv[0], 1), sci(iv[1], 1), core.sss.sigmaOf(e.p()) });
+}
+
+/// `printSss` as one JSON object led by `,\n` (#235): `"kind": "sss"`,
+/// `analysis`, `fail`, `trials`, `scales`, `failures`, then `p`, `lo`,
+/// `hi` and `sigma`, null with an `error` when the fit is refused.
+pub fn writeSss(out: *Writer, analysis: Kind, s: Sss) Writer.Error!void {
+    try out.print(",\n    {{\"kind\": \"sss\", \"analysis\": \"{t}\", \"fail\": ", .{analysis});
+    try std.json.Stringify.encodeJsonString(s.fail, .{}, out);
+    try out.print(", \"trials\": {d}, \"scales\": [", .{s.trials});
+    for (s.scales, 0..) |x, j| {
+        if (j != 0) try out.writeAll(", ");
+        try writeNumber(out, x);
+    }
+    try out.writeAll("], \"failures\": [");
+    for (s.failures, 0..) |k, j| try out.print("{s}{d}", .{ if (j == 0) "" else ", ", k });
+    try out.writeAll("]");
+    const e = s.estimate catch |err| return out.print(", \"p\": null, \"lo\": null, \"hi\": null, \"sigma\": null, \"error\": \"{t}\"}}", .{err});
+    const iv = e.interval();
+    for ([_][]const u8{ "p", "lo", "hi", "sigma" }, [_]f64{ e.p(), iv[0], iv[1], core.sss.sigmaOf(e.p()) }) |field, x| {
+        try out.print(", \"{s}\": ", .{field});
+        try writeNumber(out, x);
+    }
+    try out.writeAll("}");
+}
+
 /// A card's Welford accumulator over the trials; every field moves together.
 const Acc = struct {
     n: f64 = 0,

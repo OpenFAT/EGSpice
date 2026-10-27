@@ -9,6 +9,7 @@
 //! error each misuse must get.
 const std = @import("std");
 const api = @import("espice");
+const core = @import("core");
 const t = std.testing;
 const deck = "query fixture\nV1 in 0 dc 1 ac 1\nR1 in out 1k\nC1 out 0 1n\n.ac dec 80 1 100k\n.tran 1n 10n uic\n.end\n";
 
@@ -1835,6 +1836,88 @@ test "--measures (#235): Monte Carlo trials are labelled by trial, and the stati
     // another summation order), and RC ln 2 = 693 ns within the 3 % spread.
     try t.expectApproxEqRel(sum / 50, jsonFloat(s.get("mean").?), 1e-12);
     try t.expectApproxEqRel(1e-6 * @log(2.0), jsonFloat(s.get("mean").?), 2e-2);
+}
+
+/// A margin linear in two unit Gaussians: v(out) = 0.6 z1 + 0.8 z2 is
+/// N(0, s²) at sigma scale s, so `m > b` fails with probability Q(b/s).
+const sss_linear = "sss linear\n.param z1=agauss(0,1,1) z2=agauss(0,1,1)\nv1 in 0 1\nr0 in 0 1k\nb1 out 0 v=0.6*z1+0.8*z2\nr1 out 0 1k\n.dc v1 1 1 1 sweep monte={d} sigma_scale={s} fail='m > {d}'\n.meas dc m find v(out) {s}\n.end\n";
+
+/// Runs `source` at `max_parallel`, printing its `.meas` text into `text`
+/// and its `--measures` JSON into `json`; returns `print_measures`' error
+/// after both are written.
+fn sssRun(source: []const u8, max_parallel: u16, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
+    var errors: std.Io.Writer.Allocating = .init(t.allocator);
+    defer errors.deinit();
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "sss.cir" } }, .max_parallel = max_parallel, .measures_json = true });
+    defer p.deinit();
+    try p.run_all();
+    const printed = p.print_measures(&text.writer, &errors.writer);
+    try p.write_measures_json(&json.writer, "sss.cir");
+    return printed;
+}
+
+/// The `"kind": "sss"` object of a parsed `write_measures_json` document.
+fn sssObject(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
+    for (parsed.value.object.get("statistics").?.array.items) |s| if (std.mem.eql(u8, s.object.get("kind").?.string, "sss")) return s.object;
+    return error.NoSssObject;
+}
+
+test "SIGMA_SCALE (#239): a margin linear in Gaussians fails Q(b/s) per scale and extrapolates to Q(5) and Q(6), at any --jobs" {
+    // Oracle: the closed form Q. Each scale's count lies within 5 binomial
+    // sigmas of n·Q(b/s) (the draws scale), and the 95 % interval at s = 1
+    // holds Q(b). It is statistical only: at 1000 trials per scale its
+    // half-width (a factor of hundreds) dwarfs the model's own error at
+    // s = 1 (ln P about 0.2 low on this margin), which far more trials would
+    // expose (#239 design, risk 1).
+    for ([_]struct { f64, []const u8, []const f64, []const u16 }{
+        .{ 5, "2.5,3,3.5,4,4.5", &.{ 2.5, 3, 3.5, 4, 4.5 }, &.{ 1, 4 } },
+        .{ 6, "3,3.5,4,4.5,5", &.{ 3, 3.5, 4, 4.5, 5 }, &.{4} },
+    }) |c| {
+        const src = try std.fmt.allocPrint(t.allocator, sss_linear, .{ 1000, c[1], c[0], "at=1" });
+        defer t.allocator.free(src);
+        var first: ?[]u8 = null;
+        defer if (first) |f| t.allocator.free(f);
+        for (c[3]) |jobs| {
+            var text: std.Io.Writer.Allocating = .init(t.allocator);
+            defer text.deinit();
+            var json: std.Io.Writer.Allocating = .init(t.allocator);
+            defer json.deinit();
+            try sssRun(src, jobs, &text, &json);
+            // The same deck and seed print the same bytes at any --jobs.
+            if (first) |f| try t.expectEqualStrings(f, text.written()) else first = try t.allocator.dupe(u8, text.written());
+            try t.expect(std.mem.indexOf(u8, text.written(), "Scaled-sigma sampling: FAIL = m > ") != null);
+            try t.expect(std.mem.indexOf(u8, text.written(), "Monte Carlo statistics") == null);
+            const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+            defer parsed.deinit();
+            const s = try sssObject(parsed);
+            try t.expectEqual(@as(f64, 1000), jsonFloat(s.get("trials").?));
+            for (c[2], s.get("failures").?.array.items) |scale, k| {
+                const p = core.numerics.normalTail(c[0] / scale);
+                try t.expect(@abs(jsonFloat(k) - 1000 * p) <= 5 * @sqrt(1000 * p * (1 - p)));
+            }
+            const truth = core.numerics.normalTail(c[0]);
+            try t.expect(jsonFloat(s.get("lo").?) <= truth and truth <= jsonFloat(s.get("hi").?));
+        }
+    }
+}
+
+test "SIGMA_SCALE (#239): a trial whose FAIL card has no value fails, and a fit without three informative scales is refused" {
+    // `at=2` lies outside the one-point sweep: `m` has no value in any
+    // trial, so every trial fails, and no scale has a pass to fit.
+    const src = try std.fmt.allocPrint(t.allocator, sss_linear, .{ 10, "1,2,3", 100, "at=2" });
+    defer t.allocator.free(src);
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try t.expectError(error.TooFewScales, sssRun(src, 2, &text, &json));
+    try t.expect(std.mem.indexOf(u8, text.written(), "refused: fewer than three scales") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+    defer parsed.deinit();
+    const s = try sssObject(parsed);
+    for (s.get("failures").?.array.items) |k| try t.expectEqual(@as(f64, 10), jsonFloat(k));
+    try t.expectEqualStrings("TooFewScales", s.get("error").?.string);
+    try t.expect(s.get("p").? == .null);
 }
 
 test "--measures (#235): SWEEP DATA rows carry their columns, and a failed WHEN is null with its error" {

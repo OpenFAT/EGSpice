@@ -25,6 +25,10 @@ pub const printMeasureStatistics = @import("measure").printStatistics;
 pub const MeasureJson = @import("measure").Json;
 /// `printMeasureStatistics` as JSON objects.
 pub const writeMeasureStatistics = @import("measure").writeStatistics;
+/// A SIGMA_SCALE run's counts and fit (#239), printed or as JSON.
+pub const Sss = @import("measure").Sss;
+pub const printSss = @import("measure").printSss;
+pub const writeSss = @import("measure").writeSss;
 /// A result's JSON `variant` object: what row of `core.Variants` made it.
 pub const writeVariantJson = @import("measure").writeVariant;
 /// An f64 as the shortest JSON number that reads back as it; `null` when not finite.

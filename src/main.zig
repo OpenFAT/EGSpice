@@ -268,7 +268,15 @@ pub fn main(init: std.process.Init) !u8 {
                 std.debug.print("Error: {s}: --emir={s}: {s}\n", .{ path, file, @errorName(e) });
             continue;
         };
-        try p.print_measures(meas_out, &stderr.interface);
+        // A refused SIGMA_SCALE fit (#239) fails the deck; its table and
+        // the JSON are still written.
+        p.print_measures(meas_out, &stderr.interface) catch |err| switch (err) {
+            error.TooFewScales, error.Singular => {
+                std.debug.print("Error: {s}: SIGMA_SCALE: {s}\n", .{ path, @errorName(err) });
+                failed = true;
+            },
+            else => return err,
+        };
         // Tangents are no `.meas` result: on stderr when stdout is JSON.
         try p.print_tangents(if (json_stdout) &stderr.interface else &stdout.interface);
         try p.print_soa(&stderr.interface);

@@ -428,6 +428,38 @@ test "an analysis card inside a subcircuit is refused (#165)" {
     _ = try parse(arena.allocator(), "t\n.subckt s a\nr1 a 0 1k\n.ends\nx1 1 s\n.tran 1n 2n\n");
 }
 
+test "SIGMA_SCALE and FAIL (#239): the scales in order, FAIL over the card's own .meas; every other form refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deck = "t\nv1 in 0 1\nr1 in 0 1k\n.meas tran x max v(in)\n{s}\n.meas ac gain find vm(in) at=1\n.meas ac ph find vp(in) at=1\n.end\n";
+    const ok = try parse(a, try a.print(deck, .{".ac dec 10 1 1g sweep monte=20 sigma_scale=2,2.5,3 fail='ph < -2.0944 || !(gain >= 100)'"}));
+    const m = ok.deck.analyses[0].sweep.monte;
+    try std.testing.expectEqual(@as(u32, 20), m.n);
+    try std.testing.expectEqualSlices(f64, &.{ 2, 2.5, 3 }, m.scales);
+    try std.testing.expectEqualStrings("ph < -2.0944 || !(gain >= 100)", m.fail.text);
+    // `ph` and `gain` read cards 2 and 1, the `.meas ac` ones.
+    var reads: std.ArrayList(u32) = .empty;
+    for (m.fail.ops) |op| if (op.code == .live) try reads.append(a, op.a);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, reads.items);
+    for ([_]struct { anyerror, []const u8 }{
+        .{ error.ParseError, ".ac dec 10 1 1g sweep monte=20 sigma_scale=0,2,3 fail='ph < 0'" },
+        .{ error.ParseError, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,2,3 fail='ph < 0'" },
+        .{ error.ParseError, ".ac dec 10 1 1g sweep monte=20 sigma_scale fail='ph < 0'" },
+        .{ error.ParseError, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail=ph" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 fail='ph < 0'" },
+        .{ error.UnsupportedCard, ".op sweep monte=20 sigma_scale=2,3,4 fail='ph < 0'" },
+        .{ error.UnsupportedCard, ".dc monte=20 sigma_scale=2,3,4 fail='ph < 0'" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='x > 0'" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='vm(in) > 0'" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='agauss(0,1,1) > ph'" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='ph < 0'\n.ac dec 10 1 1g sweep monte=5" },
+    }) |c| try std.testing.expectError(c[0], parse(a, try a.print(deck, .{c[1]})));
+    // An HSPICE `.temp` list would run each trial at several temperatures.
+    try std.testing.expectError(error.UnsupportedCard, netlist.parse(a, try a.print(deck, .{".temp 0 50\n.ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='ph < 0'"}), .hspice));
+}
+
 test "a block close with no block open is refused (#162)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

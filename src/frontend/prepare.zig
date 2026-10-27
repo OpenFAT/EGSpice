@@ -16,6 +16,8 @@ const Job = requests.Query;
 pub const Library = device.Library;
 /// HSPICE `OPTIMIZE=`: the optimizer's point-to-rows adapter (variants.zig).
 pub const Tuner = variants.Tuner;
+/// A SIGMA_SCALE card, for counting its trials' failures (#239).
+pub const Sss = variants.Sss;
 const Ic = core.Ic;
 const GROUND = core.GROUND;
 
@@ -38,6 +40,8 @@ pub const Prepared = struct {
     /// (`prepare`'s `live`); null without any. It borrows the parse arena,
     /// which must then outlive the Prepared.
     tuning: ?*variants.Tuning = null,
+    /// The deck's SIGMA_SCALE cards (#239), in the session arena.
+    sss: []const variants.Sss = &.{},
 
     /// Releases this run's circuit and every nested run's, and the tuning's
     /// templates. The deck slices stay with the session arena. Leaves
@@ -424,7 +428,7 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         return error.UnsupportedCard;
     };
     const ov = try opVars(sim_arena, parse_arena, lib, &circuit, cards, out.probes, out.probe_labels, nl, queries);
-    return .{ .rebuilds = plan.rebuilds, .prepared = .{ .circuit = circuit, .tuner = tuner, .tuning = tuning, .deck = .{
+    return .{ .rebuilds = plan.rebuilds, .prepared = .{ .circuit = circuit, .tuner = tuner, .tuning = tuning, .sss = try variants.sssCards(sim_arena, nl.deck), .deck = .{
         .probes = out.probes,
         .probe_labels = out.probe_labels,
         .source_node = out.source_node,

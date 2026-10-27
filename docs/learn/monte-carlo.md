@@ -111,6 +111,29 @@ device that uses the model. That is how a PDK states mismatch: the sky130
 read `MC_MM_SWITCH*AGAUSS(0,1,1)*slope/sqrt(l*w*mult)`, so `MONTE=n` on a
 sky130 deck gives n mismatch samples.
 
+## Rare failures: scaled sigma
+
+Counting failures needs failures to count. At 5σ one trial in 3.5 million
+fails, so plain trials cannot see it. `SIGMA_SCALE=` draws every
+distribution with its sigma 2.5, 3, ... times larger, where failures are
+common, counts them per scale against a `FAIL=` test over the `.meas`
+results, and extrapolates the counts back to the real sigma:
+
+```spice
+--8<-- "examples/monte_sss.sp"
+```
+
+```sh
+espice monte_sss.sp
+```
+
+The run ends with a table of the failures at each scale, then the
+estimated failure probability at the real sigma, its 95 % interval, and
+the equivalent sigma. Here the margin is linear in two Gaussians, so the
+true answer is known, Q(5) = 2.87e-7, and it lies in the interval. The
+[analyses reference](../using/analyses.md#scaled-sigma) covers the fit and
+what it refuses.
+
 ## Mismatch without trials
 
 For the DC offset that mismatch causes, `.dcmatch v(out)` computes the

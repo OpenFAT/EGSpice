@@ -153,8 +153,20 @@ pub const StepTarget = union(enum) {
 pub const Step = struct { target: StepTarget, values: []const f64 };
 
 /// HSPICE `MONTE=n [FIRSTRUN=k]`: trials `first..first + n - 1`; or
-/// `MONTE=list(a b:c ...)` [CR .DC]: exactly the trials in `list`.
-pub const Monte = struct { n: u32, first: u32 = 1, list: []const u32 = &.{} };
+/// `MONTE=list(a b:c ...)` [CR .DC]: exactly the trials in `list`. ESPice's
+/// `SIGMA_SCALE=s1,... FAIL='expr'` (#239) runs n trials at each scale.
+pub const Monte = struct {
+    n: u32,
+    first: u32 = 1,
+    list: []const u32 = &.{},
+    /// Each scale's draws have every sigma times it; empty for plain MONTE.
+    scales: []const f64 = &.{},
+    fail: Fail = .{},
+};
+
+/// A SIGMA_SCALE run's `FAIL=` test over its analysis's `.meas` cards:
+/// `ops` in postfix, each `.live` operand a card's index in `Deck.measures`.
+pub const Fail = struct { text: []const u8 = "", ops: []const expr.Op = &.{}, consts: []const f64 = &.{} };
 
 /// An HSPICE sweep on one analysis card: the card runs once per point.
 /// On a `.dc` card with no sweep of its own (`.dc DATA=d`, `.dc MONTE=n`)
@@ -1340,6 +1352,7 @@ fn Reader(comptime S: type) type {
             r.card = "";
             try r.shunts();
             try r.readMeasures();
+            try r.compileFails();
             var live = try r.resolveLive();
             live.conds = try r.liveConds();
             const scale = try r.arena.alloc(f64, live.slots.len);
@@ -2051,6 +2064,24 @@ fn Reader(comptime S: type) type {
             return args.items;
         }
 
+        /// Cuts `fail='expr'` (quoted or braced) out of analysis card
+        /// `line` and points `f`, past the card, at what is left; returns
+        /// the expression's text, "" when no field is `fail=`.
+        fn cutFail(r: *R, line: []const u8, f: *F) Error![]const u8 {
+            var g = f.*;
+            while (g.next()) |t| {
+                if (!std.mem.eql(u8, t, "fail") or !g.takeEq()) continue;
+                const v = g.next() orelse return r.failed(line, error.ParseError);
+                if (!F.isQuote(v[0]) and !(v[0] == '{' and v[v.len - 1] == '}')) return r.failed(line, error.ParseError);
+                const start = @intFromPtr(t.ptr) - @intFromPtr(line.ptr);
+                const end = @intFromPtr(v.ptr) - @intFromPtr(line.ptr) + v.len;
+                f.* = F.init(try std.mem.concat(r.arena, u8, &.{ line[0..start], " ", line[end..] }));
+                _ = f.next(); // the card
+                return F.body(v);
+            }
+            return "";
+        }
+
         /// A `.options` card that sets `vpi=` (ESPice's, #197): each
         /// `vpi="app.so"` names a VPI application (LRM 12.33) for `vpi_apps`,
         /// path case kept; the card's other options read as any `.options`.
@@ -2097,6 +2128,9 @@ fn Reader(comptime S: type) type {
             // depend on it.
             if (c == .store) return std.log.warn("netlist: .store: checkpoints are not written; the run is not restartable", .{});
             if (c == .options and setsKey(line, "vpi")) return r.readVpiOptions(line);
+            // `FAIL='expr'` keeps its text: `readArgs` would fold it before
+            // the `.meas` cards it names are read.
+            const fail = if (c == .analysis and setsKey(line, "fail")) try r.cutFail(line, &f) else "";
             const args = r.readArgs(&f) catch |err| return r.failed(line, err);
             switch (c) {
                 .step => try r.steps.append(r.arena, r.readStep(args) catch |err| return r.failed(line, err)),
@@ -2104,7 +2138,15 @@ fn Reader(comptime S: type) type {
                     // HSPICE's `.temp t1 t2 ...` lists run temperatures; ngspice's
                     // three-number form is a sweep.
                     const temp_list = kind == .temp and args.len > 1 and r.dialect == .hspice;
-                    const swept = r.readSweep(kind, args) catch |err| return r.failed(line, err);
+                    var swept = r.readSweep(kind, args) catch |err| return r.failed(line, err);
+                    const scaled = swept.sweep == .monte and swept.sweep.monte.scales.len != 0;
+                    if (scaled != (fail.len != 0)) return r.unsupported(line, "SIGMA_SCALE= without FAIL=, or FAIL= without SIGMA_SCALE=");
+                    if (scaled) {
+                        if (kind != .tran and kind != .ac and kind != .dc) return r.unsupported(line, "SIGMA_SCALE on a card other than .tran, .ac or .dc");
+                        // The lane ensemble (`.dc MONTE=n`) measures no trial.
+                        if (kind == .dc and swept.args.len == 0) return r.unsupported(line, "SIGMA_SCALE on a .dc with no sweep of its own");
+                        swept.sweep.monte.fail.text = fail;
+                    }
                     if (!temp_list) try appendAnalysis(r.arena, &r.analyses, .{ .kind = kind, .args = swept.args, .sweep = swept.sweep, .line = r.written(line), .dialect = r.dialect, .sn = isSn(line) });
                     if (kind == .temp and (args.len == 1 or temp_list)) try r.config.append(r.arena, .{ .temp = true, .args = args, .line = r.written(line) });
                 },
@@ -2382,9 +2424,25 @@ fn Reader(comptime S: type) type {
                     break :blk .{ .monte = .{ .n = @intCast(list.len), .list = list } };
                 }
                 var m: Monte = .{ .n = try positiveCount(tail, 1) };
-                if (tail.len == 4 and tail[2] == .name and std.mem.eql(u8, tail[2].name, "firstrun")) {
-                    m.first = try positiveCount(tail, 3);
-                } else if (tail.len != 2) return error.ParseError;
+                var k: usize = 2;
+                while (k < tail.len) {
+                    if (tail[k] != .name) return error.ParseError;
+                    if (std.mem.eql(u8, tail[k].name, "firstrun")) {
+                        m.first = try positiveCount(tail, k + 1);
+                        k += 2;
+                    } else if (std.mem.eql(u8, tail[k].name, "sigma_scale") and m.scales.len == 0) {
+                        // `SIGMA_SCALE=2,2.5,3`: the numbers up to the next name.
+                        var scales: std.ArrayList(f64) = .empty;
+                        k += 1;
+                        while (k < tail.len and tail[k] == .num) : (k += 1) {
+                            const s = tail[k].num;
+                            if (!(s > 0 and s < std.math.inf(f64)) or std.mem.indexOfScalar(f64, scales.items, s) != null) return error.ParseError;
+                            try scales.append(r.arena, s);
+                        }
+                        if (scales.items.len == 0) return error.ParseError;
+                        m.scales = scales.items;
+                    } else return error.ParseError;
+                }
                 r.monte = true;
                 break :blk .{ .monte = m };
             } else blk: {
@@ -2936,6 +2994,37 @@ fn Reader(comptime S: type) type {
             try r.scratch.names.append(r.arena, name);
             try r.scratch.ops.append(r.arena, .{ .code = .ident, .a = @intCast(mark.names) });
             return r.fold(mark.ops, frame, geometry);
+        }
+
+        /// Compiles each SIGMA_SCALE card's FAIL now that every `.meas`
+        /// card is read: a name reads that card's value (`.live`, its index
+        /// in `measures`). A name of no card of the analysis, a probe, a
+        /// distribution or an unknown function is refused, as is a second
+        /// MONTE card of the analysis (its trials would count too).
+        fn compileFails(r: *R) Error!void {
+            for (r.analyses.items, 0..) |*a, i| {
+                if (a.sweep != .monte or a.sweep.monte.scales.len == 0) continue;
+                for (r.analyses.items, 0..) |b, j| if (j != i and b.kind == a.kind and b.sweep == .monte)
+                    return r.unsupported(a.line, "SIGMA_SCALE beside another MONTE card of its analysis");
+                // ponytail: one result per trial; a `.temp` list would give several.
+                for (r.config.items) |c| if (c.temp and c.args.len > 1) return r.unsupported(a.line, "SIGMA_SCALE with a .temp list");
+                const fail = &a.sweep.monte.fail;
+                const mark = r.scratch.mark();
+                defer r.scratch.reset(mark);
+                expr.compileAll(S, r.arena, &r.scratch, fail.text) catch |err| return r.failed(a.line, err);
+                const ops = try r.arena.dupe(expr.Op, r.scratch.ops.items[mark.ops..]);
+                const names = r.scratch.names.items;
+                for (ops) |*op| switch (op.code) {
+                    .ident => op.* = .{ .code = .live, .a = for (r.measures.items, 0..) |m, k| {
+                        if (m.analysis == a.kind and std.mem.eql(u8, m.name, names[op.a])) break @intCast(k);
+                    } else return r.unsupported(a.line, "FAIL names no .meas card of its analysis") },
+                    .vprobe, .iprobe, .ucall => return r.unsupported(a.line, "FAIL reads its analysis's .meas cards, not vectors or unknown functions"),
+                    .call => if (expr.isDistribution(@fromBackingInt(@intCast(op.a)))) return r.unsupported(a.line, "a distribution in FAIL"),
+                    else => {}, // else: numbers, arithmetic, comparisons, logic and math calls
+                };
+                fail.ops = ops;
+                fail.consts = try r.arena.dupe(f64, r.scratch.consts.items);
+            }
         }
 
         /// Parses the `.meas` cards in deck order. ngspice reports a bad one

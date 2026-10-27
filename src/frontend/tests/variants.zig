@@ -238,6 +238,47 @@ test "a MONTE run whose trial numbers pass u32 is refused, not wrapped" {
     try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), past));
 }
 
+test "SIGMA_SCALE plans MONTE trials per scale, numbered on from FIRSTRUN; LHS, .alter and numbers past u32 are refused (#239)" {
+    var sa = std.heap.ArenaAllocator.init(t.allocator);
+    defer sa.deinit();
+    var pa = std.heap.ArenaAllocator.init(t.allocator);
+    defer pa.deinit();
+    var lib = try device.Library.init(t.allocator);
+    defer lib.deinit();
+    const deck =
+        \\sigma scale
+        \\.param g=agauss(1, 0.1, 1)
+        \\v1 in 0 1
+        \\r1 in 0 '1k*g'
+        \\{s}
+        \\.tran 1n 10n sweep monte=3 firstrun={s} sigma_scale=1,2 fail='m > 1'
+        \\.meas tran m max v(in)
+        \\.end
+    ;
+    const ok = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{ "", "5" }), .hspice);
+    var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), ok);
+    defer prepared.deinit();
+    try t.expectEqual(@as(u32, 6), prepared.deck.variants.count());
+    for (prepared.deck.variants.labels, 5..) |label, trial| try t.expectEqualStrings(try std.fmt.allocPrint(pa.allocator(), "monte={d}", .{trial}), label);
+    try t.expectEqual(@as(usize, 1), prepared.sss.len);
+    const s = prepared.sss[0];
+    try t.expectEqual(@as(?usize, null), s.scaleOf(4));
+    try t.expectEqual(@as(?usize, 0), s.scaleOf(7));
+    try t.expectEqual(@as(?usize, 1), s.scaleOf(8));
+    try t.expectEqual(@as(?usize, null), s.scaleOf(11));
+    // Six trials from 4294967291 pass u32; three would not.
+    for ([_]struct { []const u8, []const u8, bool }{
+        .{ ".option sampling_method=lhs", "1", false },
+        .{ "", "1", true },
+        .{ "", "4294967291", false },
+    }) |c| {
+        var refused = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{ c[0], c[1] }), .hspice);
+        // `frontend.prepare` splits the `.alter` runs off the text.
+        if (c[2]) refused.deck.alters = &.{"alter\nr1 in 0 2k\n.end\n"};
+        try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), refused));
+    }
+}
+
 test "a MONTE sweep draws a distribution written in a .model card per trial (#100)" {
     var sa = std.heap.ArenaAllocator.init(t.allocator);
     defer sa.deinit();

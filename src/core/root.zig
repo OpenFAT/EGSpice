@@ -19,6 +19,8 @@ pub const lm = @import("lm.zig");
 pub const bisect = @import("bisect.zig");
 /// Dense real eigenvalues (balance, Hessenberg, Francis QR).
 pub const eigen = @import("eigen.zig");
+/// Scaled-sigma sampling: the failure-rate fit over sigma scales (#239).
+pub const sss = @import("sss.zig");
 /// Test support: the allocator every allocation-failure sweep runs over.
 pub const testing = @import("testing.zig");
 
@@ -68,6 +70,7 @@ test {
     _ = lm;
     _ = bisect;
     _ = eigen;
+    _ = sss;
     _ = query;
     _ = deck;
     _ = validate;

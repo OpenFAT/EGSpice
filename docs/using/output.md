@@ -210,7 +210,11 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
   line; a `_CONT` card's events are `name[1]`, `name[2]`, ... as printed.
 - `statistics` holds, per card and Monte Carlo analysis, the trial count
   `n`, the trials the card `failed` in, and its mean, sigma (Bessel's
-  correction), min and max.
+  correction), min and max. An analysis run with `SIGMA_SCALE=` has one
+  object instead, `"kind": "sss"`: its `fail` text, the `trials` per
+  scale, the `scales` and `failures` lists, then `p`, `lo`, `hi` (the 95 %
+  interval) and `sigma`; these four are null with an `error` when the fit
+  is refused ([analyses](analyses.md#scaled-sigma)).
 
 ### Terminal currents as JSON
 

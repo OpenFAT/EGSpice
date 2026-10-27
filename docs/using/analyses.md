@@ -629,3 +629,47 @@ These wrap other analyses rather than being analyses themselves; see the
 - An HSPICE `.temp` list: `<plot> (temp=t)`.
 - `.mosra` adds `MOSRA Degradation` (aging per device) and reruns the
   aged circuit.
+- `SWEEP MONTE=n SIGMA_SCALE=... FAIL=...` estimates a failure rate too
+  rare to count (below).
+
+### Scaled-sigma sampling { #scaled-sigma }
+
+Brute-force Monte Carlo resolves a failure tail to about 4σ in 10⁵ trials.
+A replicated cell needs more: 32 comparators at a 3σ chip target need 4σ
+each, and a bit cell needs 6σ. Scaled-sigma sampling (Sun, Li, Liu, Luo,
+Gu, "Fast statistical analysis of rare circuit failure events via
+scaled-sigma sampling", IEEE TCAD 34(7), 2015) draws with every sigma
+made larger, where failures are common, and extrapolates back:
+
+```spice
+--8<-- "examples/monte_sss.sp"
+```
+
+- `SIGMA_SCALE=s1,...` runs `MONTE` trials at each scale: every
+  statistical parameter (`agauss`/`gauss` draws, `.variation` local and
+  global, `DEV`/`LOT`, a kit's in-model mismatch) is drawn with its sigma
+  multiplied by s. A uniform (`unif`, `aunif`) is scaled in its
+  standard-normal image, Φ(s·Φ⁻¹(u)), so its mass moves to its edges; a
+  `limit` is unchanged. Each scale's trials are numbered after the last
+  scale's (`(monte=n)` plots), so the scales draw independently.
+- `FAIL=` is a quoted boolean expression over the analysis's own `.meas`
+  names. A trial whose measure has no value, or that did not converge,
+  counts as a failure.
+- ESPice fits ln P_f(s) = α + β·ln s − γ/s² by weighted least squares
+  over the scales where some, but not all, trials failed (weights from the
+  binomial counts), extrapolates to s = 1, and prints, in place of the
+  Monte Carlo statistics of that analysis, the table `scale trials
+  failures`, then `P_f(1)`, its 95 % interval and the equivalent sigma
+  Φ⁻¹(1 − P_f).
+- The interval is statistical only. The model's own error at s = 1 is not
+  in it; on a margin linear in Gaussians it puts ln P_f about 0.2 low,
+  which only a very large `MONTE` makes visible. The extrapolation is
+  long, so the interval is wide: a factor of tens to hundreds at 1000
+  trials per scale.
+- Fewer than three such scales is refused, naming the scales where none or
+  all trials failed: the run's exit status is an error. `--measures`
+  writes the same numbers as `{"kind": "sss", ...}`.
+- Seeds follow `.option seed`, so a run is reproducible. Refused:
+  `sampling_method=lhs` (its counts are not binomial), `.alter`, an
+  HSPICE `.temp` list, a second `MONTE` card of the same analysis,
+  `MONTE=list(...)`, and a bare `.dc MONTE=n`.
