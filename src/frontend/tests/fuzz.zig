@@ -481,7 +481,7 @@ test "device cards scanned on 1 or 8 threads build the tables a whole read build
     var text: std.ArrayList(u8) = .empty;
     try text.appendSlice(a,
         \\scan
-        \\.param rv=2k cv=1p
+        \\.param rv=2k cv=1p wp=1u
         \\.model nch nmos level=1
         \\.model rm r
         \\.model dm d
