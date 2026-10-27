@@ -175,15 +175,20 @@ pub fn main(init: std.process.Init) !u8 {
         var err_buf: [1024]u8 = undefined;
         var stdout: std.Io.File.Writer = .initStreaming(.stdout(), init.io, &out_buf);
         var stderr: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &err_buf);
+        // Read once: a pipe or FIFO (`/dev/stdin`, `<(...)`) drains on the first read (#234).
+        const text = std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .unlimited) catch |err| {
+            std.debug.print("Error: {s}: {s}\n", .{ path, @errorName(err) });
+            failed = true;
+            continue;
+        };
+        defer init.gpa.free(text);
         const deck_dialect = dialect orelse detected: {
-            const text = std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .unlimited) catch break :detected .ngspice;
-            defer init.gpa.free(text);
             const d = problem.detectDialect(text);
             if (d != .ngspice) std.debug.print("{s}: reading as {t} (--tokenizer to override)\n", .{ path, d });
             break :detected d;
         };
         const p = problem.Problem.init(init.gpa, init.io, .{
-            .source = .{ .file = path },
+            .source = .{ .bytes = .{ .data = text, .origin = path } },
             .dialect = deck_dialect,
             .output = selection,
             .backend = .{
