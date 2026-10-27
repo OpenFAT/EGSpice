@@ -770,6 +770,69 @@ test "an R reading v() is ngspice's B source: pow() takes |x|, tc divides, m mul
     try t.expectApproxEqRel(@as(f64, -0.5 * 2 / (1017.28 * 1.035178)), i, 1e-12);
 }
 
+/// What `print_soa` writes once `source` runs as the CLI runs it: a final
+/// plan with `auto_point`, which streams, trims and releases every
+/// waveform no reader claims. The caller frees it.
+fn soaText(source: []const u8) ![]u8 {
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "soa.cir" } },
+        .backend = .{ .final_plan = true },
+        .auto_point = true,
+    });
+    defer p.deinit();
+    try p.run_all();
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    try p.print_soa(&text.writer);
+    return text.toOwnedSlice();
+}
+
+test ".option soa: a gate held exactly at vgs_max reports nothing, 1 mV past it one excursion (#238)" {
+    // Oracle: the limit is the solved v(g) itself, read off the same deck,
+    // so the point sits on the limit to the bit; vgs_max binds to no model
+    // field, so moving it moves no voltage.
+    const body = "soa\nV1 d 0 1\nV2 g 0 2\nM1 d g 0 0 nm\n.model nm nmos level=1 vgs_max={e}\n{s}.op\n.end\n";
+    var buf: [256]u8 = undefined;
+    const vg = try opValue(try std.fmt.bufPrint(&buf, body, .{ @as(f64, 9), "" }), "v(g)");
+    const cases = [_]struct { f64, []const u8, usize }{
+        .{ vg, ".option soa=1\n", 0 },
+        .{ vg - 1e-3, ".option soa=1\n", 2 }, // the excursion, then the count
+        .{ vg - 1e-3, ".option warn=1\n", 2 }, // ngspice's spelling
+        .{ vg - 1e-3, "", 0 }, // no check asked for
+    };
+    for (cases) |c| {
+        const text = try soaText(try std.fmt.bufPrint(&buf, body, .{ c[0], c[1] }));
+        defer t.allocator.free(text);
+        try t.expectEqual(c[2], std.mem.count(u8, text, "\n"));
+        if (c[2] == 0) continue;
+        try t.expect(std.mem.startsWith(u8, text, "soa: "));
+        try t.expect(std.mem.indexOf(u8, text, " vgs = ") != null and std.mem.indexOf(u8, text, " > vgs_max ") != null);
+        try t.expect(std.mem.endsWith(u8, text, " (op)\nsoa: 1 excursions on 1 instances\n"));
+    }
+}
+
+test ".option soa: a ramp crossing vgs_max twice is two excursions; maxwarns prints one, counts both (#238)" {
+    // Oracle: v(g) is V2's PWL, past 1 V on (0.5u, 1.5u) and (2.5u, 3.5u)
+    // only. A window opens at the first accepted point past 1 V and closes
+    // at the first back under it, so within a step (at most tstep, 10 ns)
+    // after each crossing.
+    const text = try soaText("soa ramp\nV1 d 0 1\nV2 g 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)\nM1 d g 0 0 nm\n" ++
+        ".model nm nmos level=1 vgs_max=1\n.option soa=1 maxwarns=1\n.tran 10n 4u\n.end\n");
+    defer t.allocator.free(text);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const first = lines.next().?;
+    try t.expect(std.mem.endsWith(u8, first, " s (tran)"));
+    var words = std.mem.tokenizeScalar(u8, first[std.mem.indexOf(u8, first, " from ").?..], ' ');
+    _ = words.next(); // from
+    const from = try std.fmt.parseFloat(f64, words.next().?);
+    _ = words.next(); // to
+    const to = try std.fmt.parseFloat(f64, words.next().?);
+    try t.expect(from >= 0.5e-6 and from <= 0.52e-6);
+    try t.expect(to >= 1.5e-6 and to <= 1.52e-6);
+    try t.expectEqualStrings("soa: 2 excursions on 1 instances", lines.next().?);
+    try t.expectEqualStrings("", lines.rest());
+}
+
 test "Monte Carlo: a B source reads the trial's draw of a sampled .param, as a resistor does (#133)" {
     // Analytic oracle from the deck itself: within a trial v(out) = g and
     // v(c) = 1/(1+g), so v(out) = 1/v(c) - 1.

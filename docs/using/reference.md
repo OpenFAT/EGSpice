@@ -201,6 +201,8 @@ against each `.option search='dir'`. Includes nest up to 32 levels.
 | `runlvl`, `accurate`, `fast` | | HSPICE accuracy presets: set `trtol` |
 | `em_recovery` | 1 | recovery factor for `.meas EM_AVG` |
 | `search` | | HSPICE: an include search directory |
+| `soa` (`warn`) | 0 | 1 checks every device against its model-card SOA limits ([analyses](analyses.md#soa)) |
+| `maxwarns` | 5 | most SOA excursion lines printed; every excursion is counted |
 
 `reltol` and `trtol` must be positive; a zero or negative value fails at its
 card. `abstol`, `vntol` and `chgtol` may be 0, as in ngspice.

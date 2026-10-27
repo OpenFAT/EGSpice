@@ -251,6 +251,7 @@ pub fn main(init: std.process.Init) !u8 {
         try p.print_measures(meas_out, &stderr.interface);
         // Tangents are no `.meas` result: on stderr when stdout is JSON.
         try p.print_tangents(if (json_stdout) &stderr.interface else &stdout.interface);
+        try p.print_soa(&stderr.interface);
         if (measures_path) |file| writeMeasures(init.io, p, file, path, &stdout.interface) catch |e| {
             std.debug.print("Error: {s}: --measures={s}: {s}\n", .{ path, file, @errorName(e) });
             failed = true;

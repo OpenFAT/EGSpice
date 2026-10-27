@@ -92,7 +92,7 @@ pub const Options = struct {
     vpi: ?*const Vpi = null,
     /// What every `.tran` of the deck does, as `append_points` asks of a
     /// point (the CLI's `--measures-only`, `--early-stop`, `--abort-after`).
-    /// `measures_only` is dropped for a deck with `.save` or `.stim`, which
+    /// `measures_only` is dropped for a deck with `.save`, `.stim` or `.option soa`, which
     /// read every column.
     point: requests.PointOptions = .{},
     /// The CLI's default: also turn on `point`'s `measures_only`,
@@ -370,7 +370,7 @@ pub const Problem = struct {
         // point within Newton's tolerances, in a few iterations instead of
         // the cold ladder (145 → 2 per point on a 20-stage CMOS chain).
         if (options.auto_point and isSweep(&self.prepared.deck)) point.warm_start = true;
-        if (self.save_path != null or self.prepared.deck.stims.len != 0) point.measures_only = false;
+        if (self.save_path != null or self.prepared.deck.stims.len != 0 or self.prepared.deck.soa.limits.len != 0) point.measures_only = false;
         // No analysis card runs an OP, unless it would have no columns (a
         // title-only deck): ngspice runs nothing there either.
         const jobs: []Query = if (self.prepared.deck.queries.len == 0 and self.prepared.deck.probes.len == 0)
@@ -422,13 +422,13 @@ pub const Problem = struct {
     }
 
     /// Whether anything besides the `.meas` cards reads the deck's
-    /// transient waveforms: an output file, `.save`, `.stim`, an
+    /// transient waveforms: an output file, `.save`, `.stim`, `.option soa`, an
     /// optimization, tangents, or a device's display tasks, which print at
     /// every accepted step. `.print`, `.probe` and `.plot` are ignored
     /// cards, and `.four`, `.fft` and MOSRA run transients of their own.
     fn waveformsConsumed(self: *const Problem, options: Options) bool {
         const deck = &self.prepared.deck;
-        if (options.output.path != null or self.save_path != null or deck.stims.len != 0) return true;
+        if (options.output.path != null or self.save_path != null or deck.stims.len != 0 or deck.soa.limits.len != 0) return true;
         if (self.prepared.tuner != null or options.point.tangent_step > 0) return true;
         for (self.prepared.circuit.batches) |b| if (b.hooks.say != null) return true;
         for (self.prepared.runs) |run| for (run.circuit.batches) |b| if (b.hooks.say != null) return true;
@@ -1242,7 +1242,7 @@ pub const Problem = struct {
     fn sidesAllowed(self: *const Problem) bool {
         const deck = &self.prepared.deck;
         return self.session.config.final_plan and self.save_path == null and deck.stims.len == 0 and
-            self.prepared.tuner == null and deck.probe_labels.len == deck.probes.len;
+            self.prepared.tuner == null and deck.soa.limits.len == 0 and deck.probe_labels.len == deck.probes.len;
     }
 
     /// `Session.stream_opener`: a transient or AC plot that no `.meas` card
@@ -1399,6 +1399,25 @@ pub const Problem = struct {
         };
     }
 
+    /// With `.option soa=1` (ngspice `warn=1`), holds every accepted point
+    /// of each completed operating point, DC sweep and transient, the
+    /// variant runs' too, to the deck's model-card limits (`core.Soa`): one
+    /// `soa:` line per instance, limit and excursion, at most `maxwarns` of
+    /// them, then the count of every one; nothing when none happened. An
+    /// excursion runs from the first point past the limit to the first one
+    /// back at or under it, so a point at the limit passes. A limit whose
+    /// terminal a result lacks (left out by `.save`) is counted as skipped.
+    pub fn print_soa(self: *const Problem, out: *std.Io.Writer) !void {
+        const soa = self.prepared.deck.soa;
+        if (soa.limits.len == 0) return;
+        var tally: SoaTally = .{ .gpa = self.allocator, .out = out, .max_warns = soa.max_warns };
+        defer tally.instances.deinit(self.allocator);
+        try tally.session(&self.session);
+        for (self.runs) |*run| try tally.session(&run.session);
+        if (tally.excursions != 0) try out.print("soa: {d} excursions on {d} instances\n", .{ tally.excursions, tally.instances.count() });
+        if (tally.skipped != 0) try out.print("soa: {d} limit checks skipped: a terminal is not saved\n", .{tally.skipped});
+    }
+
     /// Prints to `Options.measures` every `.meas` block whose turn has come
     /// and flushes; the first error stops it for good.
     fn printReady(self: *Problem) void {
@@ -1473,8 +1492,8 @@ pub const Problem = struct {
     /// trials (`print_measures` reads them at the end), the tangent runs,
     /// and a requested OP that later queries still read.
     fn releaseDelivered(self: *Problem) void {
-        // `.save` and `.stim` read the results after the run.
-        if (!self.session.config.final_plan or self.save_path != null or self.prepared.deck.stims.len != 0) return;
+        // `.save`, `.stim` and `print_soa` read the results after the run.
+        if (!self.session.config.final_plan or self.save_path != null or self.prepared.deck.stims.len != 0 or self.prepared.deck.soa.limits.len != 0) return;
         const outputs = self.session.outputs.items;
         const printed = if (self.prepared.deck.measures.len == 0 or self.measure_cursor.session > 0) outputs.len else self.measure_cursor.next;
         const upto = @min(self.next_output, printed);
@@ -1852,6 +1871,84 @@ pub const Problem = struct {
 
 /// The index of the `.meas` card named `name` (case-insensitive), the first
 /// when several share it.
+/// `Problem.print_soa`'s running count: the excursions, the instances they
+/// happened on, and the (limit, result) pairs a missing column skipped.
+const SoaTally = struct {
+    gpa: std.mem.Allocator,
+    out: *std.Io.Writer,
+    max_warns: u32,
+    excursions: u64 = 0,
+    instances: std.StringHashMapUnmanaged(void) = .empty,
+    skipped: u64 = 0,
+
+    /// Every SOA limit of `s`'s deck over each of its completed operating
+    /// points, DC sweeps and transients, in request order.
+    fn session(tally: *SoaTally, s: *const analysis.session.Session) !void {
+        for (s.outputs.items) |id| {
+            const info = try s.info(id);
+            switch (info.kind) {
+                .op, .dc, .tran => {},
+                else => continue, // else: only these publish the accepted points
+            }
+            if (info.status != .complete or s.released(id)) continue;
+            const res = try s.result(id);
+            const label = if (variantOf(try s.query(id))) |v| s.deck.variants.labels[v] else "";
+            for (s.deck.soa.limits) |lim| try tally.scan(lim, res, info.kind, label);
+        }
+    }
+
+    /// `lim` over every row of `res`; `kind` says what column 0 is: a
+    /// transient's time, a DC sweep's value, nothing for an operating point.
+    fn scan(tally: *SoaTally, lim: core.SoaLimit, res: Result, kind: requests.Kind, label: []const u8) !void {
+        const w = res.varnames.len;
+        if (res.data.len != res.npoints * w) {
+            tally.skipped += 1;
+            return;
+        }
+        var cols: [2]?usize = .{ null, null };
+        for (&cols, [2][]const u8{ lim.pos, lim.neg }) |*col, name| if (name.len != 0) {
+            col.* = for (res.varnames, 0..) |v, k| {
+                if (std.mem.eql(u8, v, name)) break k;
+            } else {
+                tally.skipped += 1;
+                return;
+            };
+        };
+        var from: ?f64 = null;
+        var peak: f64 = 0;
+        for (0..res.npoints) |i| {
+            const row = res.data[i * w ..][0..w];
+            const d = (if (cols[0]) |c| row[c] else 0) - (if (cols[1]) |c| row[c] else 0);
+            const v = if (lim.abs) @abs(d) else d;
+            const at = if (kind == .op) 0 else row[0];
+            if (v > lim.limit) {
+                peak = if (from == null) v else @max(peak, v);
+                if (from == null) from = at;
+            } else if (from) |f| {
+                try tally.excursion(lim, peak, f, at, kind, label);
+                from = null;
+            }
+        }
+        if (from) |f| try tally.excursion(lim, peak, f, null, kind, label);
+    }
+
+    /// Counts one excursion, `from` to `to` (null: past the last row) at
+    /// `peak`, and prints it while `max_warns` allows.
+    fn excursion(tally: *SoaTally, lim: core.SoaLimit, peak: f64, from: f64, to: ?f64, kind: requests.Kind, label: []const u8) !void {
+        tally.excursions += 1;
+        try tally.instances.put(tally.gpa, lim.name, {});
+        if (tally.excursions > tally.max_warns) return;
+        const out = tally.out;
+        try out.print("soa: {s} {s} = {d:.4} V > {s} {d} V", .{ lim.name, lim.quantity, peak, lim.key, lim.limit });
+        if (kind != .op) {
+            try out.print(" from {e:.3}", .{from});
+            if (to) |t| try out.print(" to {e:.3}", .{t}) else try out.writeAll(" to the end");
+            if (kind == .tran) try out.writeAll(" s");
+        }
+        try out.print(" ({t}{s}{s})\n", .{ kind, if (label.len != 0) " " else "", label });
+    }
+};
+
 fn measureIndex(measures: []const core.Measure, name: []const u8) ?u32 {
     for (measures, 0..) |m, k| if (std.ascii.eqlIgnoreCase(m.name, name)) return @as(u32, @intCast(k));
     return null;

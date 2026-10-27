@@ -452,6 +452,7 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
             break :blk own;
         } else null,
         .stims = try stims(sim_arena, nl.deck.stims),
+        .soa = if (deck_opts.soa) .{ .max_warns = deck_opts.max_warns, .limits = try soaLimits(sim_arena, nl, &nb, &circuit) } else .{},
     } } };
 }
 
@@ -481,6 +482,52 @@ fn nodeRows(arena: std.mem.Allocator, nb: *const builder.NetBuilder, items: []co
         if (row == NO_NODE or row == GROUND) continue;
         try out.append(arena, .{ .node = row, .value = item.value });
     }
+    return out.items;
+}
+
+/// A model-card SOA limit (ngspice's names) of card letter `card`: held
+/// across terminals `pos` and `neg`, by magnitude unless `abs` is false.
+const SoaKey = struct { card: u8, key: []const u8, quantity: []const u8, pos: u8, neg: u8, abs: bool = true };
+
+/// MOS pins d g s b, BJT c b e, diode a k; a diode's `bv_max` holds the
+/// reverse voltage v(k) - v(a), as ngspice's diosoachk.c does.
+const soa_keys = [_]SoaKey{
+    .{ .card = 'm', .key = "vgs_max", .quantity = "vgs", .pos = 1, .neg = 2 },
+    .{ .card = 'm', .key = "vgd_max", .quantity = "vgd", .pos = 1, .neg = 0 },
+    .{ .card = 'm', .key = "vgb_max", .quantity = "vgb", .pos = 1, .neg = 3 },
+    .{ .card = 'm', .key = "vds_max", .quantity = "vds", .pos = 0, .neg = 2 },
+    .{ .card = 'm', .key = "vbs_max", .quantity = "vbs", .pos = 3, .neg = 2 },
+    .{ .card = 'm', .key = "vbd_max", .quantity = "vbd", .pos = 3, .neg = 0 },
+    .{ .card = 'q', .key = "vbe_max", .quantity = "vbe", .pos = 1, .neg = 2 },
+    .{ .card = 'q', .key = "vbc_max", .quantity = "vbc", .pos = 1, .neg = 0 },
+    .{ .card = 'q', .key = "vce_max", .quantity = "vce", .pos = 0, .neg = 2 },
+    .{ .card = 'd', .key = "bv_max", .quantity = "vr", .pos = 1, .neg = 0, .abs = false },
+    .{ .card = 'r', .key = "bv_max", .quantity = "v", .pos = 0, .neg = 1 },
+    .{ .card = 'c', .key = "bv_max", .quantity = "v", .pos = 0, .neg = 1 },
+};
+
+/// One `core.SoaLimit` per `soa_keys` limit the model card of an M, Q, D,
+/// R or C card states, each terminal named by its result column as
+/// `NetBuilder.publish` labels it. A limit that is no number, or names a
+/// terminal the card does not connect, is skipped.
+fn soaLimits(arena: std.mem.Allocator, nl: *const netlist.Netlist, nb: *const builder.NetBuilder, circuit: *const device.Circuit) ![]const core.SoaLimit {
+    var out: std.ArrayList(core.SoaLimit) = .empty;
+    for ("mqdrc") |card| for (nl.bucket(card)) |e| {
+        const d = nl.device(e);
+        const m = d.model orelse continue;
+        for (soa_keys) |k| {
+            if (k.card != card or @max(k.pos, k.neg) >= d.pins.len) continue;
+            const limit = (for (m.kv) |kv| {
+                if (std.mem.eql(u8, kv.key, k.key)) break kv.value.number();
+            } else null) orelse continue;
+            var columns: [2][]const u8 = undefined;
+            for (&columns, [2]u8{ k.pos, k.neg }) |*column, pin| {
+                const row = nb.frozenRow(d.pins[pin].index());
+                column.* = if (row == NO_NODE or row == GROUND) "" else try std.mem.concat(arena, u8, &.{ "v(", circuit.nodeName(row), ")" });
+            }
+            try out.append(arena, .{ .name = try arena.dupe(u8, d.name), .quantity = k.quantity, .key = k.key, .limit = limit, .pos = columns[0], .neg = columns[1], .abs = k.abs });
+        }
+    };
     return out.items;
 }
 

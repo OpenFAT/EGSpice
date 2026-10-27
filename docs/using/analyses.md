@@ -578,6 +578,42 @@ each tone (default 5). Plot `Quasi-Periodic Steady State`.
 .qpss 1000 1414.2 2 2
 ```
 
+## Safe operating area { #soa }
+
+`.option soa=1` (ngspice's `.option warn=1` works too) holds every accepted
+point of each operating point, DC sweep and transient to the limits the
+model cards state: `vgs_max`, `vgd_max`, `vgb_max`, `vds_max`, `vbs_max`,
+`vbd_max` (MOS), `vbe_max`, `vbc_max`, `vce_max` (BJT) and `bv_max`
+(diode, resistor, capacitor). Each limit bounds the
+magnitude of its terminal voltage; a diode's `bv_max` bounds its reverse voltage.
+
+```spice
+SOA check
+V1 d 0 1
+V2 g 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)
+M1 d g 0 0 nm
+.model nm nmos level=1 vgs_max=1.8 vds_max=1.95
+.option soa=1 maxwarns=20
+.tran 10n 4u
+.end
+```
+
+Here the gate passes 1.8 V twice. Each excursion prints one line on
+stderr, with its peak and window (no window at an operating point, the
+sweep value in a DC sweep), then the count:
+
+```text
+soa: <instance> <quantity> = <peak> V > <key> <limit> V from <t1> to <t2> s (tran)
+soa: <n> excursions on <m> instances
+```
+
+A value exactly at the limit passes. An excursion runs from the first
+point past the limit to the first point back at or under it. `maxwarns`
+(default 5) caps the printed lines; the count includes every excursion. A
+limit whose terminal `.save` leaves out is not checked, and the count of
+such checks is printed. `.biaschk` stays for expressions a rating table
+cannot state.
+
 ## Runs over variants
 
 These wrap other analyses rather than being analyses themselves; see the

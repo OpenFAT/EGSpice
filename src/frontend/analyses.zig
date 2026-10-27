@@ -352,6 +352,10 @@ pub const DeckOptions = struct {
     sample: ?requests.NoiseSample = null,
     /// The deck's card names, for `.noise` and `.sens` labels.
     card_names: requests.CardNames = .empty,
+    /// `.options soa=1` (ngspice's `warn=1`): check the model-card limits.
+    soa: bool = false,
+    /// `.options maxwarns`: the most SOA excursion lines printed.
+    max_warns: u32 = 5,
 };
 
 /// `trtol` at HSPICE RUNLVL 1..6 [CR .OPTION RUNLVL]. HSPICE scales its
@@ -363,7 +367,7 @@ const runlvl_trtol = [6]f64{ 28, 14, 7, 3.5, 1.75, 0.875 };
 /// Option names outside this list (and the ones `foldOptions` passes on to
 /// other readers) are not simulated, and each draws a warning in every
 /// dialect. `gshunt`, `cshunt` and `rshunt` are read by the netlist.
-const Option = enum(u8) { method, tran_ceiling, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt };
+const Option = enum(u8) { method, tran_ceiling, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt, maxwarns };
 
 /// Folds the deck's `.options` and `.temp` cards; `InvalidAnalysisArguments`
 /// on a value out of range, logged with its card. The last `.temp` card
@@ -390,7 +394,7 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
         .{ "tnom", .tnom },     .{ "absv", .vntol },                .{ "relv", .reltol },
         .{ "absi", .abstol },   .{ "gmindc", .gmin },               .{ "delmax", .delmax },
         .{ "gshunt", .gshunt }, .{ "cshunt", .cshunt },             .{ "xmu", .xmu },
-        .{ "rshunt", .rshunt }, .{ "tran_ceiling", .tran_ceiling },
+        .{ "rshunt", .rshunt }, .{ "tran_ceiling", .tran_ceiling }, .{ "maxwarns", .maxwarns },
     });
     const methods = std.StaticStringMap(requests.Method).initComptime(.{
         .{ "gear", .gear_2 }, .{ "trap", .trapezoidal }, .{ "trapezoidal", .trapezoidal }, .{ "bdf", .gear_2 },
@@ -428,14 +432,15 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
                 i += 1;
                 continue;
             }
-            // RUNLVL alone is level 3; ACCURATE and FAST are flags with an
-            // optional 0|1.
-            const preset = std.ascii.eqlIgnoreCase(key, "runlvl") or std.ascii.eqlIgnoreCase(key, "accurate") or std.ascii.eqlIgnoreCase(key, "fast");
+            // RUNLVL alone is level 3; ACCURATE, FAST, SOA and ngspice's
+            // WARN are flags with an optional 0|1.
+            const soa = std.ascii.eqlIgnoreCase(key, "soa") or std.ascii.eqlIgnoreCase(key, "warn");
+            const preset = soa or std.ascii.eqlIgnoreCase(key, "runlvl") or std.ascii.eqlIgnoreCase(key, "accurate") or std.ascii.eqlIgnoreCase(key, "fast");
             if (preset) {
                 const given = numberAt(args, i + 1);
                 if (given != null) i += 1;
                 const on = (given orelse 1) != 0;
-                if (std.ascii.eqlIgnoreCase(key, "accurate")) accurate = on else if (std.ascii.eqlIgnoreCase(key, "fast")) fast = on else {
+                if (soa) o.soa = on else if (std.ascii.eqlIgnoreCase(key, "accurate")) accurate = on else if (std.ascii.eqlIgnoreCase(key, "fast")) fast = on else {
                     const level = @floor(0.5 + (given orelse 3));
                     // Negated so a NaN level fails here, not in @intFromFloat.
                     if (!(level >= 0 and level <= 6)) return error.InvalidAnalysisArguments;
@@ -468,7 +473,7 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
             // ngspice reads an IF_INTEGER option as floor(0.5 + x)
             // (spiceif.c:501, inpgval.c:31), so itl4=1.5 is 2.
             const value = switch (option) {
-                .itl1, .itl2, .itl4, .maxord => @floor(0.5 + raw),
+                .itl1, .itl2, .itl4, .maxord, .maxwarns => @floor(0.5 + raw),
                 else => raw,
             };
             switch (option) {
@@ -500,6 +505,10 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
                     o.xmu = value;
                 },
                 .gshunt, .cshunt, .rshunt => if (value < 0) return error.InvalidAnalysisArguments,
+                .maxwarns => {
+                    if (!(value >= 0 and value <= std.math.maxInt(u32))) return error.InvalidAnalysisArguments;
+                    o.max_warns = @intFromFloat(value);
+                },
                 // A zero reltol or trtol leaves no step a transient can take
                 // (ngspice aborts "timestep too small"), so the card fails here.
                 .reltol, .trtol => {

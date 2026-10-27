@@ -213,6 +213,32 @@ pub const MosraModel = struct {
     hcimu: f64 = 0,
 };
 
+/// `.option soa=1` (ngspice `warn=1`): the model-card limits every accepted
+/// point of an operating point, DC sweep and transient is held to.
+pub const Soa = struct {
+    /// `maxwarns`: the most excursion lines printed; every one is counted.
+    /// ngspice's default.
+    max_warns: u32 = 5,
+    limits: []const SoaLimit = &.{},
+};
+
+/// One model-card limit of one instance: |v(pos) - v(neg)|, or the signed
+/// difference where `abs` is false (a diode's reverse voltage), may reach
+/// `limit` but not exceed it.
+pub const SoaLimit = struct {
+    /// Card name of the instance.
+    name: []const u8,
+    /// What is held: `vds`, a diode's `vr`, a resistor's or capacitor's `v`.
+    quantity: []const u8,
+    /// The model-card key that set `limit` (`vds_max`).
+    key: []const u8,
+    limit: f64,
+    /// Result columns of the two terminals (`v(x1.d)`); empty is ground.
+    pos: []const u8,
+    neg: []const u8,
+    abs: bool = true,
+};
+
 /// Source bindings kept from construction so later analysis directives can
 /// name sources and ports. All rows are post-permutation.
 pub const QueryBindings = struct {
@@ -294,6 +320,8 @@ pub const Deck = struct {
     mosra: ?Mosra = null,
     /// HSPICE `.stim` cards, in deck order.
     stims: []const Stim = &.{},
+    /// The safe-operating-area check; no limits without `.option soa=1`.
+    soa: Soa = .{},
 };
 
 /// What a `.meas` card computes, after ngspice com_measure2.c, plus the
