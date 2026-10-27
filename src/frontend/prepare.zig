@@ -462,13 +462,13 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
 
 /// The device operating-point variables (`@m1[gm]`, #236) the deck's
 /// `.save` and `.meas` cards name, and what records them: `probes` and
-/// `labels`, then each named instance's rows, unlabeled. A name that is not
-/// `@<card>[<variable>]` of a MOSFET in the deck is `UnsupportedCard`,
+/// `labels`, then each named instance's rows, unlabeled. A variable is the
+/// model's own (VerA `op_vars`) or, for a MOSFET, a terminal quantity
+/// (`core.OpVar.Quantity`). A name that is neither, or not
+/// `@<card>[<variable>]` of a device in the deck, is `UnsupportedCard`,
 /// logged with the variables there are. So is one under a `.dc` that sweeps
 /// the temperature or a device of its type: the instance would be
 /// evaluated at the sweep's last state.
-// ponytail: MOSFET terminal quantities only (`core.OpVar.Quantity`); a
-// Verilog-A module's own `desc` variables need VerA to export their values.
 fn opVars(
     sim_arena: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -538,16 +538,34 @@ fn opVar(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const d
         return error.UnsupportedCard;
     };
     const batch = std.mem.indexOfScalar(core.DeviceType, circuit.batch_types, ref.type).?;
+    const hooks = circuit.batches[batch].hooks;
     const ports = lib.vtable(ref.type).num_ports;
-    if (std.ascii.toLower(card[0]) != 'm' or ports < 3 or circuit.batches[batch].hooks.local_eval == null) {
-        if (!@import("builtin").is_test) std.log.err("netlist: {s}: only a MOSFET publishes operating-point variables yet (#236)", .{name});
-        return error.UnsupportedCard;
+    // The terminal quantities are a MOSFET's (d, g, s, b).
+    const mosfet = std.ascii.toLower(card[0]) == 'm' and ports >= 3;
+    if (hooks.local_eval == null) return refuseOpVar(arena, name, card, variable, &.{}, false);
+    var v: core.OpVar = .{ .label = try arena.dupe(u8, name), .batch = @intCast(batch), .index = ref.index, .ports = ports };
+    // The model's own variable first: BSIM-CMG's `ids` is its own.
+    for (hooks.op_vars, 0..) |own, k| {
+        if (std.ascii.eqlIgnoreCase(own, variable)) {
+            v.own = @intCast(k);
+            break;
+        }
+    } else {
+        const terminal = if (mosfet) std.meta.stringToEnum(core.OpVar.Quantity, variable) else null;
+        v.quantity = terminal orelse return refuseOpVar(arena, name, card, variable, hooks.op_vars, mosfet);
     }
-    const quantity = std.meta.stringToEnum(core.OpVar.Quantity, variable) orelse {
-        if (!@import("builtin").is_test) std.log.err("netlist: {s}: {s} has no variable '{s}'; its variables are {s}", .{ name, card, variable, opvar_names });
-        return error.UnsupportedCard;
-    };
-    return .{ .label = try arena.dupe(u8, name), .batch = @intCast(batch), .index = ref.index, .ports = ports, .quantity = quantity };
+    return v;
+}
+
+/// Logs that `card` has no variable `variable`, listing the model's own
+/// variables `own` and, for a MOSFET, the terminal ones; `UnsupportedCard`.
+fn refuseOpVar(arena: std.mem.Allocator, name: []const u8, card: []const u8, variable: []const u8, own: []const []const u8, mosfet: bool) error{ OutOfMemory, UnsupportedCard } {
+    if (!@import("builtin").is_test) {
+        const listed = std.mem.join(arena, " ", own) catch return error.OutOfMemory;
+        const sep = if (listed.len != 0 and mosfet) " " else "";
+        std.log.err("netlist: {s}: {s} has no variable '{s}'; its variables are: {s}{s}{s}", .{ name, card, variable, listed, sep, if (mosfet) opvar_names else "" });
+    }
+    return error.UnsupportedCard;
 }
 
 /// `.stim` cards with their strings copied out of the parse arena.

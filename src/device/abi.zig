@@ -217,6 +217,9 @@ pub const LocalEval = struct {
     /// The unknown each one collapses into (`DeviceVtable.collapse`), itself
     /// when it stays its own node.
     root: []u32,
+    /// `Hooks.op_vars.len` values, the model's own (VerA `opVars`), without
+    /// `$mfactor`.
+    vars: []f64 = &.{},
 };
 
 /// Stable identity of a captured LTE charge: the original staged instance
@@ -485,6 +488,10 @@ pub const Hooks = struct {
     /// instance, in that order (LRM §4.6.4 `name` argument; "" when absent).
     /// Its length is the per-instance generator count.
     noise_names: []const []const u8 = &.{},
+    /// The model's own operating-point variables (VerA `op_vars`: the
+    /// module-scope variables with a `desc`), whose values `local_eval`
+    /// writes into `LocalEval.vars` in this order.
+    op_vars: []const []const u8 = &.{},
     /// Appends the global CSC slot of every frequency-dependent small-signal
     /// entry (VerA `ac_dyn_slots`: §4.5.7 absdelay, §4.5.11 laplace, §4.5.12
     /// zi), instance-major. A ground entry reads as the trash slot. Under
@@ -746,6 +753,7 @@ pub const GpuPayload = struct {
 //     `GpuPayload.brk`, the source breakpoint caches device step control
 //     starts from; `set_bypass`, the opt-in latency bypass.
 // 37: `Hooks.local_eval` and `LocalEval`, one instance in its own unknowns,
+//     and `Hooks.op_vars` with `LocalEval.vars`, VerA's `op_vars`/`opVars`,
 //     for device operating-point variables (#236).
 pub const abi_version: u32 = 37;
 

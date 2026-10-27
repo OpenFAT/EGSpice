@@ -2013,6 +2013,7 @@ pub fn DeviceBatch(comptime D: type) type {
             .status = if (@hasDecl(D, "status_sites")) statusFn else null,
             .say = if (@hasDecl(D, "say")) sayFn else null,
             .local_eval = localEvalFn,
+            .op_vars = if (@hasDecl(D, "op_vars")) &D.op_vars else &.{},
             .collect_params = collectParams,
             .param_layout = paramLayout,
             .write_params = writeParams,
@@ -2512,6 +2513,11 @@ pub fn DeviceBatch(comptime D: type) type {
             var sink: LocalSink(D) = .{ .batch = self, .xs = x, .inst_ = &inst, .out = out };
             evalRange(D, false, host_pad, &sink, id, id + 1, self.sim, false);
             out.x[0..n_u].* = self.localX(x, id);
+            if (comptime @hasDecl(D, "opVars")) {
+                std.debug.assert(out.vars.len == D.op_vars.len);
+                // `noisePsd`'s family, so a `ddx` in a variable reads its partial.
+                out.vars[0..D.op_vars.len].* = D.opVars(NoiseFamily(D), self.localX(x, id), self.model(id), &self.instances[id], self.sim);
+            }
             for (out.root, 0..) |*r, u| r.* = @intCast(u);
             if (comptime @hasDecl(D, "collapse")) {
                 const col = D.collapse(Real, self.model(id), &self.instances[id]);

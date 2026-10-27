@@ -40,11 +40,15 @@ fn columns(a: std.mem.Allocator, scratch: std.mem.Allocator, circuit: *const typ
     const out = try a.alloc(f64, rows * w_out);
     if (rows == 0) return out;
     var n_max: usize = 0;
-    for (deck.opvars) |v| n_max = @max(n_max, circuit.batches[v.batch].n_u);
+    var own_max: usize = 0;
+    for (deck.opvars) |v| {
+        n_max = @max(n_max, circuit.batches[v.batch].n_u);
+        own_max = @max(own_max, circuit.batches[v.batch].hooks.op_vars.len);
+    }
     const x = try scratch.alloc(f64, circuit.n);
     defer scratch.free(x);
     @memset(x, 0);
-    const reals = try scratch.alloc(f64, 6 * n_max + 3 * n_max * n_max);
+    const reals = try scratch.alloc(f64, 6 * n_max + 3 * n_max * n_max + own_max);
     defer scratch.free(reals);
     const ints = try scratch.alloc(u32, 3 * n_max);
     defer scratch.free(ints);
@@ -58,15 +62,16 @@ fn columns(a: std.mem.Allocator, scratch: std.mem.Allocator, circuit: *const typ
     return out;
 }
 
-/// `v` of its instance at `x`; NaN for a bulk quantity of a device with
-/// three terminals, or a partial whose internal block is singular.
-/// `reals` and `ints` are work, sized as `columns` sizes them.
+/// `v` of its instance at `x`: the model's own value, or a terminal
+/// quantity, NaN for a bulk one of a device with three terminals or a
+/// partial whose internal block is singular. `reals` and `ints` are work,
+/// sized as `columns` sizes them.
 fn value(b: abi.Batch, v: core.OpVar, x: []const f64, reals: []f64, ints: []u32) f64 {
     const n: usize = b.n_u;
     const ports: usize = v.ports;
-    std.debug.assert(ports >= 3 and ports <= n);
     var off: usize = 0;
     const ev: abi.LocalEval = .{
+        .vars = types.take(reals, &off, b.hooks.op_vars.len),
         .x = types.take(reals, &off, n),
         .f = types.take(reals, &off, n),
         .q = types.take(reals, &off, n),
@@ -75,6 +80,8 @@ fn value(b: abi.Batch, v: core.OpVar, x: []const f64, reals: []f64, ints: []u32)
         .root = ints[0..n],
     };
     b.hooks.local_eval.?(b.ctx, x, v.index, ev);
+    if (v.own) |k| return ev.vars[k];
+    std.debug.assert(ports >= 3 and ports <= n);
     merge(n, ev);
     // The internal unknowns that are still their own nodes.
     var n_in: usize = 0;
