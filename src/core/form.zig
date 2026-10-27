@@ -289,7 +289,7 @@ test "FORM's failure probability on a curved margin is off by Breitung's curvatu
     const exact = sum * h / 3;
     const form = numerics.normalTail(s.beta.?);
     try std.testing.expect(exact > 1.1 * form);
-    try std.testing.expectApproxEqRel(1 / @sqrt(1 - kappa * b), exact / form, 0.03);
+    try std.testing.expectApproxEqRel(1.0 / @sqrt(1 - kappa * b), exact / form, 0.03);
 }
 
 test "a margin no coordinate moves has no gradient and no converged beta" {

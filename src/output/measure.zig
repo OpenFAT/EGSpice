@@ -2207,13 +2207,13 @@ test "par() waveforms resolve their vectors, past the cached eight too" {
 }
 
 test "malformed PARAM postfix reads NaN" {
-    try std.testing.expect(std.math.isNan(paramValue(&.{.add}, &.{})));
-    try std.testing.expect(std.math.isNan(paramValue(&.{.neg}, &.{})));
-    try std.testing.expect(std.math.isNan(paramValue(&.{ .{ .num = 1 }, .{ .num = 2 } }, &.{})));
-    try std.testing.expect(std.math.isNan(paramValue(&.{.{ .measure = 7 }}, &.{1})));
+    try std.testing.expect(std.math.isNan(paramValue(&.{.add}, &.{}, nan)));
+    try std.testing.expect(std.math.isNan(paramValue(&.{.neg}, &.{}, nan)));
+    try std.testing.expect(std.math.isNan(paramValue(&.{ .{ .num = 1 }, .{ .num = 2 } }, &.{}, nan)));
+    try std.testing.expect(std.math.isNan(paramValue(&.{.{ .measure = 7 }}, &.{1}, nan)));
     const deep: [33]core.MeasureOp = @splat(.{ .num = 1 });
-    try std.testing.expect(std.math.isNan(paramValue(&deep, &.{})));
-    try std.testing.expectEqual(-6, paramValue(&.{ .{ .num = 2 }, .{ .measure = 0 }, .pow, .neg, .{ .num = 2 }, .sub }, &.{2}));
+    try std.testing.expect(std.math.isNan(paramValue(&deep, &.{}, nan)));
+    try std.testing.expectEqual(-6, paramValue(&.{ .{ .num = 2 }, .{ .measure = 0 }, .pow, .neg, .{ .num = 2 }, .sub }, &.{2}, nan));
 }
 
 test "crossings, windows, NaN samples and a single point match ngspice 45" {
