@@ -947,6 +947,91 @@ test "an operating-point variable no MOSFET of the deck has refuses the deck (#2
     }
 }
 
+/// Level 1's saturated gm at the opvars decks' bias (W/L = 2, VTO = 0.5,
+/// KP = 1e-4, LAMBDA = 0.02, V_DS = 1.8 V): KP W/L (V_GS - VTO)(1 + LAMBDA
+/// V_DS), linear in V_GS, so a `find ... at=` between sweep points is exact.
+fn squareLawGm(vgs: f64) f64 {
+    return 1e-4 * 2 * (vgs - 0.5) * (1 + 0.02 * 1.8);
+}
+
+/// Runs `text` in `dialect` and returns its `.meas` cards gm1 (at the OP)
+/// and gm2 (along the .dc).
+fn opvarMeasures(text: []const u8, dialect: api.Dialect) ![2]f64 {
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = text, .origin = "opvars.cir" } }, .dialect = dialect });
+    defer p.deinit();
+    try p.run_all();
+    const first = for (0..p.query_count()) |i| {
+        const id: api.QueryId = @fromBackingInt(@intCast(i));
+        if ((try p.query_info(id)).requested) break id;
+    } else return error.MissingQuery;
+    var out: [2]f64 = undefined;
+    var reasons: [1]api.Problem.Reason = undefined;
+    try p.point_measures(first, &.{ "gm1", "gm2" }, &out, &reasons);
+    try t.expectEqual(api.Problem.Reason.ok, reasons[0]);
+    return out;
+}
+
+test ".meas reads @m1[gm], HSPICE's lx7(x1.mn1) and their columns at the OP and along a .dc (#236)" {
+    // Oracle: `squareLawGm` by hand at V_GS = 1.2 V (the OP) and 1.4 V,
+    // inside the three-point sweep `find ... at=` interpolates over.
+    const ngspice = "opvars meas\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n" ++
+        ".op\n.dc vg 1.2 1.6 0.2\n.meas op gm1 find @m1[gm]\n.meas dc gm2 find @m1[gm] at=1.4\n.end\n";
+    // A subcircuit's device, named by its path; `.probe` saves without
+    // narrowing what else is written.
+    const hspice = "opvars meas\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nx1 d g 0 cell\n.subckt cell d g s\nmn1 d g s s nm w=2u l=1u\n.ends\n" ++
+        ".model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n.probe dc lx7(x1.mn1)\n.op\n.dc vg 1.2 1.6 0.2\n.meas op gm1 find lx7(x1.mn1)\n.meas dc gm2 find lx7(x1.mn1) at=1.4\n.end\n";
+    for ([_][]const u8{ ngspice, hspice }, [_]api.Dialect{ .ngspice, .hspice }) |text, dialect| {
+        const gm = try opvarMeasures(text, dialect);
+        try t.expectApproxEqRel(squareLawGm(1.2), gm[0], 1e-9);
+        try t.expectApproxEqRel(squareLawGm(1.4), gm[1], 1e-9);
+    }
+    // Level 1 has no `vth` of its own (lv9), lx5 is not mapped, and x9 is
+    // no instance.
+    for ([_][]const u8{ "lv9(x1.mn1)", "lx5(x1.mn1)", "lx7(x9.mn1)" }) |name| {
+        var buf: [512]u8 = undefined;
+        const refused = try std.fmt.bufPrint(&buf, "{s}.meas op vt find {s}\n.end\n", .{ hspice[0 .. hspice.len - 5], name });
+        try t.expectError(error.UnsupportedCard, api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = refused, .origin = "opvars.cir" } }, .dialect = .hspice }));
+    }
+}
+
+test "Spectre's save nm1:gm and HSPICE's .probe op are columns with the square law's values (#236)" {
+    // Oracle: `squareLawGm` by hand at each sweep point. `nm1`'s name does
+    // not carry its letter; its master makes it a MOSFET.
+    const spectre_deck =
+        \\// opvars spectre
+        \\vd (dd 0) vsource dc=1.8
+        \\vm (dd d) vsource dc=0
+        \\vg (g 0) vsource dc=1.2
+        \\nm1 (d g 0 0) nm w=2u l=1u
+        \\model nm mos1 type=n vto=0.5 kp=1e-4 lambda=0.02
+        \\save d nm1:gm nm1:d
+        \\sw dc dev=vg start=1.2 stop=1.6 step=0.2
+        \\
+    ;
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = spectre_deck, .origin = "opvars.scs" } }, .dialect = .spectre });
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .dc));
+    const gm = try columnIndex(r, "nm1:gm");
+    try t.expectEqual(@as(usize, 3), r.npoints);
+    for (0..r.npoints) |k| {
+        const row = r.data[k * r.varnames.len ..][0..r.varnames.len];
+        try t.expectApproxEqRel(squareLawGm(row[0]), row[gm], 1e-9);
+    }
+    // `.probe op`: every variable as @<card>[<variable>], without the
+    // `ids` alias; a resistor has none.
+    const probe_deck = "opvars probe op\nvd d 0 1.8\nvg g 0 1.2\nr1 g 0 1k\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n.probe op\n.op\n.end\n";
+    const probed = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = probe_deck, .origin = "probe.sp" } }, .dialect = .hspice });
+    defer probed.deinit();
+    try probed.run_all();
+    const op = try probed.result(try find(probed, .op));
+    try t.expectApproxEqRel(squareLawGm(1.2), try column(op, "@m1[gm]"), 1e-9);
+    // V(g) - V(s) of two solved nodes: 1 ulp from 1.2.
+    try t.expectApproxEqRel(@as(f64, 1.2), try column(op, "@m1[vgs]"), 1e-15);
+    try t.expectError(error.MissingColumn, column(op, "@m1[ids]"));
+    try t.expectError(error.MissingColumn, column(op, "@r1[id]"));
+}
+
 /// Creates `body` at `values[0]` with `name` live, then for each later
 /// value sets it and runs one more `.op`, checking it against a fresh
 /// Problem parsed at that value (the re-parse oracle). Returns how many

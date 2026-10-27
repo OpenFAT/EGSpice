@@ -506,6 +506,23 @@ const T = struct {
 
     /// Pass 1: model, subcircuit and module names, which instances before
     /// their definitions may name (§6.4).
+    /// `save X[:t] ... [key=value]` (§4.11): every node is written anyway,
+    /// and a device's operating-point variable `m1:gm` becomes the HSPICE
+    /// `.probe m1:gm` netlist.zig reads (#236). A `:` needs a name on each
+    /// side.
+    // ponytail: a one-byte or numeric `t` is a terminal (`m1:d`, `r1:1`),
+    // whose current is not written; save it once terminal currents are.
+    fn save(t: *T, toks: []const Tok) Error!void {
+        var text: std.ArrayList(u8) = .empty;
+        for (toks, 0..) |tok, i| if (tok.is(":")) {
+            if (i == 0 or i + 1 == toks.len or toks[i - 1].kind != .word or toks[i + 1].kind != .word) return error.ParseError;
+            const out = toks[i + 1].text;
+            if (out.len == 1 or std.ascii.isDigit(out[0])) continue;
+            try text.print(t.arena, " {s}:{s}", .{ toks[i - 1].text, out });
+        };
+        if (text.items.len > 0) try t.emit(".probe{s}", .{text.items});
+    }
+
     fn declare(t: *T, in: []const []const u8) Error!void {
         var spice = false;
         for (in) |line| {
@@ -549,7 +566,7 @@ const T = struct {
         if (std.mem.eql(u8, w, "ends")) return t.ends();
         if (std.mem.eql(u8, w, "global")) return t.global(rest);
         if (std.mem.eql(u8, w, "ic") or std.mem.eql(u8, w, "nodeset")) return t.initial(w, rest);
-        if (std.mem.eql(u8, w, "save")) return saveChecked(rest);
+        if (std.mem.eql(u8, w, "save")) return t.save(rest);
         if (std.mem.eql(u8, w, "ahdl_include")) {
             if (rest.len != 1 or rest[0].kind != .string) return error.ParseError;
             return t.emit(".hdl {s}", .{rest[0].text});
@@ -1043,14 +1060,6 @@ const T = struct {
         }
     }
 };
-
-/// `save X[:t] ... [key=value]` (§4.11): checked, and not acted on, since
-/// every vector is written. A `:` needs a terminal or output after it.
-fn saveChecked(toks: []const Tok) Error!void {
-    for (toks, 0..) |tok, i| if (tok.is(":")) {
-        if (i + 1 == toks.len or toks[i + 1].kind != .word) return error.ParseError;
-    };
-}
 
 /// A parameter's value as SPICE text: a name, a plain number, or an
 /// expression in quotes, which every card field reads as one (a bare `(`

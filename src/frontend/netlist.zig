@@ -378,9 +378,12 @@ pub const Deck = struct {
     /// `.save` outputs as lowercased `v(net)`/`i(name)` labels. Empty: save
     /// everything, as with no `.save` card or a `.save all`.
     saves: []const []const u8,
-    /// `.save` device operating-point variables (`@m1[gm]`, #236),
+    /// `.save` device operating-point variables (`@m1[gm]`, #236), and
+    /// HSPICE's `.probe lx7(m1)` and Spectre's `save m1:gm` ones (`isOpVar`),
     /// lowercased, `.save all` or not.
     opvar_saves: []const []const u8 = &.{},
+    /// HSPICE `.probe op`: every device's operating-point variables.
+    probe_op: bool = false,
     foreign: []const Foreign,
     /// `.options vpi="app.so"` paths as written (relative to the deck): VPI
     /// applications to load (LRM 12.33, #197).
@@ -642,6 +645,19 @@ pub fn siteKey(owner: u64, salt: u64) u64 {
 
 fn nameKey(owner: u64, name: []const u8) u64 {
     return siteKey(owner, std.hash.Wyhash.hash(0, name));
+}
+
+/// Whether output name `name`, lowercased, is a device operating-point
+/// variable as `dialect` spells one (#236): ngspice's `@m1[gm]` in any,
+/// HSPICE's `lx7(m1)` and `lv9(m1)` element templates, Spectre's `m1:gm`.
+/// `prepare` resolves it or refuses the deck.
+pub fn isOpVar(dialect: Dialect, name: []const u8) bool {
+    if (name.len != 0 and name[0] == '@') return true;
+    return switch (dialect) {
+        .ngspice => false,
+        .hspice => name.len > 3 and name[0] == 'l' and (name[1] == 'x' or name[1] == 'v') and std.ascii.isDigit(name[2]) and name[name.len - 1] == ')',
+        .spectre => std.mem.indexOfScalar(u8, name, ':') != null and std.mem.indexOfScalar(u8, name, '(') == null,
+    };
 }
 
 /// True for a name that is ground in `dialect`: only `0` in Spectre, where
@@ -1140,6 +1156,7 @@ fn Reader(comptime S: type) type {
         bindings: std.ArrayList(Binding) = .empty,
         saves: std.ArrayList([]const u8) = .empty,
         opvar_saves: std.ArrayList([]const u8) = .empty,
+        probe_op: bool = false,
         save_all: bool = false,
         save_op: ?core.SaveOp = null,
         stims: std.ArrayList(core.Stim) = .empty,
@@ -1402,6 +1419,7 @@ fn Reader(comptime S: type) type {
                     .nodeset = try nodeValues(arena, r.nodeset_cards.items, nets),
                     .saves = if (r.save_all) &.{} else r.saves.items,
                     .opvar_saves = r.opvar_saves.items,
+                    .probe_op = r.probe_op,
                     .foreign = r.foreign.items,
                     .vpi_apps = r.vpi_apps.items,
                     .measures = r.measures.items,
@@ -2121,7 +2139,10 @@ fn Reader(comptime S: type) type {
             // takes the last one.
             if (card != null and card.? == .meas) return r.meas_lines.append(r.arena, line);
             const c = card orelse return r.unsupported(line, "unsupported card");
-            if (c == .ignored) return;
+            if (c == .ignored) {
+                if (r.dialect != .ngspice and std.ascii.startsWithIgnoreCase(line, ".probe")) try r.readProbe(line);
+                return;
+            }
             if (c == .save and r.dialect == .hspice) return r.readSaveOp(line, &f);
             // HSPICE `.store` checkpoints the process on a wall-clock
             // schedule for an OS-level restore [CR .STORE]; the results do not
@@ -2196,6 +2217,21 @@ fn Reader(comptime S: type) type {
                     else => {},
                 },
                 else => {},
+            }
+        }
+
+        /// HSPICE `.probe` [CR .PROBE], and Spectre's `save` as spectre.zig
+        /// rewrites it: `op` saves every device's operating-point variables
+        /// and an `isOpVar` name that one (#236). Every other output is
+        /// written anyway, as HSPICE does without `.option probe`.
+        fn readProbe(r: *R, line: []const u8) Error!void {
+            var it = std.mem.tokenizeAny(u8, line, " \t,");
+            _ = it.next(); // the card
+            while (it.next()) |t| {
+                const name = try std.ascii.allocLowerString(r.arena, t);
+                if (std.mem.eql(u8, name, "op")) {
+                    r.probe_op = true;
+                } else if (isOpVar(r.dialect, name)) try r.opvar_saves.append(r.arena, name);
             }
         }
 

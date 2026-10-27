@@ -137,19 +137,33 @@ point, along a `.dc` sweep and in a `.tran`. Save or measure them by name:
 .meas op gm1 find @m1[gm]
 ```
 
+HSPICE names them `.probe op` (every variable of every device, written as
+`@m1[gm]`) and `.probe lx7(m1)`, Spectre `save m1:gm x1.mn1:vdsat`, and
+each dialect's `.meas` takes the same names (`.meas dc gm1 find lx7(m1)
+at=0.9`). A vector is written under the name it was saved as. HSPICE's
+element template numbers, after its MOSFET output templates: `lx1` vbs,
+`lx2` vgs, `lx3` vds, `lx4` id, `lx7` gm, `lx8` gds, `lx9` gmbs, `lx18`
+cgg, `lv9` vth, `lv10` vdsat; another number refuses the deck. A Spectre
+`inst:t` with a one-character or numeric `t` is a terminal current and is
+not written.
+
 A device has its model's own variables: each module-scope variable with a
 `desc` or `units` attribute (the LRM's output variables, §3.2.1), such as `vth`,
-`vdsat` or `region`, without `m=`. A MOSFET also has `id` (`ids`), `ig`,
+`vdsat` or `region`. They are the instance's own, per unit of `m=`: VerA
+leaves `$mfactor` to the host, and does not say which variables scale with
+it (the CMC models mark that with `multiplicity`, which it does not read).
+BSIM4 (`bsim4va`, sky130's model) has `vth` and `vdsat`, ngspice's `von`
+and `vdsat` from b4ld.c, in the n-type frame. A MOSFET also has `id` (`ids`), `ig`,
 `is`, `ib`, `gm`, `gds`, `gmbs`, `cgg`, `cgd`, `cgs`, `cgb`, `ft`, `vgs`,
-`vds` and `vbs`, where the model has none of that name. These come from
+`vds` and `vbs`, where the model has none of that name, with `m=` applied.
+These come from
 its terminals (d, g, s, b) with its internal nodes eliminated: currents
 flow into the device, `cgg` is ∂Q_g/∂V_g, `cgd` is -∂Q_g/∂V_d (and so on),
-and `ft` is gm / (2π·cgg). An unknown name refuses the deck and lists the
+both with the overlap charges, and `ft` is gm / (2π·cgg). An unknown name refuses the deck and lists the
 device's variables. A `.dc` that sweeps the temperature or a device of the
-same type, HSPICE's `.probe op` and Spectre's `save m1:gm` are not
-supported yet (#236).
+same type is not supported yet (#236).
 
-`.print`, `.plot`, `.probe` and `.graph` are accepted and ignored for the
+`.print`, `.plot`, `.probe` and `.graph` are otherwise accepted and ignored for the
 same reason. In the HSPICE dialect `.save` has HSPICE's meaning: it writes
 the operating point as a loadable `.nodeset` or `.ic` file, beside the
 output file.
