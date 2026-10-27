@@ -49,6 +49,8 @@ pub const measure_no_at = deck.measure_no_at;
 const result = @import("result.zig");
 pub const Result = result.Result;
 pub const Measured = result.Measured;
+pub const Emir = result.Emir;
+pub const EmirTerminal = result.EmirTerminal;
 pub const Schema = result.Schema;
 pub const QuerySchema = result.QuerySchema;
 

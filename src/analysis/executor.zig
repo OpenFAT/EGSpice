@@ -1006,6 +1006,7 @@ pub const Executor = struct {
             .stream = self.stream,
             .measures = self.deck.measures,
             .source = if (self.source) |s| s.result() else null,
+            .emir_ports = self.deck.emir_ports,
         };
     }
 

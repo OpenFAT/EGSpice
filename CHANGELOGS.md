@@ -5,6 +5,7 @@ Newest first.
 ## Unreleased
 
 - `.four` and `.fft` read the deck's `.tran` result instead of integrating the same transient again, where that run keeps its waveform with the same options and operating point (CPU backend); the values are bit for bit the same (#231).
+- `--emir=FILE` writes each device terminal's and independent source's average, EM_AVG, RMS and peak current over the deck's first `.tran` (or `--emir-window=T1:T2`) as JSON, one file per `.step`/`.alter`/sweep variant (#237).
 - `--measures=FILE` also writes every `.meas` result as JSON, labelled with its analysis and variant (`.step`, `SWEEP DATA`, `.alter`, Monte Carlo trial, `.temp` entry), a failed one as `null` with its error; `--measures=-` puts it on stdout (#235).
 - `.option soa=1` (ngspice `warn=1`) checks every accepted point of an operating point, DC sweep and transient against the model-card SOA limits (`vds_max`, `vbe_max`, `bv_max`, ...), one line per excursion, `maxwarns` of them, then the count (#238).
 - `.save @m1[gm]` and `.meas ... find @m1[id]`: MOSFET operating-point variables (terminal currents, gm, gds, gmbs, capacitances, ft, terminal voltages) at the operating point, along `.dc` and in `.tran`; an unknown name refuses the deck instead of being dropped (#236).

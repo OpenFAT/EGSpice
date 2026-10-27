@@ -29,6 +29,7 @@ pub const Column = tran_types.Column;
 pub const initialCapacity = tran_types.initialCapacity;
 const measure = @import("measure");
 const Stream = measure.Stream;
+const Emir = @import("emir.zig").Emir;
 
 /// Writes the MODEINITPRED first iterate, trial = cur + xfact·(cur - prev),
 /// into `trial[0..cur.len]`; `prev` must be at least as long as `cur`.
@@ -395,6 +396,8 @@ const Sim = struct {
     attempted_dt: f64,
     vpi_again: u32,
     resolved: bool,
+    /// `point.emir`'s terminal currents, read at every accepted point.
+    emir: ?*Emir,
 
     fn qHist(s: *Sim) [][]f64 {
         return s.q_ring[0..s.n_hist];
@@ -572,6 +575,7 @@ const Sim = struct {
             .attempted_dt = undefined,
             .vpi_again = 0,
             .resolved = false,
+            .emir = null,
         };
         const q_hist = s.qHist();
         const qt_hist = s.qtHist();
@@ -1041,6 +1045,9 @@ const Sim = struct {
         // txl2_3_line, hfet_inverter, mesa_oscillator and mos6_inverter.
         // `evalQ` computes the same q bits as `eval`, charges only.
         ops.rebase(s, a);
+        // `--emir` (#237): the terminal currents at the committed point,
+        // under this step's companion coefficients.
+        if (s.emir) |e| e.point(ckt, s.cur, t_new, .{ .method = eff_method, .c = cf, .ag = a.ag, .gear_hi = gear_hi });
 
         // ngspice neither steps onto TSTART nor prints it: dctran.c dumps
         // the accepted points at t >= CKTinitTime and nothing else (#167).
@@ -1343,6 +1350,8 @@ const Run = struct {
     tangents: ?Tangents,
     /// `take` handed `wf`'s rows to the result.
     published: bool = false,
+    /// `opts.point.emir`'s terminal currents, which `sim` points at.
+    emir: ?Emir = null,
     sim: Sim,
 
     /// `run`'s setup, then `Sim.init`.
@@ -1426,12 +1435,22 @@ const Run = struct {
             .sim = undefined,
         };
         try r.sim.init(ctx.circuit, x, probes, &r.wf, opts, scratch, if (r.tangents) |*tg| tg else null, if (r.stream) |*sm| sm else null);
+        // `--emir` (#237), on the deck's own transients: from the state
+        // `Sim.init` seeded its histories at. Under uic that state is the
+        // raw `.ic` vector, so its t = 0 row is left out.
+        if (opts.point.emir and !opts.snapshot and !opts.sources_at_zero and ctx.emir_ports.len == ctx.circuit.batches.len) {
+            errdefer r.sim.deinit();
+            r.emir = try Emir.init(scratch, ctx.circuit, ctx.emir_ports, opts.method, opts.point.emir_window, opts.t_start);
+            r.sim.emir = &r.emir.?;
+            r.emir.?.start(ctx.circuit, r.sim.cur, opts.t_start <= 0 and !opts.uic);
+        }
     }
 
     /// Frees what `init` made, `wf` unless `take` published it.
     fn deinit(r: *Run) void {
         const scratch = r.ctx.scratch_allocator;
         r.sim.deinit();
+        if (r.emir) |*e| e.deinit();
         if (r.tangents) |*tg| tg.deinit(scratch);
         if (!r.published) r.wf.deinit();
         if (r.stream) |*sm| sm.deinit();
@@ -1460,6 +1479,7 @@ const Run = struct {
                 .data = data,
             };
         }
+        const emir: @import("core").Emir = if (r.emir) |*e| try e.publish(a, ctx.circuit) else .{};
         const tg = if (r.tangents) |*tg| tg else {
             const res: root.Result = .{
                 .plotname = plotname,
@@ -1468,6 +1488,7 @@ const Run = struct {
                 .npoints = r.wf.len,
                 .data = r.wf.data(),
                 .measured = if (r.streamed) try r.stream.?.measured(a) else &.{},
+                .emir = emir,
             };
             r.published = r.kept;
             return res;
@@ -1484,6 +1505,7 @@ const Run = struct {
             .npoints = r.wf.len,
             .data = r.wf.data(),
             .tangents = blocks,
+            .emir = emir,
         };
     }
 };

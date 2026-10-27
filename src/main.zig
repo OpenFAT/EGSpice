@@ -56,6 +56,7 @@ pub fn main(init: std.process.Init) !u8 {
     var plan_only = false;
     var timing_in_depth = false;
     var measures_path: ?[]const u8 = null;
+    var emir_path: ?[]const u8 = null;
     var point: problem.requests.PointOptions = .{};
     var tangents: std.ArrayList([]const u8) = .empty;
     defer tangents.deinit(init.gpa);
@@ -70,6 +71,8 @@ pub fn main(init: std.process.Init) !u8 {
                 \\  -r, --rawfile=FILE          Result destination
                 \\      --format=FMT            binary|ascii|csv|touchstone|psf|fsdb|sst2|citi|print
                 \\      --measures=FILE         Also write every .meas result, labelled, as JSON (- for stdout)
+                \\      --emir=FILE             Write each device terminal's average, RMS and peak current (JSON)
+                \\      --emir-window=T1:T2     Limit the statistics to [T1, T2] of the transient (default: whole run)
                 \\      --backend=BE            cpu|auto|cuda|hip (default auto with GPU kernels, else cpu)
                 \\      --gpu                   Require an available GPU
                 \\      --jobs=N|auto           Maximum parallel queries (default auto: one per CPU)
@@ -141,6 +144,11 @@ pub fn main(init: std.process.Init) !u8 {
             selection.path = value orelse return usageFail();
         } else if (optionValue(arg, "", "--measures", &args)) |value| {
             measures_path = value orelse return usageFail();
+        } else if (optionValue(arg, "", "--emir", &args)) |value| {
+            emir_path = value orelse return usageFail();
+            point.emir = true;
+        } else if (optionValue(arg, "", "--emir-window", &args)) |value| {
+            point.emir_window = parseWindow(value orelse return usageFail()) orelse return usageFail();
         } else if (optionValue(arg, "", "--format", &args)) |value| {
             selection.format = problem.parseFormat(value orelse return usageFail()) orelse return usageFail();
         } else if (optionValue(arg, "", "--backend", &args)) |value| {
@@ -169,9 +177,18 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("Error: --measures=FILE takes one netlist\n", .{});
         return usageFail();
     }
+    if (emir_path != null and paths.items.len > 1) {
+        std.debug.print("Error: --emir=FILE takes one netlist\n", .{});
+        return usageFail();
+    }
+    // `--emir` reads the host device batches (#237).
+    if (emir_path != null and explicit_gpu) {
+        std.debug.print("Error: --emir runs on the CPU backend\n", .{});
+        return usageFail();
+    }
     // With kernels in the build the default is `auto`, which prices each
     // query and stays on the CPU, silently, unless the GPU pays.
-    const backend: problem.Request = backend_arg orelse if (problem.gpu_available) .auto else .cpu;
+    const backend: problem.Request = if (emir_path != null) .cpu else backend_arg orelse if (problem.gpu_available) .auto else .cpu;
     if (max_parallel == 0) max_parallel = autoJobs();
     if (tangents.items.len == 0) point.tangent_step = 0 else if (point.tangent_step == 0) point.tangent_step = 1e-6;
 
@@ -246,6 +263,9 @@ pub fn main(init: std.process.Init) !u8 {
             // as NaN: the JSON still records them.
             if (measures_path) |file| writeMeasures(init.io, p, file, path, &stdout.interface) catch |e|
                 std.debug.print("Error: {s}: --measures={s}: {s}\n", .{ path, file, @errorName(e) });
+            // The variants that completed.
+            if (emir_path) |file| writeEmir(init.io, init.gpa, p, file, path) catch |e|
+                std.debug.print("Error: {s}: --emir={s}: {s}\n", .{ path, file, @errorName(e) });
             continue;
         };
         try p.print_measures(meas_out, &stderr.interface);
@@ -254,6 +274,10 @@ pub fn main(init: std.process.Init) !u8 {
         try p.print_soa(&stderr.interface);
         if (measures_path) |file| writeMeasures(init.io, p, file, path, &stdout.interface) catch |e| {
             std.debug.print("Error: {s}: --measures={s}: {s}\n", .{ path, file, @errorName(e) });
+            failed = true;
+        };
+        if (emir_path) |file| writeEmir(init.io, init.gpa, p, file, path) catch |e| {
+            std.debug.print("Error: {s}: --emir={s}: {s}\n", .{ path, file, @errorName(e) });
             failed = true;
         };
         try stdout.interface.flush();
@@ -286,6 +310,38 @@ fn writeMeasures(io: std.Io, p: *problem.Problem, file: []const u8, deck: []cons
     try p.write_measures_json(&fw.interface, deck);
     try fw.interface.flush();
     try atomic.replace(io);
+}
+
+/// `--emir=FILE`: each variant's document (`Problem.write_emir_json`), the
+/// first to `file` and the k-th to `file.k`, each replaced atomically, as
+/// `-r` writes a format that does not append. `error.NoTransient` when the
+/// run has none.
+fn writeEmir(io: std.Io, gpa: std.mem.Allocator, p: *problem.Problem, file: []const u8, deck: []const u8) !void {
+    var k: usize = 0;
+    while (true) : (k += 1) {
+        var doc: std.Io.Writer.Allocating = .init(gpa);
+        defer doc.deinit();
+        if (!try p.write_emir_json(&doc.writer, deck, k)) break;
+        const name = if (k == 0) file else try std.fmt.allocPrint(gpa, "{s}.{d}", .{ file, k + 1 });
+        defer if (k != 0) gpa.free(name);
+        var atomic = try std.Io.Dir.cwd().createFileAtomic(io, name, .{ .replace = true });
+        defer atomic.deinit(io);
+        var buf: [4096]u8 = undefined;
+        var fw = atomic.file.writer(io, &buf);
+        try fw.interface.writeAll(doc.written());
+        try fw.interface.flush();
+        try atomic.replace(io);
+    }
+    if (k == 0) return error.NoTransient;
+}
+
+/// `--emir-window=T1:T2`, seconds with 0 <= T1 < T2; null when malformed.
+fn parseWindow(text: []const u8) ?[2]f64 {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
+    const from = std.fmt.parseFloat(f64, text[0..colon]) catch return null;
+    const to = std.fmt.parseFloat(f64, text[colon + 1 ..]) catch return null;
+    if (!(from >= 0 and to > from) or std.math.isInf(to)) return null;
+    return .{ from, to };
 }
 
 /// `--jobs=auto`: one query per CPU.
@@ -348,6 +404,13 @@ test "optionValue: separate, joined, missing and empty values" {
     try t.expect(optionValue("--rawfilex", "-r", "--rawfile", &args) == null);
     try t.expect(optionValue("out.raw", "-r", "--rawfile", &args) == null);
     try t.expect(optionValue("", "", "--format", &args) == null);
+}
+
+test "parseWindow: T1:T2 with 0 <= T1 < T2, nothing else" {
+    try std.testing.expectEqual([2]f64{ 1e-6, 3e-6 }, parseWindow("1e-6:3e-6").?);
+    try std.testing.expectEqual([2]f64{ 0, 2 }, parseWindow("0:2").?);
+    for ([_][]const u8{ "", "1e-6", "3:1", "1:1", "-1:2", "0:inf", "a:2", "1:", ":2", "nan:1" }) |bad|
+        try std.testing.expect(parseWindow(bad) == null);
 }
 
 test "envThreads: positive integers only, 1 otherwise" {

@@ -331,6 +331,11 @@ pub const Deck = struct {
     /// without `opvars`.
     opvar_probes: []const u32 = &.{},
     opvar_labels: []const []const u8 = &.{},
+    /// Each batch's port count, parallel to the circuit's batches: the
+    /// instance unknowns `--emir` reads a current at (#237).
+    emir_ports: []const u32 = &.{},
+    /// `.option em_recovery`, as `.meas EM_AVG` reads it; 1 when unset.
+    em_recovery: f64 = 1,
 };
 
 /// One device operating-point variable (ngspice `@m1[gm]`, #236) of

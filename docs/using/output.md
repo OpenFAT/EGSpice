@@ -8,6 +8,7 @@ A run produces three kinds of output:
 | stdout | `.meas` results, Monte Carlo statistics, and `--plan` / `--print-dag` graphs |
 | `--rawfile FILE` | the results themselves, in the `--format` you choose |
 | `--measures FILE` | the `.meas` results as JSON, labelled with analysis and variant |
+| `--emir FILE` | each device terminal's average, RMS and peak current as JSON, per variant |
 
 Without `--rawfile`, results stay in memory and nothing is written.
 
@@ -210,6 +211,53 @@ JSON to stdout in place of the text blocks. The shape (values abridged):
 - `statistics` holds, per card and Monte Carlo analysis, the trial count
   `n`, the trials the card `failed` in, and its mean, sigma (Bessel's
   correction), min and max.
+
+### Terminal currents as JSON
+
+`espice hot.sp --emir=hot.emir.json` writes, for the deck's first `.tran`,
+the current statistics of every device terminal and every independent
+source, for electromigration and IR-drop sign-off (values abridged):
+
+```json
+{
+  "format": "espice-emir/1",
+  "deck": "hot.sp",
+  "analysis": "tran",
+  "variant": {"kind": "nominal"},
+  "temp": 125,
+  "window": [1e-06, 3e-06],
+  "em_recovery": 1,
+  "terminals": [
+    {"instance": "x1.mn1", "device": "bsim4va", "terminal": "d", "net": "x1.out",
+     "avg": 1.21e-04, "em_avg": 1.21e-04, "rms": 1.53e-04, "peak": 4.10e-04},
+    {"instance": "x1.mn1", "device": "bsim4va", "terminal": "s", "net": "x1.tail",
+     "avg": -1.21e-04, "em_avg": 1.21e-04, "rms": 1.53e-04, "peak": 4.10e-04}
+  ],
+  "sources": [
+    {"instance": "vdd", "net": "vdd", "avg": -5.49e-04, "em_avg": 5.49e-04, "rms": 6.27e-04, "peak": 1.14e-03}
+  ]
+}
+```
+
+- Current is positive into the terminal. It is the current the solver's
+  own Kirchhoff rows see, charge currents included, so at every internal
+  net the terminals' `avg` sum to zero.
+- `avg` is the signed mean over the window and `em_avg` the
+  electromigration average with `.option em_recovery` applied, both as
+  `.meas AVG` and `.meas EM_AVG` compute them over the same samples; `rms`
+  is over the window, and `peak` the largest |i| at an accepted point.
+- `window` holds the first and last accepted points read. `--emir-window=T1:T2`
+  reads `[T1, T2]` as `.meas ... FROM=T1 TO=T2` does; the default is the
+  whole run.
+- `instance` is the card's flattened name, `device` its model's device
+  type, `terminal` the device's port and `net` the node it connects to.
+  Internal nodes of a device are not terminals. A source reports its
+  positive terminal.
+- Under `.step`, `.alter` or a sweep, each variant writes its own file
+  (`FILE`, `FILE.2`, ...), the variant's label (the `--measures` object)
+  under `variant`.
+- The file is the same at any `--jobs`. The transient runs on the CPU, to
+  its end (no early stop).
 
 HSPICE's `.stim` writes transient signals as PWL sources or a `.data`
 table, and `.save` (HSPICE dialect) writes the operating point; both go

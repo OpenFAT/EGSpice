@@ -457,6 +457,8 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         .opvars = ov.vars,
         .opvar_probes = ov.probes,
         .opvar_labels = ov.labels,
+        .emir_ports = try portCounts(sim_arena, lib, &circuit),
+        .em_recovery = deck_opts.em_recovery,
     } } };
 }
 
@@ -566,6 +568,13 @@ fn refuseOpVar(arena: std.mem.Allocator, name: []const u8, card: []const u8, var
         std.log.err("netlist: {s}: {s} has no variable '{s}'; its variables are: {s}{s}{s}", .{ name, card, variable, listed, sep, if (mosfet) opvar_names else "" });
     }
     return error.UnsupportedCard;
+}
+
+/// `Deck.emir_ports`: each batch's port count, from its type's vtable.
+fn portCounts(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit) ![]const u32 {
+    const ports = try arena.alloc(u32, circuit.batch_types.len);
+    for (ports, circuit.batch_types) |*p, t| p.* = lib.vtable(t).num_ports;
+    return ports;
 }
 
 /// `.stim` cards with their strings copied out of the parse arena.

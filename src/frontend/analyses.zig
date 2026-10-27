@@ -356,6 +356,9 @@ pub const DeckOptions = struct {
     soa: bool = false,
     /// `.options maxwarns`: the most SOA excursion lines printed.
     max_warns: u32 = 5,
+    /// `.options em_recovery`, as EM_AVG reads it (`measureOption`), for
+    /// `--emir` (#237).
+    em_recovery: f64 = 1,
 };
 
 /// `trtol` at HSPICE RUNLVL 1..6 [CR .OPTION RUNLVL]. HSPICE scales its
@@ -429,6 +432,10 @@ fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *
             if (std.ascii.eqlIgnoreCase(key, "seed") or std.ascii.eqlIgnoreCase(key, "sampling_method") or std.ascii.eqlIgnoreCase(key, "em_recovery") or
                 std.ascii.eqlIgnoreCase(key, "search") or std.ascii.eqlIgnoreCase(key, "scale") or std.ascii.eqlIgnoreCase(key, "wnflag"))
             {
+                // As `measureOption` reads it: byte for byte, a number, the last one.
+                if (std.mem.eql(u8, key, "em_recovery")) if (numberAt(args, i + 1)) |v| {
+                    o.em_recovery = v;
+                };
                 i += 1;
                 continue;
             }

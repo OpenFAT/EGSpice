@@ -17,6 +17,8 @@ Usage: espice [OPTION]... FILE...
   -r, --rawfile=FILE          Result destination
       --format=FMT            binary|ascii|csv|touchstone|psf|fsdb|sst2|citi|print
       --measures=FILE         Also write every .meas result, labelled, as JSON (- for stdout)
+      --emir=FILE             Write each device terminal's average, RMS and peak current (JSON)
+      --emir-window=T1:T2     Limit the statistics to [T1, T2] of the transient (default: whole run)
       --backend=BE            cpu|auto|cuda|hip (default cpu)
       --gpu                   Require an available GPU
       --jobs=N|auto           Maximum parallel queries (default auto: one per CPU)
@@ -73,6 +75,15 @@ A flag that takes a value accepts it three ways: `--rawfile=out.raw`,
   JSON to stdout in place of the text blocks (`--tangents` lines then go to
   stderr). `FILE` takes one netlist; `-` writes one document per netlist.
   See [Output](output.md#measurements-as-json).
+
+`--emir=FILE`, `--emir-window=T1:T2`
+: Write the average, electromigration average, RMS and peak current of
+  every device terminal and independent source over the deck's first
+  `.tran` to `FILE` as JSON; each `.step`, `.alter` or sweep variant writes
+  its own file (`FILE`, `FILE.2`, ...). `--emir-window` limits the
+  statistics to `[T1, T2]` seconds of the run. The transient runs to its
+  end and on the CPU. `FILE` takes one netlist. See
+  [Output](output.md#terminal-currents-as-json).
 
 `--tokenizer=FMT`
 : The netlist dialect: `ngspice` (alias `ng`), `hspice` (`hs`) or

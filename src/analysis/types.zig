@@ -85,6 +85,9 @@ pub const RunCtx = struct {
     /// transient would record, laid out over `probes`. Null: run that
     /// transient.
     source: ?Result = null,
+    /// Each batch's port count (`Deck.emir_ports`), which a transient's
+    /// `point.emir` reads; empty turns it off.
+    emir_ports: []const u32 = &.{},
     /// The leading frequency sweep's solutions, solved up front by a lane
     /// batch (`Executor.runFreqLanes`) as `freq.solveAll` lays them out;
     /// `.ac`, `.acxf`, `.stb` and `.noise` replay them (`freq.Stream.pre`).

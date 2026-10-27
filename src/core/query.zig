@@ -695,6 +695,15 @@ pub const PointOptions = struct {
     /// prediction of the point with that parameter moved by this times
     /// its magnitude (`Tran.tangents`), for d(measure)/d(parameter).
     tangent_step: f64 = 0,
+    /// Read every device terminal's current at each accepted point of the
+    /// transient into `Result.emir` (`--emir`, #237). It needs the whole
+    /// run, so `Problem` drops `early_stop`, and the host batches, so such
+    /// a transient joins no lane batch and wants the CPU backend (the CLI
+    /// forces it): under a GPU context the host batches are not current.
+    emir: bool = false,
+    /// `emir`'s window in seconds, read as `.meas` FROM=/TO= read theirs:
+    /// `to` 0 runs to the end.
+    emir_window: [2]f64 = .{ 0, 0 },
 };
 
 /// Transient noise: a transient with sampled noise sources, or the noise

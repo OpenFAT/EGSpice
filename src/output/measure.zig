@@ -1580,8 +1580,9 @@ const Wave = struct {
     }
 };
 
-/// Area under max(v, 0) over one linear segment from `v0` to `v1`, `dx` wide.
-fn positiveArea(v0: f64, v1: f64, dx: f64) f64 {
+/// Area under max(v, 0) over one linear segment from `v0` to `v1`, `dx`
+/// wide; `--emir` folds its EM_AVG halves with it too (#237).
+pub fn positiveArea(v0: f64, v1: f64, dx: f64) f64 {
     if (v0 >= 0 and v1 >= 0) return 0.5 * (v0 + v1) * dx;
     if (v0 <= 0 and v1 <= 0) return 0;
     const hi = @max(v0, v1);

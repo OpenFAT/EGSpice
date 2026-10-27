@@ -1870,6 +1870,143 @@ test "--measures (#235): SWEEP DATA rows carry their columns, and a failed WHEN 
     try t.expect(results[(rows.len - 2) * 3].object.get("value").? != .null);
 }
 
+/// What `espice --emir` writes for a deck (#237): every `write_emir_json`
+/// document, and the `--measures` document of the same run.
+const EmirRun = struct {
+    docs: std.ArrayList([]u8) = .empty,
+    meas: std.Io.Writer.Allocating,
+
+    fn deinit(r: *EmirRun) void {
+        for (r.docs.items) |d| t.allocator.free(d);
+        r.docs.deinit(t.allocator);
+        r.meas.deinit();
+    }
+};
+
+fn emirRun(source: []const u8, jobs: u16, window: [2]f64) !EmirRun {
+    var r: EmirRun = .{ .meas = .init(t.allocator) };
+    errdefer r.deinit();
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "emir.sp" } },
+        .max_parallel = jobs,
+        .point = .{ .emir = true, .emir_window = window },
+        .measures_json = true,
+    });
+    defer p.deinit();
+    try p.run_all();
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    try p.print_measures(&sink.writer, &sink.writer);
+    try p.write_measures_json(&r.meas.writer, "emir.sp");
+    while (true) {
+        var doc: std.Io.Writer.Allocating = .init(t.allocator);
+        defer doc.deinit();
+        if (!try p.write_emir_json(&doc.writer, "emir.sp", r.docs.items.len)) break;
+        try r.docs.ensureUnusedCapacity(t.allocator, 1);
+        r.docs.appendAssumeCapacity(try t.allocator.dupe(u8, doc.written()));
+    }
+    return r;
+}
+
+/// Field `key` of a terminal or source object, as an f64.
+fn emirField(v: std.json.Value, key: []const u8) f64 {
+    return jsonFloat(v.object.get(key).?);
+}
+
+test "--emir (#237): a divider's terminal currents are Ohm's law, positive into the terminal, and each net's sum to zero" {
+    var r = try emirRun("emir divider\nV1 in 0 dc 3\nR1 in mid 1k\nR2 mid 0 2k\nC1 mid 0 1p\n.tran 1n 50n\n.end\n", 1, .{ 0, 0 });
+    defer r.deinit();
+    try t.expectEqual(@as(usize, 1), r.docs.items.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+    defer parsed.deinit();
+    const doc = parsed.value.object;
+    try t.expectEqualStrings("espice-emir/1", doc.get("format").?.string);
+    try t.expectEqualStrings("nominal", doc.get("variant").?.object.get("kind").?.string);
+    const terms = doc.get("terminals").?.array.items;
+    try t.expectEqual(@as(usize, 6), terms.len);
+    const sources = doc.get("sources").?.array.items;
+    try t.expectEqual(@as(usize, 1), sources.len);
+    try t.expect(std.ascii.eqlIgnoreCase("in", sources[0].object.get("net").?.string));
+    // Oracle: 3 V over 1k + 2k is 1 mA, into each resistor's p and out of
+    // its n, none through the capacitor at DC; V1's p delivers it.
+    try t.expectApproxEqAbs(@as(f64, -1e-3), emirField(sources[0], "avg"), 1e-12);
+    var at_in = emirField(sources[0], "avg");
+    var at_mid: f64 = 0;
+    for (terms) |term| {
+        const o = term.object;
+        const want: f64 = if (std.ascii.eqlIgnoreCase("c1", o.get("instance").?.string)) 0 else if (std.mem.eql(u8, "p", o.get("terminal").?.string)) 1e-3 else -1e-3;
+        try t.expectApproxEqAbs(want, emirField(term, "avg"), 1e-12);
+        for ([_][]const u8{ "em_avg", "rms", "peak" }) |key| try t.expectApproxEqAbs(@abs(want), emirField(term, key), 1e-12);
+        const net = o.get("net").?.string;
+        if (std.ascii.eqlIgnoreCase("in", net)) at_in += emirField(term, "avg");
+        if (std.ascii.eqlIgnoreCase("mid", net)) at_mid += emirField(term, "avg");
+    }
+    // Oracle: Kirchhoff at both internal nets, within abstol.
+    try t.expectApproxEqAbs(@as(f64, 0), at_in, 1e-12);
+    try t.expectApproxEqAbs(@as(f64, 0), at_mid, 1e-12);
+}
+
+test "--emir (#237): a sine through a resistor has rms = peak/sqrt(2), and its EM_AVG is .meas EM_AVG's over the same window" {
+    const source = "emir sine\n.option em_recovery=0\nv1 in 0 sin(0 1 1meg)\nr1 in 0 1k\n.tran 1n 10u\n.meas tran emv em_avg i(v1) from=2u to=8u\n.end\n";
+    var r = try emirRun(source, 1, .{ 2e-6, 8e-6 });
+    defer r.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+    defer parsed.deinit();
+    const doc = parsed.value.object;
+    try t.expectEqual(@as(f64, 0), jsonFloat(doc.get("em_recovery").?));
+    // The window's samples: the first at or past 2 us, the last at or
+    // before 8 us, a step (at most TSTEP) from each.
+    const window = doc.get("window").?.array.items;
+    try t.expect(jsonFloat(window[0]) >= 2e-6 and jsonFloat(window[0]) <= 2e-6 + 1e-9);
+    try t.expect(jsonFloat(window[1]) <= 8e-6 and jsonFloat(window[1]) >= 8e-6 - 1e-9);
+    const v1 = doc.get("sources").?.array.items[0];
+    const meas = try std.json.parseFromSlice(std.json.Value, t.allocator, r.meas.written(), .{});
+    defer meas.deinit();
+    const emv = jsonResults(meas)[0].object;
+    try t.expectEqualStrings("emv", emv.get("name").?.string);
+    // Oracle: `.meas EM_AVG` of the same branch, window and em_recovery.
+    try t.expectApproxEqRel(jsonFloat(emv.get("value").?), emirField(v1, "em_avg"), 1e-12);
+    const terms = doc.get("terminals").?.array.items;
+    try t.expectEqual(@as(usize, 2), terms.len);
+    const p = for (terms) |term| {
+        if (std.mem.eql(u8, "p", term.object.get("terminal").?.string)) break term;
+    } else return error.TestUnexpectedResult;
+    // Oracle: a 1 mA sine over six whole periods: RMS 1/sqrt(2) of the
+    // peak, mean 0, and with em_recovery = 0 EM_AVG the mean of one
+    // half-wave, 1/pi mA.
+    try t.expectApproxEqRel(@as(f64, 1e-3), emirField(p, "peak"), 1e-4);
+    try t.expectApproxEqRel(emirField(p, "peak") / @sqrt(2.0), emirField(p, "rms"), 2e-3);
+    try t.expectApproxEqRel(@as(f64, 1e-3 / std.math.pi), emirField(p, "em_avg"), 2e-3);
+    try t.expectApproxEqAbs(@as(f64, 0), emirField(p, "avg"), 5e-9);
+    // Oracle: Kirchhoff at `in`, the source's and the resistor's.
+    try t.expectApproxEqAbs(@as(f64, 0), emirField(p, "avg") + emirField(v1, "avg"), 1e-12);
+    try t.expectApproxEqRel(emirField(p, "em_avg"), emirField(v1, "em_avg"), 1e-9);
+}
+
+test "--emir (#237): each .step point writes its own document under its label, byte-identical at any --jobs" {
+    const source = "emir step\n.param rv=1k\nV1 in 0 dc 2\nR1 in 0 {rv}\n.tran 1n 20n\n.step param rv list 1k 4k\n.end\n";
+    var one = try emirRun(source, 1, .{ 0, 0 });
+    defer one.deinit();
+    try t.expectEqual(@as(usize, 2), one.docs.items.len);
+    for (one.docs.items, [_]f64{ 1e3, 4e3 }) |text, rv| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, text, .{});
+        defer parsed.deinit();
+        const variant = parsed.value.object.get("variant").?.object;
+        try t.expectEqualStrings("step", variant.get("kind").?.string);
+        // Oracle: the deck's own `.step` values, bit for bit, and Ohm's law
+        // at each.
+        try t.expectEqual(rv, jsonFloat(variant.get("params").?.object.get("rv").?));
+        for (parsed.value.object.get("terminals").?.array.items) |term| {
+            const sign: f64 = if (std.mem.eql(u8, "p", term.object.get("terminal").?.string)) 1 else -1;
+            try t.expectApproxEqRel(sign * 2 / rv, emirField(term, "avg"), 1e-9);
+        }
+    }
+    // Oracle: the one-job run, byte for byte.
+    var four = try emirRun(source, 4, .{ 0, 0 });
+    defer four.deinit();
+    try t.expectEqual(one.docs.items.len, four.docs.items.len);
+    for (one.docs.items, four.docs.items) |a, b| try t.expectEqualStrings(a, b);
+}
+
 test "Options.point.tangent_step with live parameters: the deck's own transient prints the tangents append_points gives" {
     const source =
         \\deck tangents

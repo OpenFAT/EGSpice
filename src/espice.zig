@@ -236,6 +236,9 @@ pub const Problem = struct {
     /// found, which every later call returns too.
     checked_outputs: usize = 0,
     first_failure: ?anyerror = null,
+    /// `Options.point.emir`: `write_emir_json` reads every transient after
+    /// the run, so none is released.
+    emir: bool = false,
 
     /// A variant run's queries and its next result to publish.
     const Run = struct { session: analysis.session.Session, next_output: usize = 0 };
@@ -371,6 +374,9 @@ pub const Problem = struct {
         // the cold ladder (145 → 2 per point on a 20-stage CMOS chain).
         if (options.auto_point and isSweep(&self.prepared.deck)) point.warm_start = true;
         if (self.save_path != null or self.prepared.deck.stims.len != 0 or self.prepared.deck.soa.limits.len != 0) point.measures_only = false;
+        // `--emir` reads every accepted point to t_stop (#237).
+        if (point.emir) point.early_stop = false;
+        self.emir = point.emir;
         // No analysis card runs an OP, unless it would have no columns (a
         // title-only deck): ngspice runs nothing there either.
         const jobs: []Query = if (self.prepared.deck.queries.len == 0 and self.prepared.deck.probes.len == 0)
@@ -1362,6 +1368,32 @@ pub const Problem = struct {
         try out.print("{s}\n  ]\n}}\n", .{if (s.len == 0) "" else s[1..]});
     }
 
+    /// Writes `--emir`'s document `k` (#237), `espice-emir/1`, and returns
+    /// true; false, writing nothing, past the last one. One document per
+    /// variant (a variant row and temperature of the main session or of a
+    /// variant run, in output order): its first completed transient's
+    /// terminal currents (`Result.emir`) under its `variant` label
+    /// (`output.writeVariantJson`). An instance is named by its card, a
+    /// terminal by its device's port and a net by its node; an independent
+    /// source reports its first port, under `sources`. `em_avg` is what
+    /// `.meas EM_AVG` makes of the same halves with `.option em_recovery`.
+    pub fn write_emir_json(self: *const Problem, out: *std.Io.Writer, deck: []const u8, k: usize) !bool {
+        var n: usize = 0;
+        for (0..1 + self.runs.len) |s| {
+            const session = if (s == 0) &self.session else &self.runs[s - 1].session;
+            const outputs = session.outputs.items;
+            for (outputs, 0..) |id, j| {
+                if (!try emirFirst(session, outputs[0..j], id)) continue;
+                if (n == k) {
+                    try writeEmir(out, deck, &self.library, if (s == 0) &self.prepared else &self.prepared.runs[s - 1], session, id);
+                    return true;
+                }
+                n += 1;
+            }
+        }
+        return false;
+    }
+
     /// The `.meas` statistics over the Monte Carlo trials of each tran, AC
     /// and DC card, as text or as JSON objects.
     fn writeStatistics(self: *const Problem, out: *std.Io.Writer, json: bool) !void {
@@ -1494,8 +1526,8 @@ pub const Problem = struct {
     /// trials (`print_measures` reads them at the end), the tangent runs,
     /// and a requested OP that later queries still read.
     fn releaseDelivered(self: *Problem) void {
-        // `.save`, `.stim` and `print_soa` read the results after the run.
-        if (!self.session.config.final_plan or self.save_path != null or self.prepared.deck.stims.len != 0 or self.prepared.deck.soa.limits.len != 0) return;
+        // `.save`, `.stim`, `print_soa` and `write_emir_json` read the results after the run.
+        if (!self.session.config.final_plan or self.save_path != null or self.prepared.deck.stims.len != 0 or self.prepared.deck.soa.limits.len != 0 or self.emir) return;
         const outputs = self.session.outputs.items;
         const printed = if (self.prepared.deck.measures.len == 0 or self.measure_cursor.session > 0) outputs.len else self.measure_cursor.next;
         const upto = @min(self.next_output, printed);
@@ -1962,6 +1994,78 @@ fn variantOf(job: Query) ?u32 {
     return switch (job) {
         inline else => |o| o.tol.variant,
     };
+}
+
+/// Whether `id` is a completed transient with terminal currents and the
+/// first such of its variant after those in `before`.
+// ponytail: quadratic in the outputs; a key set once sweeps reach thousands of points.
+fn emirFirst(session: *const analysis.session.Session, before: []const QueryId, id: QueryId) !bool {
+    if (!try hasEmir(session, id)) return false;
+    const job = try session.query(id);
+    for (before) |b| if (try hasEmir(session, b)) {
+        const other = try session.query(b);
+        if (std.meta.eql(variantOf(other), variantOf(job)) and std.meta.eql(tempOf(other), tempOf(job))) return false;
+    };
+    return true;
+}
+
+/// Whether `id` is a completed, kept transient that read terminal currents.
+fn hasEmir(session: *const analysis.session.Session, id: QueryId) !bool {
+    const info = try session.info(id);
+    if (info.kind != .tran or info.status != .complete or session.released(id)) return false;
+    return (try session.result(id)).emir.terminals.len != 0;
+}
+
+/// `Problem.write_emir_json`'s document for transient `id` of `session`,
+/// which runs `prepared`.
+fn writeEmir(out: *std.Io.Writer, deck: []const u8, lib: *const frontend.Library, prepared: *const frontend.Prepared, session: *const analysis.session.Session, id: QueryId) !void {
+    const e = (try session.result(id)).emir;
+    const job = try session.query(id);
+    const d = &prepared.deck;
+    const ckt = &prepared.circuit;
+    try out.writeAll("{\n  \"format\": \"espice-emir/1\",\n  \"deck\": ");
+    try std.json.Stringify.encodeJsonString(deck, .{}, out);
+    try out.writeAll(",\n  \"analysis\": \"tran\",\n  \"variant\": ");
+    try output.writeVariantJson(out, d.variants, variantOf(job), tempOf(job));
+    try out.writeAll(",\n  \"temp\": ");
+    if (tempOf(job) orelse d.deck_temp) |temp| try output.writeJsonNumber(out, temp) else try out.writeAll("null");
+    try out.writeAll(",\n  \"window\": [");
+    try output.writeJsonNumber(out, e.from);
+    try out.writeAll(", ");
+    try output.writeJsonNumber(out, e.to);
+    try out.writeAll("],\n  \"em_recovery\": ");
+    try output.writeJsonNumber(out, d.em_recovery);
+    // `Wave.emAvg`'s value from the same halves and span.
+    const span = e.to - e.from;
+    inline for (.{ false, true }) |sources| {
+        try out.writeAll(if (sources) "\n  ],\n  \"sources\": [" else ",\n  \"terminals\": [");
+        var first = true;
+        for (e.terminals) |term| {
+            const b = ckt.batches[term.batch];
+            const source = std.mem.eql(u8, b.type_name, "vsource") or std.mem.eql(u8, b.type_name, "isource");
+            if (source != sources or (sources and term.port != 0)) continue;
+            try out.writeAll(if (first) "\n    {\"instance\": " else ",\n    {\"instance\": ");
+            first = false;
+            const t = ckt.batch_types[term.batch];
+            try std.json.Stringify.encodeJsonString(d.card_names.get(t, term.instance) orelse b.type_name, .{}, out);
+            if (!sources) {
+                try out.writeAll(", \"device\": ");
+                try std.json.Stringify.encodeJsonString(b.type_name, .{}, out);
+                try out.writeAll(", \"terminal\": ");
+                const ports = lib.vtable(t).unknown_names;
+                if (term.port < ports.len) try std.json.Stringify.encodeJsonString(ports[term.port], .{}, out) else try out.print("\"{d}\"", .{term.port});
+            }
+            try out.writeAll(", \"net\": ");
+            try std.json.Stringify.encodeJsonString(if (term.row == core.GROUND or term.row >= ckt.n) "0" else ckt.nodeName(term.row), .{}, out);
+            const em_avg = if (span > 0) (@max(term.pos, term.neg) - d.em_recovery * @min(term.pos, term.neg)) / span else std.math.nan(f64);
+            for ([_][]const u8{ "avg", "em_avg", "rms", "peak" }, [_]f64{ term.avg, em_avg, term.rms, term.peak }) |key, v| {
+                try out.print(", \"{s}\": ", .{key});
+                try output.writeJsonNumber(out, v);
+            }
+            try out.writeAll("}");
+        }
+    }
+    try out.writeAll("\n  ]\n}\n");
 }
 
 /// The error query `id` ended with, its prerequisite's for a query that
