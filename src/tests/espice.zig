@@ -847,6 +847,32 @@ test ".option soa: a ramp crossing vgs_max twice is two excursions; maxwarns pri
     try t.expectEqualStrings("", lines.rest());
 }
 
+test ".option soa: a BSIM4 drain ramp crossing vds_max twice reports ngspice 45's windows (#238)" {
+    // Oracle: ngspice 45 (nixpkgs) on this deck, 2026-10-27,
+    // `ngspice -n -b -r reference.raw soa.sp`: 1006 "Instance: m1 ... has
+    // exceeded Vds_max=1.5" warnings in two runs of 503 accepted points,
+    // from 7.5028e-07 and 2.7505e-06 s, each closed by the next accepted
+    // time, 1.2505e-06 and 3.2505e-06 s. ngspice's MOS1 ignores vds_max, so
+    // the card is BSIM4. Either simulator's edge lies within one step
+    // (tmax, 1 ns) after the crossing; the suite keeps no SOA oracle, as no
+    // dialect defines its output.
+    const text = try soaText("soa vds_max ramp\n.option warn=1 maxwarns=100000\nV1 d 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)\nV2 g 0 1\n" ++
+        "M1 d g 0 0 nm\n.model nm nmos level=54 vds_max=1.5\n.tran 1n 4u 0 1n\n.end\n");
+    defer t.allocator.free(text);
+    const ngspice = [_][2]f64{ .{ 7.5028e-07, 1.2505e-06 }, .{ 2.7505e-06, 3.2505e-06 } };
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    for (ngspice) |window| {
+        const line = lines.next().?;
+        try t.expect(std.mem.startsWith(u8, line, "soa: m1 vds = ") and std.mem.endsWith(u8, line, " s (tran)"));
+        var words = std.mem.tokenizeScalar(u8, line[std.mem.indexOf(u8, line, " from ").?..], ' ');
+        _ = words.next(); // from
+        try t.expectApproxEqAbs(window[0], try std.fmt.parseFloat(f64, words.next().?), 1e-9);
+        _ = words.next(); // to
+        try t.expectApproxEqAbs(window[1], try std.fmt.parseFloat(f64, words.next().?), 1e-9);
+    }
+    try t.expectEqualStrings("soa: 2 excursions on 1 instances", lines.next().?);
+}
+
 test ".option soa: BJT vce_max, diode bv_max, R and C bv_max held at the limit report nothing, 1 mV past it one excursion (#238)" {
     // Oracle: as for vgs_max, each limit is the solved terminal voltage of
     // the same deck checked against a limit far above it, and no SOA key
