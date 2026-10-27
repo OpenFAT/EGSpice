@@ -180,7 +180,10 @@ pub fn place() Placement {
 /// low; cap by each device's `split` share if multi-GPU waves bind.
 pub fn waveLanes(devs: []const Device, lane_bytes: usize) usize {
     var lanes: usize = std.math.maxInt(usize);
-    for (devs) |d| lanes = @min(lanes, d.budget / @max(lane_bytes, 1));
+    // An unknown budget (maxInt) caps nothing.
+    for (devs) |d| if (d.budget != std.math.maxInt(usize)) {
+        lanes = @min(lanes, d.budget / @max(lane_bytes, 1));
+    };
     return @max(lanes, 1);
 }
 

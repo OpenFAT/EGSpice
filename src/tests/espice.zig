@@ -928,7 +928,8 @@ test "a Verilog-A model's own desc and units variables are @n1[...] vectors with
     try t.expectEqual(@as(f64, 0.5), try column(r, "@n1[vth]"));
     try t.expectEqual(@as(f64, 2), try column(r, "@n1[region]"));
     // `units` alone makes `vgs` one (LRM 3.2.1).
-    try t.expectEqual(@as(f64, 1.2), try column(r, "@n1[vgs]"));
+    // V(g) - V(s) of two solved nodes: 1 ulp from 1.2.
+    try t.expectApproxEqRel(@as(f64, 1.2), try column(r, "@n1[vgs]"), 1e-15);
     // `vov` has neither `desc` nor `units`, and an N card has no terminal quantities.
     var other: [512]u8 = undefined;
     for ([_][]const u8{ "@n1[vov]", "@n1[gds]" }) |name| {
@@ -1843,7 +1844,8 @@ test "--measures (#235): Monte Carlo trials are labelled by trial, and the stati
 
 /// A margin linear in two unit Gaussians: v(out) = 0.6 z1 + 0.8 z2 is
 /// N(0, s²) at sigma scale s, so `m > b` fails with probability Q(b/s).
-const sss_linear = "sss linear\n.param z1=agauss(0,1,1) z2=agauss(0,1,1)\nv1 in 0 1\nr0 in 0 1k\nb1 out 0 v=0.6*z1+0.8*z2\nr1 out 0 1k\n.dc v1 1 1 1 sweep monte={d} sigma_scale={s} fail='m > {d}'\n.meas dc m find v(out) {s}\n.end\n";
+/// The sweep has two points: `find ... at=` needs an interval.
+const sss_linear = "sss linear\n.param z1=agauss(0,1,1) z2=agauss(0,1,1)\nv1 in 0 1\nr0 in 0 1k\nb1 out 0 v=0.6*z1+0.8*z2\nr1 out 0 1k\n.dc v1 1 2 1 sweep monte={d} sigma_scale={s} fail='m > {d}'\n.meas dc m find v(out) {s}\n.end\n";
 
 /// Runs `source` at `max_parallel`, printing its `.meas` text into `text`
 /// and its `--measures` JSON into `json`; returns `print_measures`' error
@@ -1905,9 +1907,9 @@ test "SIGMA_SCALE (#239): a margin linear in Gaussians fails Q(b/s) per scale an
 }
 
 test "SIGMA_SCALE (#239): a trial whose FAIL card has no value fails, and a fit without three informative scales is refused" {
-    // `at=2` lies outside the one-point sweep: `m` has no value in any
-    // trial, so every trial fails, and no scale has a pass to fit.
-    const src = try std.fmt.allocPrint(t.allocator, sss_linear, .{ 10, "1,2,3", 100, "at=2" });
+    // `at=3` lies outside the sweep 1..2: `m` has no value in any trial,
+    // so every trial fails, and no scale has a pass to fit.
+    const src = try std.fmt.allocPrint(t.allocator, sss_linear, .{ 10, "1,2,3", 100, "at=3" });
     defer t.allocator.free(src);
     var text: std.Io.Writer.Allocating = .init(t.allocator);
     defer text.deinit();
