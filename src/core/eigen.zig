@@ -1,14 +1,28 @@
-//! Dense real eigenvalues: balance, Hessenberg reduction, Francis
-//! double-shift QR. Row-major n×n input, destroyed in place; eigenvalues out.
-//! Cites LAPACK dgebal (permutation and scaling) and Numerical Recipes
-//! `balanc`; the QR is the textbook Francis double-shift chase.
+//! Dense real eigenvalues: a row-major n×n matrix in (destroyed in place),
+//! its eigenvalues out. Permutation isolation, balancing, Householder
+//! Hessenberg reduction, then the Francis double-shift QR with deflation.
+//! O(n³), no allocation.
+//! Cites: LAPACK dgebal (permutation and scaling); Numerical Recipes
+//! `balanc`; EISPACK hqr (the exceptional shift); the textbook Francis
+//! double-shift chase.
+//!
+//! Contents:
+//! - `pub const Eigs = struct { count: usize, converged: bool }`
+//! - `pub fn eigenvalues(n: usize, a: []f64, out: []Complex, tol: f64, max_iter: u32) Eigs`
+//! - `pub fn hessenbergReduce(n: usize, a: []f64, scratch: []f64) void`
+
 const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("numerics.zig");
 const Complex = num.Complex;
+const testing = std.testing;
 
 /// How many eigenvalues were written, and whether all of them were.
 pub const Eigs = struct { count: usize, converged: bool };
+
+/// Past 3x the widest f64 vector (8 lanes on AVX-512), so every lane count
+/// sees full blocks and every tail length.
+const test_max_n = 3 * 8 + 2;
 
 /// Writes the eigenvalues of `a` (n×n, destroyed) into `out[0..count]`,
 /// in no particular order; `out` needs n slots. A subdiagonal entry below
@@ -28,6 +42,61 @@ pub fn eigenvalues(n: usize, a: []f64, out: []Complex, tol: f64, max_iter: u32) 
     if (rest.converged) assert(count == n);
     return .{ .count = count, .converged = rest.converged };
 }
+
+/// Reduces `a` (n×n, row-major) in place to upper Hessenberg form by
+/// Householder similarities; the eigenvalues are unchanged and every entry
+/// below the subdiagonal is an exact zero. `scratch` holds at least 2n
+/// entries: a contiguous copy of each reflector v and the row vector
+/// βvᵀA, so both updates run over contiguous rows instead of stride-n
+/// columns. O(n³). Asserts that `a` holds n×n entries.
+pub fn hessenbergReduce(n: usize, a: []f64, scratch: []f64) void {
+    assert(a.len >= n * n);
+    assert(scratch.len >= 2 * n);
+    if (n <= 2) return;
+
+    for (0..n - 2) |k| {
+        var sigma: f64 = 0;
+        for (k + 1..n) |row| {
+            const x = a[row * n + k];
+            sigma += x * x;
+        }
+        sigma = @sqrt(sigma);
+
+        if (sigma == 0) continue;
+
+        if (a[(k + 1) * n + k] < 0) sigma = -sigma;
+
+        a[(k + 1) * n + k] += sigma;
+        const beta = 1.0 / (sigma * a[(k + 1) * n + k]);
+
+        // The reflector v = a[k+1.., k]. Column k itself is known after the
+        // update (-sigma, then zeros), so only columns k+1.. are touched.
+        const m = n - (k + 1);
+        const v = scratch[0..m];
+        const w = scratch[n..][0..m];
+        for (v, k + 1..) |*x, row| x.* = a[row * n + k];
+
+        // From the left: A := (I - beta * v * v^T) * A. w = beta * vᵀA is
+        // summed row by row, each w[j] in ascending row order.
+        @memset(w, 0);
+        for (v, k + 1..) |x, row| num.axpy(w, x, a[row * n + k + 1 ..][0..m]);
+        num.scale(w, beta, w);
+        for (v, k + 1..) |x, row| num.axpy(a[row * n + k + 1 ..][0..m], -x, w);
+
+        // From the right: A := A * (I - beta * v * v^T)
+        for (0..n) |row| {
+            const ar = a[row * n + k + 1 ..][0..m];
+            num.axpy(ar, -beta * num.dot(ar, v), v);
+        }
+
+        // francisStep reads the slots below the subdiagonal as bulge
+        // entries, so they must be true zeros.
+        a[(k + 1) * n + k] = -sigma;
+        for (k + 2..n) |row| a[row * n + k] = 0;
+    }
+}
+
+// ---- private ----
 
 /// dgebal's permutation step. A row or column whose off-diagonal part inside
 /// the active block is zero carries its diagonal entry as an exact
@@ -228,59 +297,6 @@ fn extract2x2(a: []const f64, n: usize, offset: usize, out: *[2]Complex) void {
     }
 }
 
-/// Reduces `a` (n×n, row-major) in place to upper Hessenberg form by
-/// Householder similarities; the eigenvalues are unchanged and every entry
-/// below the subdiagonal is an exact zero. `scratch` holds at least 2n
-/// entries: a contiguous copy of each reflector v and the row vector
-/// βvᵀA, so both updates run over contiguous rows instead of stride-n
-/// columns. O(n³). Asserts that `a` holds n×n entries.
-pub fn hessenbergReduce(n: usize, a: []f64, scratch: []f64) void {
-    assert(a.len >= n * n);
-    assert(scratch.len >= 2 * n);
-    if (n <= 2) return;
-
-    for (0..n - 2) |k| {
-        var sigma: f64 = 0;
-        for (k + 1..n) |row| {
-            const x = a[row * n + k];
-            sigma += x * x;
-        }
-        sigma = @sqrt(sigma);
-
-        if (sigma == 0) continue;
-
-        if (a[(k + 1) * n + k] < 0) sigma = -sigma;
-
-        a[(k + 1) * n + k] += sigma;
-        const beta = 1.0 / (sigma * a[(k + 1) * n + k]);
-
-        // The reflector v = a[k+1.., k]. Column k itself is known after the
-        // update (-sigma, then zeros), so only columns k+1.. are touched.
-        const m = n - (k + 1);
-        const v = scratch[0..m];
-        const w = scratch[n..][0..m];
-        for (v, k + 1..) |*x, row| x.* = a[row * n + k];
-
-        // From the left: A := (I - beta * v * v^T) * A. w = beta * vᵀA is
-        // summed row by row, each w[j] in ascending row order.
-        @memset(w, 0);
-        for (v, k + 1..) |x, row| num.axpy(w, x, a[row * n + k + 1 ..][0..m]);
-        num.scale(w, beta, w);
-        for (v, k + 1..) |x, row| num.axpy(a[row * n + k + 1 ..][0..m], -x, w);
-
-        // From the right: A := A * (I - beta * v * v^T)
-        for (0..n) |row| {
-            const ar = a[row * n + k + 1 ..][0..m];
-            num.axpy(ar, -beta * num.dot(ar, v), v);
-        }
-
-        // francisStep reads the slots below the subdiagonal as bulge
-        // entries, so they must be true zeros.
-        a[(k + 1) * n + k] = -sigma;
-        for (k + 2..n) |row| a[row * n + k] = 0;
-    }
-}
-
 /// One Francis double-shift bulge chase over the active block, rows and
 /// columns [lo, nn).
 fn francisStep(n: usize, a: []f64, lo: usize, nn: usize, iter: u32) void {
@@ -398,11 +414,6 @@ fn applyReflector2(n: usize, a: []f64, lo: usize, nn: usize, k: usize, x_in: f64
         a[row * n + k + 1] -= tv * v1;
     }
 }
-
-const testing = std.testing;
-/// Past 3x the widest f64 vector (8 lanes on AVX-512), so every lane count
-/// sees full blocks and every tail length.
-const test_max_n = 3 * 8 + 2;
 
 /// The textbook reduction `hessenbergReduce` reorganizes: each column's
 /// dot product taken down the stride-n column, the reflector read from `a`

@@ -1,6 +1,21 @@
-//! Net and device names, each stored once: bytes plus u32 offsets,
-//! deduplicated through a map keyed by the dense id itself. Strings in,
-//! dense `Name` ids out. Cites nothing: a plain intern table.
+//! Net and device names, each stored once. Strings in, dense `Name` ids out,
+//! in first-seen order. Layout: every name's bytes back to back in one
+//! buffer, a u32 start offset per name (plus one closing offset), and a hash
+//! set keyed by the id itself that hashes the stored bytes on demand, so a
+//! set entry is 4 bytes.
+//! Cites: none (a plain intern table).
+//!
+//! Contents:
+//! - `pub const Name = enum(u32) { _ }`, `Name.index(n: Name) u32`
+//! - `pub const bytes_max: usize`
+//! - `pub const InternPool = struct`
+//! - `InternPool.deinit(p: *InternPool, gpa: Allocator) void`
+//! - `InternPool.intern(p: *InternPool, gpa: Allocator, s: []const u8) Allocator.Error!Name`
+//! - `InternPool.reserve(p: *InternPool, gpa: Allocator, names: u32) Allocator.Error!void`
+//! - `InternPool.find(p: *const InternPool, s: []const u8) ?Name`
+//! - `InternPool.str(p: *const InternPool, n: Name) []const u8`
+//! - `Context.hash`, `Context.eql`, `Adapter.hash`, `Adapter.eql`: the set's hooks
+
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -8,46 +23,33 @@ const Allocator = std.mem.Allocator;
 /// Dense id of an interned name, in first-seen order.
 pub const Name = enum(u32) {
     _,
+
     /// The id as a row index into tables kept parallel to the pool.
     pub inline fn index(n: Name) u32 {
         return @backingInt(n);
     }
 };
+
+/// Most name bytes one pool holds, the reach of a u32 offset with one id to
+/// spare: past it `intern` fails instead of wrapping an offset.
+pub const bytes_max: usize = std.math.maxInt(u32) - 1;
+
 comptime {
-    // The map stores bare ids, so its entries are 4 bytes.
+    // The set stores bare ids, so its entries are 4 bytes.
     assert(@sizeOf(Name) == 4);
+    // Distinct names are at most bytes + 1 (one empty name), so every id fits.
+    assert(bytes_max + 1 <= std.math.maxInt(u32));
 }
 
-/// Deduplicating string table. Names live in one byte buffer; the map holds
-/// only ids and hashes the stored bytes on demand. Capacity: maxInt(u32)
-/// bytes of names in all, the reach of a u32 offset.
+/// Deduplicating string table. Invariant: `offs` is empty or holds one entry
+/// more than the pool has names, ascending, ending at `bytes.items.len`; the
+/// set holds exactly the ids `0..offs.len - 1`. Change it only through its
+/// methods.
 pub const InternPool = struct {
     bytes: std.ArrayList(u8) = .empty,
     /// `offs[i]` starts name i; one trailing entry ends the last name.
     offs: std.ArrayList(u32) = .empty,
     map: std.HashMapUnmanaged(Name, void, Context, std.hash_map.default_max_load_percentage) = .empty,
-
-    /// Hashes a stored name through the offsets, so a key is just its id.
-    const Context = struct {
-        pool: *const InternPool,
-        pub fn hash(ctx: Context, n: Name) u64 {
-            return std.hash_map.hashString(ctx.pool.str(n));
-        }
-        pub fn eql(_: Context, a: Name, b: Name) bool {
-            return a == b;
-        }
-    };
-
-    /// Looks a string up against stored ids without interning it.
-    const Adapter = struct {
-        pool: *const InternPool,
-        pub fn hash(_: Adapter, s: []const u8) u64 {
-            return std.hash_map.hashString(s);
-        }
-        pub fn eql(ctx: Adapter, s: []const u8, n: Name) bool {
-            return std.mem.eql(u8, s, ctx.pool.str(n));
-        }
-    };
 
     /// Frees the pool's storage; every `str` slice dies with it.
     pub fn deinit(p: *InternPool, gpa: Allocator) void {
@@ -58,15 +60,22 @@ pub const InternPool = struct {
     }
 
     /// Returns the id of `s`, adding it on first sight. Invalidates slices
-    /// returned by `str` when it adds. Leaves the pool unchanged on error.
+    /// returned by `str` when it adds. Fails with `error.OutOfMemory` when
+    /// memory runs out or the pool would pass `bytes_max`; the pool is then
+    /// unchanged but for capacity and, on the first call, the opening offset.
     pub fn intern(p: *InternPool, gpa: Allocator, s: []const u8) Allocator.Error!Name {
         if (p.offs.items.len == 0) try p.offs.append(gpa, 0);
+        assert(p.offs.items.len == p.map.count() + 1);
+
         const gop = try p.map.getOrPutContextAdapted(gpa, s, Adapter{ .pool = p }, .{ .pool = p });
         if (gop.found_existing) return gop.key_ptr.*;
         errdefer p.map.removeByPtr(gop.key_ptr);
+
+        if (s.len > bytes_max - p.bytes.items.len) return error.OutOfMemory;
         const n: Name = @fromBackingInt(@intCast(p.offs.items.len - 1));
         try p.bytes.appendSlice(gpa, s);
         errdefer p.bytes.shrinkRetainingCapacity(p.bytes.items.len - s.len);
+
         try p.offs.append(gpa, @intCast(p.bytes.items.len));
         gop.key_ptr.* = n;
         assert(p.offs.items.len == n.index() + 2);
@@ -74,25 +83,59 @@ pub const InternPool = struct {
         return n;
     }
 
-    /// Pre-sizes the map and the offsets for `names` distinct names in all,
+    /// Pre-sizes the set and the offsets for `names` distinct names in all,
     /// so interning that many grows neither. Only capacity changes, also on
     /// error.
     pub fn reserve(p: *InternPool, gpa: Allocator, names: u32) Allocator.Error!void {
         try p.map.ensureTotalCapacityContext(gpa, names, .{ .pool = p });
         try p.offs.ensureTotalCapacity(gpa, @as(usize, names) + 1);
+        assert(p.offs.capacity > names);
     }
 
     /// Returns the id of `s` if it was interned, without adding it.
     pub fn find(p: *const InternPool, s: []const u8) ?Name {
-        return p.map.getKeyAdapted(s, Adapter{ .pool = p });
+        const n = p.map.getKeyAdapted(s, Adapter{ .pool = p }) orelse return null;
+        assert(n.index() + 1 < p.offs.items.len);
+        return n;
     }
 
     /// Returns the bytes of `n`. Valid until the next `intern` that adds a
     /// name. Asserts that `n` is an id this pool handed out.
     pub fn str(p: *const InternPool, n: Name) []const u8 {
         assert(n.index() + 1 < p.offs.items.len);
-        return p.bytes.items[p.offs.items[n.index()]..p.offs.items[n.index() + 1]];
+        const start = p.offs.items[n.index()];
+        const end = p.offs.items[n.index() + 1];
+        assert(start <= end);
+        return p.bytes.items[start..end];
     }
+
+    // ---- private ----
+
+    /// Hashes a stored name through the offsets, so a key is just its id.
+    const Context = struct {
+        pool: *const InternPool,
+
+        pub fn hash(ctx: Context, n: Name) u64 {
+            return std.hash_map.hashString(ctx.pool.str(n));
+        }
+
+        pub fn eql(_: Context, a: Name, b: Name) bool {
+            return a == b;
+        }
+    };
+
+    /// Looks a string up against stored ids without interning it.
+    const Adapter = struct {
+        pool: *const InternPool,
+
+        pub fn hash(_: Adapter, s: []const u8) u64 {
+            return std.hash_map.hashString(s);
+        }
+
+        pub fn eql(ctx: Adapter, s: []const u8, n: Name) bool {
+            return std.mem.eql(u8, s, ctx.pool.str(n));
+        }
+    };
 };
 
 test "names intern once, in first-seen order" {

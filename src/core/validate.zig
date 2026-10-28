@@ -1,10 +1,24 @@
-//! Query validation at the analysis boundary: every numeric option a driver
-//! would otherwise trust, checked once before any allocation. The frontend
-//! runs it on each analysis card's query too, so a card it refuses names
-//! its line (#108). In: a `Query` and the circuit size; out: nothing, or
-//! `error.InvalidQueryOptions`. The HSPICE `.fft` bounds cite [CR .FFT].
+//! Query validation at the analysis boundary: a `Query` and the circuit size
+//! in, nothing or an error out. Every numeric option a driver would
+//! otherwise trust is checked once, before any allocation; past this point
+//! the drivers assert what it established. The frontend runs it on each
+//! analysis card's query too, so a card it refuses names its line (#108).
+//! Cites: HSPICE [CR .FFT] (the `.fft` bounds); analysis/pss/mhb.zig (the
+//! multi-tone box limits).
+//!
+//! Contents:
+//! - `pub const mhb_max_tones`, `pub const mhb_max_box: usize`
+//! - `pub const Error = error{InvalidQueryOptions}`
+//! - `pub const DeckError = Error || error{DcSweepSourceNotFound}`
+//! - `pub fn validate(query: requests.Query, n: u32) Error!void`
+//! - `pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) DeckError!void`
+//! - `pub fn envelopeMaxPoints(options: requests.Envelope) u32`
+//! - `pub fn matexEstPoints(opts: requests.Matex) u32`
+
 const std = @import("std");
+const assert = std.debug.assert;
 const requests = @import("query.zig");
+const Tolerances = @import("numerics.zig").Tolerances;
 const Deck = @import("deck.zig").Deck;
 
 /// The most tones a multi-tone HB spectrum takes (analysis/pss/mhb.zig).
@@ -13,29 +27,141 @@ pub const mhb_max_tones = 8;
 /// The largest box a multi-tone HB spectrum enumerates, Π(2H_i + 1).
 pub const mhb_max_box: usize = 1 << 22;
 
+/// Every way `validate` refuses a query. Nothing is allocated or changed.
+pub const Error = error{
+    /// A non-finite option, a bad tolerance, a row past the circuit, a zero
+    /// count, a step or frequency no driver can take, or a derived table
+    /// too large to address; also any query on an empty circuit.
+    InvalidQueryOptions,
+};
+
+/// Every way `validateDeck` refuses a query.
+pub const DeckError = Error || error{
+    /// A `.dc` sweep names a (type, index) card the deck does not have.
+    DcSweepSourceNotFound,
+};
+
+/// Row fields, by name, that every query kind having one must keep below n.
+const row_fields = .{ "out_node", "out_neg", "out_pos", "osc_node", "output_node", "output_neg", "output_branch", "source_node", "ac_source_node", "probe_p", "probe_n", "probe_branch", "input_branch", "in_branch", "in_pos", "in_neg", "drive_branch", "drive2_branch", "local_gnd", "in_nodes", "input_nodes" };
+/// Counts and iteration limits that must be non-zero.
+const count_fields = .{ "n_samples", "n_time_samples", "pss_n_samples", "n_trials", "max_steps", "max_iter", "max_newton", "max_shooting_iter", "carrier_steps_per_period", "periods_per_outer_step", "min_periods_per_step", "max_periods_per_step", "max_outer_steps", "max_points", "m_max", "gmres_restart", "gmres_max_restarts", "max_newton_iter", "pss_max_newton_iter", "pss_shoot_max_iter", "pss_newton_max_iter", "qr_max_iter" };
+/// Times and frequencies that must be positive (`Temp` excepted: its
+/// `t_stop` is a temperature).
+const positive_fields = .{ "f0", "f1", "f2", "f_lo", "f_fundamental", "period", "t_carrier", "dt_init", "dt_min", "t_stop" };
+/// Solver tolerances: positive and finite.
+const tol_fields = .{ "shooting_tol", "fd_epsilon", "newton_tol", "gmres_tol", "hb_tol", "pss_newton_tol", "pss_shoot_tol", "krylov_tol", "qr_tol", "fd_eps", "envelope_reltol" };
+/// Fundamentals: their period must be a usable time step.
+const freq_fields = .{ "f0", "f1", "f2", "f_lo", "f_fundamental" };
+
+/// Checks `query` against a circuit of `n` unknowns: finite options, valid
+/// tolerances, in-range node and branch indices, positive steps and counts,
+/// and representable derived sizes. Fails with `error.InvalidQueryOptions`,
+/// also for `n == 0`. Allocates nothing.
+pub fn validate(query: requests.Query, n: u32) Error!void {
+    if (n == 0) return error.InvalidQueryOptions;
+    switch (query) {
+        inline else => |o| try checkCommon(@TypeOf(o), o, n),
+    }
+    try checkKind(query, n);
+}
+
+/// `validate`, plus the checks that need the deck: `error.InvalidQueryOptions`
+/// when the query's `tol.variant`, an `.mc` variant range or a `.dc` tangent
+/// row or a `.tran` one lies past `deck.variants`, and `error.DcSweepSourceNotFound`
+/// when a `.dc` sweep names a card the deck does not have. Asserts that a
+/// non-empty `deck.variants` has one `starts` entry more than rows.
+pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) DeckError!void {
+    try validate(query, n);
+    const rows = deck.variants.count();
+    const variant = switch (query) {
+        inline else => |o| o.tol.variant,
+    };
+    if (variant) |v| if (v >= rows) return error.InvalidQueryOptions;
+    switch (query) {
+        .mc => |o| if (@as(u64, o.variants.first) + o.variants.count > rows) return error.InvalidQueryOptions,
+        .dc => |o| {
+            try dcTargetExists(o.target, deck);
+            if (o.target2) |t2| try dcTargetExists(t2, deck);
+            for (o.tangents) |row| if (row >= rows) return error.InvalidQueryOptions;
+        },
+        .tran => |o| for (o.tangents) |row| if (row >= rows) return error.InvalidQueryOptions,
+        .ac, .dcmatch, .disto, .envelope, .four, .hb, .matex, .noise, .op, .pac, .pnoise, .pss, .pxf, .pz, .qpss, .sens, .sp, .stb, .temp, .tf, .tran_noise, .hbac, .hbnoise, .hbxf, .phasenoise, .lstb, .acxf, .dcxf, .dcinc, .fft, .acmatch, .dcsens, .hblin => {},
+    }
+}
+
 // What the drivers allocate, not their caps: a cap times n can pass the
-// 64-plane ceiling on a 32-bit target (wasm) where the run never comes near it.
-// Both live here so the frontend can validate without the analysis module;
-// analysis/tran/envelope.zig and matex.zig alias them.
+// 64-plane ceiling on a 32-bit target (wasm) where the run never comes near
+// it. Both live here so the frontend can validate without the analysis
+// module; analysis/tran/envelope.zig and matex.zig alias them.
 
 /// Upper bound on envelope rows: every accepted outer step advances at least
 /// min_periods_per_step carrier periods, plus the t = 0 row and one row of
-/// rounding slack.
+/// rounding slack. Asserts options `validate` accepts (a positive carrier
+/// and stop time).
 pub fn envelopeMaxPoints(options: requests.Envelope) u32 {
     const min_step = @as(f64, @floatFromInt(@max(options.min_periods_per_step, 1))) * options.t_carrier;
     const by_time = @ceil(options.t_stop / min_step);
-    const cap = @as(f64, @floatFromInt(options.max_outer_steps));
-    return @as(u32, @intFromFloat(@min(by_time, cap))) + 2;
+    const cap: f64 = @floatFromInt(options.max_outer_steps);
+    const rows = @min(by_time, cap);
+    assert(rows >= 0);
+    return @as(u32, @intFromFloat(rows)) + 2;
 }
 
 /// The waveform rows MATEX's `run` reserves up front: two per output-capped
 /// step, at least 256, at most `max_points`. The waveform grows past it.
 pub fn matexEstPoints(opts: requests.Matex) u32 {
     const h_cap = opts.h_output_cap orelse opts.t_stop / 200.0;
-    return @intFromFloat(@min(@max(256, opts.t_stop / h_cap * 2.0), @as(f64, @floatFromInt(opts.max_points))));
+    const est = @min(@max(256, opts.t_stop / h_cap * 2.0), @as(f64, @floatFromInt(opts.max_points)));
+    assert(est >= 0);
+    return @intFromFloat(est);
 }
 
-/// True when every float reachable from `value` is finite.
+// ---- private ----
+
+/// The checks every option struct gets, driven by which named fields it
+/// has. Comptime reflection over the field-name tables above: the axis is
+/// the 36 query kinds, and a hand-written check per kind would repeat each
+/// rule up to 20 times.
+fn checkCommon(comptime T: type, o: T, n: u32) Error!void {
+    @setEvalBranchQuota(10000);
+    assert(n > 0);
+    if (!finite(o)) return error.InvalidQueryOptions;
+    try tolerance(o.tol);
+    inline for (row_fields) |field| if (@hasField(T, field)) {
+        const value = @field(o, field);
+        switch (@TypeOf(value)) {
+            u32 => if (value >= n) return error.InvalidQueryOptions,
+            ?u32 => if (value) |v| if (v >= n) return error.InvalidQueryOptions,
+            ?[2]u32 => if (value) |v| for (v) |row| if (row >= n) return error.InvalidQueryOptions,
+            else => comptime unreachable, // else: a new index field type needs its arm
+        }
+    };
+    if (@hasField(T, "sweep")) {
+        // `.lin` is the one grid that may start at DC; every geometric
+        // grid needs a positive first point to step from.
+        if (o.sweep.f_start < 0 or o.sweep.f_stop < o.sweep.f_start) return error.InvalidQueryOptions;
+        if (o.sweep.kind != .lin and o.sweep.f_start <= 0) return error.InvalidQueryOptions;
+        if (o.sweep.points == 0) return error.InvalidQueryOptions;
+        if (o.sweep.f_start > 0) try frequency(o.sweep.f_start);
+        try frequency(o.sweep.f_stop);
+        _ = try elements(&.{ o.sweep.count(), n, 2 });
+    }
+    inline for (count_fields) |field| if (@hasField(T, field)) {
+        if (@field(o, field) == 0) return error.InvalidQueryOptions;
+    };
+    inline for (positive_fields) |field| if (@hasField(T, field) and T != requests.Temp) {
+        if (@field(o, field) <= 0) return error.InvalidQueryOptions;
+    };
+    inline for (tol_fields) |field| if (@hasField(T, field)) try positive(@field(o, field));
+    inline for (freq_fields) |field| if (@hasField(T, field)) try frequency(@field(o, field));
+    if (@hasField(T, "gmres_restart")) {
+        _ = try elements(&.{ @as(u64, o.gmres_restart) + 1, @as(u64, o.gmres_restart) + 1 });
+        _ = try elements(&.{ @as(u64, o.gmres_restart) + 1, n });
+    }
+}
+
+/// True when every float reachable from `value` is finite. `anytype`
+/// because it recurses through every field type of every option struct.
 fn finite(value: anytype) bool {
     return switch (@typeInfo(@TypeOf(value))) {
         .float => std.math.isFinite(value),
@@ -52,37 +178,40 @@ fn finite(value: anytype) bool {
     };
 }
 
-/// Returns the point count of an ascending or descending linear sweep.
-fn sweep(start: f64, stop: f64, step: f64) !usize {
-    const intervals = (stop - start) / step;
-    if (step == 0 or intervals < 0) return error.InvalidQueryOptions;
-    const count = @floor(intervals + 1e-6) + 1;
-    if (!std.math.isFinite(count) or count >= @as(f64, @floatFromInt(std.math.maxInt(u32))))
-        return error.InvalidQueryOptions;
-    // Repeated-addition sweeps must make representable progress at both ends.
-    if (start != stop and (start + step == start or stop + step == stop)) return error.InvalidQueryOptions;
-    return @intFromFloat(count);
+/// reltol and trtol scale every acceptance test and step bound, so they must
+/// be positive. abstol, vntol and chgtol are absolute floors that ngspice
+/// accepts at 0, leaving the relative part alone.
+fn tolerance(t: Tolerances) Error!void {
+    inline for (.{ "reltol", "residual_tol", "trtol" }) |field| try positive(@field(t, field));
+    if (t.abstol < 0 or t.vntol < 0 or t.chgtol < 0 or t.gmin < 0 or t.gmin_start < 0) return error.InvalidQueryOptions;
+    if (t.itl1 == 0 or t.itl2 == 0 or t.itl4 == 0) return error.InvalidQueryOptions;
+    if (t.temp_c) |c| try kelvin(c);
 }
 
-fn positive(value: f64) !void {
+fn positive(value: f64) Error!void {
     if (!std.math.isFinite(value) or value <= 0) return error.InvalidQueryOptions;
 }
 
-fn timeStep(value: f64) !void {
+/// Refuses a temperature at or below absolute zero, as the frontend does.
+fn kelvin(celsius: f64) Error!void {
+    if (celsius <= -273.15) return error.InvalidQueryOptions;
+}
+
+fn frequency(value: f64) Error!void {
+    try timeStep(1 / value);
+    try positive(2 * std.math.pi * value);
+}
+
+fn timeStep(value: f64) Error!void {
     try positive(value);
     // Trapezoidal companion stamps use 2/dt.
     try positive(2 / value);
 }
 
-fn frequency(value: f64) !void {
-    try timeStep(1 / value);
-    try positive(2 * std.math.pi * value);
-}
-
 /// Returns the product of `factors`, rejecting any slab too large for 64 f64
 /// planes of it to be byte-addressable. A representability ceiling for the
 /// unchecked arithmetic downstream, not a memory budget.
-fn elements(factors: []const u64) !usize {
+fn elements(factors: []const u64) Error!usize {
     // u64, so a caller's `n + 1` cannot wrap a 32-bit usize to a small count.
     var count: u64 = 1;
     for (factors) |factor| count = std.math.mul(u64, count, factor) catch return error.InvalidQueryOptions;
@@ -90,80 +219,10 @@ fn elements(factors: []const u64) !usize {
     return @intCast(count);
 }
 
-/// reltol and trtol scale every acceptance test and step bound, so they must
-/// be positive. abstol, vntol and chgtol are absolute floors that ngspice
-/// accepts at 0, leaving the relative part alone.
-fn tolerance(t: @import("numerics.zig").Tolerances) !void {
-    inline for (.{ "reltol", "residual_tol", "trtol" }) |field|
-        try positive(@field(t, field));
-    if (t.abstol < 0 or t.vntol < 0 or t.chgtol < 0 or t.gmin < 0 or t.gmin_start < 0 or t.itl1 == 0 or t.itl2 == 0 or t.itl4 == 0)
-        return error.InvalidQueryOptions;
-    if (t.temp_c) |c| try kelvin(c);
-}
-
-/// Refuses a temperature at or below absolute zero, as the frontend does.
-fn kelvin(celsius: f64) !void {
-    if (celsius <= -273.15) return error.InvalidQueryOptions;
-}
-
-/// Refuses a port whose rows are out of range or whose z0 is not positive.
-fn port(p: requests.Port, n: u32, net: bool) !void {
-    const branch_ok = p.branch < n or (net and p.branch == requests.Port.no_branch);
-    if (p.node >= n or p.neg >= n or !branch_ok or !(p.z0 > 0)) return error.InvalidQueryOptions;
-    if (p.balanced) |leg| if (leg.node >= n or leg.branch >= n or net) return error.InvalidQueryOptions;
-}
-
-/// Checks `query` against a circuit of `n` unknowns: finite options, valid
-/// tolerances, in-range node and branch indices, positive steps and counts,
-/// and representable derived sizes. Fails with `error.InvalidQueryOptions`,
-/// also for `n == 0`. Allocates nothing.
-pub fn validate(query: requests.Query, n: u32) !void {
-    @setEvalBranchQuota(10000);
-    if (n == 0) return error.InvalidQueryOptions;
-    switch (query) {
-        inline else => |o| {
-            if (!finite(o)) return error.InvalidQueryOptions;
-            try tolerance(o.tol);
-            inline for (.{ "out_node", "out_neg", "out_pos", "osc_node", "output_node", "output_neg", "output_branch", "source_node", "ac_source_node", "probe_p", "probe_n", "probe_branch", "input_branch", "in_branch", "in_pos", "in_neg", "drive_branch", "drive2_branch", "local_gnd", "in_nodes", "input_nodes" }) |field| {
-                if (@hasField(@TypeOf(o), field)) {
-                    const value = @field(o, field);
-                    switch (@TypeOf(value)) {
-                        u32 => if (value >= n) return error.InvalidQueryOptions,
-                        ?u32 => if (value) |v| if (v >= n) return error.InvalidQueryOptions,
-                        ?[2]u32 => if (value) |v| for (v) |row| if (row >= n) return error.InvalidQueryOptions,
-                        else => comptime unreachable, // else: a new index field type needs its arm
-                    }
-                }
-            }
-            if (@hasField(@TypeOf(o), "sweep")) {
-                // `.lin` is the one grid that may start at DC; every geometric
-                // grid needs a positive first point to step from.
-                if (o.sweep.f_start < 0 or o.sweep.f_stop < o.sweep.f_start) return error.InvalidQueryOptions;
-                if (o.sweep.kind != .lin and o.sweep.f_start <= 0) return error.InvalidQueryOptions;
-                if (o.sweep.points == 0) return error.InvalidQueryOptions;
-                if (o.sweep.f_start > 0) try frequency(o.sweep.f_start);
-                try frequency(o.sweep.f_stop);
-                _ = try elements(&.{ o.sweep.count(), n, 2 });
-            }
-            inline for (.{ "n_samples", "n_time_samples", "pss_n_samples", "n_trials", "max_steps", "max_iter", "max_newton", "max_shooting_iter", "carrier_steps_per_period", "periods_per_outer_step", "min_periods_per_step", "max_periods_per_step", "max_outer_steps", "max_points", "m_max", "gmres_restart", "gmres_max_restarts", "max_newton_iter", "pss_max_newton_iter", "pss_shoot_max_iter", "pss_newton_max_iter", "qr_max_iter" }) |field| {
-                if (@hasField(@TypeOf(o), field)) if (@field(o, field) == 0) return error.InvalidQueryOptions;
-            }
-            inline for (.{ "f0", "f1", "f2", "f_lo", "f_fundamental", "period", "t_carrier", "dt_init", "dt_min", "t_stop" }) |field| {
-                if (@hasField(@TypeOf(o), field) and @TypeOf(o) != requests.Temp)
-                    if (@field(o, field) <= 0) return error.InvalidQueryOptions;
-            }
-            inline for (.{ "shooting_tol", "fd_epsilon", "newton_tol", "gmres_tol", "hb_tol", "pss_newton_tol", "pss_shoot_tol", "krylov_tol", "qr_tol", "fd_eps", "envelope_reltol" }) |field| {
-                if (@hasField(@TypeOf(o), field)) try positive(@field(o, field));
-            }
-            inline for (.{ "f0", "f1", "f2", "f_lo", "f_fundamental" }) |field| {
-                if (@hasField(@TypeOf(o), field)) try frequency(@field(o, field));
-            }
-            if (@hasField(@TypeOf(o), "gmres_restart")) {
-                _ = try elements(&.{ @as(u64, o.gmres_restart) + 1, @as(u64, o.gmres_restart) + 1 });
-                _ = try elements(&.{ @as(u64, o.gmres_restart) + 1, n });
-            }
-        },
-    }
+/// The per-kind checks `checkCommon`'s tables cannot express: ranges
+/// between fields, derived grid sizes, nested queries. Asserts n > 0.
+fn checkKind(query: requests.Query, n: u32) Error!void {
+    assert(n > 0);
     switch (query) {
         .dc => |o| {
             const inner = if (o.points.len > 0) o.points.len else try sweep(o.start, o.stop, o.step);
@@ -183,7 +242,8 @@ pub fn validate(query: requests.Query, n: u32) !void {
             if (o.variation < 0) return error.InvalidQueryOptions;
             try validate(.{ .dc = o.dc_options }, n);
             _ = try elements(&.{ o.n_trials, @as(u64, n) + 1 });
-            if (o.lane) |k| if (k >= if (o.variants.count != 0) o.variants.count else o.n_trials) return error.InvalidQueryOptions;
+            const lanes = if (o.variants.count != 0) o.variants.count else o.n_trials;
+            if (o.lane) |k| if (k >= lanes) return error.InvalidQueryOptions;
         },
         .tran => |o| {
             if (o.dt_min > o.dt_init) return error.InvalidQueryOptions;
@@ -257,29 +317,7 @@ pub fn validate(query: requests.Query, n: u32) !void {
             try frequency(o.sweep.f_stop + @as(f64, @floatFromInt(o.n_sidebands)) * o.f_fundamental);
         },
         .hblin => |o| for (o.ports) |p| try port(p, n, false),
-        .hb => |o| {
-            if (o.n_harmonics == 0 or o.subharms == 0) return error.InvalidQueryOptions;
-            if (o.extra_tones.len != 0) {
-                if (o.osc_node != 0 or o.extra_harmonics.len != o.extra_tones.len or o.extra_tones.len >= mhb_max_tones)
-                    return error.InvalidQueryOptions;
-                var box: usize = 2 * @as(usize, o.n_harmonics) + 1;
-                var top = o.f0 * @as(f64, @floatFromInt(o.n_harmonics));
-                for (o.extra_tones, o.extra_harmonics) |f, h| {
-                    try positive(f);
-                    if (h == 0 or h > std.math.maxInt(i16)) return error.InvalidQueryOptions;
-                    box = try elements(&.{ box, 2 * @as(u64, h) + 1 });
-                    top += f * @as(f64, @floatFromInt(h));
-                }
-                if (box > mhb_max_box) return error.InvalidQueryOptions;
-                _ = try elements(&.{ box, box, 2 * n });
-                try frequency(top);
-                return;
-            }
-            const bands = 2 * @as(usize, o.n_harmonics) + 1;
-            _ = try elements(&.{ bands, n, bands, n });
-            _ = try elements(&.{ bands, bands });
-            try frequency(o.f0 * @as(f64, @floatFromInt(o.n_harmonics)));
-        },
+        .hb => |o| try hb(o, n),
         .qpss => |o| {
             // Runs as `.hb TONES=f1 f2 NHARMS=k1 k2`: the same box limits.
             if (o.k1 == 0 and o.k2 == 0) return error.InvalidQueryOptions;
@@ -336,36 +374,59 @@ pub fn validate(query: requests.Query, n: u32) !void {
             if (o.out_pos >= n or o.out_neg >= n) return error.InvalidQueryOptions;
             try validate(.{ .tran = o.tran }, n);
         },
-        else => {},
+        // The common checks cover these whole.
+        .ac, .dcmatch, .noise, .op, .sens, .stb, .dcinc, .acmatch, .dcsens => {},
     }
 }
 
-/// `validate`, plus the checks that need the deck: `error.InvalidQueryOptions`
-/// when the query's `tol.variant`, an `.mc` variant range or a `.dc` tangent
-/// row or a `.tran` one lies past `deck.variants`, and `error.DcSweepSourceNotFound` when a
-/// `.dc` sweep names a card the deck does not have. Asserts that a non-empty
-/// `deck.variants` has one `starts` entry more than rows.
-pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) !void {
-    try validate(query, n);
-    const variant = switch (query) {
-        inline else => |o| o.tol.variant,
-    };
-    if (variant) |v| if (v >= deck.variants.count()) return error.InvalidQueryOptions;
-    if (query == .mc) {
-        const r = query.mc.variants;
-        if (@as(u64, r.first) + r.count > deck.variants.count()) return error.InvalidQueryOptions;
+/// Returns the point count of an ascending or descending linear sweep.
+fn sweep(start: f64, stop: f64, step: f64) Error!usize {
+    const intervals = (stop - start) / step;
+    if (step == 0 or intervals < 0) return error.InvalidQueryOptions;
+    const count = @floor(intervals + 1e-6) + 1;
+    if (!std.math.isFinite(count) or count >= @as(f64, @floatFromInt(std.math.maxInt(u32))))
+        return error.InvalidQueryOptions;
+    // Repeated-addition sweeps must make representable progress at both ends.
+    if (start != stop and (start + step == start or stop + step == stop)) return error.InvalidQueryOptions;
+    assert(count >= 1);
+    return @intFromFloat(count);
+}
+
+/// Refuses a port whose rows are out of range or whose z0 is not positive.
+fn port(p: requests.Port, n: u32, net: bool) Error!void {
+    const branch_ok = p.branch < n or (net and p.branch == requests.Port.no_branch);
+    if (p.node >= n or p.neg >= n or !branch_ok or !(p.z0 > 0)) return error.InvalidQueryOptions;
+    if (p.balanced) |leg| if (leg.node >= n or leg.branch >= n or net) return error.InvalidQueryOptions;
+}
+
+/// A driven or autonomous single-tone HB, or a driven multi-tone one whose
+/// mixing box stays inside `mhb_max_box`.
+fn hb(o: requests.Hb, n: u32) Error!void {
+    if (o.n_harmonics == 0 or o.subharms == 0) return error.InvalidQueryOptions;
+    if (o.extra_tones.len == 0) {
+        const bands = 2 * @as(usize, o.n_harmonics) + 1;
+        _ = try elements(&.{ bands, n, bands, n });
+        _ = try elements(&.{ bands, bands });
+        return frequency(o.f0 * @as(f64, @floatFromInt(o.n_harmonics)));
     }
-    if (query == .dc) {
-        try dcTargetExists(query.dc.target, deck);
-        if (query.dc.target2) |t2| try dcTargetExists(t2, deck);
-        for (query.dc.tangents) |row| if (row >= deck.variants.count()) return error.InvalidQueryOptions;
+    if (o.osc_node != 0 or o.extra_harmonics.len != o.extra_tones.len or o.extra_tones.len >= mhb_max_tones)
+        return error.InvalidQueryOptions;
+    var box: usize = 2 * @as(usize, o.n_harmonics) + 1;
+    var top = o.f0 * @as(f64, @floatFromInt(o.n_harmonics));
+    for (o.extra_tones, o.extra_harmonics) |f, h| {
+        try positive(f);
+        if (h == 0 or h > std.math.maxInt(i16)) return error.InvalidQueryOptions;
+        box = try elements(&.{ box, 2 * @as(u64, h) + 1 });
+        top += f * @as(f64, @floatFromInt(h));
     }
-    if (query == .tran) for (query.tran.tangents) |row| if (row >= deck.variants.count()) return error.InvalidQueryOptions;
+    if (box > mhb_max_box) return error.InvalidQueryOptions;
+    _ = try elements(&.{ box, box, 2 * n });
+    try frequency(top);
 }
 
 /// The same (type, ordinal) lookup `dc.run` does, made before anything is
 /// allocated for the sweep.
-fn dcTargetExists(target: requests.Dc.SweepTarget, deck: *const Deck) !void {
+fn dcTargetExists(target: requests.Dc.SweepTarget, deck: *const Deck) DeckError!void {
     const d = switch (target) {
         .temp => return,
         .device => |d| d,
@@ -444,4 +505,22 @@ test "validateDeck refuses a variant past the deck's table" {
     try std.testing.expectError(error.InvalidQueryOptions, validateDeck(.{ .tran = .{ .t_stop = 1e-9, .method = .gear_3, .tangents = &.{1} } }, 2, &deck));
     try validateDeck(.{ .tran = .{ .t_stop = 1e-9, .method = .gear_6 } }, 2, &deck);
     try std.testing.expectError(error.DcSweepSourceNotFound, validateDeck(.{ .dc = .{ .target = .{ .device = .{ .type = @fromBackingInt(0) } } } }, 2, &deck));
+}
+
+test "a non-finite float anywhere in a query refuses it, inside slices and optionals too" {
+    // Oracle: validate's contract ("finite options"), at each shape `finite`
+    // walks, on fields no other check reads: a slice entry (`Dc.points`), an
+    // optional inside a nested struct (`tol.temp_c`), a plain field
+    // (`Disto.ac_phase`).
+    const t = std.testing;
+    const nan = std.math.nan(f64);
+    try validate(.{ .dc = .{ .points = &.{ 0, 1 } } }, 4);
+    try t.expectError(error.InvalidQueryOptions, validate(.{ .dc = .{ .points = &.{ 0, nan } } }, 4));
+    try validate(.{ .op = .{ .tol = .{ .temp_c = 27 } } }, 4);
+    try t.expectError(error.InvalidQueryOptions, validate(.{ .op = .{ .tol = .{ .temp_c = nan } } }, 4));
+    const disto: requests.Disto = .{ .sweep = .{ .f_start = 1, .f_stop = 10 }, .output_node = 1 };
+    try validate(.{ .disto = disto }, 4);
+    var bad = disto;
+    bad.ac_phase = std.math.inf(f64);
+    try t.expectError(error.InvalidQueryOptions, validate(.{ .disto = bad }, 4));
 }

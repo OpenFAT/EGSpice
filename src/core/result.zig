@@ -1,5 +1,14 @@
-//! What an analysis publishes: the shape known up front and the finished payload.
-//! Plain data; cites nothing beyond ESPice's own analysis/output contract.
+//! What an analysis publishes: the shape known before it runs, and the
+//! finished payload. Plain data; an analysis writes it, the output layer and
+//! the embedders read it.
+//! Cites: none (ESPice's own analysis/output contract).
+//!
+//! Contents:
+//! - `pub const QuerySchema = struct`
+//! - `pub const Schema = struct`
+//! - `pub const Result = struct`
+//! - `pub const Measured = struct`, `Measured.Found = struct`
+
 const Kind = @import("query.zig").Kind;
 
 /// What a query will publish, known before it runs: enough for an output
@@ -24,7 +33,8 @@ pub const Schema = struct {
     npoints: ?usize = null,
 };
 
-/// A completed analysis payload, valid until the owning Problem is destroyed.
+/// A completed analysis payload. Every slice borrows from the owning
+/// Problem and is valid until it is destroyed.
 pub const Result = struct {
     plotname: []const u8,
     varnames: []const []const u8,
@@ -32,8 +42,9 @@ pub const Result = struct {
     npoints: usize,
     /// Point-major samples, `npoints * varnames.len` of them; a complex
     /// variable takes two adjacent f64s (real, imaginary). Empty for a
-    /// transient or AC sweep whose rows streamed straight to the output (a final plan
-    /// that nothing reads after it, see `analysis.session.Session.stream`).
+    /// transient or AC sweep whose rows streamed straight to the output (a
+    /// final plan that nothing reads after it, see
+    /// `analysis.session.Session.stream`).
     data: []const f64,
     /// Per `.meas` card of the deck, what it found while the run went
     /// (measurement-only mode, `output/measure.zig` `Stream`), in place of
@@ -48,9 +59,11 @@ pub const Result = struct {
 
 /// A `.meas` card measured as its run went: each of its passes over the
 /// waveform (an event, a value at a time, a window), in the order the
-/// evaluator reads them.
+/// evaluator reads them. Only `found[0..scans]` is meaningful.
 pub const Measured = struct {
     scans: u8 = 0,
+    // SAFETY: readers stop at `scans`, and the one writer
+    // (output/measure.zig) sets the whole array with `scans`.
     found: [2]Found = undefined,
 
     /// A pass's numbers: the value, then where (`at=`, `from=`, `to=`), or

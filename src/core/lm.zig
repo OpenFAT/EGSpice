@@ -1,17 +1,34 @@
 //! Bounded Levenberg-Marquardt least squares, the HSPICE optimizer
-//! (`.model m OPT`, LEVEL=1) [SA Ch.27]. The caller owns evaluation: `Lm`
-//! yields the parameter points it needs (`points`) and takes their residual
-//! vectors back (`feed`), so a batch of finite-difference points can run in
-//! parallel. The Jacobian is forward differences; bounds are handled by
-//! clamping each step into the box and holding a parameter fixed while it
-//! sits on a limit its gradient pushes it past.
+//! (`.model m OPT`, LEVEL=1) [SA Ch.27]: a start point, a box and the
+//! caller's residuals in, the best point found and its history out. The
+//! caller owns evaluation: `Lm` yields the parameter points it needs
+//! (`points`) and takes their residual vectors back (`feed`), so a batch of
+//! finite-difference points can run in parallel. The Jacobian is forward
+//! differences; bounds are handled by clamping each step into the box and
+//! holding a parameter fixed while it sits on a limit its gradient pushes
+//! it past.
 //!
 //! With `batch` set, every start or trial point comes with the n Jacobian
 //! points around it, so an accepted trial costs one round of evaluations
 //! instead of two. The points a rejected trial brought along are dropped
 //! uncounted, so the path and every reported figure match the unbatched run.
+//! Cites: HSPICE [SA Ch.27 "Optimization"]; Marquardt 1963 (the diagonal
+//! scaling of the damped normal equations).
+//!
+//! Contents:
+//! - `pub const Options = struct`, `Options.stepOverreach(o: Options, x0: f64, del: f64) ?f64`
+//! - `pub const Status = enum(u8)`
+//! - `pub const Lm = struct`, `Lm.History = struct`
+//! - `Lm.init(arena: Allocator, x0, lo, hi, dels, grid: []const f64, m: u32, opts: Options, batch: bool) Allocator.Error!Lm`
+//! - `Lm.points(s: *const Lm) []const f64`
+//! - `Lm.stepping(s: *const Lm) bool`, `Lm.batched(s: *const Lm) bool`
+//! - `Lm.feed(s: *Lm, residuals_all: []const f64) Allocator.Error!void`
+//! - `Lm.pinned(s: *const Lm, j: usize) i2`
+//! - `Lm.gradientNorm(s: *const Lm) f64`
+
 const std = @import("std");
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 const dot = @import("numerics.zig").dot;
 
 /// The optimizer knobs of an HSPICE `.model m OPT` card, with its defaults.
@@ -117,9 +134,8 @@ pub const Lm = struct {
     /// The next parameter the polish tries; n once it is done.
     polish_j: u32 = 0,
     history: History = .{},
-    arena: std.mem.Allocator,
-
-    const Phase = enum(u8) { start, jacobian, trial, polish };
+    /// Where `init` put every slice above and where `feed` grows `history`.
+    arena: Allocator,
 
     /// Accepted iterates, SoA: row 0 is the starting point.
     pub const History = struct {
@@ -138,7 +154,7 @@ pub const Lm = struct {
     /// would retry forever). DIFSIZ and PARMIN must be positive: a zero
     /// finite-difference step asserts at the first Jacobian. `batch` as the
     /// field says. Fails only when `arena` is out of memory.
-    pub fn init(arena: std.mem.Allocator, x0: []const f64, lo: []const f64, hi: []const f64, dels: []const f64, grid: []const f64, m: u32, opts: Options, batch: bool) !Lm {
+    pub fn init(arena: Allocator, x0: []const f64, lo: []const f64, hi: []const f64, dels: []const f64, grid: []const f64, m: u32, opts: Options, batch: bool) Allocator.Error!Lm {
         const n: u32 = @intCast(x0.len);
         assert(n > 0);
         assert(lo.len == n);
@@ -211,7 +227,7 @@ pub const Lm = struct {
     /// arena cannot grow `history`, and then before it changes anything, so
     /// the same residuals can be fed again. Asserts that the run is still
     /// going and that there is one residual vector per point.
-    pub fn feed(s: *Lm, residuals_all: []const f64) std.mem.Allocator.Error!void {
+    pub fn feed(s: *Lm, residuals_all: []const f64) Allocator.Error!void {
         const n = s.n;
         const m = s.m;
         assert(s.status == .running);
@@ -327,6 +343,10 @@ pub const Lm = struct {
         return @sqrt(norm);
     }
 
+    // ---- private ----
+
+    const Phase = enum(u8) { start, jacobian, trial, polish };
+
     /// Ends the run, after one polish pass when a parameter is gridded.
     fn stop(s: *Lm, status: Status) void {
         assert(status != .running);
@@ -377,7 +397,7 @@ pub const Lm = struct {
     /// Enters the Jacobian phase at the accepted `x`: feeds it `rows`,
     /// the residuals of the Jacobian points queued with `x` (empty unless
     /// `batch`), or else queues those points.
-    fn jacobian(s: *Lm, rows: []const f64) std.mem.Allocator.Error!void {
+    fn jacobian(s: *Lm, rows: []const f64) Allocator.Error!void {
         const n = s.n;
         assert(rows.len == if (s.batch) @as(usize, n) * s.m else 0);
         s.phase = .jacobian;
@@ -461,6 +481,8 @@ pub const Lm = struct {
         s.speculate();
     }
 };
+
+// ---- private ----
 
 /// `v` rounded to the nearest multiple of `g`; `g == 0` is continuous.
 fn onGrid(g: f64, v: f64) f64 {

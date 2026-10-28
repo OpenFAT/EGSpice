@@ -1,6 +1,14 @@
-//! Ids every layer shares that no other core leaf owns: the dense device
-//! type id and the ground row. A leaf so `query.zig` and `deck.zig` need not
-//! import `root.zig` (`restricted_imports` in build.zig).
+//! Ids every layer shares that no other core file owns: the dense device
+//! type id and the ground row. Nothing in, two constants out. A leaf with no
+//! import but std, because every device object and GPU kernel module
+//! imports it as its whole `core` (build.zig `abi_dev`, `k_abi`): an edit
+//! here rebuilds every model.
+//! Cites: none (ESPice's own MNA row convention).
+//!
+//! Contents:
+//! - `pub const DeviceType = enum(u16) { unset = maxInt(u16), _ }`
+//! - `pub const GROUND: u32`
+
 const std = @import("std");
 
 /// Dense id of a device type in a `device.Library`: built-ins first, in

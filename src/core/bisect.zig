@@ -1,11 +1,24 @@
 //! HSPICE bisection optimization (`.model m OPT METHOD=BISECTION|PASSFAIL`,
-//! or LEVEL=2|3) [SA Ch.19 "Using Bisection"; CR .MODEL]: a binary search
-//! of one parameter's range for the value where its RESULTS card turns from
-//! fail to pass. Like `lm.Lm`, the caller owns evaluation: `points` hands
-//! out the values to test and `feed` takes their goal errors back. The two
-//! limits go out as one batch, then one midpoint per iteration.
+//! or LEVEL=2|3) [SA Ch.19 "Using Bisection"; CR .MODEL]: one parameter's
+//! range and the caller's goal errors in, the value where its RESULTS card
+//! turns from fail to pass out, by binary search. Like `lm.Lm`, the caller
+//! owns evaluation: `points` hands out the values to test and `feed` takes
+//! their goal errors back. The two limits go out as one batch, then one
+//! midpoint per iteration.
+//! Cites: HSPICE [SA Ch.19 "Using Bisection", "Using RELOUT and RELIN";
+//! CR .MODEL METHOD].
+//!
+//! Contents:
+//! - `pub const Method = enum(u8) { lm, bisection, passfail }`
+//! - `pub const Status = enum(u8)`
+//! - `pub const Bisect = struct`, `Bisect.History = struct`
+//! - `Bisect.init(arena: Allocator, method: Method, lo_in: f64, hi_in: f64, grid: f64, scale: f64, opts: Options) Bisect`
+//! - `Bisect.points(s: *const Bisect) []const f64`
+//! - `Bisect.feed(s: *Bisect, residuals: []const f64) Allocator.Error!void`
+
 const std = @import("std");
 const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 const Options = @import("lm.zig").Options;
 
 /// The `.model OPT` search: LEVEL=1 (Levenberg-Marquardt), LEVEL=2 or
@@ -55,7 +68,8 @@ pub const Bisect = struct {
     evaluations: u32 = 0,
     status: Status = .running,
     history: History = .{},
-    arena: std.mem.Allocator,
+    /// Where `feed` grows `history`.
+    arena: Allocator,
 
     /// One row per midpoint test, SoA: the window it was taken from, the
     /// value tested and its goal error.
@@ -70,7 +84,7 @@ pub const Bisect = struct {
     /// the manual ignores the initial value. `scale` converts a goal error
     /// to measure units for ABSOUT. Asserts that the method is not `lm` and
     /// that a (grid) point lies inside lo <= hi.
-    pub fn init(arena: std.mem.Allocator, method: Method, lo_in: f64, hi_in: f64, grid: f64, scale: f64, opts: Options) Bisect {
+    pub fn init(arena: Allocator, method: Method, lo_in: f64, hi_in: f64, grid: f64, scale: f64, opts: Options) Bisect {
         const lo = if (grid > 0) @ceil(lo_in / grid) * grid else lo_in;
         const hi = if (grid > 0) @floor(hi_in / grid) * grid else hi_in;
         assert(method != .lm);
@@ -89,7 +103,7 @@ pub const Bisect = struct {
     /// the arena cannot grow `history`, and then before it changes
     /// anything. Asserts that the search is still running and that there is
     /// one error per point.
-    pub fn feed(s: *Bisect, residuals: []const f64) std.mem.Allocator.Error!void {
+    pub fn feed(s: *Bisect, residuals: []const f64) Allocator.Error!void {
         assert(s.status == .running);
         assert(residuals.len == s.pending);
         if (s.pending == 1) {
@@ -128,6 +142,8 @@ pub const Bisect = struct {
         s.pts[0] = s.mid();
         s.pending = 1;
     }
+
+    // ---- private ----
 
     /// The window's midpoint; on a grid, the grid point at or below the
     /// middle grid index, so a one-step window's midpoint is `lo`.
@@ -174,10 +190,13 @@ pub const Bisect = struct {
 
     fn stop(s: *Bisect, status: Status) void {
         assert(status != .running);
+        assert(s.status == .running);
         s.status = status;
         s.pending = 0;
     }
 };
+
+// ---- private ----
 
 /// Runs `s` to completion against `f`, a test oracle.
 fn solve(s: *Bisect, f: anytype) !void {
