@@ -17,14 +17,21 @@
 //! the factor and solves with A and A^T, plus the Schur growth that
 //! `direct.zig` reads to refine or demote (#136). Cites no ngspice source:
 //! ngspice factors every matrix with its general sparse LU.
+//!
+//! Contents:
+//! - `pub const InitError = error`
+//! - `pub const Limits = struct`
+//! - `pub const Bbd = struct`
+//!   - `pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, info: num.BbdInfo, limits: Limits) InitError!Bbd`
+//!   - `pub fn deinit(self: *Self) void`
+//!   - `pub fn factorWithExecution(self: *Self, vals: []const f64, execution: num.Execution) error{SingularMatrix}!void`
+//!   - `pub fn solve(self: *Self, comptime transpose: bool, x: []f64) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
 const dense_lu = @import("dense_lu.zig");
-
 const Allocator = std.mem.Allocator;
-const NONE: u32 = std.math.maxInt(u32);
 
 /// `NotApplicable`: the split is unprofitable under `Limits`, the blocks
 /// overlap or leave a node outside both the blocks and the border, some CSC
@@ -283,7 +290,7 @@ pub const Bbd = struct {
         self.* = undefined;
     }
 
-    /// Full numeric factor of `vals` (CSC order). Block factors may run
+    /// Runs the full numeric factor of `vals` (CSC order). Block factors may run
     /// on `execution.io`; the Schur reduction is always serial in block
     /// order, so the result does not depend on the schedule. Sets `growth`
     /// unless a block is singular. Fails when a block or S is singular; the
@@ -322,58 +329,8 @@ pub const Bbd = struct {
         dense_lu.factorize(bsz, sd, self.s_piv) catch return error.SingularMatrix;
     }
 
-    inline fn factorBlock(self: *const Self, bi: usize) error{SingularMatrix}!void {
-        assert(bi < self.nb);
-        const s: usize = self.blk_s[bi];
-        const m: usize = self.blk_m[bi];
-        const a = self.arena[self.blk_a_off[bi]..][0 .. s * s];
-        const pv = self.piv[self.blk_piv_off[bi]..][0..s];
-        dense_lu.factorize(s, a, pv) catch return error.SingularMatrix;
-        const w = self.arena[self.blk_w_off[bi]..][0 .. s * m];
-        for (0..m) |j| {
-            const col = w[j * s ..][0..s];
-            dense_lu.solveFactored(s, a, pv, col, col);
-        }
-    }
-
-    fn factorBlocks(self: *const Self, start: usize, end: usize) error{SingularMatrix}!void {
-        assert(start <= end);
-        assert(end <= self.nb);
-        for (start..end) |bi| try self.factorBlock(bi);
-    }
-
-    fn taskCount(self: *const Self, execution: num.Execution) usize {
-        if (execution.io == null or execution.threads < 2) return 1;
-        var work: u64 = 0;
-        for (self.blk_s, self.blk_m) |s, m| work += @as(u64, s) * s * (s + 3 * @as(u64, m));
-        const tasks: usize = @intCast(@max(1, @min(execution.threads, tasks_max, self.nb, work / 131_072)));
-        assert(tasks <= tasks_max);
-        return tasks;
-    }
-
-    /// Block-factor tasks per factor at most: the futures live on the stack.
-    const tasks_max = 16;
-
-    fn factorBlocksScheduled(self: *const Self, io: std.Io, tasks: usize) error{SingularMatrix}!void {
-        // ponytail: at most 16 equal block ranges; weight them by block
-        // cost if mixed sizes ever show measurable worker imbalance.
-        assert(tasks >= 2);
-        assert(tasks <= tasks_max);
-        var futures: [tasks_max]std.Io.Future(error{SingularMatrix}!void) = undefined;
-        for (0..tasks) |i| {
-            futures[i] = io.async(factorBlocks, .{ self, self.nb * i / tasks, self.nb * (i + 1) / tasks });
-        }
-        // Join every task before reporting a failure: the caller frees
-        // these slabs when it demotes to the flat LU.
-        var result: error{SingularMatrix}!void = {};
-        for (futures[0..tasks]) |*future| future.await(io) catch |err| {
-            result = err;
-        };
-        return result;
-    }
-
-    /// x = A^-1 x, or A^-T x with `transpose`, in place after a successful
-    /// factor. The transposed Schur complement is S^T, and W^T = E^T A^-T
+    /// Replaces `x` with A^-1 x, or A^-T x with `transpose`, after a
+    /// successful factor. The transposed Schur complement is S^T, and W^T = E^T A^-T
     /// takes F's role, so that border reduction reads the raw b_i before
     /// any block solve. Asserts that `x` holds all n unknowns.
     pub fn solve(self: *Self, comptime transpose: bool, x: []f64) void {
@@ -432,9 +389,63 @@ pub const Bbd = struct {
             }
         }
     }
+
+    // Block-factor tasks per factor at most: the futures live on the stack.
+    const tasks_max = 16;
+
+    inline fn factorBlock(self: *const Self, bi: usize) error{SingularMatrix}!void {
+        assert(bi < self.nb);
+        const s: usize = self.blk_s[bi];
+        const m: usize = self.blk_m[bi];
+        const a = self.arena[self.blk_a_off[bi]..][0 .. s * s];
+        const pv = self.piv[self.blk_piv_off[bi]..][0..s];
+        dense_lu.factorize(s, a, pv) catch return error.SingularMatrix;
+        const w = self.arena[self.blk_w_off[bi]..][0 .. s * m];
+        for (0..m) |j| {
+            const col = w[j * s ..][0..s];
+            dense_lu.solveFactored(s, a, pv, col, col);
+        }
+    }
+
+    fn factorBlocks(self: *const Self, start: usize, end: usize) error{SingularMatrix}!void {
+        assert(start <= end);
+        assert(end <= self.nb);
+        for (start..end) |bi| try self.factorBlock(bi);
+    }
+
+    fn taskCount(self: *const Self, execution: num.Execution) usize {
+        if (execution.io == null or execution.threads < 2) return 1;
+        var work: u64 = 0;
+        for (self.blk_s, self.blk_m) |s, m| work += @as(u64, s) * s * (s + 3 * @as(u64, m));
+        const tasks: usize = @intCast(@max(1, @min(execution.threads, tasks_max, self.nb, work / 131_072)));
+        assert(tasks <= tasks_max);
+        return tasks;
+    }
+
+    fn factorBlocksScheduled(self: *const Self, io: std.Io, tasks: usize) error{SingularMatrix}!void {
+        // ponytail: at most 16 equal block ranges; weight them by block
+        // cost if mixed sizes ever show measurable worker imbalance.
+        assert(tasks >= 2);
+        assert(tasks <= tasks_max);
+        var futures: [tasks_max]std.Io.Future(error{SingularMatrix}!void) = undefined;
+        for (0..tasks) |i| {
+            futures[i] = io.async(factorBlocks, .{ self, self.nb * i / tasks, self.nb * (i + 1) / tasks });
+        }
+        // Join every task before reporting a failure: the caller frees
+        // these slabs when it demotes to the flat LU.
+        var result: error{SingularMatrix}!void = {};
+        for (futures[0..tasks]) |*future| future.await(io) catch |err| {
+            result = err;
+        };
+        return result;
+    }
 };
 
-/// Appends `v` unless present.
+const NONE: u32 = std.math.maxInt(u32);
+
+// ---- private ----
+
+// Appends `v` unless present.
 fn addToSet(gpa: Allocator, s: *std.ArrayList(u32), v: u32) error{OutOfMemory}!void {
     assert(v != NONE);
     // ponytail: linear scan over a few border nodes; a bitset if they grow.
@@ -442,7 +453,7 @@ fn addToSet(gpa: Allocator, s: *std.ArrayList(u32), v: u32) error{OutOfMemory}!v
     try s.append(gpa, v);
 }
 
-/// Position of `v` in a block footprint; pass 1 guarantees it is present.
+// Position of `v` in a block footprint; pass 1 guarantees it is present.
 fn localIdx(sorted: []const u32, v: u32) u32 {
     // ponytail: linear scan over a few border nodes; binary search if
     // footprints grow past ~64.

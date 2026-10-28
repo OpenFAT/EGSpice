@@ -7,11 +7,19 @@
 //! nothing. Cites Saad and Schultz, "GMRES" (SIAM J. Sci. Stat. Comput.
 //! 7(3), 1986: Arnoldi with modified Gram-Schmidt, Givens QR of H) and
 //! dev/solvers/monodromy-krylov.md.
+//!
+//! Contents:
+//! - `pub const Gmres = struct`
+//!   - `pub const SolveResult = struct`
+//!   - `pub fn init(gpa: Allocator, n: u32, m: u32) Allocator.Error!Gmres`
+//!   - `pub fn deinit(self: *Gmres, gpa: Allocator) void`
+//!   - `pub fn solve(self: *Gmres, op: anytype, b: []const f64, x: []f64, tol: f64, max_restarts: u32) SolveResult`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const num = @import("core").numerics;
+const testing = std.testing;
 
 /// GMRES(m) workspace for n-dimensional systems.
 pub const Gmres = struct {
@@ -48,9 +56,10 @@ pub const Gmres = struct {
     w: []f64,
     r: []f64,
 
-    /// Allocates (m + 1)(n + m) + 2n + 4m + 1 f64s in one block. Asserts that n and m
-    /// are positive. Caller frees with `deinit` and the same allocator.
-    pub fn init(gpa: Allocator, n: u32, m: u32) !Self {
+    /// Returns a workspace of (m + 1)(n + m) + 2n + 4m + 1 f64s in one block.
+    /// Asserts that n and m are positive. Caller owns the result; free it
+    /// with `deinit` and the same `gpa`.
+    pub fn init(gpa: Allocator, n: u32, m: u32) Allocator.Error!Self {
         assert(n > 0);
         assert(m > 0);
         const nu: usize = n;
@@ -83,6 +92,7 @@ pub const Gmres = struct {
 
     /// Frees the workspace; `gpa` must be the allocator `init` got.
     pub fn deinit(self: *Self, gpa: Allocator) void {
+        assert(self.slab.len == (@as(usize, self.m) + 1) * (@as(usize, self.n) + self.m) + 2 * @as(usize, self.n) + 4 * @as(usize, self.m) + 1);
         gpa.free(self.slab);
         self.* = undefined;
     }
@@ -214,7 +224,9 @@ pub const Gmres = struct {
         return .{ .iterations = total_iters, .residual = final_res / b_norm, .converged = final_res <= abs_tol };
     }
 
-    /// r = b - r.
+    // ---- private ----
+
+    // r = b - r.
     fn residual(self: *Self, b: []const f64) void {
         assert(b.len == self.n);
         num.sub(self.r[0..b.len], b, self.r[0..b.len]);
@@ -298,7 +310,9 @@ pub const Gmres = struct {
     }
 };
 
-/// c, s with [c s; -s c] [a; b] = [r; 0].
+// ---- private ----
+
+// c, s with [c s; -s c] [a; b] = [r; 0].
 fn givensRotation(a: anytype, b: @TypeOf(a)) struct { c: @TypeOf(a), s: @TypeOf(a) } {
     if (b == 0) return .{ .c = 1, .s = 0 };
     if (a == 0) return .{ .c = 0, .s = std.math.sign(b) };
@@ -307,8 +321,6 @@ fn givensRotation(a: anytype, b: @TypeOf(a)) struct { c: @TypeOf(a), s: @TypeOf(
     const r = std.math.hypot(a, b);
     return .{ .c = a / r, .s = b / r };
 }
-
-const testing = std.testing;
 
 test "Gmres.init carves disjoint slices that tile its one slab, and frees on failure" {
     inline for (.{ .{ 1, 1 }, .{ 7, 3 }, .{ 30, 30 }, .{ 5, 40 } }) |c| {

@@ -1,41 +1,59 @@
-//! In-place radix-2 Cooley-Tukey FFT on split real/imaginary f64 arrays.
+//! Radix-2 Cooley-Tukey FFT: N samples as split real and imaginary f64
+//! planes in, their N-point DFT out in the same planes, O(N log N), no
+//! allocation.
 //!
-//! In: N samples, real and imaginary planes. Out: their N-point DFT in the
-//! same planes, O(N log N), no allocation. Convention: X[k] = sum x[n] e^(-j 2 pi n k / N), unnormalized forward,
-//! as in ngspice and numpy (cos(2 pi t / T) over N points gives X[1] = N/2).
-//! Twiddle reseeding: #41.
+//! Convention: X[k] = sum x[n] e^(-j 2 pi n k / N), unnormalized forward, as
+//! in ngspice and numpy (cos(2 pi t / T) over N points gives X[1] = N/2).
+//! Cites: Cooley and Tukey, Math. Comp. 19 (1965); twiddle reseeding #41.
+//!
+//! Contents:
+//! - `pub fn fft(re: []f64, im: []f64) void`
+//! - `pub fn nextPow2(n: usize) usize`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const math = std.math;
+const testing = std.testing;
 
 const W = std.simd.suggestVectorLength(f64) orelse 1;
 const V = @Vector(W, f64);
 
-/// Twiddles come from cos/sin exactly every `reseed` butterflies and by a
-/// rotation recurrence in between, whose rounding grows with its length:
-/// one recurrence per stage half drifted to 9e3 eps of N on a 2^20-point
-/// bin, against 3 eps reseeding every 32 (#41).
+// Twiddles come from cos/sin exactly every `reseed` butterflies and by a
+// rotation recurrence in between, whose rounding grows with its length: one
+// recurrence per stage half drifted to 9e3 eps of N on a 2^20-point bin,
+// against 3 eps reseeding every 32 (#41).
 const reseed = 32;
+
+// Twiddles per table chunk: a stage with half > chunk walks its k range in
+// chunks, each applied to every group. 8 KiB of stack per stage.
+const chunk = 512;
+
 comptime {
     assert(reseed % W == 0);
+    assert(chunk % reseed == 0);
+    assert(math.isPowerOfTwo(chunk));
 }
 
-/// Forward DFT in place, O(N log N). Asserts that `re` and `im` have the
-/// same length N and that N is a power of two (N = 1 is the identity).
+/// Replaces `re` and `im` with their forward DFT, O(N log N).
+/// Asserts that `re` and `im` have the same length N and that N is a power
+/// of two (N = 1 is the identity).
 pub fn fft(re: []f64, im: []f64) void {
-    const n = re.len;
-    assert(n == im.len);
-    assert(math.isPowerOfTwo(n));
+    assert(re.len == im.len);
+    assert(math.isPowerOfTwo(re.len));
     bitReverse(re, im);
     butterflyPass(re, im);
 }
 
-/// Smallest power of two >= n, the length to zero-pad an `fft` input to.
-/// Asserts that n > 0 and that the result fits in a usize.
+/// Returns the smallest power of two >= n, the length to zero-pad an `fft`
+/// input to. Asserts that n > 0 and that the result fits in a usize.
 pub fn nextPow2(n: usize) usize {
-    return math.ceilPowerOfTwoAssert(usize, n);
+    assert(n > 0);
+    const p = math.ceilPowerOfTwoAssert(usize, n);
+    assert(p >= n);
+    return p;
 }
+
+// ---- private ----
 
 fn bitReverse(re: []f64, im: []f64) void {
     const n = re.len;
@@ -46,6 +64,7 @@ fn bitReverse(re: []f64, im: []f64) void {
     const shift: math.Log2Int(usize) = @intCast(@as(u7, @bitSizeOf(usize)) - @as(u7, log_n));
     for (0..n) |i| {
         const j = @bitReverse(@as(usize, i)) >> shift;
+        assert(j < n);
         if (i < j) {
             std.mem.swap(f64, &re[i], &re[j]);
             std.mem.swap(f64, &im[i], &im[j]);
@@ -53,20 +72,10 @@ fn bitReverse(re: []f64, im: []f64) void {
     }
 }
 
-/// Twiddles per table chunk; a stage with half > chunk walks its k range
-/// in chunks, each applied to every group. 8 KiB of stack per stage.
-const chunk = 512;
-comptime {
-    assert(chunk % reseed == 0);
-    assert(math.isPowerOfTwo(chunk));
-}
-
-/// All butterfly stages. Each stage's twiddles for one chunk of k are made
-/// once, by `twiddles`, and every group of the stage reuses them: before,
-/// every group re-ran the cos/sin reseeds, n / 2 trig pairs on the half = 1
-/// stage alone. The table holds the values the per-group recurrence made, so
-/// the output is bitwise what it was (checked against the old stages when
-/// the table went in).
+// Every butterfly stage. A stage's twiddles for one chunk of k are made once
+// by `twiddles` and reused by every group of the stage, so the trig reseeds
+// cost n / chunk pairs per stage instead of n / 2. The table holds the values
+// the per-group recurrence made, so the output is bitwise the per-group form.
 fn butterflyPass(re: []f64, im: []f64) void {
     const n = re.len;
     assert(im.len == n);
@@ -82,24 +91,32 @@ fn butterflyPass(re: []f64, im: []f64) void {
             var group: usize = 0;
             while (group < n) : (group += 2 * half) {
                 const i = group + k0;
-                butterflies(re[i..][0..len], im[i..][0..len], re[i + half ..][0..len], im[i + half ..][0..len], twr[0..len], twi[0..len]);
+                butterflies(
+                    re[i..][0..len],
+                    im[i..][0..len],
+                    re[i + half ..][0..len],
+                    im[i + half ..][0..len],
+                    twr[0..len],
+                    twi[0..len],
+                );
             }
         }
     }
+    assert(half == n or n == 1);
 }
 
-/// w_k = cis(k * step) for k in k0..k0 + wr.len, exact cos/sin at every
-/// multiple of `reseed` and a rotation recurrence in between: W lanes
-/// advancing by cis(W * step) when half >= W, one lane by cis(step) below.
-/// Asserts that k0 is a multiple of `reseed` (the chunk starts reseed).
+// w_k = cis(k * step) for k in k0..k0 + wr.len: exact cos/sin at every
+// multiple of `reseed` and a rotation recurrence in between, W lanes
+// advancing by cis(W * step) when half >= W, one lane by cis(step) below.
 fn twiddles(wr: []f64, wi: []f64, k0: usize, half: usize, step: f64) void {
     assert(wr.len == wi.len);
-    assert(k0 % reseed == 0);
+    assert(k0 % reseed == 0); // Each chunk starts on a reseed.
     assert(k0 + wr.len <= half);
     if (W > 1 and half >= W) {
         assert(wr.len % W == 0);
         const rot_r: V = @splat(@cos(step * @as(f64, @floatFromInt(W))));
         const rot_i: V = @splat(@sin(step * @as(f64, @floatFromInt(W))));
+        // SAFETY: k = 0 is a multiple of `reseed`, so the first pass seeds both.
         var cr: V = undefined;
         var ci: V = undefined;
         var k: usize = 0;
@@ -124,6 +141,7 @@ fn twiddles(wr: []f64, wi: []f64, k0: usize, half: usize, step: f64) void {
     } else {
         const dwr = @cos(step);
         const dwi = @sin(step);
+        // SAFETY: k = 0 is a multiple of `reseed`, so the first pass seeds both.
         var cr: f64 = undefined;
         var ci: f64 = undefined;
         for (wr, wi, 0..) |*r, *i, k| {
@@ -141,9 +159,9 @@ fn twiddles(wr: []f64, wi: []f64, k0: usize, half: usize, step: f64) void {
     }
 }
 
-/// x' = x + w y, y' = x - w y over one group's chunk: the top half `xr`/`xi`
-/// and the bottom half `yr`/`yi`, which do not overlap. A plain loop the
-/// vectorizer takes (ymm, same speed as the hand-written `@Vector` form).
+// x' = x + w y, y' = x - w y over one group's chunk: the top half `xr`/`xi`
+// and the bottom half `yr`/`yi`, which do not overlap. A plain loop the
+// vectorizer takes (ymm, same speed as the hand-written `@Vector` form).
 fn butterflies(xr: []f64, xi: []f64, yr: []f64, yi: []f64, wr: []const f64, wi: []const f64) void {
     assert(xi.len == xr.len);
     assert(yr.len == xr.len);
@@ -159,8 +177,6 @@ fn butterflies(xr: []f64, xi: []f64, yr: []f64, yi: []f64, wr: []const f64, wi: 
         ai.* += ti;
     }
 }
-
-const testing = std.testing;
 
 test "fft: N = 1 and N = 2 are the identity and the sum/difference, NaN propagates" {
     var re1 = [_]f64{3.5};

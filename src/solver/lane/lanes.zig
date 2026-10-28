@@ -1,13 +1,37 @@
-//! The lane surface of every lane-generic analysis: one value per lane, one
-//! mask bit per lane, the seven functions of the design (splat, any, all,
-//! select, cmp, lane, each) and three mask combinators (both, either, not).
-//! `Lanes(1)` maps each function to the scalar operation it replaces, which
-//! the `gen_lanes_*` probes in tests/codegen.zig hold to FOLDED. Lanes are
-//! independent points: nothing here reduces across lanes, so no decision
-//! couples them. dev/research/lane-batched-simulation.md §3.1.
+//! The lane surface of every lane-generic analysis: a lane width W in, the
+//! types and operations that carry one value and one mask bit per lane out.
+//!
+//! The seven functions of the design (splat, any, all, select, cmp, lane,
+//! each) and three mask combinators (both, either, not). `Lanes(1)` maps each
+//! function to the scalar operation it replaces, which the `gen_lanes_*`
+//! probes in tests/codegen.zig hold to FOLDED. Lanes are independent points:
+//! nothing here reduces across lanes, so no decision couples them.
+//! Cites: dev/research/lane-batched-simulation.md §3.1.
+//!
+//! Contents:
+//! - `pub fn Lanes(comptime W: usize) type`
+//!     - `pub const width = W`
+//!     - `pub const V = if (W == 1) f64 else @Vector(W, f64)`
+//!     - `pub const Mask = if (W == 1) bool else @Int(.unsigned, W)`
+//!     - `pub const none: Mask = if (W == 1) false else 0`
+//!     - `pub const every: Mask = if (W == 1) true else std.math.maxInt(Mask)`
+//!     - `pub inline fn splat(x: f64) V`
+//!     - `pub inline fn any(m: Mask) bool`
+//!     - `pub inline fn all(m: Mask) bool`
+//!     - `pub inline fn select(m: Mask, a: V, b: V) V`
+//!     - `pub inline fn cmp(comptime op: std.math.CompareOperator, a: V, b: V) Mask`
+//!     - `pub inline fn lane(v: V, l: usize) f64`
+//!     - `pub inline fn both(a: Mask, b: Mask) Mask`
+//!     - `pub inline fn either(a: Mask, b: Mask) Mask`
+//!     - `pub inline fn not(m: Mask) Mask`
+//!     - `pub inline fn each(m: Mask) Iter`
+//!     - `pub const Iter = struct`
+//!       - `pub inline fn next(it: *Iter) ?usize`
+//! - `pub fn Of(comptime V: type) type`
 
 const std = @import("std");
 const assert = std.debug.assert;
+const testing = std.testing;
 
 /// W lanes, 1 <= W <= 64 (`LaneLu`'s failure mask width).
 pub fn Lanes(comptime W: usize) type {
@@ -111,8 +135,6 @@ pub fn Lanes(comptime W: usize) type {
 pub fn Of(comptime V: type) type {
     return Lanes(if (V == f64) 1 else @typeInfo(V).vector.len);
 }
-
-const testing = std.testing;
 
 test "Lanes(W) primitives agree with the scalar operation in every lane, NaN included" {
     inline for (.{ 1, 4, 8 }) |W| {

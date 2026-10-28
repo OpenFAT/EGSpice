@@ -1,20 +1,165 @@
-//! O(n) Thomas solver for tridiagonal patterns (RC ladders, chains).
-//! No pivoting: a pivot threshold pivoting would not keep fails the factor
-//! and `direct` demotes the system to the pivoting sparse LU (#45).
-//! In: a tridiagonal CSC pattern and its values. Out: solutions of A x = b
-//! and A^T x = b.
+//! Thomas solver for tridiagonal patterns (RC ladders, chains): a CSC
+//! pattern and its values in, solutions of A x = b and A^T x = b out, O(n).
+//!
+//! No pivoting: a pivot that threshold partial pivoting would not keep fails
+//! the factor, and `direct` demotes the system to the pivoting sparse LU.
+//! Cites: Thomas (1949) via Golub and Van Loan, Matrix Computations §4.3;
+//! the demotion rule #45.
+//!
+//! Contents:
+//! - `pub fn isTridiag(n: u32, col_ptr: []const u32, row_idx: []const u32) bool`
+//! - `pub const TriDiag = struct`
+//! - `pub const FactorError = error{SingularMatrix}` (as `TriDiag.FactorError`)
+//! - `pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) Allocator.Error!TriDiag`
+//! - `pub fn deinit(self: *TriDiag, gpa: Allocator) void`
+//! - `pub fn factor(self: *TriDiag, vals: []const f64, pivot_tol: f64) FactorError!void`
+//! - `pub fn solve(self: *TriDiag, x: []f64) void`
+//! - `pub fn solveT(self: *TriDiag, x: []f64) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
-const NONE: u32 = std.math.maxInt(u32);
+/// Factors of a tridiagonal matrix whose CSC slots were resolved once at
+/// `init`; `factor`, `solve` and `solveT` allocate nothing.
+pub const TriDiag = struct {
+    n: u32,
+    /// The CSC slots of row i's three band entries, read together by
+    /// `factor`, so one row is one 12-byte record.
+    rows: []Row,
+    /// Modified diagonal `bp`, elimination multiplier `mul` (`mul[0]`
+    /// unused) and super-diagonal `cv` (`cv[n-1]` unused), as three
+    /// n-long planes in that order. Valid only after a successful `factor`.
+    planes: []f64,
 
-/// True when every entry has |row - col| <= 1 and n >= 3. O(nnz). Asserts
-/// that `col_ptr` has n + 1 entries.
+    /// `SingularMatrix`: a modified pivot is zero, non-finite or too small
+    /// against the entry below it. Thomas does not pivot, so this covers
+    /// nonsingular matrices too. The factors are unusable after it.
+    pub const FactorError = error{SingularMatrix};
+
+    /// Resolves the band's CSC slots, O(nnz). Borrows nothing.
+    /// Caller owns the result; free it with `deinit` and the same `gpa`.
+    /// Asserts that the pattern passes `isTridiag`, which needs n >= 3.
+    pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) Allocator.Error!TriDiag {
+        assert(isTridiag(n, col_ptr, row_idx));
+        const rows = try gpa.alloc(Row, n);
+        errdefer gpa.free(rows);
+
+        const planes = try gpa.alloc(f64, 3 * @as(usize, n));
+
+        @memset(rows, .{ .sub = .none, .diag = .none, .sup = .none });
+        for (0..n) |j| {
+            for (col_ptr[j]..col_ptr[j + 1]) |p| {
+                const r = row_idx[p];
+                const slot: Slot = @fromBackingInt(@as(u32, @intCast(p)));
+                if (r == j) {
+                    rows[j].diag = slot;
+                } else if (r == j + 1) {
+                    rows[j + 1].sub = slot;
+                } else {
+                    assert(r + 1 == j); // isTridiag leaves only the super-diagonal.
+                    rows[r].sup = slot;
+                }
+            }
+        }
+        assert(rows[0].sub == .none);
+        assert(rows[n - 1].sup == .none);
+        return .{ .n = n, .rows = rows, .planes = planes };
+    }
+
+    /// Frees the slot table and the factors.
+    pub fn deinit(self: *TriDiag, gpa: Allocator) void {
+        assert(self.rows.len == self.n);
+        assert(self.planes.len == 3 * @as(usize, self.n));
+        gpa.free(self.rows);
+        gpa.free(self.planes);
+        self.* = undefined;
+    }
+
+    /// Runs the Thomas forward sweep over `vals`, O(n). Fails when a
+    /// modified pivot is zero, non-finite, or below `pivot_tol` times the
+    /// entry under it: the test threshold partial pivoting keeps the
+    /// diagonal by, so the sparse LU `direct` demotes to pivots where Thomas
+    /// cannot (#45). Asserts that `pivot_tol` is not negative and `vals`
+    /// covers every slot.
+    pub fn factor(self: *TriDiag, vals: []const f64, pivot_tol: f64) FactorError!void {
+        const n = self.n;
+        assert(n >= 3);
+        assert(pivot_tol >= 0);
+        const bp, const mul, const cv = self.split();
+        bp[0] = value(self.rows[0].diag, vals);
+        cv[0] = value(self.rows[0].sup, vals);
+        for (self.rows, 0..) |row, i| {
+            if (i > 0) {
+                const m = value(row.sub, vals) / bp[i - 1];
+                mul[i] = m;
+                bp[i] = value(row.diag, vals) - m * cv[i - 1];
+                if (i + 1 < n) cv[i] = value(row.sup, vals);
+            }
+            const d = @abs(bp[i]);
+            const below = if (i + 1 < n) @abs(value(self.rows[i + 1].sub, vals)) else 0;
+            // Negated, so a NaN pivot fails too.
+            if (!(d > 0 and d < std.math.inf(f64) and d >= pivot_tol * below)) return error.SingularMatrix;
+        }
+    }
+
+    /// Replaces `x` with A^-1 x after a successful `factor`, O(n).
+    /// Asserts that `x` has n entries.
+    pub fn solve(self: *TriDiag, x: []f64) void {
+        const n = self.n;
+        assert(n >= 3);
+        assert(x.len == n);
+        const bp, const mul, const cv = self.split();
+        for (1..n) |i| x[i] -= mul[i] * x[i - 1];
+        x[n - 1] /= bp[n - 1];
+        var i: usize = n - 1;
+        while (i > 0) {
+            i -= 1;
+            x[i] = (x[i] - cv[i] * x[i + 1]) / bp[i];
+        }
+    }
+
+    /// Replaces `x` with A^-T x after a successful `factor`, O(n): forward
+    /// through U^T (diagonal bp, sub-diagonal cv), then back through unit
+    /// L^T. Asserts that `x` has n entries.
+    pub fn solveT(self: *TriDiag, x: []f64) void {
+        const n = self.n;
+        assert(n >= 3);
+        assert(x.len == n);
+        const bp, const mul, const cv = self.split();
+        x[0] /= bp[0];
+        for (1..n) |i| x[i] = (x[i] - cv[i - 1] * x[i - 1]) / bp[i];
+        var i: usize = n - 1;
+        while (i > 0) {
+            i -= 1;
+            x[i] -= mul[i + 1] * x[i + 1];
+        }
+    }
+
+    // ---- private ----
+
+    fn split(self: *TriDiag) struct { []f64, []f64, []f64 } {
+        const n = self.n;
+        assert(self.planes.len == 3 * @as(usize, n));
+        return .{ self.planes[0..n], self.planes[n .. 2 * n], self.planes[2 * n ..] };
+    }
+};
+
+// A CSC position, or `none` for an entry the pattern lacks (read as 0).
+const Slot = enum(u32) { none = std.math.maxInt(u32), _ };
+
+const Row = struct { sub: Slot, diag: Slot, sup: Slot };
+
+comptime {
+    assert(@sizeOf(Row) == 12);
+}
+
+/// Returns true when every entry has |row - col| <= 1 and n >= 3, O(nnz).
+/// Asserts that `col_ptr` has n + 1 entries.
 pub fn isTridiag(n: u32, col_ptr: []const u32, row_idx: []const u32) bool {
     assert(col_ptr.len == @as(usize, n) + 1);
     if (n < 3) return false;
+    assert(col_ptr[n] <= row_idx.len);
     for (0..n) |j| {
         for (col_ptr[j]..col_ptr[j + 1]) |p| {
             const r = row_idx[p];
@@ -25,127 +170,11 @@ pub fn isTridiag(n: u32, col_ptr: []const u32, row_idx: []const u32) bool {
     return true;
 }
 
-inline fn triVal(pos: u32, vals: []const f64) f64 {
-    return if (pos != NONE) vals[pos] else 0;
+// ---- private ----
+
+inline fn value(slot: Slot, vals: []const f64) f64 {
+    return if (slot != .none) vals[@backingInt(slot)] else 0;
 }
-
-/// Thomas-algorithm solver. CSC slots are resolved once at `init`;
-/// `factor`, `solve` and `solveT` allocate nothing.
-pub const TriDiag = struct {
-    const Self = @This();
-
-    n: u32,
-    /// CSC slots of A[i,i-1], A[i,i] and A[i,i+1]; NONE when absent. The
-    /// three are slices of one `3n` allocation, `a_pos` first.
-    a_pos: []u32,
-    b_pos: []u32,
-    c_pos: []u32,
-    /// Modified diagonal, elimination multiplier (`mul[0]` unused) and
-    /// super-diagonal value (`cv[n-1]` unused); one `3n` allocation, `bp`
-    /// first. Valid only after a successful `factor`.
-    bp: []f64,
-    mul: []f64,
-    cv: []f64,
-
-    /// `SingularMatrix`: a modified pivot is zero, non-finite or too small
-    /// against its column. Thomas does not pivot, so this covers
-    /// nonsingular matrices too.
-    pub const FactorError = error{SingularMatrix};
-
-    /// Builds the slot maps, O(nnz). Borrows nothing. Free with `deinit`.
-    /// Asserts that the pattern passes `isTridiag`, which needs n >= 3.
-    pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) Allocator.Error!Self {
-        assert(isTridiag(n, col_ptr, row_idx));
-        const pos = try gpa.alloc(u32, 3 * @as(usize, n));
-        errdefer gpa.free(pos);
-        const fac = try gpa.alloc(f64, 3 * @as(usize, n));
-        var self = Self{
-            .n = n,
-            .a_pos = pos[0..n],
-            .b_pos = pos[n .. 2 * n],
-            .c_pos = pos[2 * n ..],
-            .bp = fac[0..n],
-            .mul = fac[n .. 2 * n],
-            .cv = fac[2 * n ..],
-        };
-        @memset(pos, NONE);
-        for (0..n) |j| {
-            for (col_ptr[j]..col_ptr[j + 1]) |p| {
-                const r = row_idx[p];
-                if (r == j) {
-                    self.b_pos[j] = @intCast(p);
-                } else if (r == j + 1) {
-                    self.a_pos[j + 1] = @intCast(p);
-                } else if (j > 0 and r + 1 == j) {
-                    self.c_pos[r] = @intCast(p);
-                }
-            }
-        }
-        return self;
-    }
-
-    /// Frees the slot maps and factors.
-    pub fn deinit(self: *Self, gpa: Allocator) void {
-        gpa.free(self.a_pos.ptr[0 .. 3 * @as(usize, self.n)]);
-        gpa.free(self.bp.ptr[0 .. 3 * @as(usize, self.n)]);
-        self.* = undefined;
-    }
-
-    /// Thomas forward sweep, O(n). Fails when a modified pivot is zero or
-    /// non-finite, or below `pivot_tol` times the entry under it: the test
-    /// threshold partial pivoting would keep the diagonal by, so the sparse
-    /// LU `direct` demotes to pivots where Thomas cannot (#45). The factors
-    /// are then unusable. Asserts that `pivot_tol` is not negative.
-    pub fn factor(self: *Self, vals: []const f64, pivot_tol: f64) FactorError!void {
-        const n = self.n;
-        assert(n >= 3);
-        assert(pivot_tol >= 0);
-
-        self.bp[0] = triVal(self.b_pos[0], vals);
-        self.cv[0] = triVal(self.c_pos[0], vals);
-        for (0..n) |i| {
-            if (i > 0) {
-                const m = triVal(self.a_pos[i], vals) / self.bp[i - 1];
-                self.mul[i] = m;
-                self.bp[i] = triVal(self.b_pos[i], vals) - m * self.cv[i - 1];
-                if (i + 1 < n) self.cv[i] = triVal(self.c_pos[i], vals);
-            }
-            const d = @abs(self.bp[i]);
-            const below = if (i + 1 < n) @abs(triVal(self.a_pos[i + 1], vals)) else 0;
-            // Negated, so a NaN pivot fails too.
-            if (!(d > 0 and d < std.math.inf(f64) and d >= pivot_tol * below)) return error.SingularMatrix;
-        }
-    }
-
-    /// x = A^-1 x after a successful `factor`, O(n). Asserts that `x` has n
-    /// entries.
-    pub fn solve(self: *Self, x: []f64) void {
-        const n = self.n;
-        assert(x.len == n);
-        for (1..n) |i| x[i] -= self.mul[i] * x[i - 1];
-        x[n - 1] /= self.bp[n - 1];
-        var i: usize = n - 1;
-        while (i > 0) {
-            i -= 1;
-            x[i] = (x[i] - self.cv[i] * x[i + 1]) / self.bp[i];
-        }
-    }
-
-    /// x = A^-T x after a successful `factor`: forward through U^T
-    /// (diagonal bp, sub-diagonal cv), then back through unit L^T. Asserts
-    /// that `x` has n entries.
-    pub fn solveT(self: *Self, x: []f64) void {
-        const n = self.n;
-        assert(x.len == n);
-        x[0] /= self.bp[0];
-        for (1..n) |i| x[i] = (x[i] - self.cv[i - 1] * x[i - 1]) / self.bp[i];
-        var i: usize = n - 1;
-        while (i > 0) {
-            i -= 1;
-            x[i] -= self.mul[i + 1] * x[i + 1];
-        }
-    }
-};
 
 test "TriDiag: random diagonally dominant ladders solve both ways; NaN, Inf and absent entries" {
     const testing = std.testing;

@@ -1,33 +1,64 @@
-//! Dense row-major LU with partial pivoting and SIMD row operations, for the
-//! small dense f64 systems: HB/PSS Jacobians, BBD blocks and the dense AC
-//! path. Matrices are n x n, row-major, stride n. From n = 40 elimination
-//! runs in rank-8 panels; the unblocked loops are its bitwise oracle.
-//! Cites LAPACK's dgetrf pivot convention and #160 (`pinVoid`).
+//! Dense LU with partial pivoting for the small dense f64 systems (HB/PSS
+//! Jacobians, BBD blocks, the dense AC path): an n x n row-major matrix
+//! (stride n) and right-hand sides in, its in-place factors and solutions
+//! of A x = b and A^T x = b out.
+//!
+//! From n = 40 elimination runs in rank-8 panels; the unblocked loops are
+//! its bitwise oracle (same multipliers, same update order per entry).
+//! Cites: LAPACK dgetrf's pivot convention (`piv[k]` is the row swapped with
+//! row k at step k); the void-unknown pin #160.
+//!
+//! Contents:
+//! - `pub const Error = error`
+//! - `pub const test_access = if (@import("builtin").is_test) .{ .backSubstitute = back...`
+//! - `pub fn factorizeSolve(n: usize, a: []f64, b: []const f64, x: []f64) Error!void`
+//! - `pub fn factorizeSolveNeg(n: usize, a: []f64, b: []const f64, x: []f64) Error!void`
+//! - `pub fn factorize(n: usize, a: []f64, piv: []u32) Error!void`
+//! - `pub fn solveFactored(n: usize, lu: []const f64, piv: []const u32, b: []const f64, x: []f64) void`
+//! - `pub fn solveFactoredT(n: usize, lu: []const f64, piv: []const u32, b: []const f64, x: []f64) void`
+//! - `pub fn buildComplexAdmittance(n: usize, nn: usize, g_dense: []const f64, c_mat: []const f64, omega: f64, a: []f64) void`
+//! - `pub fn pinVoid(n: usize, a: []f64) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
+const testing = std.testing;
 
-// ponytail: rank-8 panels are the only blocking; 2-D register tiling of the
-// trailing update is next if dense solves dominate again.
+/// Every way a factorization fails; the factors and any solution written
+/// so far are partial and unusable after it.
+pub const Error = error{
+    /// A pivot fell below eps^2 in magnitude or was not finite.
+    Singular,
+};
 
-/// A pivot fell below eps^2 or was not finite.
-pub const Error = error{Singular};
+/// Private kernels for src/solver/tests.zig; empty outside test builds.
+pub const test_access = if (@import("builtin").is_test) .{ .backSubstitute = backSubstitute } else {};
 
 const W = std.simd.suggestVectorLength(f64) orelse 1;
+
 const V = @Vector(W, f64);
+
 /// Pivot magnitudes below eps^2 (4.9e-32) count as zero.
 const singular_tol: f64 = std.math.floatEps(f64) * std.math.floatEps(f64);
 
-/// Whether pivot `p` fails the factor: below `singular_tol`, inf or NaN.
-/// The pivot search never picks a NaN over a finite candidate, but strict
-/// elimination carries any NaN entry into some later pivot, so every NaN
-/// input fails here.
-inline fn badPivot(p: f64) bool {
-    return !(@abs(p) >= singular_tol and @abs(p) <= std.math.floatMax(f64));
+// Pivot columns per panel.
+// ponytail: rank-8 panels are the only blocking; 2-D register tiling of the
+// trailing update is next if dense solves dominate again.
+const block = 8;
+
+/// Below this order the unblocked loops win: panel bookkeeping costs
+/// more than the row traffic it saves (Ir crossover between 32 and 48).
+const blocked_min = 5 * block;
+
+comptime {
+    // The vector row loops step by whole vectors inside one panel.
+    assert(std.math.isPowerOfTwo(W));
+    assert(blocked_min >= block);
 }
 
-/// x = A^-1 b in one elimination pass, O(n^3). Destroys `a`; `b` and `x`
+const Mode = enum { factor, solve };
+
+/// Solves A x = b in one elimination pass, O(n^3). Destroys `a`; `b` and `x`
 /// must not alias. `Singular` when a pivot falls below eps^2 in absolute
 /// terms or is not finite; `x` is then partial. Asserts that `a` holds
 /// n x n entries, `b` and `x` at least n each, and that `b` is not `x`.
@@ -35,13 +66,13 @@ pub fn factorizeSolve(n: usize, a: []f64, b: []const f64, x: []f64) Error!void {
     return factorizeSolveImpl(n, a, b, x, false);
 }
 
-/// x = -A^-1 b, the Newton step. Destroys `a`; `b` and `x` must not
+/// Solves A x = -b, the Newton step, in one elimination pass. Destroys `a`; `b` and `x` must not
 /// alias. Asserts as `factorizeSolve` does.
 pub fn factorizeSolveNeg(n: usize, a: []f64, b: []const f64, x: []f64) Error!void {
     return factorizeSolveImpl(n, a, b, x, true);
 }
 
-/// PA = LU in place: unit-lower L below the diagonal, U on and above
+/// Factors PA = LU in place: unit-lower L below the diagonal, U on and above
 /// it. `piv[k]` is the row swapped with row k at step k (LAPACK
 /// convention). O(n^3). `Singular` as in `factorizeSolve`; on error `a`
 /// and `piv` are partial. Asserts that `a` holds n x n entries and `piv`
@@ -68,7 +99,7 @@ pub fn factorize(n: usize, a: []f64, piv: []u32) Error!void {
     }
 }
 
-/// x = A^-1 b from `factorize` output. `b` and `x` may alias. Asserts that
+/// Solves A x = b from `factorize` output. `b` and `x` may alias. Asserts that
 /// `lu` holds n x n entries and `piv`, `b` and `x` at least n each.
 pub fn solveFactored(n: usize, lu: []const f64, piv: []const u32, b: []const f64, x: []f64) void {
     assert(lu.len >= n * n);
@@ -99,7 +130,7 @@ pub fn solveFactored(n: usize, lu: []const f64, piv: []const u32, b: []const f64
     backSubstitute(n, lu, x);
 }
 
-/// x = A^-T b from `factorize` output: A^T = U^T L^T P, so forward
+/// Solves A^T x = b from `factorize` output: A^T = U^T L^T P, so forward
 /// through U^T, back through L^T, then undo the swaps. `b` and `x`
 /// may alias. Asserts as `solveFactored` does.
 pub fn solveFactoredT(n: usize, lu: []const f64, piv: []const u32, b: []const f64, x: []f64) void {
@@ -166,12 +197,24 @@ pub fn buildComplexAdmittance(
 /// variable, not a singular system, and solves to x_i = b_i (#160). Only
 /// for a whole circuit matrix: a zero row inside a BBD block can still
 /// couple through the border. O(n^2) against the O(n^3) factorization.
+/// Asserts that `a` holds n x n entries.
 pub fn pinVoid(n: usize, a: []f64) void {
+    assert(a.len >= n * n);
     outer: for (0..n) |i| {
         for (a[i * n ..][0..n]) |v| if (v != 0) continue :outer;
         for (0..n) |r| if (a[r * n + i] != 0) continue :outer;
         a[i * n + i] = 1;
     }
+}
+
+// ---- private ----
+
+/// Whether pivot `p` fails the factor: below `singular_tol`, inf or NaN.
+/// The pivot search never picks a NaN over a finite candidate, but strict
+/// elimination carries any NaN entry into some later pivot, so every NaN
+/// input fails here.
+inline fn badPivot(p: f64) bool {
+    return !(@abs(p) >= singular_tol and @abs(p) <= std.math.floatMax(f64));
 }
 
 /// Carries x through the elimination instead of recording pivots.
@@ -210,19 +253,6 @@ fn factorizeSolveImpl(n: usize, a: []f64, b: []const f64, x: []f64, comptime neg
 
     backSubstitute(n, a, x);
 }
-
-/// Pivot columns per panel.
-const block = 8;
-/// Below this order the unblocked loops win: panel bookkeeping costs
-/// more than the row traffic it saves (Ir crossover between 32 and 48).
-const blocked_min = 5 * block;
-comptime {
-    // The vector row loops step by whole vectors inside one panel.
-    assert(std.math.isPowerOfTwo(W));
-    assert(blocked_min >= block);
-}
-
-const Mode = enum { factor, solve };
 
 /// Blocked right-looking elimination. A panel of `block` columns is
 /// factored as in the unblocked loops, then each trailing row takes
@@ -348,11 +378,6 @@ fn swapRows(a: []f64, n: usize, r1: usize, r2: usize) void {
     assert(r2 < n);
     for (a[r1 * n ..][0..n], a[r2 * n ..][0..n]) |*p, *q| std.mem.swap(f64, p, q);
 }
-
-/// Private kernels for src/solver/tests.zig; empty outside test builds.
-pub const test_access = if (@import("builtin").is_test) .{ .backSubstitute = backSubstitute } else {};
-
-const testing = std.testing;
 
 /// LAPACK's scaled residual ||A x - b|| / (||A|| ||x|| n eps) in max norms,
 /// with n max|a_ij| bounding ||A||; `transpose` checks A^T x = b.
