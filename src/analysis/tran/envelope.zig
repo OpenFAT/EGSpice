@@ -1,25 +1,258 @@
-//! Envelope-following transient. Each outer step skips `periods_per_step`
-//! carrier periods with coarse trapezoid steps, then resolves the last period
-//! finely to extract per-probe peak and RMS. The outer step halves when the
-//! envelope moves more than envelope_reltol and doubles below a quarter of it.
-//! In: a circuit at its operating point and the carrier period. Out: one
-//! row of time, peak and rms per probe per envelope point.
-//! Cites Verilog-AMS LRM §9.10.
+//! Envelope-following transient: a circuit at its operating point and the
+//! carrier period in, one row of time, peak and rms per probe per envelope
+//! point out. Each outer step skips `periods_per_step` carrier periods with
+//! coarse trapezoid steps, then resolves the last period finely to extract
+//! each probe's peak and RMS. The outer step halves when the envelope moves
+//! more than envelope_reltol and doubles below a quarter of it.
+//! Cites: Verilog-AMS LRM §9.10 (`$abstime`).
+//!
+//! Contents:
+//! - `pub const Options = core.query.Envelope`
+//! - `pub const maxPoints = core.validate.envelopeMaxPoints`
+//! - `pub const test_access`
+//! - `pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result`
+
 const std = @import("std");
-const root = @import("../types.zig");
-const converger = @import("solver").converger;
-const integrator = @import("integrator.zig");
+const assert = std.debug.assert;
 const num = @import("core").numerics;
+const converger = @import("solver").converger;
+const root = @import("../types.zig");
+const integrator = @import("integrator.zig");
 
 /// `.envelope` query options, defined in core/query.zig.
 pub const Options = @import("core").query.Envelope;
 
-/// Upper bound on envelope rows (core/validate.zig, which query validation shares).
+/// Returns the most envelope rows a query may write (core/validate.zig,
+/// which query validation shares).
 pub const maxPoints = @import("core").validate.envelopeMaxPoints;
+
+/// Private implementation access for the analysis test suite.
+pub const test_access = if (@import("builtin").is_test) .{
+    .stepCount = stepCount,
+} else {};
 
 /// Trapezoidal charge history carried across every envelope step, coarse and
 /// fine alike (trapezoid is one-step, so dt may change between them).
 const Trap = integrator.Hook(.trapezoidal);
+
+/// The coarse steps are this many inner steps long.
+const coarse_factor = 4.0;
+
+/// A peak this small counts as this for the envelope's relative change.
+const peak_floor = 1e-15;
+
+/// Returns the envelope-follow from ctx.x_op as point-major rows (time, peak
+/// and rms per probe) in `ctx.allocator`. Fails with
+/// error.DigitalDeviceUnsupported for a deck with a digital device, since a
+/// rejected outer step rewinds time, and error.EnvelopeDidNotConverge when
+/// a step fails at `min_periods_per_step` or `max_outer_steps` runs out
+/// before t_stop.
+pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
+    try ctx.circuit.refuseDigital("envelope");
+    const a = ctx.allocator;
+    const scratch = ctx.scratch_allocator;
+    const x = try scratch.dupe(f64, ctx.x_op);
+    defer scratch.free(x);
+
+    // `data` is the Result, so it lives on the results arena.
+    const ncols = 1 + 2 * ctx.probes.len;
+    const data = try a.alloc(f64, @as(usize, maxPoints(opts)) * ncols);
+    errdefer a.free(data);
+    const npoints: usize = try simulate(ctx.circuit, x, ctx.probes, data, opts, scratch);
+    assert(npoints >= 1);
+    assert(npoints <= maxPoints(opts));
+
+    // probeNames uses the deck's labels, which also name branch-current rows.
+    const labels = try root.probeNames(ctx, null);
+    const names = try a.alloc([]const u8, ncols);
+    names[0] = "time";
+    for (labels, 0..) |l, p| {
+        names[1 + p * 2] = try a.print("peak({s})", .{l});
+        names[2 + p * 2] = try a.print("rms({s})", .{l});
+    }
+
+    return .{
+        .plotname = "Envelope Analysis",
+        .varnames = names,
+        .is_complex = false,
+        .npoints = npoints,
+        .data = try a.realloc(data, npoints * ncols),
+    };
+}
+
+// ---- private ----
+
+/// Envelope-following transient from `x` into the caller's `rows`:
+/// point-major rows [t, peak_p0, rms_p0, peak_p1, rms_p1, ...]. Returns the
+/// rows written, the t = 0 row included.
+fn simulate(
+    ckt: *root.Circuit,
+    x: []f64,
+    probes: []const u32,
+    rows: []f64,
+    options: Options,
+    scratch: std.mem.Allocator,
+) !u32 {
+    const n: usize = ckt.n;
+    const t_carrier = options.t_carrier;
+    const ncols = 1 + 2 * probes.len;
+    assert(rows.len >= @as(usize, maxPoints(options)) * ncols);
+    assert(x.len == n);
+    assert(options.min_periods_per_step >= 1);
+
+    try ckt.computeBaseline();
+    const ws = try ckt.workspace();
+
+    // One block: [x_outer_save | prev_peak | peak | sum_sq | trap], trap =
+    // q_prev, i_prev, q_cur and rollback copies of the first two, present
+    // only when the circuit has charge.
+    const nt: usize = if (ckt.has_charge) n else 0;
+    const np = probes.len;
+    const block = try scratch.alloc(f64, n + 3 * np + 5 * nt);
+    defer scratch.free(block);
+    var off: usize = 0;
+    const x_outer_save = root.take(block, &off, n);
+    const prev_peak = root.take(block, &off, np);
+    const peak = root.take(block, &off, np);
+    const sum_sq = root.take(block, &off, np);
+    const ts = root.take(block, &off, 5 * nt);
+    assert(off == block.len);
+    const q_save = ts[3 * nt ..][0..nt];
+    const i_save = ts[4 * nt ..][0..nt];
+    var trap_state: Trap = undefined;
+    const trap: ?*Trap = if (ckt.has_charge) blk: {
+        trap_state = .{
+            .method = {},
+            .c = .{ .ag0 = 0, .ag2 = 0 },
+            .q_prev = ts[0..n],
+            .i_prev = ts[n..][0..n],
+            .q_cur = ts[2 * n ..][0..n],
+            .a_vals = try ws.ensureAVals(ckt.nnz),
+            .has_charge = true,
+        };
+        // Exact at a DC operating point: q = q(x_op), no dynamic current.
+        ckt.eval(x, 0);
+        num.copySimd(trap_state.q_prev, ckt.q_vec[0..n]);
+        @memset(trap_state.i_prev, 0);
+        break :blk &trap_state;
+    } else null;
+    const dt_inner: f64 = t_carrier / @as(f64, @floatFromInt(options.carrier_steps_per_period));
+    const outer_state = try ckt.saveState(scratch);
+    defer outer_state.deinit(scratch);
+
+    // Row 0 is the operating point.
+    rows[0] = 0;
+    for (probes, 0..) |node, p| {
+        rows[1 + 2 * p] = @abs(x[node]); // peak
+        rows[2 + 2 * p] = @abs(x[node]); // rms
+        prev_peak[p] = @abs(x[node]);
+    }
+
+    var t: f64 = 0;
+    var outer_steps: u32 = 0;
+    var periods_per_step: u32 = options.periods_per_outer_step;
+    var attempts: u64 = 0;
+    while (t < options.t_stop and outer_steps < options.max_outer_steps) : (attempts += 1) {
+        if (attempts != 0) try ckt.checkpoint(.{ .phase = .transient, .completed = attempts });
+        num.copySimd(x_outer_save, x);
+        ckt.storeState(outer_state);
+        if (trap) |tr| {
+            num.copySimd(q_save, tr.q_prev);
+            num.copySimd(i_save, tr.i_prev);
+        }
+
+        const t_target = @min(t + @as(f64, @floatFromInt(periods_per_step)) * t_carrier, options.t_stop);
+        // Coarse steps up to one carrier period short of the target, then
+        // one fine period for the envelope.
+        const t_fine_start = if (t_target - t > t_carrier) t_target - t_carrier else t;
+        var ok = !(t_fine_start > t) or
+            try coarseAdvance(ckt, ws, x, t, t_fine_start - t, dt_inner * coarse_factor, options, trap);
+
+        // RMS by trapezoid weights over the window: half weight on each
+        // endpoint, so a sine reads its true RMS.
+        for (probes, peak, sum_sq) |node, *pk, *sq| {
+            pk.* = @abs(x[node]);
+            sq.* = 0.5 * x[node] * x[node];
+        }
+        // Counted, not accumulated: summing dt_inner drifts below the window
+        // and takes one step past it.
+        const n_fine = stepCount(t_target - t_fine_start, dt_inner);
+        var n_steps: u32 = 0;
+        while (ok and n_steps < n_fine) : (n_steps += 1) {
+            const t_step = t_fine_start + @as(f64, @floatFromInt(n_steps + 1)) * dt_inner;
+            if (!try newtonAt(ckt, ws, x, t_step, dt_inner, options, trap)) {
+                ok = false;
+                break;
+            }
+            for (probes, peak, sum_sq) |node, *pk, *sq| {
+                const v = x[node];
+                pk.* = @max(pk.*, @abs(v));
+                sq.* += v * v;
+            }
+        }
+
+        if (!ok) {
+            // The outer step was too aggressive: restore and retry shorter.
+            num.copySimd(x, x_outer_save);
+            ckt.restoreState(outer_state);
+            if (trap) |tr| {
+                num.copySimd(tr.q_prev, q_save);
+                num.copySimd(tr.i_prev, i_save);
+            }
+            if (periods_per_step == options.min_periods_per_step) return error.EnvelopeDidNotConverge;
+            periods_per_step = @max(periods_per_step / 2, options.min_periods_per_step);
+            continue;
+        }
+        assert(n_steps == n_fine);
+
+        t = t_target;
+        outer_steps += 1;
+        const row = rows[outer_steps * ncols ..][0..ncols];
+        row[0] = t;
+        var max_rel_change: f64 = 0;
+        for (probes, peak, sum_sq, prev_peak, 0..) |node, pk, sq, *prev, p| {
+            row[1 + 2 * p] = pk;
+            row[2 + 2 * p] = @sqrt(@max(sq - 0.5 * x[node] * x[node], 0) / @as(f64, @floatFromInt(n_steps)));
+            max_rel_change = @max(max_rel_change, @abs(pk - prev.*) / @max(prev.*, peak_floor));
+            prev.* = pk;
+        }
+        if (max_rel_change > options.envelope_reltol) {
+            periods_per_step = @max(periods_per_step / 2, options.min_periods_per_step);
+        } else if (max_rel_change < options.envelope_reltol * 0.25) {
+            periods_per_step = @min(periods_per_step * 2, options.max_periods_per_step);
+        }
+    }
+
+    if (!(t >= options.t_stop)) return error.EnvelopeDidNotConverge;
+    assert(outer_steps <= options.max_outer_steps);
+    return outer_steps + 1;
+}
+
+/// Steps from t_start through `duration` seconds at `dt_coarse`, the last
+/// step shortened to land exactly. Returns false on the first Newton failure.
+fn coarseAdvance(
+    ckt: *root.Circuit,
+    ws: *converger.Workspace,
+    x: []f64,
+    t_start: f64,
+    duration: f64,
+    dt_coarse: f64,
+    options: Options,
+    trap: ?*Trap,
+) !bool {
+    assert(duration > 0);
+    assert(dt_coarse > 0);
+    // Counted like the fine window: an accumulated time left a roundoff-sized
+    // last step whose 2/dt companion swamps the matrix.
+    const n = stepCount(duration, dt_coarse);
+    var t_prev = t_start;
+    for (1..@as(usize, n) + 1) |k| {
+        const t_end = if (k == n) t_start + duration else t_start + @as(f64, @floatFromInt(k)) * dt_coarse;
+        if (!try newtonAt(ckt, ws, x, t_end, t_end - t_prev, options, trap)) return false;
+        t_prev = t_end;
+    }
+    return true;
+}
 
 /// One step to absolute time t: a trapezoid step of length dt when the
 /// circuit has charge (`trap`), else a static solve. Returns convergence.
@@ -32,11 +265,13 @@ fn newtonAt(
     options: Options,
     trap: ?*Trap,
 ) !bool {
+    assert(x.len == ckt.n);
+    assert(trap == null or dt > 0);
+    // Envelope is not ngspice's NIiter, so ITL4 caps it without the floor.
+    var opts = converger.optionsFromTolerances(options.tol, null);
+    opts.max_iter = options.tol.itl4;
     // Devices read Instance.abstime (§9.10 `$abstime`), not the `t`
     // argument, so every step publishes its time.
-    var opts = converger.optionsFromTolerances(options.tol, null);
-    // Envelope is not ngspice's NIiter, so ITL4 caps it without the floor.
-    opts.max_iter = options.tol.itl4;
     const nr = if (trap) |tr| blk: {
         ckt.setSimState(.{ .t = t, .dt = dt, .kind = .tran });
         tr.c = .{ .ag0 = 2.0 / dt, .ag2 = 0 };
@@ -61,240 +296,11 @@ fn newtonAt(
     return true;
 }
 
-/// Envelope-following transient from `x` into the caller's `rows`:
-/// point-major rows [t, peak_p0, rms_p0, peak_p1, rms_p1, ...]. Asserts
-/// that `rows` holds at least maxPoints(options) * (1 + 2*probes.len)
-/// values. Returns the rows written, the t = 0 row included, or
-/// error.EnvelopeDidNotConverge when a step fails at min_periods_per_step
-/// or `max_outer_steps` runs out before t_stop.
-fn simulate(
-    ckt: *root.Circuit,
-    x: []f64,
-    probes: []const u32,
-    rows: []f64,
-    options: Options,
-    allocator: std.mem.Allocator,
-) !u32 {
-    const n: usize = ckt.n;
-    const t_carrier = options.t_carrier;
-    const ncols = 1 + 2 * probes.len;
-    std.debug.assert(rows.len >= @as(usize, maxPoints(options)) * ncols);
-
-    try ckt.computeBaseline();
-    const ws = try ckt.workspace();
-
-    // One scratch block: [x_outer_save | prev_peak | peak | sum_sq | trap]
-    // where trap = q_prev, i_prev, q_cur and rollback copies of the first
-    // two, present only when the circuit has charge.
-    const nt: usize = if (ckt.has_charge) n else 0;
-    const scratch = try allocator.alloc(f64, n + 3 * probes.len + 5 * nt);
-    defer allocator.free(scratch);
-    const x_outer_save = scratch[0..n];
-    const prev_peak = scratch[n..][0..probes.len];
-    const peak = scratch[n + probes.len ..][0..probes.len];
-    const sum_sq = scratch[n + 2 * probes.len ..][0..probes.len];
-    const ts = scratch[n + 3 * probes.len ..][0 .. 5 * nt];
-    const q_save = ts[3 * nt ..][0..nt];
-    const i_save = ts[4 * nt ..][0..nt];
-    var trap_state: Trap = undefined;
-    const trap: ?*Trap = if (ckt.has_charge) blk: {
-        trap_state = .{
-            .method = {},
-            .c = .{ .ag0 = 0, .ag2 = 0 },
-            .q_prev = ts[0..n],
-            .i_prev = ts[n..][0..n],
-            .q_cur = ts[2 * n ..][0..n],
-            .a_vals = try ws.ensureAVals(ckt.nnz),
-            .has_charge = true,
-        };
-        // Exact at a DC operating point: q = q(x_op), no dynamic current.
-        ckt.eval(x, 0);
-        num.copySimd(trap_state.q_prev, ckt.q_vec[0..n]);
-        @memset(trap_state.i_prev, 0);
-        break :blk &trap_state;
-    } else null;
-    const dt_inner: f64 = t_carrier / @as(f64, @floatFromInt(options.carrier_steps_per_period));
-    const outer_state = try ckt.saveState(allocator);
-    defer outer_state.deinit(allocator);
-
-    // Row 0 is the operating point.
-    {
-        const row = rows[0..ncols];
-        row[0] = 0;
-        for (probes, 0..) |node, p| {
-            row[1 + 2 * p] = @abs(x[node]); // peak
-            row[2 + 2 * p] = @abs(x[node]); // rms
-            prev_peak[p] = @abs(x[node]);
-        }
-    }
-
-    var t: f64 = 0;
-    var outer_steps: u32 = 0;
-    var periods_per_step: u32 = options.periods_per_outer_step;
-
-    var attempts: u64 = 0;
-    while (t < options.t_stop and outer_steps < options.max_outer_steps) {
-        if (attempts != 0) try ckt.checkpoint(.{ .phase = .transient, .completed = attempts });
-        attempts += 1;
-        num.copySimd(x_outer_save, x);
-        ckt.storeState(outer_state);
-        if (trap) |tr| {
-            num.copySimd(q_save, tr.q_prev);
-            num.copySimd(i_save, tr.i_prev);
-        }
-
-        const t_outer_step = @as(f64, @floatFromInt(periods_per_step)) * t_carrier;
-        const t_target = @min(t + t_outer_step, options.t_stop);
-        const actual_outer_dt = t_target - t;
-
-        // Coarse steps (4x the inner dt) up to one carrier period short of
-        // the target, then one fine period for the envelope.
-        const t_fine_start = if (actual_outer_dt > t_carrier)
-            t_target - t_carrier
-        else
-            t;
-        const needs_coarse = t_fine_start > t;
-        var ok = !needs_coarse or try coarseAdvance(ckt, ws, x, t, t_fine_start - t, dt_inner * 4.0, options, trap);
-
-        // RMS by trapezoid weights over the window: half weight on each
-        // endpoint, so a sine reads its true RMS.
-        for (probes, 0..) |node, p| {
-            peak[p] = @abs(x[node]);
-            sum_sq[p] = 0.5 * x[node] * x[node];
-        }
-        var n_steps: u32 = 0;
-
-        // Counted, not accumulated: summing dt_inner drifts below the window
-        // and takes one step past it.
-        const n_fine = stepCount(t_target - t_fine_start, dt_inner);
-        while (ok and n_steps < n_fine) {
-            const t_step = t_fine_start + @as(f64, @floatFromInt(n_steps + 1)) * dt_inner;
-            if (!try newtonAt(ckt, ws, x, t_step, dt_inner, options, trap)) {
-                ok = false;
-                break;
-            }
-
-            n_steps += 1;
-
-            for (probes, 0..) |node, p| {
-                const v = x[node];
-                peak[p] = @max(peak[p], @abs(v));
-                sum_sq[p] += v * v;
-            }
-        }
-
-        if (!ok) {
-            // The outer step was too aggressive: restore and retry shorter.
-            num.copySimd(x, x_outer_save);
-            ckt.restoreState(outer_state);
-            if (trap) |tr| {
-                num.copySimd(tr.q_prev, q_save);
-                num.copySimd(tr.i_prev, i_save);
-            }
-            if (periods_per_step == options.min_periods_per_step) return error.EnvelopeDidNotConverge;
-            periods_per_step = @max(periods_per_step / 2, options.min_periods_per_step);
-            continue;
-        }
-
-        t = t_target;
-        outer_steps += 1;
-
-        const row = rows[outer_steps * ncols ..][0..ncols];
-        row[0] = t;
-
-        var max_rel_change: f64 = 0;
-        for (probes, 0..) |node, p| {
-            const rms = @sqrt(@max(sum_sq[p] - 0.5 * x[node] * x[node], 0) / @as(f64, @floatFromInt(n_steps)));
-
-            row[1 + 2 * p] = peak[p];
-            row[2 + 2 * p] = rms;
-
-            const denom = @max(prev_peak[p], 1e-15);
-            const rel_change = @abs(peak[p] - prev_peak[p]) / denom;
-            max_rel_change = @max(max_rel_change, rel_change);
-
-            prev_peak[p] = peak[p];
-        }
-
-        if (max_rel_change > options.envelope_reltol) {
-            periods_per_step = @max(periods_per_step / 2, options.min_periods_per_step);
-        } else if (max_rel_change < options.envelope_reltol * 0.25) {
-            periods_per_step = @min(periods_per_step * 2, options.max_periods_per_step);
-        }
-    }
-
-    if (!(t >= options.t_stop)) return error.EnvelopeDidNotConverge;
-    return outer_steps + 1;
-}
-
-/// Steps from t_start through `duration` seconds at `dt_coarse`, the last
-/// step shortened to land exactly. Returns false on the first Newton failure.
-fn coarseAdvance(
-    ckt: *root.Circuit,
-    ws: *converger.Workspace,
-    x: []f64,
-    t_start: f64,
-    duration: f64,
-    dt_coarse: f64,
-    options: Options,
-    trap: ?*Trap,
-) !bool {
-    // Counted like the fine window: an accumulated time left a roundoff-sized
-    // last step whose 2/dt companion swamps the matrix.
-    const n = stepCount(duration, dt_coarse);
-    var t_prev = t_start;
-    for (1..@as(usize, n) + 1) |k| {
-        const t_end = if (k == n) t_start + duration else t_start + @as(f64, @floatFromInt(k)) * dt_coarse;
-        if (!try newtonAt(ckt, ws, x, t_end, t_end - t_prev, options, trap)) return false;
-        t_prev = t_end;
-    }
-    return true;
-}
-
 /// Steps of at most `dt` that cover `duration` > 0: at least one, and a
 /// remainder within 1e-9 of a step is roundoff, not one more step.
 fn stepCount(duration: f64, dt: f64) u32 {
-    return @max(1, @as(u32, @intFromFloat(@ceil(duration / dt - 1e-9))));
+    assert(dt > 0);
+    const n = @max(1, @as(u32, @intFromFloat(@ceil(duration / dt - 1e-9))));
+    assert(n >= 1);
+    return n;
 }
-
-/// Contract entry: envelope-follow from ctx.x_op. Point-major rows
-/// (time, peak and rms per probe), exactly what `simulate` writes. Returns
-/// error.DigitalDeviceUnsupported for a deck with a digital device, since
-/// a rejected outer step rewinds time.
-pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
-    try ctx.circuit.refuseDigital("envelope");
-    const a = ctx.allocator;
-    const x_op = ctx.x_op;
-    const scratch = ctx.scratch_allocator;
-    const x = try scratch.alloc(f64, x_op.len);
-    defer scratch.free(x);
-    @memcpy(x, x_op);
-
-    // `data` is the Result, so it lives on the results arena.
-    const ncols = 1 + 2 * ctx.probes.len;
-    const data = try a.alloc(f64, @as(usize, maxPoints(opts)) * ncols);
-    errdefer a.free(data);
-    const npoints: usize = try simulate(ctx.circuit, x, ctx.probes, data, opts, scratch);
-
-    // probeNames uses the deck's labels, which also name branch-current rows.
-    const labels = try root.probeNames(ctx, null);
-    const names = try a.alloc([]const u8, ncols);
-    names[0] = "time";
-    for (labels, 0..) |l, p| {
-        names[1 + p * 2] = try std.fmt.allocPrint(a, "peak({s})", .{l});
-        names[2 + p * 2] = try std.fmt.allocPrint(a, "rms({s})", .{l});
-    }
-
-    return .{
-        .plotname = "Envelope Analysis",
-        .varnames = names,
-        .is_complex = false,
-        .npoints = npoints,
-        .data = try a.realloc(data, npoints * ncols),
-    };
-}
-
-// Private implementation access for the analysis test suite.
-pub const test_access = if (@import("builtin").is_test) .{
-    .stepCount = stepCount,
-} else {};
