@@ -27,29 +27,26 @@
 //! 2.1-2.6x at 8 lanes, the supply columns' tail holding the rest. A
 //! level-structure nested dissection was tried for more and filled 116x
 //! against AMD's 2.6x there.
+//!
+//! Contents:
+//! - `pub const max_lanes = 16`
+//! - `pub const Plan = struct`
+//!   - `pub const Options = struct`
+//!   - `pub fn phases(self: *const Plan) u32`
+//!   - `pub fn init(gpa: Allocator, lu: *const SparseLu, col_ptr: []const u32, threads: u32, opt: Options) Allocator.Error!?Plan`
+//!   - `pub fn deinit(self: *Plan, gpa: Allocator) void`
+//!   - `pub fn run(self: *Plan, lu: *SparseLu, col_ptr: []const u32, vals: []const f64, growth: f64, io: std.Io) error{SingularMatrix}!void`
+//!     - `pub inline fn wait(self: Tail, i: u32) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const SparseLu = @import("sparse_lu.zig").SparseLu;
-
 const Allocator = std.mem.Allocator;
+const testing = std.testing;
 
 /// Lanes at most, the caller's included (`num.Execution.lu_threads` caps
 /// at 16).
 pub const max_lanes = 16;
-
-/// Model cost units per column on top of its flops and slots: the
-/// scatter, the pivot tests and the loop overheads. ponytail: a guess in
-/// flop units; fit it if the admission misjudges a deck.
-const col_cost = 8;
-/// Model cost of starting and joining one phase's lanes, in the same units
-/// (about 1 ns each on the i9-14900HX): the `std.Io` task queue and futex
-/// wake-ups, padded for a loaded machine, where the slowest lane decides.
-const spawn_cost = 50_000;
-/// Model cost per step of the pipelined tail on top of the column's own:
-/// the ticket and the done stamp's cache line moving between cores.
-/// ponytail: a guess, like `col_cost`.
-const hop_cost = 200;
 
 /// One pivot epoch's schedule: phases of lanes, then a serial tail.
 pub const Plan = struct {
@@ -88,9 +85,6 @@ pub const Plan = struct {
         /// Cost units charged per step of the pipelined tail.
         hop: u64 = hop_cost,
     };
-
-    /// Phases at most: each costs a spawn and a join.
-    const max_phases = 8;
 
     /// Phases of lanes before the tail, 1 to `max_phases`.
     pub fn phases(self: *const Plan) u32 {
@@ -219,50 +213,6 @@ pub const Plan = struct {
         return self;
     }
 
-    /// The pipelined tail's makespan in model units: `threads` workers
-    /// take steps cut..n-1 in order, each when free, and a step's update
-    /// from a tail step i starts once i is done. `fin` holds each step's
-    /// finish time afterwards (n entries, those below `cut` untouched).
-    fn pipeline(lu: *const SparseLu, cut: u32, threads: u32, hop: u64, fin: []u64) u64 {
-        var free: [max_lanes]u64 = @splat(0);
-        var span: u64 = 0;
-        for (cut..lu.n) |k| {
-            var pick: usize = 0;
-            for (1..threads) |l| if (free[l] < free[pick]) {
-                pick = l;
-            };
-            var t = free[pick] + hop + col_cost + (lu.lp[k + 1] - lu.lp[k]);
-            for (lu.ui.items[lu.up[k]..lu.up[k + 1]]) |i| {
-                if (i >= cut) t = @max(t, fin[i]);
-                t += 1 + lu.lp[i + 1] - lu.lp[i];
-            }
-            fin[k] = t;
-            free[pick] = t;
-            span = @max(span, t);
-        }
-        return span;
-    }
-
-    const Desc = struct {
-        fn lt(c: []const u64, a: u64, b: u64) bool {
-            return c[a] > c[b] or (c[a] == c[b] and a < b);
-        }
-    };
-
-    /// Adds step k to the union-find of the DAG over steps [start, k]:
-    /// k joins the component of each U[:,k] step at or after `start`.
-    fn unite(lu: *const SparseLu, parent: []u32, comp: []u64, cost: []const u64, start: usize, k: usize) void {
-        parent[k] = @intCast(k);
-        comp[k] = cost[k];
-        for (lu.ui.items[lu.up[k]..lu.up[k + 1]]) |i| {
-            if (i < start) continue;
-            const ri = find(parent, i);
-            if (ri == k) continue;
-            parent[ri] = @intCast(k);
-            comp[k] += comp[ri];
-        }
-    }
-
     /// Frees the schedule and lane accumulators; `lu` stays the caller's.
     pub fn deinit(self: *Plan, gpa: Allocator) void {
         gpa.free(self.lane_ptr);
@@ -317,6 +267,55 @@ pub const Plan = struct {
         }
         if (bits != 0) return error.SingularMatrix;
         if (growth > 0) lu.replay_mult = m;
+    }
+
+    // ---- private ----
+
+    /// Phases at most: each costs a spawn and a join.
+    const max_phases = 8;
+
+    /// The pipelined tail's makespan in model units: `threads` workers
+    /// take steps cut..n-1 in order, each when free, and a step's update
+    /// from a tail step i starts once i is done. `fin` holds each step's
+    /// finish time afterwards (n entries, those below `cut` untouched).
+    fn pipeline(lu: *const SparseLu, cut: u32, threads: u32, hop: u64, fin: []u64) u64 {
+        var free: [max_lanes]u64 = @splat(0);
+        var span: u64 = 0;
+        for (cut..lu.n) |k| {
+            var pick: usize = 0;
+            for (1..threads) |l| if (free[l] < free[pick]) {
+                pick = l;
+            };
+            var t = free[pick] + hop + col_cost + (lu.lp[k + 1] - lu.lp[k]);
+            for (lu.ui.items[lu.up[k]..lu.up[k + 1]]) |i| {
+                if (i >= cut) t = @max(t, fin[i]);
+                t += 1 + lu.lp[i + 1] - lu.lp[i];
+            }
+            fin[k] = t;
+            free[pick] = t;
+            span = @max(span, t);
+        }
+        return span;
+    }
+
+    const Desc = struct {
+        fn lt(c: []const u64, a: u64, b: u64) bool {
+            return c[a] > c[b] or (c[a] == c[b] and a < b);
+        }
+    };
+
+    /// Adds step k to the union-find of the DAG over steps [start, k]:
+    /// k joins the component of each U[:,k] step at or after `start`.
+    fn unite(lu: *const SparseLu, parent: []u32, comp: []u64, cost: []const u64, start: usize, k: usize) void {
+        parent[k] = @intCast(k);
+        comp[k] = cost[k];
+        for (lu.ui.items[lu.up[k]..lu.up[k + 1]]) |i| {
+            if (i < start) continue;
+            const ri = find(parent, i);
+            if (ri == k) continue;
+            parent[ri] = @intCast(k);
+            comp[k] += comp[ri];
+        }
     }
 
     /// The pipelined tail: one worker per lane, steps by ticket in order.
@@ -377,6 +376,23 @@ pub const Plan = struct {
     }
 };
 
+/// Model cost units per column on top of its flops and slots: the
+/// scatter, the pivot tests and the loop overheads. ponytail: a guess in
+/// flop units; fit it if the admission misjudges a deck.
+const col_cost = 8;
+
+/// Model cost of starting and joining one phase's lanes, in the same units
+/// (about 1 ns each on the i9-14900HX): the `std.Io` task queue and futex
+/// wake-ups, padded for a loaded machine, where the slowest lane decides.
+const spawn_cost = 50_000;
+
+/// Model cost per step of the pipelined tail on top of the column's own:
+/// the ticket and the done stamp's cache line moving between cores.
+/// ponytail: a guess, like `col_cost`.
+const hop_cost = 200;
+
+// ---- private ----
+
 fn share(part: u64, total: u64) f64 {
     return @as(f64, @floatFromInt(part)) / @as(f64, @floatFromInt(@max(total, 1)));
 }
@@ -390,8 +406,6 @@ fn find(parent: []u32, x: u32) u32 {
     }
     return i;
 }
-
-const testing = std.testing;
 
 test "Plan: lanes plus the serial tail are bitwise refactor, failures included" {
     const gpa = testing.allocator;

@@ -13,6 +13,14 @@
 //! In: W solvers on one pattern, W lanes of values and right-hand sides.
 //! Out: W lanes of -A^-1 rhs, and the lanes whose own factor failed.
 //! dev/research/lane-batched-simulation.md §6 (direct solve row).
+//!
+//! Contents:
+//! - `pub fn LaneSolver(comptime W: usize) type`
+//!     - `pub const V = L.V`
+//!     - `pub const Mask = L.Mask`
+//!     - `pub fn init(gpa: Allocator, lanes: [W]*direct.Solver) !Self`
+//!     - `pub fn deinit(self: *Self) void`
+//!     - `pub fn factorSolveNeg(self: *Self, vals: []const V, rhs: []const V, dx: []V, m: Mask, execution: Execution) !Mask`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -22,6 +30,7 @@ const SparseLu = @import("../sparse_lu.zig").SparseLu;
 const LaneLu = @import("lu.zig").LaneLu;
 const Lanes = @import("lanes.zig").Lanes;
 const Execution = @import("core").numerics.Execution;
+const testing = std.testing;
 
 /// W borrowed `direct.Solver`s solved as one; W >= 2 (W = 1 is the solver
 /// itself, the oracle).
@@ -29,11 +38,6 @@ pub fn LaneSolver(comptime W: usize) type {
     comptime assert(W >= 2); // W = 1 is `direct.Solver` itself
     return struct {
         const Self = @This();
-        const L = Lanes(W);
-        /// Lane l's value in element l (`Lanes(W).V`).
-        pub const V = L.V;
-        /// Bit l for lane l (`Lanes(W).Mask`).
-        pub const Mask = L.Mask;
 
         /// Lane l's own solver, borrowed; all on one pattern.
         lanes: [W]*direct.Solver,
@@ -50,7 +54,11 @@ pub fn LaneSolver(comptime W: usize) type {
         scratch: []f64,
         gpa: Allocator,
 
-        const no_lu = std.math.maxInt(u64);
+        /// Lane l's value in element l (`Lanes(W).V`).
+        pub const V = L.V;
+
+        /// Bit l for lane l (`Lanes(W).Mask`).
+        pub const Mask = L.Mask;
 
         /// Borrows `lanes`, which must share one pattern and keep their
         /// bypass copies. Fails only on allocation.
@@ -135,6 +143,12 @@ pub fn LaneSolver(comptime W: usize) type {
             return singular;
         }
 
+        // ---- private ----
+
+        const L = Lanes(W);
+
+        const no_lu = std.math.maxInt(u64);
+
         inline fn bit(l: usize) Mask {
             return @as(Mask, 1) << @intCast(l);
         }
@@ -206,12 +220,7 @@ pub fn LaneSolver(comptime W: usize) type {
     };
 }
 
-const testing = std.testing;
-
-test "LaneSolver(W) lane l is bitwise its own scalar factor and solveNeg, through re-pivots, singular lanes and bypasses" {
-    try expectLanesMatch(2);
-    try expectLanesMatch(std.simd.suggestVectorLength(f64) orelse 4);
-}
+// ---- private ----
 
 fn expectLanesMatch(comptime W: usize) !void {
     const gpa = testing.allocator;
@@ -294,4 +303,9 @@ fn expectLanesMatch(comptime W: usize) !void {
     }
     // Both paths ran.
     try testing.expect(vector_lanes > 0 and peeled_lanes > 0);
+}
+
+test "LaneSolver(W) lane l is bitwise its own scalar factor and solveNeg, through re-pivots, singular lanes and bypasses" {
+    try expectLanesMatch(2);
+    try expectLanesMatch(std.simd.suggestVectorLength(f64) orelse 4);
 }

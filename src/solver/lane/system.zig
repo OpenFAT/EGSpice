@@ -10,12 +10,98 @@
 //! and `LaneHook`, its `newtonLanes` hook. Each lane's own planes end every
 //! iterate as its scalar solve leaves them (`loadCheck`).
 //! dev/research/lane-batched-simulation.md §3.2 and §4 (the CPU decision).
+//!
+//! Contents:
+//!   - `pub fn applyLimits(self: *Toy, x: []f64, x_old: []const f64) bool`
+//!   - `pub fn updateStates(self: *Toy, _: []const f64) ?f64`
+//!     - `pub fn assemble(_: Hook, s: *Toy, x: []const f64, t: f64) void`
+//!     - `pub fn vals(_: Hook, s: *Toy) []f64`
+//!     - `pub fn diagAt(_: Hook, s: *Toy, slot: u32) f64`
+//! - `pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) type`
+//!     - `pub const V = L.V`
+//!     - `pub const Mask = L.Mask`
+//!     - `pub fn init(gpa: Allocator, lanes: [W]*Sys, hook: Hook) !Self`
+//!     - `pub fn deinit(self: *Self, gpa: Allocator) void`
+//!     - `pub const LaneHook = struct`
+//!       - `pub fn assemble(_: LaneHook, sys: *Self, x: []const V, t: V) void`
+//!       - `pub fn vals(_: LaneHook, sys: *Self) []V`
+//!       - `pub fn diagAt(_: LaneHook, sys: *Self, slot: u32) V`
+//!     - `pub fn beginSolve(self: *Self) void`
+//!     - `pub fn checkpoint(self: *Self, event: Event) !void`
+//!     - `pub fn advanceIteration(self: *Self, x_old: []const V) void`
+//!     - `pub fn loadCheck(self: *Self, x: []const V, v: []const V, rhs: []const V, reltol: f64, abstol: f64) Mask`
+//!     - `pub fn applyLimits(self: *Self, x: []V, x_old: []const V) Mask`
+//!     - `pub fn checkConvergence(self: *Self, x: []const V, m: Mask) Mask`
+//!     - `pub fn updateStates(self: *Self, x: []const V, m: Mask) Mask`
+//!     - `pub fn clearLimits(self: *Self) void`
+//!     - `pub fn getLane(dst: []f64, src: []const V, l: usize) void`
+//!     - `pub fn putLane(dst: []V, src: []const f64, l: usize) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Lanes = @import("lanes.zig").Lanes;
 const Execution = @import("core").numerics.Execution;
+const testing = std.testing;
+const converger = @import("../converger.zig");
+
+/// A diode-loaded sparse network: F(x) = A x + c (e^(x / 0.5) - 1) - b, a
+/// step limiter, and a device that flips once when first staged.
+const Toy = struct {
+    n: u32,
+    nnz: u32,
+    col_ptr: []const u32,
+    row_idx: []const u32,
+    diag_slots: []const u32,
+    current_row: []const bool,
+    a: []f64,
+    c: []f64,
+    b: []f64,
+    rhs: []f64,
+    g: []f64,
+    flips: u8 = 1,
+    staged: u32 = 0,
+
+    pub fn applyLimits(self: *Toy, x: []f64, x_old: []const f64) bool {
+        var hit = false;
+        for (x[0..self.n], x_old[0..self.n]) |*xi, xo| {
+            if (@abs(xi.* - xo) > 1) {
+                xi.* = xo + std.math.copysign(@as(f64, 1), xi.* - xo);
+                hit = true;
+            }
+        }
+        return hit;
+    }
+
+    pub fn updateStates(self: *Toy, _: []const f64) ?f64 {
+        self.staged += 1;
+        if (self.flips == 0) return null;
+        self.flips -= 1;
+        return 0;
+    }
+
+    const Hook = struct {
+        pub fn assemble(_: Hook, s: *Toy, x: []const f64, t: f64) void {
+            _ = t;
+            @memcpy(s.g, s.a);
+            @memset(s.rhs, 0);
+            for (0..s.n) |j| for (s.col_ptr[j]..s.col_ptr[j + 1]) |p| {
+                s.rhs[s.row_idx[p]] += s.a[p] * x[j];
+            };
+            for (0..s.n) |i| {
+                const e = @exp(x[i] / 0.5);
+                s.rhs[i] += s.c[i] * (e - 1) - s.b[i];
+                s.g[s.diag_slots[i]] += s.c[i] / 0.5 * e;
+            }
+        }
+        pub fn vals(_: Hook, s: *Toy) []f64 {
+            return s.g;
+        }
+        pub fn diagAt(_: Hook, s: *Toy, slot: u32) f64 {
+            return s.g[slot];
+        }
+    };
+};
 
 /// W systems of type `Sys` (a pointer's child, with fields `n`, `nnz`,
 /// `diag_slots`, `rhs`, `current_row`) and their scalar hook `Hook`.
@@ -23,11 +109,6 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
     comptime assert(W >= 2);
     return struct {
         const Self = @This();
-        const L = Lanes(W);
-        /// Lane l's value in element l (`Lanes(W).V`).
-        pub const V = L.V;
-        /// Bit l for lane l (`Lanes(W).Mask`).
-        pub const Mask = L.Mask;
 
         /// Lane l's own system, borrowed; all on one pattern.
         lanes: [W]*Sys,
@@ -50,6 +131,12 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
         /// One lane's x and x_old, deinterleaved.
         xs: []f64,
         xo: []f64,
+
+        /// Lane l's value in element l (`Lanes(W).V`).
+        pub const V = L.V;
+
+        /// Bit l for lane l (`Lanes(W).Mask`).
+        pub const Mask = L.Mask;
 
         /// Borrows `lanes`. Asserts that they share n, nnz and diagonal
         /// slots. Fails only on allocation.
@@ -125,12 +212,6 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
             }
         }
 
-        /// The scalar checkpoint's event, or the shape `newtonLanes` passes.
-        const Event = if (@hasDecl(Sys, "checkpoint"))
-            @typeInfo(@TypeOf(Sys.checkpoint)).@"fn".param_types[1].?
-        else
-            struct { phase: enum { nonlinear }, completed: u16, total: u16 };
-
         /// Each active lane's `advanceIteration` on its own x_old.
         pub fn advanceIteration(self: *Self, x_old: []const V) void {
             if (comptime !@hasDecl(Sys, "advanceIteration")) return;
@@ -205,10 +286,6 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
             if (comptime @hasDecl(Sys, "clearLimits")) for (self.lanes) |s| s.clearLimits();
         }
 
-        inline fn bit(l: usize) Mask {
-            return @as(Mask, 1) << @intCast(l);
-        }
-
         /// dst = lane l of src.
         pub fn getLane(dst: []f64, src: []const V, l: usize) void {
             for (dst, src[0..dst.len]) |*d, v| d.* = L.lane(v, l);
@@ -222,74 +299,24 @@ pub fn LaneSystem(comptime W: usize, comptime Sys: type, comptime Hook: type) ty
                 d.* = a;
             }
         }
+
+        // ---- private ----
+
+        const L = Lanes(W);
+
+        /// The scalar checkpoint's event, or the shape `newtonLanes` passes.
+        const Event = if (@hasDecl(Sys, "checkpoint"))
+            @typeInfo(@TypeOf(Sys.checkpoint)).@"fn".param_types[1].?
+        else
+            struct { phase: enum { nonlinear }, completed: u16, total: u16 };
+
+        inline fn bit(l: usize) Mask {
+            return @as(Mask, 1) << @intCast(l);
+        }
     };
 }
 
-const testing = std.testing;
-const converger = @import("../converger.zig");
-
-/// A diode-loaded sparse network: F(x) = A x + c (e^(x / 0.5) - 1) - b, a
-/// step limiter, and a device that flips once when first staged.
-const Toy = struct {
-    n: u32,
-    nnz: u32,
-    col_ptr: []const u32,
-    row_idx: []const u32,
-    diag_slots: []const u32,
-    current_row: []const bool,
-    a: []f64,
-    c: []f64,
-    b: []f64,
-    rhs: []f64,
-    g: []f64,
-    flips: u8 = 1,
-    staged: u32 = 0,
-
-    pub fn applyLimits(self: *Toy, x: []f64, x_old: []const f64) bool {
-        var hit = false;
-        for (x[0..self.n], x_old[0..self.n]) |*xi, xo| {
-            if (@abs(xi.* - xo) > 1) {
-                xi.* = xo + std.math.copysign(@as(f64, 1), xi.* - xo);
-                hit = true;
-            }
-        }
-        return hit;
-    }
-
-    pub fn updateStates(self: *Toy, _: []const f64) ?f64 {
-        self.staged += 1;
-        if (self.flips == 0) return null;
-        self.flips -= 1;
-        return 0;
-    }
-
-    const Hook = struct {
-        pub fn assemble(_: Hook, s: *Toy, x: []const f64, t: f64) void {
-            _ = t;
-            @memcpy(s.g, s.a);
-            @memset(s.rhs, 0);
-            for (0..s.n) |j| for (s.col_ptr[j]..s.col_ptr[j + 1]) |p| {
-                s.rhs[s.row_idx[p]] += s.a[p] * x[j];
-            };
-            for (0..s.n) |i| {
-                const e = @exp(x[i] / 0.5);
-                s.rhs[i] += s.c[i] * (e - 1) - s.b[i];
-                s.g[s.diag_slots[i]] += s.c[i] / 0.5 * e;
-            }
-        }
-        pub fn vals(_: Hook, s: *Toy) []f64 {
-            return s.g;
-        }
-        pub fn diagAt(_: Hook, s: *Toy, slot: u32) f64 {
-            return s.g[slot];
-        }
-    };
-};
-
-test "newtonLanes(W) lane l is bitwise the scalar newton on lane l, through limiting, flips, INITFIX, gmin and a singular lane" {
-    try expectNewtonLanes(2);
-    try expectNewtonLanes(std.simd.suggestVectorLength(f64) orelse 4);
-}
+// ---- private ----
 
 fn expectNewtonLanes(comptime W: usize) !void {
     const gpa = testing.allocator;
@@ -401,4 +428,9 @@ fn expectNewtonLanes(comptime W: usize) !void {
         }
     }
     try testing.expect(converged_lanes > 0);
+}
+
+test "newtonLanes(W) lane l is bitwise the scalar newton on lane l, through limiting, flips, INITFIX, gmin and a singular lane" {
+    try expectNewtonLanes(2);
+    try expectNewtonLanes(std.simd.suggestVectorLength(f64) orelse 4);
 }

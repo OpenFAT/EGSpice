@@ -18,6 +18,16 @@
 //! Johnson and Maiti, "Recycling Krylov subspaces for sequences of linear
 //! systems", SIAM J. Sci. Comput. 28(5), 2006 (Algorithm 2), and
 //! dev/solvers/monodromy-krylov.md.
+//!
+//! Contents:
+//! - `pub const Gcrodr = struct`
+//!   - `pub fn init(gpa: Allocator, n: u32, m: u32, k: u32) Allocator.Error!Self`
+//!   - `pub fn deinit(self: *Self, gpa: Allocator) void`
+//!   - `pub fn forget(self: *Self) void`
+//!   - `pub fn solve(self: *Self, op: anytype, b: []const f64, x: []f64, tol: f64, max_restarts: u32) SolveResult`
+//! - `const TestOp = struct` (test fixture, private)
+//!   - `pub fn matvec(self: *TestOp, v: []const f64, w: []f64) void`
+//!   - `pub fn precond(self: *TestOp, r: []f64) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -26,6 +36,7 @@ const core = @import("core");
 const num = core.numerics;
 const dense_lu = @import("dense_lu.zig");
 const SolveResult = @import("gmres.zig").Gmres.SolveResult;
+const testing = std.testing;
 
 /// GCRO-DR(m, k) workspace for n-dimensional systems. The recycled space
 /// survives `solve` calls; `forget` drops it.
@@ -39,7 +50,6 @@ pub const Gcrodr = struct {
     k: u32,
     /// Valid recycled vectors in `u`/`c`, at most k.
     have: u32 = 0,
-
     slab: []f64,
     /// Arnoldi basis, m + 1 vectors of n.
     v: []f64,
@@ -81,7 +91,7 @@ pub const Gcrodr = struct {
 
     /// Asserts n > 0 and k < m; k = 0 is plain GMRES(m). Caller frees with `deinit` and the same
     /// allocator.
-    pub fn init(gpa: Allocator, n: u32, m: u32, k: u32) !Self {
+    pub fn init(gpa: Allocator, n: u32, m: u32, k: u32) Allocator.Error!Self {
         assert(n > 0);
         assert(k < m);
         // The Ritz selection keeps fixed 64-entry tables.
@@ -156,20 +166,6 @@ pub const Gcrodr = struct {
         self.have = 0;
     }
 
-    inline fn vec(buf: []f64, n: usize, i: usize) []f64 {
-        return buf[i * n ..][0..n];
-    }
-
-    /// out = Â v = A M^-1 v.
-    inline fn apply(self: *Self, op: anytype, v: []const f64, out: []f64) void {
-        const n: usize = self.n;
-        if (comptime @hasDecl(std.meta.Child(@TypeOf(op)), "precond")) {
-            @memcpy(self.w[0..n], v);
-            op.precond(self.w[0..n]);
-            op.matvec(self.w[0..n], out);
-        } else op.matvec(v, out);
-    }
-
     /// Solves A x = b as `Gmres.solve` does, `x` holding the start; at most
     /// `max_restarts + 1` cycles of up to m - (recycled) Arnoldi steps.
     /// `iterations` counts operator applications in the cycles and in
@@ -215,6 +211,22 @@ pub const Gcrodr = struct {
         }
         const res = num.norm2(self.r[0..n]);
         return .{ .iterations = iters, .residual = res / b_norm, .converged = res <= abs_tol };
+    }
+
+    // ---- private ----
+
+    inline fn vec(buf: []f64, n: usize, i: usize) []f64 {
+        return buf[i * n ..][0..n];
+    }
+
+    /// out = Â v = A M^-1 v.
+    inline fn apply(self: *Self, op: anytype, v: []const f64, out: []f64) void {
+        const n: usize = self.n;
+        if (comptime @hasDecl(std.meta.Child(@TypeOf(op)), "precond")) {
+            @memcpy(self.w[0..n], v);
+            op.precond(self.w[0..n]);
+            op.matvec(self.w[0..n], out);
+        } else op.matvec(v, out);
     }
 
     /// x += M^-1 d, d = 0, r = b - A x; returns ||r||.
@@ -498,6 +510,26 @@ pub const Gcrodr = struct {
     }
 };
 
+/// A dense nonsymmetric test operator with a cluster of small eigenvalues,
+/// the shape restarted GMRES stalls on, and a Jacobi preconditioner.
+const TestOp = struct {
+    n: usize,
+    a: []f64,
+    diag: []f64,
+    pub fn matvec(self: *TestOp, v: []const f64, w: []f64) void {
+        for (0..self.n) |i| {
+            var s: f64 = 0;
+            for (0..self.n) |j| s += self.a[i * self.n + j] * v[j];
+            w[i] = s;
+        }
+    }
+    pub fn precond(self: *TestOp, r: []f64) void {
+        for (r, self.diag) |*e, dg| e.* /= dg;
+    }
+};
+
+// ---- private ----
+
 /// Modified Gram-Schmidt QR of the `cnt` vectors in `c` (n each), applying
 /// R^-1 to the matching vectors of `u` so that C = Q R keeps C U^-1 fixed:
 /// afterwards c is orthonormal and Â u_i = c_i still holds. A column whose
@@ -527,26 +559,6 @@ fn orthonormalize(n: usize, c: []f64, u: []f64, cnt: usize) usize {
     }
     return kept;
 }
-
-const testing = std.testing;
-
-/// A dense nonsymmetric test operator with a cluster of small eigenvalues,
-/// the shape restarted GMRES stalls on, and a Jacobi preconditioner.
-const TestOp = struct {
-    n: usize,
-    a: []f64,
-    diag: []f64,
-    pub fn matvec(self: *TestOp, v: []const f64, w: []f64) void {
-        for (0..self.n) |i| {
-            var s: f64 = 0;
-            for (0..self.n) |j| s += self.a[i * self.n + j] * v[j];
-            w[i] = s;
-        }
-    }
-    pub fn precond(self: *TestOp, r: []f64) void {
-        for (r, self.diag) |*e, dg| e.* /= dg;
-    }
-};
 
 test "Gcrodr solves a sequence of drifting systems to tolerance, recycling cuts the operator applications" {
     const gpa = testing.allocator;
@@ -612,4 +624,15 @@ test "Gcrodr returns at once on a zero right-hand side and on a start that alrea
     const res = rec.solve(&op, &b, &x, 1e-12, 3);
     try testing.expect(res.converged);
     try testing.expectEqual(@as(u32, 0), res.iterations);
+}
+
+test "Gcrodr.init frees what it took on every allocation failure" {
+    // Oracle: std.testing.allocator's leak and double-free detection, each of
+    // init's three allocations failing once.
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: Allocator) !void {
+            var g = try Gcrodr.init(gpa, 9, 6, 2);
+            g.deinit(gpa);
+        }
+    }.run, .{});
 }

@@ -4,12 +4,25 @@
 //! point. Arithmetic follows gmres.zig and core/numerics.zig, including the
 //! fixed sixteen-accumulator dot product and singular true-residual check.
 //! std only, so the same bodies compile for the host oracle and GPU kernels.
+//! In: per-point state, the requested products' results. Out: the next
+//! request per point, then each point's solution and residual.
+//! Cites: Saad and Schultz, SIAM J. Sci. Stat. Comput. 7(3), 1986.
+//!
+//! Contents:
+//! - `pub const Request = enum`
+//! - `pub const Shape = extern struct`
+//! - `pub const Layout = extern struct`
+//!   - `pub fn init(n: u32, m: u32) !Layout`
+//! - `pub const State = extern struct`
+//! - `pub fn Bodies(comptime P: fn (type) type) type`
+//!     - `pub fn start(s: Shape, states: P(State), b: P(f64), x: P(f64), input: P(f64), point: u64) Request`
+//!     - `pub fn advance(s: Shape, layout: Layout, states: P(State), b: P(f64), x: P(f64), work: P(f64), input: P(f64), output: P(f64), point: u64) Request`
+
 const std = @import("std");
 
 /// What the driver must run for a point before its next `advance`: nothing,
 /// `output = A input`, or `output = M^-1 input`.
 pub const Request = enum(u8) { done = 0, matvec = 1, precond = 2 };
-const Phase = enum(u32) { done, cycle_residual, arnoldi_precond, arnoldi_matvec, update_precond, final_residual };
 
 /// The batch's dimensions and stopping rule, shared by every point.
 /// `preconditioned` nonzero routes each Arnoldi vector through `precond`.
@@ -80,10 +93,43 @@ pub const State = extern struct {
     phase: Phase = .done,
 };
 
+const Phase = enum(u32) { done, cycle_residual, arnoldi_precond, arnoldi_matvec, update_precond, final_residual };
+
 /// The per-point bodies over the pointer type `P`; a point reads and writes
 /// only its own column of every buffer.
 pub fn Bodies(comptime P: fn (type) type) type {
     return struct {
+        /// Initializes one point, writes its first operator input, and
+        /// returns what the driver must execute before calling advance.
+        pub fn start(s: Shape, states: P(State), b: P(f64), x: P(f64), input: P(f64), point: u64) Request {
+            var state: State = .{};
+            state.b_norm = norm(.{ .ptr = b }, s.n, s.points, point);
+            const request: Request = blk: {
+                if (state.b_norm == 0) {
+                    fill(.{ .ptr = x }, s.n, s.points, point, 0);
+                    break :blk finish(&state, 0, true);
+                }
+                if (!std.math.isFinite(state.b_norm)) break :blk finish(&state, state.b_norm, false);
+                state.abs_tol = s.tolerance * state.b_norm;
+                state.phase = .cycle_residual;
+                copy(.{ .ptr = input }, .{ .ptr = x }, s.n, s.points, point);
+                break :blk .matvec;
+            };
+            states[point] = state;
+            return request;
+        }
+
+        /// Consumes this point's last callback output. Inactive points
+        /// remain untouched; an active point advances until its next request.
+        pub fn advance(s: Shape, layout: Layout, states: P(State), b: P(f64), x: P(f64), work: P(f64), input: P(f64), output: P(f64), point: u64) Request {
+            var state = states[point];
+            const request = advanceState(s, layout, &state, b, x, work, input, output, point);
+            states[point] = state;
+            return request;
+        }
+
+        // ---- private ----
+
         const Vec = struct { ptr: P(f64), start: u64 = 0 };
 
         fn get(v: Vec, row: u64, count: u64, point: u64) f64 {
@@ -158,26 +204,6 @@ pub fn Bodies(comptime P: fn (type) type) type {
             return .done;
         }
 
-        /// Initializes one point, writes its first operator input, and
-        /// returns what the driver must execute before calling advance.
-        pub fn start(s: Shape, states: P(State), b: P(f64), x: P(f64), input: P(f64), point: u64) Request {
-            var state: State = .{};
-            state.b_norm = norm(.{ .ptr = b }, s.n, s.points, point);
-            const request: Request = blk: {
-                if (state.b_norm == 0) {
-                    fill(.{ .ptr = x }, s.n, s.points, point, 0);
-                    break :blk finish(&state, 0, true);
-                }
-                if (!std.math.isFinite(state.b_norm)) break :blk finish(&state, state.b_norm, false);
-                state.abs_tol = s.tolerance * state.b_norm;
-                state.phase = .cycle_residual;
-                copy(.{ .ptr = input }, .{ .ptr = x }, s.n, s.points, point);
-                break :blk .matvec;
-            };
-            states[point] = state;
-            return request;
-        }
-
         fn arnoldi(s: Shape, layout: Layout, state: *State, work: P(f64), input: P(f64), point: u64) Request {
             state.iterations += 1;
             const v: Vec = .{ .ptr = work, .start = layout.v + @as(u64, state.j) * s.n };
@@ -197,15 +223,6 @@ pub fn Bodies(comptime P: fn (type) type) type {
             state.phase = if (state.cycle <= s.max_restarts) .cycle_residual else .final_residual;
             copy(.{ .ptr = input }, .{ .ptr = x }, s.n, s.points, point);
             return .matvec;
-        }
-
-        /// Consumes this point's last callback output. Inactive points
-        /// remain untouched; an active point advances until its next request.
-        pub fn advance(s: Shape, layout: Layout, states: P(State), b: P(f64), x: P(f64), work: P(f64), input: P(f64), output: P(f64), point: u64) Request {
-            var state = states[point];
-            const request = advanceState(s, layout, &state, b, x, work, input, output, point);
-            states[point] = state;
-            return request;
         }
 
         fn advanceState(s: Shape, layout: Layout, state: *State, b: P(f64), x: P(f64), work: P(f64), input: P(f64), output: P(f64), point: u64) Request {
@@ -308,6 +325,8 @@ pub fn Bodies(comptime P: fn (type) type) type {
         }
     };
 }
+
+// ---- private ----
 
 fn givens(a: f64, b: f64) struct { c: f64, s: f64 } {
     if (b == 0) return .{ .c = 1, .s = 0 };

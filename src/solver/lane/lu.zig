@@ -8,11 +8,23 @@
 //! them on the scalar path (freq_solve.zig `solveBatch`) or holds them
 //! (`factorEach`). In: a factored SparseLu and W lanes of values. Out: W
 //! lanes of L and U, and W-lane solves. Cites no outside source.
+//!
+//! Contents:
+//! - `pub fn LaneLu(comptime W: usize) type`
+//!     - `pub const V = @Vector(W, f64)`
+//!     - `pub fn init(gpa: Allocator, base: *const Base) !Self`
+//!     - `pub fn deinit(self: *Self, gpa: Allocator) void`
+//!     - `pub const Plane = struct`
+//!       - `pub inline fn load(self: Plane, c: usize, w: []V, prow: []const u32) void`
+//!     - `pub fn refactor(self: *Self, src: anytype, growth_limit: f64) u64`
+//!     - `pub fn solve(self: *Self, b_in: []const V, x: []V) void`
+//!     - `pub fn solveT(self: *Self, b_in: []const V, x: []V) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const sparse_lu = @import("../sparse_lu.zig");
+const testing = std.testing;
 
 /// W numeric factorizations sharing one SparseLu pattern. W is at most 64,
 /// the width of the failure mask.
@@ -23,23 +35,21 @@ pub fn LaneLu(comptime W: usize) type {
     }
     return struct {
         const Self = @This();
-        const Base = sparse_lu.SparseLu;
-        /// One structural entry or unknown across the lanes: element l
-        /// belongs to lane l's matrix.
-        pub const V = @Vector(W, f64);
 
         /// Borrowed factored pattern and pivot sequence; must outlive self.
         base: *const Base,
         n: u32,
-
         // One vector per L entry, U entry and pivot step.
         lx: []V,
         ux: []V,
         udiag: []V,
-
         /// All-zero between calls, as in SparseLu.
         w: []V,
         y: []V,
+
+        /// One structural entry or unknown across the lanes: element l
+        /// belongs to lane l's matrix.
+        pub const V = @Vector(W, f64);
 
         /// Sizes the value planes from `base`. A later full factor of `base`
         /// can change its L/U lengths; the caller then rebuilds the LaneLu.
@@ -65,11 +75,6 @@ pub fn LaneLu(comptime W: usize) type {
             @memset(self.w, @as(V, @splat(0)));
             assert(self.planesMatch());
             return self;
-        }
-
-        /// True while `base` has the L/U lengths the planes were sized for.
-        fn planesMatch(self: *const Self) bool {
-            return self.lx.len == self.base.lx.items.len and self.ux.len == self.base.ux.items.len;
         }
 
         /// Frees the value planes; `base` stays the caller's.
@@ -268,6 +273,15 @@ pub fn LaneLu(comptime W: usize) type {
             for (0..self.n) |r| x[r] = y[pinv[r]];
         }
 
+        // ---- private ----
+
+        const Base = sparse_lu.SparseLu;
+
+        /// True while `base` has the L/U lengths the planes were sized for.
+        fn planesMatch(self: *const Self) bool {
+            return self.lx.len == self.base.lx.items.len and self.ux.len == self.base.ux.items.len;
+        }
+
         /// Lane l of `m` -> bit l.
         inline fn maskBits(m: @Vector(W, bool)) u64 {
             const bits: @Int(.unsigned, W) = @bitCast(m);
@@ -278,15 +292,7 @@ pub fn LaneLu(comptime W: usize) type {
     };
 }
 
-const testing = std.testing;
-
-test "LaneLu(W) lane l is the scalar replay of lane l on random systems, NaN and Inf lanes included" {
-    // W = 1 is the scalar oracle itself.
-    try expectLanesReplay(1);
-    try expectLanesReplay(std.simd.suggestVectorLength(f64) orelse 4);
-    // The AVX-512 width (TODO 9.7), checked on every host.
-    try expectLanesReplay(8);
-}
+// ---- private ----
 
 fn expectLanesReplay(comptime W: usize) !void {
     const gpa = testing.allocator;
@@ -364,6 +370,14 @@ fn expectLanesReplay(comptime W: usize) !void {
             }
         }
     }
+}
+
+test "LaneLu(W) lane l is the scalar replay of lane l on random systems, NaN and Inf lanes included" {
+    // W = 1 is the scalar oracle itself.
+    try expectLanesReplay(1);
+    try expectLanesReplay(std.simd.suggestVectorLength(f64) orelse 4);
+    // The AVX-512 width (TODO 9.7), checked on every host.
+    try expectLanesReplay(8);
 }
 
 test "LaneLu masks a lane whose finite values overflow in U off the pivot; the others stay bitwise" {

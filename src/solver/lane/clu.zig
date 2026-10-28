@@ -13,11 +13,24 @@
 //! of the modulus) and reports the lanes that fail. Pivots are stored as
 //! reciprocals. In: a factored SparseLu and a column source. Out: W lanes
 //! of L, U and 1/diag, and W-lane solves of A x = b and A^H x = b.
+//!
+//! Contents:
+//! - `pub fn ComplexLaneLu(comptime W: usize) type`
+//!     - `pub const V = @Vector(W, f64)`
+//!     - `pub fn init(gpa: Allocator, base: *const SparseLu) !Self`
+//!     - `pub fn deinit(self: *Self, gpa: Allocator) void`
+//!     - `pub fn fits(self: *const Self) bool`
+//!     - `pub const Plane = struct`
+//!       - `pub inline fn load(self: Plane, c: usize, wr: []V, wi: []V, prow: []const u32) void`
+//!     - `pub fn refactor(self: *Self, src: anytype, growth_limit: f64) u64`
+//!     - `pub fn solve(self: *Self, br: []const V, bi: []const V, xr: []V, xi: []V) void`
+//!     - `pub fn solveH(self: *Self, br: []const V, bi: []const V, xr: []V, xi: []V) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const SparseLu = @import("../sparse_lu.zig").SparseLu;
+const testing = std.testing;
 
 /// W complex factorizations sharing one SparseLu tape. W is at most 64,
 /// the width of the failure mask.
@@ -28,17 +41,11 @@ pub fn ComplexLaneLu(comptime W: usize) type {
     }
     return struct {
         const Self = @This();
-        /// One entry's real or imaginary part across the lanes (lane l in
-        /// element l).
-        pub const V = @Vector(W, f64);
-        const I = @Vector(W, i64);
-        const U = @Vector(W, u64);
 
         /// Borrowed factored tape; must outlive self and keep its L/U
         /// lengths (a new `factor` of it means a new ComplexLaneLu).
         base: *const SparseLu,
         n: u32,
-
         // Real then imaginary part of every L entry, U entry and pivot
         // reciprocal.
         lr: []V,
@@ -47,13 +54,16 @@ pub fn ComplexLaneLu(comptime W: usize) type {
         ui: []V,
         dr: []V,
         di: []V,
-
         /// Accumulator, all-zero between calls.
         wr: []V,
         wi: []V,
         /// Solve workspace.
         yr: []V,
         yi: []V,
+
+        /// One entry's real or imaginary part across the lanes (lane l in
+        /// element l).
+        pub const V = @Vector(W, f64);
 
         /// Sizes the planes from `base`. Asserts that `base` is factored.
         pub fn init(gpa: Allocator, base: *const SparseLu) !Self {
@@ -302,6 +312,12 @@ pub fn ComplexLaneLu(comptime W: usize) type {
             }
         }
 
+        // ---- private ----
+
+        const I = @Vector(W, i64);
+
+        const U = @Vector(W, u64);
+
         /// max(|re|, |im|) by bit pattern, so a NaN in either part survives
         /// (a float @max drops it).
         inline fn norm(re: V, im: V) V {
@@ -315,13 +331,7 @@ pub fn ComplexLaneLu(comptime W: usize) type {
     };
 }
 
-const testing = std.testing;
-
-test "ComplexLaneLu solves A x = b and A^H x = b on random complex systems; bad lanes are masked" {
-    // W = 8 is the AVX-512 width (TODO 9.7): built and checked here even
-    // on AVX2 hosts, where it lowers to two registers per vector.
-    inline for (.{ 1, 4, 8 }) |w| try expectComplexLanes(w);
-}
+// ---- private ----
 
 fn expectComplexLanes(comptime W: usize) !void {
     const gpa = testing.allocator;
@@ -417,4 +427,10 @@ fn expectComplexLanes(comptime W: usize) !void {
         }
     }
     try testing.expect(solved > 20 * @as(usize, @max(W - 1, 1)));
+}
+
+test "ComplexLaneLu solves A x = b and A^H x = b on random complex systems; bad lanes are masked" {
+    // W = 8 is the AVX-512 width (TODO 9.7): built and checked here even
+    // on AVX2 hosts, where it lowers to two registers per vector.
+    inline for (.{ 1, 4, 8 }) |w| try expectComplexLanes(w);
 }

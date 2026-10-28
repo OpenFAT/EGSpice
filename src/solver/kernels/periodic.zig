@@ -1,5 +1,25 @@
-//! Sampled HB Jacobian kernels. Points are the innermost dimension; each
-//! point's reductions are local and inactive points are never read.
+//! Sampled HB Jacobian kernels: per-point time samples of G and C in, the
+//! harmonic-balance Jacobian rows and products per point out. Points are the
+//! innermost dimension; each point's reductions are local and inactive points
+//! are never read. std only, so the same bodies compile for the host oracle
+//! and the GPU lane kernels (`lane_device.zig`).
+//! Cites: Kundert, Sorkin and Sangiovanni-Vincentelli, "Applying harmonic
+//! balance to almost-periodic circuits", IEEE T-MTT 36(2), 1988 (sampled
+//! Jacobian products).
+//!
+//! Contents:
+//! - `pub const Shape = extern struct`
+//! - `pub const Rows = struct`
+//!   - `pub fn init(a: std.mem.Allocator, col_ptr: []const u32, row_idx: []const u32) !Rows`
+//!   - `pub fn deinit(self: Rows, a: std.mem.Allocator) void`
+//! - `pub fn Bodies(comptime P: fn (type) type) type`
+//!     - `pub fn inverse(t: Shape, row: usize, p: usize, active: P(u8), inv: P(f64), x: P(f64), time: P(f64)) void`
+//!     - `pub fn product(t: Shape, row: usize, p: usize, active: P(u8), row_ptr: P(u32), columns: P(u32), slots: P(u32), g: P(f64), c: P(f64), time: P(f64), gv: P(f64), cv: P(f64)) void`
+//!     - `pub fn forward(t: Shape, row: usize, p: usize, active: P(u8), fwd: P(f64), omega: P(f64), gv: P(f64), cv: P(f64), out: P(f64)) void`
+//!     - `pub fn pack(t: Shape, i: usize, p: usize, active: P(u8), input: P(f64), rhs: P(f64)) void`
+//!     - `pub fn unpack(t: Shape, i: usize, p: usize, active: P(u8), identity: P(u8), rhs: P(f64), x: P(f64), out: P(f64)) void`
+//!     - `pub fn copy(t: Shape, i: usize, p: usize, active: P(u8), input: P(f64), out: P(f64)) void`
+
 const std = @import("std");
 const lk = @import("lane.zig");
 
@@ -14,27 +34,51 @@ pub const Shape = extern struct {
     charge: u32,
 };
 
+/// Incoming CSC slots, grouped by output row and retaining column order.
+/// The caller frees all three allocations with `deinit`.
+pub const Rows = struct {
+    ptr: []u32,
+    columns: []u32,
+    slots: []u32,
+
+    /// Transposes the CSC pattern's slots into rows, O(n + nnz).
+    pub fn init(a: std.mem.Allocator, col_ptr: []const u32, row_idx: []const u32) !Rows {
+        const n = col_ptr.len - 1;
+        const nz = col_ptr[n];
+        const ptr = try a.alloc(u32, n + 1);
+        errdefer a.free(ptr);
+        const columns = try a.alloc(u32, nz);
+        errdefer a.free(columns);
+        const slots = try a.alloc(u32, nz);
+        errdefer a.free(slots);
+        const cursor = try a.alloc(u32, n);
+        defer a.free(cursor);
+        @memset(ptr, 0);
+        for (row_idx[0..nz]) |row| ptr[row + 1] += 1;
+        for (1..n + 1) |i| ptr[i] += ptr[i - 1];
+        @memcpy(cursor, ptr[0..n]);
+        for (0..n) |col| for (col_ptr[col]..col_ptr[col + 1]) |slot| {
+            const row = row_idx[slot];
+            const at = cursor[row];
+            columns[at] = @intCast(col);
+            slots[at] = @intCast(slot);
+            cursor[row] += 1;
+        };
+        return .{ .ptr = ptr, .columns = columns, .slots = slots };
+    }
+
+    /// Frees the three arrays with the allocator `init` got.
+    pub fn deinit(self: Rows, a: std.mem.Allocator) void {
+        a.free(self.ptr);
+        a.free(self.columns);
+        a.free(self.slots);
+    }
+};
+
 /// The per-point bodies over the pointer type `P`; each returns without
 /// touching an inactive point (`active[p] == 0`), except `pack`.
 pub fn Bodies(comptime P: fn (type) type) type {
     return struct {
-        /// core.numerics.dot's fixed sixteen-accumulator reduction, with
-        /// the left vector strided through independent point lanes.
-        fn dot(left: P(f64), base: usize, stride: usize, right: P(f64), offset: usize, count: usize) f64 {
-            var acc: [16]f64 = @splat(0);
-            var i: usize = 0;
-            while (i + 16 <= count) : (i += 16) {
-                for (&acc, 0..) |*v, j| v.* += left[base + (i + j) * stride] * right[offset + i + j];
-            }
-            var tail: f64 = 0;
-            while (i < count) : (i += 1) tail += left[base + i * stride] * right[offset + i];
-            var width: usize = 8;
-            while (width != 0) : (width /= 2) for (0..width) |j| {
-                acc[j] += acc[j + width];
-            };
-            return acc[0] + tail;
-        }
-
         /// Row is (node, time sample). x is (node, coefficient, point).
         pub fn inverse(t: Shape, row: usize, p: usize, active: P(u8), inv: P(f64), x: P(f64), time: P(f64)) void {
             if (active[p] == 0) return;
@@ -122,6 +166,25 @@ pub fn Bodies(comptime P: fn (type) type) type {
             const at = i * @as(usize, @intCast(t.points)) + p;
             out[at] = input[at];
         }
+
+        // ---- private ----
+
+        /// core.numerics.dot's fixed sixteen-accumulator reduction, with
+        /// the left vector strided through independent point lanes.
+        fn dot(left: P(f64), base: usize, stride: usize, right: P(f64), offset: usize, count: usize) f64 {
+            var acc: [16]f64 = @splat(0);
+            var i: usize = 0;
+            while (i + 16 <= count) : (i += 16) {
+                for (&acc, 0..) |*v, j| v.* += left[base + (i + j) * stride] * right[offset + i + j];
+            }
+            var tail: f64 = 0;
+            while (i < count) : (i += 1) tail += left[base + i * stride] * right[offset + i];
+            var width: usize = 8;
+            while (width != 0) : (width /= 2) for (0..width) |j| {
+                acc[j] += acc[j + width];
+            };
+            return acc[0] + tail;
+        }
     };
 }
 
@@ -146,47 +209,6 @@ test "periodic harmonic packing retains each point and held identity blocks" {
         try std.testing.expectEqual(want, out[i * 3 + p]);
     };
 }
-
-/// Incoming CSC slots, grouped by output row and retaining column order.
-/// The caller frees all three allocations with `deinit`.
-pub const Rows = struct {
-    ptr: []u32,
-    columns: []u32,
-    slots: []u32,
-
-    /// Transposes the CSC pattern's slots into rows, O(n + nnz).
-    pub fn init(a: std.mem.Allocator, col_ptr: []const u32, row_idx: []const u32) !Rows {
-        const n = col_ptr.len - 1;
-        const nz = col_ptr[n];
-        const ptr = try a.alloc(u32, n + 1);
-        errdefer a.free(ptr);
-        const columns = try a.alloc(u32, nz);
-        errdefer a.free(columns);
-        const slots = try a.alloc(u32, nz);
-        errdefer a.free(slots);
-        const cursor = try a.alloc(u32, n);
-        defer a.free(cursor);
-        @memset(ptr, 0);
-        for (row_idx[0..nz]) |row| ptr[row + 1] += 1;
-        for (1..n + 1) |i| ptr[i] += ptr[i - 1];
-        @memcpy(cursor, ptr[0..n]);
-        for (0..n) |col| for (col_ptr[col]..col_ptr[col + 1]) |slot| {
-            const row = row_idx[slot];
-            const at = cursor[row];
-            columns[at] = @intCast(col);
-            slots[at] = @intCast(slot);
-            cursor[row] += 1;
-        };
-        return .{ .ptr = ptr, .columns = columns, .slots = slots };
-    }
-
-    /// Frees the three arrays with the allocator `init` got.
-    pub fn deinit(self: Rows, a: std.mem.Allocator) void {
-        a.free(self.ptr);
-        a.free(self.columns);
-        a.free(self.slots);
-    }
-};
 
 test "sampled harmonic operator masks poisoned points and matches a dense spectral Jacobian" {
     const a = std.testing.allocator;

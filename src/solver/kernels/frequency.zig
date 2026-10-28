@@ -4,6 +4,19 @@
 //! lanes. The positive and transpose solves follow LaneLu's operation order.
 //! The complex bodies replay `ComplexLaneLu` on the n x n proxy tape in its
 //! operation order, re and im planes stacked per buffer.
+//! In: per-lane G, C, ω and right-hand sides over one tape. Out: per-lane
+//! factors and solutions. Cites no outside source: the operation order is
+//! `lane/lu.zig`'s and `lane/clu.zig`'s.
+//!
+//! Contents:
+//! - `pub fn Bodies(comptime P: fn (type) type) type`
+//!     - `pub fn fill(slot: usize, l: usize, n_lanes: usize, n_points: usize, offsets: P(u32), g: P(f64), c: P(f64), point: P(u32), omega: P(f64), a: P(f64)) void`
+//!     - `pub fn solve(t: lk.LaneTab, indices: P(u32), lx: P(f64), ux: P(f64), diag: P(f64), rhs: P(f64), y: P(f64), out: P(f64), n_lanes: usize, l: usize, adjoint: bool) void`
+//!     - `pub fn complexFill(slot: usize, l: usize, n_lanes: usize, n_points: usize, nnz: usize, g: P(f64), c: P(f64), point: P(u32), omega: P(f64), a: P(f64)) void`
+//!     - `pub fn complexRefactor(t: lk.LaneTab, x: P(u32), a: P(f64), lx: P(f64), ux: P(f64), d: P(f64), w: P(f64), n_lanes: u32, l: u32) bool`
+//!     - `pub fn complexSolve(t: lk.LaneTab, x: P(u32), lx: P(f64), ux: P(f64), d: P(f64), rhs: P(f64), y: P(f64), out: P(f64), n_lanes: usize, l: usize, adjoint: bool) void`
+//! - `pub fn positions(src_col_ptr: []const u32, out: []u32) void`
+
 const std = @import("std");
 const lk = @import("lane.zig");
 
@@ -236,6 +249,8 @@ pub fn Bodies(comptime P: fn (type) type) type {
                 out[im + c * N + l] = y[im + j * N + l];
             }
         }
+
+        // ---- private ----
 
         /// max(|re|, |im|) by bit pattern, so a NaN in either part survives.
         inline fn norm(re: f64, im: f64) f64 {
