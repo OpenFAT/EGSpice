@@ -1,8 +1,22 @@
-//! GPU-resident, independently masked GMRES systems. The host dispatches
-//! operator requests and reads two counts per round; vectors, basis, norms,
-//! rotations and iteration decisions remain on the device. A callback must
-//! write only points selected by its u8 mask and preserve inactive outputs.
+//! GPU-resident, independently masked GMRES systems. In: `count`
+//! right-hand sides and guesses on the device, element-major with points
+//! innermost, and an operator that serves masked matvec and preconditioner
+//! requests on the engine's stream. Out: each point's best iterate in place
+//! and its convergence. The host dispatches operator requests and reads two
+//! counts per round; vectors, basis, norms, rotations and iteration
+//! decisions stay on the device. An operator writes only the points its u8
+//! mask selects and leaves the other outputs as they were.
+//! Cites: Saad & Schultz 1986 (restarted GMRES), through `solver.gmres_lanes`.
+//!
+//! Contents:
+//! - `pub const Stats = struct { rounds, matvec_rounds, precond_rounds }`
+//! - `pub fn Engine(comptime backend: gompute.Backend) type`, with
+//!   `pub fn init(allocator: std.mem.Allocator) !Self`, `pub fn deinit(self: *Self) void`,
+//!   `pub fn solve(self: *Self, op: anytype, b: *Buffer, x: *Buffer, count: usize, n: u32, m: u32, tolerance: f64, max_restarts: u32) !Stats`,
+//!   `pub fn downloadResults(self: *Self, allocator: std.mem.Allocator) ![]Gmres.SolveResult`
+
 const std = @import("std");
+const assert = std.debug.assert;
 const gompute = @import("gompute");
 const lanes = @import("solver").gmres_lanes;
 const Gmres = @import("solver").gmres.Gmres;
@@ -59,31 +73,6 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             self.* = undefined;
         }
 
-        fn ensure(self: *Self, id: Id, bytes: usize) !void {
-            const storage = &self.buffers[@backingInt(id)];
-            const required = @max(bytes, 1);
-            if (storage.capacity >= required) return;
-            const allocation = try self.start_kernel.alloc(required);
-            if (storage.buffer) |*old| old.free();
-            storage.* = .{ .buffer = allocation, .capacity = required };
-        }
-
-        fn buffer(self: *Self, id: Id) *Buffer {
-            return &self.buffers[@backingInt(id)].buffer.?;
-        }
-
-        fn arg(self: *Self, id: Id) gompute.interface.Arg {
-            return self.buffer(id).argPtr();
-        }
-
-        fn counts(self: *Self) ![2]u32 {
-            var pending: [2]u32 = undefined;
-            errdefer self.stream.synchronize() catch {};
-            try self.buffer(.counts).downloadAtAsync(&pending, 0, @sizeOf(@TypeOf(pending)), &self.stream);
-            try self.stream.synchronize();
-            return pending;
-        }
-
         /// b and x contain n*count f64s, element-major with points
         /// innermost. x is the initial guess and receives each point's best
         /// iterate. Operator failures propagate; no result is then valid.
@@ -129,7 +118,12 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             });
             var pending = try self.counts();
             var stats: Stats = .{};
+            // Every round advances each pending point by one request, and a
+            // point asks at most (m + 1) matvecs and as many preconditioners
+            // per cycle over `max_restarts + 1` cycles.
+            const rounds_max = 4 * (@as(usize, m) + 2) * (@as(usize, max_restarts) + 2);
             while (pending[0] != 0 or pending[1] != 0) {
+                assert(stats.rounds < rounds_max);
                 if (comptime has_precond) {
                     if (pending[1] != 0) {
                         // A preconditioned point's next request is a matvec or
@@ -164,6 +158,8 @@ pub fn Engine(comptime backend: gompute.Backend) type {
                 stats.rounds += 1;
             }
             self.completed = true;
+            assert(pending[0] == 0);
+            assert(pending[1] == 0);
             return stats;
         }
 
@@ -186,6 +182,33 @@ pub fn Engine(comptime backend: gompute.Backend) type {
                 .converged = state.converged != 0,
             };
             return results;
+        }
+
+        // ---- private ----
+
+        fn ensure(self: *Self, id: Id, bytes: usize) !void {
+            const storage = &self.buffers[@backingInt(id)];
+            const required = @max(bytes, 1);
+            if (storage.capacity >= required) return;
+            const allocation = try self.start_kernel.alloc(required);
+            if (storage.buffer) |*old| old.free();
+            storage.* = .{ .buffer = allocation, .capacity = required };
+        }
+
+        fn buffer(self: *Self, id: Id) *Buffer {
+            return &self.buffers[@backingInt(id)].buffer.?;
+        }
+
+        fn arg(self: *Self, id: Id) gompute.interface.Arg {
+            return self.buffer(id).argPtr();
+        }
+
+        fn counts(self: *Self) ![2]u32 {
+            var pending: [2]u32 = undefined;
+            errdefer self.stream.synchronize() catch {};
+            try self.buffer(.counts).downloadAtAsync(&pending, 0, @sizeOf(@TypeOf(pending)), &self.stream);
+            try self.stream.synchronize();
+            return pending;
         }
     };
 }
