@@ -72,19 +72,20 @@ pub fn validate(query: requests.Query, n: u32) Error!void {
 /// non-empty `deck.variants` has one `starts` entry more than rows.
 pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) DeckError!void {
     try validate(query, n);
-    const rows = deck.variants.count();
+    // `count` asserts the table's shape, so it runs only for a query that
+    // reads the table: a deck with no variant query may carry any table.
     const variant = switch (query) {
         inline else => |o| o.tol.variant,
     };
-    if (variant) |v| if (v >= rows) return error.InvalidQueryOptions;
+    if (variant) |v| if (v >= deck.variants.count()) return error.InvalidQueryOptions;
     switch (query) {
-        .mc => |o| if (@as(u64, o.variants.first) + o.variants.count > rows) return error.InvalidQueryOptions,
+        .mc => |o| if (@as(u64, o.variants.first) + o.variants.count > deck.variants.count()) return error.InvalidQueryOptions,
         .dc => |o| {
             try dcTargetExists(o.target, deck);
             if (o.target2) |t2| try dcTargetExists(t2, deck);
-            for (o.tangents) |row| if (row >= rows) return error.InvalidQueryOptions;
+            for (o.tangents) |row| if (row >= deck.variants.count()) return error.InvalidQueryOptions;
         },
-        .tran => |o| for (o.tangents) |row| if (row >= rows) return error.InvalidQueryOptions,
+        .tran => |o| for (o.tangents) |row| if (row >= deck.variants.count()) return error.InvalidQueryOptions,
         .ac, .dcmatch, .disto, .envelope, .four, .hb, .matex, .noise, .op, .pac, .pnoise, .pss, .pxf, .pz, .qpss, .sens, .sp, .stb, .temp, .tf, .tran_noise, .hbac, .hbnoise, .hbxf, .phasenoise, .lstb, .acxf, .dcxf, .dcinc, .fft, .acmatch, .dcsens, .hblin => {},
     }
 }
