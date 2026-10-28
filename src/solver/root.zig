@@ -6,6 +6,23 @@
 //! kernel images. The two kernel roots, lu_device.zig and lane_device.zig,
 //! stay beside this file: a module may import only files under its root's
 //! directory, and their bodies reach sparse_lu, converger and lane/.
+//! In: nothing; out: the namespaces below. Cites nothing.
+//!
+//! Contents:
+//! - `pub const direct = @import("direct.zig")`
+//! - `pub const lu_kernels = @import("kernels/lu.zig")`
+//! - `pub const dense_lu = @import("dense_lu.zig")`
+//! - `pub const freq_solve = @import("freq_solve.zig")`
+//! - `pub const fft = @import("fft.zig")`
+//! - `pub const gmres = @import("gmres.zig")`
+//! - `pub const gcrodr = @import("gcrodr.zig")`
+//! - `pub const converger = @import("converger.zig")`
+//! - `pub const lanes = @import("lane/lanes.zig")`
+//! - `pub const lane_system = @import("lane/system.zig")`
+//! - `pub const lane_kernels = @import("kernels/lane.zig")`
+//! - `pub const frequency_kernels = @import("kernels/frequency.zig")`
+//! - `pub const gmres_lanes = @import("kernels/gmres.zig")`
+//! - `pub const periodic_kernels = @import("kernels/periodic.zig")`
 pub const direct = @import("direct.zig");
 pub const lu_kernels = @import("kernels/lu.zig");
 pub const dense_lu = @import("dense_lu.zig");
