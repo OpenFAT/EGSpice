@@ -1,13 +1,24 @@
-//! SPICE device selection: netlist letter and `.model` LEVEL to a device
-//! name, following ngspice conventions (the LEVEL tables cite ngspice
-//! src/spicelib/parser/inpdomod.c) and HSPICE's level numbers where
-//! ngspice has none. The types behind the names come from the device
-//! catalog.
+//! SPICE device selection. In: a card letter, a `.model` LEVEL or a
+//! Verilog-A module name. Out: the `DeviceId` that builds it, whose catalog
+//! type is `DeviceId.Type`. Cites ngspice src/spicelib/parser/inpdomod.c
+//! for the LEVEL tables, and HSPICE's level numbers where ngspice has none.
+//!
+//! Contents:
+//! - `pub const DeviceId = enum`
+//! - `pub fn Type(comptime id: DeviceId) type`
+//! - `pub const letter_map: std.StaticStringMap(DeviceId)`
+//! - `pub const module_map: std.StaticStringMap(DeviceId)`
+//! - `pub const resistor, capacitor, inductor, kinduc, vsource, isource, cccs, ccvs, vcvs, bsource, bsource_i, bsource_q, cswitch, tline, lossy_tline, ltra, vcvs_laplace, vccs_laplace, vcvs_pole, vccs_pole, vcvs_delay, vccs_delay, txl, coupled_ltra, coupled_ltra3, coupled_ltra4, wline_1, wline_2, wline_3, wline_4, sparam_1, sparam_2, sparam_3, sparam_4: type`
+//! - `pub const absent_model: []const u8` (on a `Type` with no catalog model)
+//! - `pub fn mosfetDeviceId(level: u16) error{UnsupportedDevice}!DeviceId`
+//! - `pub fn bjtDeviceId(level: u16) error{UnsupportedDevice}!DeviceId`
+//! - `pub fn diodeDeviceId(level: u16) error{UnsupportedDevice}!DeviceId`
+//! - `pub fn jfetDeviceId(level: u16) error{UnsupportedDevice}!DeviceId`
+//! - `pub fn mesDeviceId(level: u16) error{UnsupportedDevice}!DeviceId`
 
 const std = @import("std");
+const assert = std.debug.assert;
 const device = @import("device");
-const has = device.has;
-const byName = device.byName;
 
 /// Every model name the dispatch policy can name. The type behind a tag
 /// comes from the catalog via `Type`. Names with no generated model
@@ -100,18 +111,10 @@ pub const DeviceId = enum {
     /// instead of silently running some other device.
     pub fn Type(comptime id: DeviceId) type {
         const name = @tagName(id);
-        if (comptime has(name)) return byName(name);
+        if (comptime device.has(name)) return device.byName(name);
         return Absent(name);
     }
 };
-
-/// Stand-in for a policy name with no generated model. It has no `eval`,
-/// which is what every consumer gates on.
-fn Absent(comptime name: []const u8) type {
-    return struct {
-        pub const absent_model = name;
-    };
-}
 
 /// Netlist first letter to device. Letters with a LEVEL table (m q j z) are
 /// resolved by the *DeviceId functions below; 'd' is listed only so diode
@@ -139,10 +142,43 @@ pub const letter_map = std.StaticStringMap(DeviceId).initComptime(.{
     .{ "d", DeviceId.diode },
 });
 
+/// `.model X <module>` on a card with no built-in letter: the Verilog-A
+/// module name an OSDI deck loads the model under (ngspice `pre_osdi`
+/// decks, IHP SG13G2's `psp103va`), lowercase.
+pub const module_map = std.StaticStringMap(DeviceId).initComptime(.{
+    .{ "psp103va", DeviceId.psp103 },
+    .{ "pspnqs103va", DeviceId.psp103_nqs },
+    .{ "psp103tva", DeviceId.psp103t },
+    .{ "psp104va", DeviceId.psp104 },
+    .{ "pspnqs104va", DeviceId.psp104_nqs },
+    .{ "psp104tva", DeviceId.psp104t },
+    .{ "juncap200", DeviceId.juncap200 },
+    .{ "bsimimg", DeviceId.bsimimg },
+    .{ "bsimcmg", DeviceId.bsimcmg },
+    .{ "bsimcmg_va", DeviceId.bsimcmg },
+    .{ "bsimbulk", DeviceId.bsimbulk },
+    .{ "l_utsoi", DeviceId.l_utsoi },
+    .{ "bjt505", DeviceId.mextram },
+    .{ "bjt505_va", DeviceId.mextram },
+    .{ "bjt505t", DeviceId.mextram_t },
+    .{ "bjt505t_va", DeviceId.mextram_t },
+    .{ "asmhemt", DeviceId.asmhemt },
+    .{ "hicuml2va", DeviceId.hicumL2_va },
+    .{ "hicuml0va", DeviceId.hicumL0 },
+    .{ "hisimhv_va", DeviceId.hisimhv_va },
+    .{ "hisimsoi_va", DeviceId.hisimsoi },
+    .{ "hisimsotb_va", DeviceId.hisimsotb },
+    .{ "mosvar", DeviceId.mosvar },
+    .{ "diode_cmc", DeviceId.diode_cmc },
+    .{ "r2_cmc", DeviceId.r2_cmc },
+    .{ "r3_cmc", DeviceId.r3_cmc },
+    .{ "mvsg_cmc", DeviceId.mvsg },
+    .{ "asmesd", DeviceId.asmesd },
+    .{ "asmesd_dio", DeviceId.asmesd_dio },
+});
+
 // Flat aliases for the devices the builder wires by hand instead of
-// dispatching through `DeviceId`. Each says which cards build it.
-// ponytail: only the names the builder uses; everything else goes through
-// `DeviceId.Type`.
+// dispatching through `DeviceId`; each names the cards that build it.
 
 /// R cards, URC lumps and a P card's series z0.
 pub const resistor = DeviceId.Type(.resistor);
@@ -175,43 +211,43 @@ pub const tline = DeviceId.Type(.tline);
 /// O cards of a static RG line.
 pub const lossy_tline = DeviceId.Type(.lossy_tline);
 /// O cards of an RLC or RC line.
-pub const ltra = byName("ltra");
+pub const ltra = device.byName("ltra");
 /// E LAPLACE cards.
-pub const vcvs_laplace = byName("vcvs_laplace");
+pub const vcvs_laplace = device.byName("vcvs_laplace");
 /// G LAPLACE cards.
-pub const vccs_laplace = byName("vccs_laplace");
+pub const vccs_laplace = device.byName("vccs_laplace");
 /// E POLE cards.
-pub const vcvs_pole = byName("vcvs_pole");
+pub const vcvs_pole = device.byName("vcvs_pole");
 /// G POLE cards.
-pub const vccs_pole = byName("vccs_pole");
+pub const vccs_pole = device.byName("vccs_pole");
 /// E DELAY cards.
-pub const vcvs_delay = byName("vcvs_delay");
+pub const vcvs_delay = device.byName("vcvs_delay");
 /// G DELAY cards.
-pub const vccs_delay = byName("vccs_delay");
+pub const vccs_delay = device.byName("vccs_delay");
 /// Y cards.
 pub const txl = DeviceId.Type(.txl);
 /// P (CPL) cards of 2 conductors.
-pub const coupled_ltra = byName("coupled_ltra");
+pub const coupled_ltra = device.byName("coupled_ltra");
 /// P (CPL) cards of 3 conductors.
-pub const coupled_ltra3 = byName("coupled_ltra3");
+pub const coupled_ltra3 = device.byName("coupled_ltra3");
 /// P (CPL) cards of 4 conductors.
-pub const coupled_ltra4 = byName("coupled_ltra4");
+pub const coupled_ltra4 = device.byName("coupled_ltra4");
 /// HSPICE W cards of N = 1.
-pub const wline_1 = byName("wline_1");
+pub const wline_1 = device.byName("wline_1");
 /// HSPICE W cards of N = 2.
-pub const wline_2 = byName("wline_2");
+pub const wline_2 = device.byName("wline_2");
 /// HSPICE W cards of N = 3.
-pub const wline_3 = byName("wline_3");
+pub const wline_3 = device.byName("wline_3");
 /// HSPICE W cards of N = 4.
-pub const wline_4 = byName("wline_4");
+pub const wline_4 = device.byName("wline_4");
 /// HSPICE S cards of 1 port.
-pub const sparam_1 = byName("sparam_1");
+pub const sparam_1 = device.byName("sparam_1");
 /// HSPICE S cards of 2 ports.
-pub const sparam_2 = byName("sparam_2");
+pub const sparam_2 = device.byName("sparam_2");
 /// HSPICE S cards of 3 ports.
-pub const sparam_3 = byName("sparam_3");
+pub const sparam_3 = device.byName("sparam_3");
 /// HSPICE S cards of 4 ports.
-pub const sparam_4 = byName("sparam_4");
+pub const sparam_4 = device.byName("sparam_4");
 
 /// `.model` LEVEL tables, per ngspice src/spicelib/parser/inpdomod.c.
 const Level = struct { level: u16, model: DeviceId };
@@ -263,41 +299,6 @@ const diode_levels = [_]Level{
     .{ .level = 6, .model = .juncap200 },
 };
 
-/// `.model X <module>` on a card with no built-in letter: the Verilog-A
-/// module name an OSDI deck loads the model under (ngspice `pre_osdi`
-/// decks, IHP SG13G2's `psp103va`), lowercase.
-pub const module_map = std.StaticStringMap(DeviceId).initComptime(.{
-    .{ "psp103va", DeviceId.psp103 },
-    .{ "pspnqs103va", DeviceId.psp103_nqs },
-    .{ "psp103tva", DeviceId.psp103t },
-    .{ "psp104va", DeviceId.psp104 },
-    .{ "pspnqs104va", DeviceId.psp104_nqs },
-    .{ "psp104tva", DeviceId.psp104t },
-    .{ "juncap200", DeviceId.juncap200 },
-    .{ "bsimimg", DeviceId.bsimimg },
-    .{ "bsimcmg", DeviceId.bsimcmg },
-    .{ "bsimcmg_va", DeviceId.bsimcmg },
-    .{ "bsimbulk", DeviceId.bsimbulk },
-    .{ "l_utsoi", DeviceId.l_utsoi },
-    .{ "bjt505", DeviceId.mextram },
-    .{ "bjt505_va", DeviceId.mextram },
-    .{ "bjt505t", DeviceId.mextram_t },
-    .{ "bjt505t_va", DeviceId.mextram_t },
-    .{ "asmhemt", DeviceId.asmhemt },
-    .{ "hicuml2va", DeviceId.hicumL2_va },
-    .{ "hicuml0va", DeviceId.hicumL0 },
-    .{ "hisimhv_va", DeviceId.hisimhv_va },
-    .{ "hisimsoi_va", DeviceId.hisimsoi },
-    .{ "hisimsotb_va", DeviceId.hisimsotb },
-    .{ "mosvar", DeviceId.mosvar },
-    .{ "diode_cmc", DeviceId.diode_cmc },
-    .{ "r2_cmc", DeviceId.r2_cmc },
-    .{ "r3_cmc", DeviceId.r3_cmc },
-    .{ "mvsg_cmc", DeviceId.mvsg },
-    .{ "asmesd", DeviceId.asmesd },
-    .{ "asmesd_dio", DeviceId.asmesd_dio },
-});
-
 const jfet_levels = [_]Level{
     .{ .level = 1, .model = .jfet },
     .{ .level = 2, .model = .jfet2 },
@@ -312,22 +313,11 @@ const mes_levels = [_]Level{
     .{ .level = 6, .model = .hfet2 },
 };
 
-/// LEVEL to device. An unknown level, or one whose model is not in the
-/// catalog, is an unsupported netlist: it logs a warning and returns
-/// `UnsupportedDevice`, never a panic and never a different device.
-fn levelId(comptime kind: []const u8, comptime table: []const Level, level: u16) error{UnsupportedDevice}!DeviceId {
-    inline for (table) |e| {
-        if (e.level == level) {
-            if (comptime !has(@tagName(e.model))) {
-                std.log.warn("devices: " ++ kind ++ " LEVEL {d} needs model '" ++
-                    @tagName(e.model) ++ "', which is not in the device catalog", .{level});
-                return error.UnsupportedDevice;
-            }
-            return e.model;
-        }
+// Each LEVEL table names a level once; `levelId` takes the first match.
+comptime {
+    for ([_][]const Level{ &mos_levels, &bjt_levels, &diode_levels, &jfet_levels, &mes_levels }) |table| {
+        for (table, 0..) |a, i| for (table[i + 1 ..]) |b| if (a.level == b.level) @compileError("duplicate LEVEL in a device table");
     }
-    std.log.warn("devices: unsupported " ++ kind ++ " LEVEL {d}", .{level});
-    return error.UnsupportedDevice;
 }
 
 /// The M card device for `.model ... LEVEL=level` (ngspice inpdomod.c).
@@ -353,20 +343,41 @@ pub fn mesDeviceId(level: u16) error{UnsupportedDevice}!DeviceId {
     return levelId("MESFET", &mes_levels, level);
 }
 
-// Each LEVEL table names a level once; `levelId` takes the first match.
-comptime {
-    for ([_][]const Level{ &mos_levels, &bjt_levels, &diode_levels, &jfet_levels, &mes_levels }) |table| {
-        for (table, 0..) |a, i| for (table[i + 1 ..]) |b| if (a.level == b.level) @compileError("duplicate LEVEL in a device table");
+// ---- private ----
+
+/// Stand-in for a policy name with no generated model. It has no `eval`,
+/// which is what every consumer gates on.
+fn Absent(comptime name: []const u8) type {
+    return struct {
+        pub const absent_model = name;
+    };
+}
+
+/// LEVEL to device. An unknown level, or one whose model is not in the
+/// catalog, is an unsupported netlist: it logs a warning and returns
+/// `UnsupportedDevice`, never a panic and never a different device.
+fn levelId(comptime kind: []const u8, comptime table: []const Level, level: u16) error{UnsupportedDevice}!DeviceId {
+    inline for (table) |e| {
+        if (e.level == level) {
+            if (comptime !device.has(@tagName(e.model))) {
+                std.log.warn("devices: " ++ kind ++ " LEVEL {d} needs model '" ++
+                    @tagName(e.model) ++ "', which is not in the device catalog", .{level});
+                return error.UnsupportedDevice;
+            }
+            return e.model;
+        }
     }
+    std.log.warn("devices: unsupported " ++ kind ++ " LEVEL {d}", .{level});
+    return error.UnsupportedDevice;
 }
 
 test "LEVEL tables follow inpdomod.c, and an unknown level is UnsupportedDevice" {
     std.testing.log_level = .err; // An unknown level logs a warning.
     // Each pair: the level and the device inpdomod.c (or HSPICE) names.
     inline for (.{ .{ 1, DeviceId.mos1 }, .{ 3, DeviceId.mos3 }, .{ 8, DeviceId.bsim3 }, .{ 49, DeviceId.bsim3 }, .{ 54, DeviceId.bsim4va }, .{ 14, DeviceId.bsim4va } }) |c|
-        if (comptime has(@tagName(c[1]))) try std.testing.expectEqual(c[1], try mosfetDeviceId(c[0]));
-    if (comptime has("gummel_poon")) try std.testing.expectEqual(.gummel_poon, try bjtDeviceId(2));
-    if (comptime has("diode")) try std.testing.expectEqual(.diode, try diodeDeviceId(3));
+        if (comptime device.has(@tagName(c[1]))) try std.testing.expectEqual(c[1], try mosfetDeviceId(c[0]));
+    if (comptime device.has("gummel_poon")) try std.testing.expectEqual(.gummel_poon, try bjtDeviceId(2));
+    if (comptime device.has("diode")) try std.testing.expectEqual(.diode, try diodeDeviceId(3));
     for ([_]u16{ 0, 7, 11, 999, 65535 }) |level| {
         try std.testing.expectError(error.UnsupportedDevice, mosfetDeviceId(level));
         try std.testing.expectError(error.UnsupportedDevice, bjtDeviceId(level));

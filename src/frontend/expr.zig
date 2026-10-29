@@ -1,396 +1,58 @@
-//! Expressions as flat postfix: compile from text, fold on a value stack.
-//! `compile` emits syntax only, names and probe arguments as indices into
-//! `Scratch.names`; netlist.zig `subst` splices parameters in and maps probe
-//! nets. No tree is built: a consumer walks subtrees backwards from their
-//! last op (`subtreeStart`).
+//! Expressions as flat postfix. In: expression text, or final ops after
+//! netlist.zig `subst`. Out: the compiled tape (expr_compile.zig) and its
+//! value, folded on a value stack (`fold`, `eval`). No tree is built: a
+//! consumer walks subtrees backwards from their last op (`subtreeStart`).
+//! Cites: dev/research/ngspice-syntax.md §2.2, ngspice xpressn.c; HSPICE
+//! [Star-Hspice Table 10-1] for `**` (#39, #77).
 //!
-//! Cites dev/research/ngspice-syntax.md §2.2 and ngspice xpressn.c for
-//! numparam's operators and built-ins, and Star-Hspice Table 10-1 for the
-//! HSPICE dialect's sqrt, log and pow (#39).
+//! Contents:
+//! - `pub const Error, CompileError, none, Code, Fn, Op, Scratch` (expr_ops.zig)
+//! - `pub const isDistribution, isDistributionName` (expr_ops.zig)
+//! - `pub const max_depth, compile, compileAll, numberLen, isOperator` (expr_compile.zig)
+//! - `pub const Val = struct`
+//! - `pub fn fold(gpa: Allocator, stack: *std.ArrayList(Val), ops: []const Op, consts: []const f64, geometry: bool, live: []const f64) Error!Val`
+//! - `pub fn eval(gpa: Allocator, stack: *std.ArrayList(Val), ops: []const Op, consts: []const f64, live: []const f64, draw: anytype) Error!f64`
+//! - `pub fn arity(op: Op) u32`
+//! - `pub fn subtreeStart(ops: []const Op, end: usize) usize`
+
 const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const expr_ops = @import("expr_ops.zig");
+const expr_compile = @import("expr_compile.zig");
+const lines = @import("lines.zig");
 
-/// `ParseError`: malformed expression text, or nesting past `max_depth`.
-/// On either error `compile` leaves what it appended in the `Scratch`;
-/// roll it back with `Scratch.mark` and `Scratch.reset`. `fold` and `eval`
-/// fail only with `OutOfMemory`.
-pub const Error = error{ OutOfMemory, ParseError };
-/// `compile`'s errors: `UnsupportedCard` for `%` or `\` used as an operator,
-/// or a unary `!`, in a dialect without it (`S.remainder_ops`,
-/// `S.unary_not`, #203).
-pub const CompileError = Error || error{UnsupportedCard};
+/// Malformed text (`ParseError`) or no memory; `fold` and `eval` fail only
+/// with `OutOfMemory`. A failed `compile` leaves what it appended in the
+/// `Scratch`; roll it back with `Scratch.mark` and `Scratch.reset`.
+pub const Error = expr_ops.Error;
+/// `compile`'s errors: `UnsupportedCard` for `%` or `\` used as an
+/// operator, or a unary `!`, in a dialect without it (#203).
+pub const CompileError = expr_ops.CompileError;
 /// Absent operand.
-pub const none = std.math.maxInt(u32);
-
-/// Postfix opcode; `a`/`b` operands as noted, none for the operators.
-pub const Code = enum(u8) {
-    /// a: constant pool index.
-    num,
-    /// A name no scope defines. As compiled, a is its index into
-    /// `Scratch.names`; in final ops a = 1 for `l`, `w`, `mult`, 2 for
-    /// `time`, 3 for `temper`, 0 otherwise.
-    ident,
-    /// A swept global parameter kept symbolic: a indexes the live table
-    /// (`fold`'s `live`). Only netlist.zig `subst` emits it.
-    live,
-    /// `v(p[,n])`: a, b are the nets (names before `subst`), `none` if absent.
-    vprobe,
-    /// `i(device)`: a is the device name (a name before `subst`, its
-    /// flattened `Netlist.pool` index after).
-    iprobe,
-    neg,
-    not,
-    add,
-    sub,
-    mul,
-    div,
-    /// `a % b`: a - b·trunc(a/b), as numparam's `%` (ngspice-syntax.md §2.2).
-    mod,
-    /// `a \ b`: trunc(|a/b|), numparam's integer division.
-    idiv,
-    pow,
-    lt,
-    gt,
-    le,
-    ge,
-    eq,
-    ne,
-    @"and",
-    @"or",
-    /// a: `Fn`, b: argument count.
-    call,
-    /// A call to a function outside `Fn`, as compiled: a is its name (an
-    /// index into `Scratch.names`), b the argument count. netlist.zig
-    /// `subst` inlines a `.func` it names and turns any other into a
-    /// `call` of `Fn.other`, so final ops never hold one.
-    ucall,
-};
-
-/// Built-in functions; `other` is any name the table does not know. The
-/// statistical distributions `agauss`, `gauss`, `unif`, `aunif` and HSPICE's
-/// `limit(nom, var)` fold to their nominal, the first argument; a Monte Carlo
-/// trial draws them instead (`eval`). `table(x, d, x1, y1, ...)` is the
-/// smoothed transfer of an E/G TABLE or PWL(1) card, built only by the
-/// B-source tape (models/bsource.va opcode 37).
-pub const Fn = enum(u8) { sqrt, abs, min, max, pow, pwr, exp, ln, log, log10, sin, cos, tan, atan, floor, ceil, ternary, tanh, sqr, int, nint, sgn, sinh, cosh, asin, acos, asinh, acosh, atanh, agauss, gauss, unif, aunif, limit, table, other, hsqrt, hlog, hlog10, hpow };
-
-/// True when `name` (lower case) calls a function a Monte Carlo trial draws.
-pub fn isDistributionName(name: []const u8) bool {
-    const f = fns.get(name) orelse return false;
-    return isDistribution(f);
-}
-
-/// True for the functions a Monte Carlo trial draws.
-pub fn isDistribution(f: Fn) bool {
-    return switch (f) {
-        .agauss, .gauss, .unif, .aunif, .limit => true,
-        else => false,
-    };
-}
-
-const fns = std.StaticStringMap(Fn).initComptime(.{
-    .{ "sqrt", .sqrt },           .{ "abs", .abs },     .{ "min", .min },       .{ "max", .max },
-    .{ "pow", .pow },             .{ "pwr", .pwr },     .{ "exp", .exp },       .{ "ln", .ln },
-    .{ "log", .log },             .{ "log10", .log10 }, .{ "sin", .sin },       .{ "cos", .cos },
-    .{ "tan", .tan },             .{ "atan", .atan },   .{ "floor", .floor },   .{ "ceil", .ceil },
-    .{ "ternary", .ternary },     .{ "tanh", .tanh },   .{ "agauss", .agauss }, .{ "gauss", .gauss },
-    .{ "unif", .unif },           .{ "aunif", .aunif }, .{ "limit", .limit },   .{ "table", .table },
-    // numparam's other built-ins (ngspice-syntax.md §2.2, xpressn.c fmathS).
-    .{ "sqr", .sqr },             .{ "int", .int },     .{ "nint", .nint },     .{ "sgn", .sgn },
-    .{ "sinh", .sinh },           .{ "cosh", .cosh },   .{ "asin", .asin },     .{ "acos", .acos },
-    .{ "asinh", .asinh },         .{ "acosh", .acosh }, .{ "atanh", .atanh },   .{ "arctan", .atan },
-    .{ "ternary_fcn", .ternary },
-});
-
-/// The HSPICE dialect's meanings [Star-Hspice Table 10-1]: sqrt(-x) is
-/// -sqrt(x), log and log10 of -x are -log(x), and pow uses the integer
-/// part of its exponent (#39).
-const hspice_fns = blk: {
-    const overrides = .{ .{ "sqrt", .hsqrt }, .{ "log", .hlog }, .{ "log10", .hlog10 }, .{ "pow", .hpow } };
-    var kvs: [fns.keys().len]struct { []const u8, Fn } = undefined;
-    for (fns.keys(), fns.values(), &kvs) |k, v, *out| {
-        out.* = .{ k, v };
-        for (overrides) |o| if (std.mem.eql(u8, k, o[0])) {
-            out.* = .{ k, o[1] };
-        };
-    }
-    break :blk std.StaticStringMap(Fn).initComptime(kvs);
-};
-
+pub const none = expr_ops.none;
+/// Postfix opcode.
+pub const Code = expr_ops.Code;
+/// Built-in functions.
+pub const Fn = expr_ops.Fn;
 /// One postfix op.
-pub const Op = struct { code: Code, a: u32 = 0, b: u32 = 0 };
-
-comptime {
-    // A row of the postfix tape: a 1-byte opcode and two u32 operands.
-    std.debug.assert(@sizeOf(Code) == 1 and @sizeOf(Fn) == 1);
-    std.debug.assert(@sizeOf(Op) == 12);
-}
-
+pub const Op = expr_ops.Op;
 /// Compile output before parameters are spliced in.
-pub const Scratch = struct {
-    ops: std.ArrayList(Op) = .empty,
-    /// The constant pool `.num` operands index.
-    consts: std.ArrayList(f64) = .empty,
-    /// Slices of the compiled text that `.ident`, probe and `.ucall`
-    /// operands index.
-    names: std.ArrayList([]const u8) = .empty,
-
-    /// Table lengths to roll back to.
-    pub const Mark = struct { ops: usize, consts: usize, names: usize };
-
-    /// The current table lengths, for a later `reset`.
-    pub fn mark(s: Scratch) Mark {
-        return .{ .ops = s.ops.items.len, .consts = s.consts.items.len, .names = s.names.items.len };
-    }
-
-    /// Drops everything appended since `m`.
-    pub fn reset(s: *Scratch, m: Mark) void {
-        s.ops.shrinkRetainingCapacity(m.ops);
-        s.consts.shrinkRetainingCapacity(m.consts);
-        s.names.shrinkRetainingCapacity(m.names);
-    }
-};
-
-/// Compiles the expression starting at `text[pos]` into `s` and returns
-/// where it ends. Grammar: ternary `?:` loosest, then `||`, `&&`,
-/// comparisons, `+ -`, `* /`, `^`/`**` (all left associative); unary `-`/`+`
-/// bind below power. Nesting deeper than `max_depth` is a ParseError;
-/// `%` or `\` after an operand, where `S.remainder_ops` lacks it, is
-/// `UnsupportedCard`. Invalidates slices of `s`'s tables, which grow in `gpa`.
-pub fn compile(comptime S: type, gpa: std.mem.Allocator, s: *Scratch, text: []const u8, pos: usize) CompileError!usize {
-    var p: Compiler(S) = .{ .text = text, .pos = pos, .gpa = gpa, .s = s };
-    try p.bin(0);
-    return p.pos;
-}
-
-/// `compile` over the whole of `text`; trailing input is a ParseError.
-/// Invalidates slices of `s`'s tables, which grow in `gpa`.
-pub fn compileAll(comptime S: type, gpa: std.mem.Allocator, s: *Scratch, text: []const u8) CompileError!void {
-    var p: Compiler(S) = .{ .text = text, .gpa = gpa, .s = s };
-    try p.bin(0);
-    if (p.peek() != null) return error.ParseError;
-}
-
-/// Recursion bound of `compile`, in parser calls: a level of parentheses,
-/// quotes or call arguments costs two, a ternary branch one, a unary
-/// operator one or two. Deeper input is a ParseError rather than a stack overflow.
-pub const max_depth = 512;
-
-fn Compiler(comptime S: type) type {
-    return struct {
-        text: []const u8,
-        pos: usize = 0,
-        gpa: std.mem.Allocator,
-        s: *Scratch,
-        depth: u16 = 0,
-
-        const P = @This();
-
-        fn peek(p: *P) ?u8 {
-            while (p.pos < p.text.len and (p.text[p.pos] == ' ' or p.text[p.pos] == '\t')) p.pos += 1;
-            return if (p.pos < p.text.len) p.text[p.pos] else null;
-        }
-
-        fn emit(p: *P, op: Op) CompileError!void {
-            try p.s.ops.append(p.gpa, op);
-        }
-
-        fn name(p: *P, n: []const u8) CompileError!u32 {
-            try p.s.names.append(p.gpa, n);
-            return @intCast(p.s.names.items.len - 1);
-        }
-
-        fn bin(p: *P, min_prec: u8) CompileError!void {
-            if (p.depth == max_depth) return error.ParseError;
-            p.depth += 1;
-            defer p.depth -= 1;
-            try p.unary();
-            while (true) {
-                const c = p.peek() orelse break;
-                if (c == '?' and min_prec == 0) {
-                    p.pos += 1;
-                    try p.bin(0);
-                    if (p.peek() != ':') return error.ParseError;
-                    p.pos += 1;
-                    try p.bin(0);
-                    try p.emit(.{ .code = .call, .a = @backingInt(Fn.ternary), .b = 3 });
-                    continue;
-                }
-                // A dialect without `%` or `\` refuses the deck by name
-                // rather than end the expression before it (#203).
-                if ((c == '%' or c == '\\') and std.mem.indexOfScalar(u8, S.remainder_ops, c) == null) return error.UnsupportedCard;
-                const power = c == '*' and p.pos + 1 < p.text.len and p.text[p.pos + 1] == '*';
-                const prec: u8 = switch (c) {
-                    '|' => 1,
-                    '&' => 2,
-                    '<', '>', '=', '!' => 3,
-                    '+', '-' => 4,
-                    '*', '/', '%', '\\' => if (power) 6 else 5,
-                    '^' => 6,
-                    else => break,
-                };
-                if (prec < min_prec) break;
-                p.pos += 1;
-                var code: Code = switch (c) {
-                    '|' => .@"or",
-                    '&' => .@"and",
-                    '<' => .lt,
-                    '>' => .gt,
-                    '=' => .eq,
-                    '!' => .ne,
-                    '+' => .add,
-                    '-' => .sub,
-                    '*' => if (power) .pow else .mul,
-                    '/' => .div,
-                    '%' => .mod,
-                    '\\' => .idiv,
-                    else => .pow,
-                };
-                if (p.pos < p.text.len) {
-                    const next = p.text[p.pos];
-                    if (power) p.pos += 1;
-                    if (next == '=' and (c == '<' or c == '>' or c == '=' or c == '!')) {
-                        if (c == '<') code = .le;
-                        if (c == '>') code = .ge;
-                        p.pos += 1;
-                    } else if (c == '<' and next == '>') {
-                        // `<>` is `!=` in numparam and B sources (§2.2, §2.6).
-                        code = .ne;
-                        p.pos += 1;
-                    } else if (c == '=' or c == '!') return error.ParseError;
-                    if (c == '&' or c == '|') {
-                        if (next != c) return error.ParseError;
-                        p.pos += 1;
-                    }
-                }
-                try p.bin(prec + 1);
-                // `b` marks an HSPICE power, which `fold` reads its own way.
-                try p.emit(.{ .code = code, .b = @intFromBool(code == .pow and S == @import("lines.zig").hspice) });
-            }
-        }
-
-        // Every recursion passes through `bin` or `unary`, so the guard in
-        // both bounds them all.
-        fn unary(p: *P) CompileError!void {
-            if (p.depth == max_depth) return error.ParseError;
-            p.depth += 1;
-            defer p.depth -= 1;
-            const c = p.peek() orelse return error.ParseError;
-            switch (c) {
-                '-' => {
-                    p.pos += 1;
-                    try p.bin(6);
-                    try p.emit(.{ .code = .neg });
-                },
-                '+' => {
-                    p.pos += 1;
-                    try p.bin(6);
-                },
-                '!' => {
-                    // HSPICE has no unary `!` (#203).
-                    if (!S.unary_not) return error.UnsupportedCard;
-                    p.pos += 1;
-                    try p.unary();
-                    try p.emit(.{ .code = .not });
-                },
-                else => try p.atom(),
-            }
-        }
-
-        /// A probe argument: up to `,` `)` or a blank, kept as a name (node
-        /// `10` is a node, and a node `1n` must not read as 1e-9).
-        fn nodeArg(p: *P) CompileError![]const u8 {
-            _ = p.peek();
-            const start = p.pos;
-            while (p.pos < p.text.len) : (p.pos += 1) {
-                const ch = p.text[p.pos];
-                if (ch == ',' or ch == ')' or ch == ' ' or ch == '\t') break;
-            }
-            if (p.pos == start) return error.ParseError;
-            return p.text[start..p.pos];
-        }
-
-        fn atom(p: *P) CompileError!void {
-            const c = p.peek() orelse return error.ParseError;
-            if (c == '"' or c == '\'' or c == '(') {
-                p.pos += 1;
-                try p.bin(0);
-                if (p.peek() != if (c == '(') ')' else c) return error.ParseError;
-                p.pos += 1;
-                return;
-            }
-            if (std.ascii.isDigit(c) or c == '.') {
-                const start = p.pos;
-                p.pos += numberLen(p.text[start..]);
-                const n = S.parseNum(p.text[start..p.pos]) orelse return error.ParseError;
-                try p.s.consts.append(p.gpa, n);
-                return p.emit(.{ .code = .num, .a = @intCast(p.s.consts.items.len - 1) });
-            }
-            if (!std.ascii.isAlphabetic(c) and c != '_') return error.ParseError;
-            const start = p.pos;
-            while (p.pos < p.text.len) : (p.pos += 1) {
-                const ch = p.text[p.pos];
-                if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '.')) break;
-            }
-            const word = p.text[start..p.pos];
-            if (p.peek() != '(') return p.emit(.{ .code = .ident, .a = try p.name(word) });
-            p.pos += 1;
-            const probe: ?Code = if (word.len != 1) null else switch (word[0]) {
-                'v', 'V' => .vprobe,
-                'i', 'I' => .iprobe,
-                else => null,
-            };
-            var args: [2]u32 = .{ none, none };
-            var argc: u32 = 0;
-            if (p.peek() != ')') while (true) {
-                if (probe != null) {
-                    const node = try p.nodeArg();
-                    if (argc < 2) args[argc] = try p.name(node);
-                } else try p.bin(0);
-                argc += 1;
-                if ((p.peek() orelse return error.ParseError) != ',') break;
-                p.pos += 1;
-            };
-            if (p.peek() != ')') return error.ParseError;
-            p.pos += 1;
-            if (probe) |code| return p.emit(.{ .code = code, .a = args[0], .b = args[1] });
-            const table = if (S == @import("lines.zig").hspice) hspice_fns else fns;
-            if (table.get(word)) |f| return p.emit(.{ .code = .call, .a = @backingInt(f), .b = argc });
-            try p.emit(.{ .code = .ucall, .a = try p.name(word), .b = argc });
-        }
-    };
-}
-
-/// Length of the number literal `text` starts with: digits and dots, an
-/// exponent, then a letter suffix (`2.5e-3`, `10meg`). `E` is an exponent
-/// too, as `lines.zig` reads it, for Spectre's case-kept text.
-pub fn numberLen(text: []const u8) usize {
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        const ch = text[i];
-        if (std.ascii.isDigit(ch) or ch == '.') continue;
-        if ((ch == 'e' or ch == 'E') and i + 1 < text.len and
-            (std.ascii.isDigit(text[i + 1]) or
-                ((text[i + 1] == '-' or text[i + 1] == '+') and i + 2 < text.len and std.ascii.isDigit(text[i + 2]))))
-        {
-            i += 1;
-            if (text[i] == '+' or text[i] == '-') i += 1;
-            continue;
-        }
-        break;
-    }
-    while (i < text.len and std.ascii.isAlphabetic(text[i])) i += 1;
-    return i;
-}
-
-/// A byte that continues an expression after an operand: the binary and
-/// ternary operator bytes, `%` and `\` included. `compile` reads those two
-/// where the dialect has them and refuses them elsewhere (#203).
-pub fn isOperator(c: u8) bool {
-    return switch (c) {
-        '|', '&', '<', '>', '=', '!', '+', '-', '*', '/', '%', '\\', '^', '?' => true,
-        else => false,
-    };
-}
+pub const Scratch = expr_ops.Scratch;
+/// True when `name` (lower case) calls a function a Monte Carlo trial draws.
+pub const isDistributionName = expr_ops.isDistributionName;
+/// True for the functions a Monte Carlo trial draws.
+pub const isDistribution = expr_ops.isDistribution;
+/// Recursion bound of `compile`, in parser calls.
+pub const max_depth = expr_compile.max_depth;
+/// Compiles the expression at `text[pos]`; returns where it ends.
+pub const compile = expr_compile.compile;
+/// Compiles the whole of `text`; trailing input is a ParseError.
+pub const compileAll = expr_compile.compileAll;
+/// Length of the number literal `text` starts with.
+pub const numberLen = expr_compile.numberLen;
+/// A byte that continues an expression after an operand.
+pub const isOperator = expr_compile.isOperator;
 
 /// A folded value. `nominal` records, for an unknown value, whether a zero
 /// multiplier may still erase it: finite constants, declared model geometry
@@ -414,21 +76,73 @@ pub const Val = struct {
     }
 };
 
-fn bool01(b: bool) f64 {
-    return @floatFromInt(@intFromBool(b));
-}
-
 /// Folds final ops (after `subst`) to a value; `stack` is reused scratch
 /// in `gpa`. `geometry` lets model-card `l`/`w`/`mult` vanish behind a zero
 /// switch; `live` holds the current value of each `.live` operand. Asserts
 /// `ops` is one complete postfix expression, as `compile` emits. Fails only
 /// with `OutOfMemory`, growing `stack` to `ops.len`.
-pub fn fold(gpa: std.mem.Allocator, stack: *std.ArrayList(Val), ops: []const Op, consts: []const f64, geometry: bool, live: []const f64) Error!Val {
+pub fn fold(gpa: Allocator, stack: *std.ArrayList(Val), ops: []const Op, consts: []const f64, geometry: bool, live: []const f64) Error!Val {
     stack.clearRetainingCapacity();
     // Every op pushes at most one value: one reserve, no per-op growth check.
     try stack.ensureTotalCapacity(gpa, ops.len);
+    assert(ops.len > 0);
     for (ops) |op| step(stack, op, consts, geometry, live);
     return stack.pop().?;
+}
+
+/// Operands an op pops.
+pub fn arity(op: Op) u32 {
+    return switch (op.code) {
+        .num, .ident, .live, .vprobe, .iprobe => 0,
+        .neg, .not => 1,
+        .call, .ucall => op.b,
+        else => 2,
+    };
+}
+
+/// First op of the subtree whose root is `ops[end]`. O(subtree size).
+/// Asserts `ops[0..end + 1]` holds that whole subtree.
+pub fn subtreeStart(ops: []const Op, end: usize) usize {
+    assert(end < ops.len);
+    var need: u32 = 1;
+    var i = end;
+    while (true) : (i -= 1) {
+        need = need - 1 + arity(ops[i]);
+        if (need == 0) return i;
+    }
+}
+
+/// Evaluates ops that fold to a number: constants, `.live` operands and
+/// arithmetic, as `fold` would, except that the distribution call ending at
+/// op `i` returns `draw.value(i, f, args)` when `draw` is not null. `stack`
+/// is reused scratch in `gpa`. Ops `fold` leaves unknown evaluate to NaN.
+/// Asserts `ops` is one complete postfix expression.
+pub fn eval(gpa: Allocator, stack: *std.ArrayList(Val), ops: []const Op, consts: []const f64, live: []const f64, draw: anytype) Error!f64 {
+    assert(ops.len > 0);
+    stack.clearRetainingCapacity();
+    try stack.ensureTotalCapacity(gpa, ops.len);
+    for (ops, 0..) |op, i| {
+        if (op.code == .call and @TypeOf(draw) != @TypeOf(null) and isDistribution(@fromBackingInt(@intCast(op.a)))) {
+            const argc: usize = op.b;
+            var nums: [4]f64 = @splat(0);
+            const args = stack.items[stack.items.len - argc ..];
+            for (args, 0..) |a, k| if (k < nums.len) {
+                nums[k] = if (a.known) a.num else std.math.nan(f64);
+            };
+            stack.shrinkRetainingCapacity(stack.items.len - argc);
+            stack.appendAssumeCapacity(.of(draw.value(i, @fromBackingInt(@intCast(op.a)), nums[0..@min(argc, nums.len)])));
+            continue;
+        }
+        step(stack, op, consts, false, live);
+    }
+    const top = stack.pop().?;
+    return if (top.known) top.num else std.math.nan(f64);
+}
+
+// ---- private ----
+
+fn bool01(b: bool) f64 {
+    return @floatFromInt(@intFromBool(b));
 }
 
 /// Applies one postfix op to the value stack, which has room for its push.
@@ -563,58 +277,9 @@ fn roundHalfEven(a: f64) f64 {
     return if (@mod(r, 2) == 0) r else r - std.math.sign(a);
 }
 
-/// Operands an op pops.
-pub fn arity(op: Op) u32 {
-    return switch (op.code) {
-        .num, .ident, .live, .vprobe, .iprobe => 0,
-        .neg, .not => 1,
-        .call, .ucall => op.b,
-        else => 2,
-    };
-}
-
-/// First op of the subtree whose root is `ops[end]`. O(subtree size).
-/// Asserts `ops[0..end + 1]` holds that whole subtree.
-pub fn subtreeStart(ops: []const Op, end: usize) usize {
-    var need: u32 = 1;
-    var i = end;
-    while (true) : (i -= 1) {
-        need = need - 1 + arity(ops[i]);
-        if (need == 0) return i;
-    }
-}
-
-/// Evaluates ops that fold to a number: constants, `.live` operands and
-/// arithmetic, as `fold` would, except that the distribution call ending at
-/// op `i` returns `draw.value(i, f, args)` when `draw` is not null. `stack`
-/// is reused scratch in `gpa`. Ops `fold` leaves unknown evaluate to NaN.
-/// Asserts `ops` is one complete postfix expression.
-pub fn eval(gpa: std.mem.Allocator, stack: *std.ArrayList(Val), ops: []const Op, consts: []const f64, live: []const f64, draw: anytype) Error!f64 {
-    stack.clearRetainingCapacity();
-    try stack.ensureTotalCapacity(gpa, ops.len);
-    for (ops, 0..) |op, i| {
-        if (op.code == .call and @TypeOf(draw) != @TypeOf(null) and isDistribution(@fromBackingInt(@intCast(op.a)))) {
-            const argc: usize = op.b;
-            var nums: [4]f64 = @splat(0);
-            const args = stack.items[stack.items.len - argc ..];
-            for (args, 0..) |a, k| if (k < nums.len) {
-                nums[k] = if (a.known) a.num else std.math.nan(f64);
-            };
-            stack.shrinkRetainingCapacity(stack.items.len - argc);
-            stack.appendAssumeCapacity(.of(draw.value(i, @fromBackingInt(@intCast(op.a)), nums[0..@min(argc, nums.len)])));
-            continue;
-        }
-        step(stack, op, consts, false, live);
-    }
-    const top = stack.pop().?;
-    return if (top.known) top.num else std.math.nan(f64);
-}
-
-const test_num = @import("lines.zig").ngspice;
-
 fn testFold(a: std.mem.Allocator, text: []const u8) !Val {
     var s: Scratch = .{};
-    try compileAll(test_num, a, &s, text);
+    try compileAll(lines.ngspice, a, &s, text);
     var stack: std.ArrayList(Val) = .empty;
     return fold(a, &stack, s.ops.items, s.consts.items, false, &.{});
 }
@@ -658,11 +323,11 @@ test "compile and fold: precedence, associativity and calls" {
         try std.testing.expect(!(try testFold(a, text)).known);
     for ([_][]const u8{ "", "1+", "(1", "1)", "a=b", "a|b", "a&b", "1 2", "1?2", "f(1,", "#", "'1" }) |text| {
         var s: Scratch = .{};
-        try std.testing.expectError(error.ParseError, compileAll(test_num, a, &s, text));
+        try std.testing.expectError(error.ParseError, compileAll(lines.ngspice, a, &s, text));
     }
     // `compile` stops at the first byte that cannot continue the expression.
     var s: Scratch = .{};
-    try std.testing.expectEqual(6, try compile(test_num, a, &s, "x 1+2 y", 2));
+    try std.testing.expectEqual(6, try compile(lines.ngspice, a, &s, "x 1+2 y", 2));
 }
 
 test "HSPICE sqrt, log, log10 and pow follow Star-Hspice Table 10-1 (#39)" {
@@ -675,7 +340,7 @@ test "HSPICE sqrt, log, log10 and pow follow Star-Hspice Table 10-1 (#39)" {
         .{ "(-2)**3", -8 },   .{ "(-2)**2.6", -8 },           .{ "0**2", 0 },
     }) |case| {
         var s: Scratch = .{};
-        try compileAll(@import("lines.zig").hspice, a, &s, case[0]);
+        try compileAll(lines.hspice, a, &s, case[0]);
         var stack: std.ArrayList(Val) = .empty;
         const v = try fold(a, &stack, s.ops.items, s.consts.items, false, &.{});
         try std.testing.expect(v.known);
@@ -696,14 +361,14 @@ test "compile bounds its recursion" {
         text[n] = shape[1];
         @memset(text[n + 1 ..], shape[2]);
         var s: Scratch = .{};
-        try std.testing.expectError(error.ParseError, compileAll(test_num, a, &s, text));
+        try std.testing.expectError(error.ParseError, compileAll(lines.ngspice, a, &s, text));
     }
     // `1?1:1?1:...1` is valid but recurses through `bin` alone.
     var chain: std.ArrayList(u8) = .empty;
     for (0..n) |_| try chain.appendSlice(a, "1?1:");
     try chain.appendSlice(a, "1");
     var s: Scratch = .{};
-    try std.testing.expectError(error.ParseError, compileAll(test_num, a, &s, chain.items));
+    try std.testing.expectError(error.ParseError, compileAll(lines.ngspice, a, &s, chain.items));
     // Realistic nesting still compiles.
     try std.testing.expectEqual(1, (try testFold(a, "((((((((((((((((1))))))))))))))))")).num);
 }
@@ -737,7 +402,7 @@ test eval {
     const a = arena.allocator();
     var stack: std.ArrayList(Val) = .empty;
     var s: Scratch = .{};
-    try compileAll(test_num, a, &s, "agauss(1,2,3)+1");
+    try compileAll(lines.ngspice, a, &s, "agauss(1,2,3)+1");
     try std.testing.expectEqual(2, try eval(a, &stack, s.ops.items, s.consts.items, &.{}, null));
     const Draw = struct {
         fn value(_: @This(), i: usize, f: Fn, args: []const f64) f64 {
@@ -749,7 +414,7 @@ test eval {
     const live = [_]Op{ .{ .code = .live }, .{ .code = .num }, .{ .code = .add } };
     try std.testing.expectEqual(5, try eval(a, &stack, &live, &.{3}, &.{2}, null));
     s = .{};
-    try compileAll(test_num, a, &s, "x+1");
+    try compileAll(lines.ngspice, a, &s, "x+1");
     try std.testing.expect(std.math.isNan(try eval(a, &stack, s.ops.items, s.consts.items, &.{}, null)));
 }
 
@@ -757,7 +422,7 @@ test "postfix subtrees" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var s: Scratch = .{};
-    try compileAll(test_num, arena.allocator(), &s, "1+2*3");
+    try compileAll(lines.ngspice, arena.allocator(), &s, "1+2*3");
     const ops = s.ops.items; // 1 2 3 mul add
     try std.testing.expectEqual(5, ops.len);
     try std.testing.expectEqual(0, subtreeStart(ops, 4));
@@ -765,12 +430,12 @@ test "postfix subtrees" {
     try std.testing.expectEqual(2, subtreeStart(ops, 2));
     // Probes keep their arguments as names; `1n` stays a node, not 1e-9.
     s = .{};
-    try compileAll(test_num, arena.allocator(), &s, "v(1n,2)+i(vdd)");
+    try compileAll(lines.ngspice, arena.allocator(), &s, "v(1n,2)+i(vdd)");
     try std.testing.expectEqual(Code.vprobe, s.ops.items[0].code);
     try std.testing.expectEqualStrings("1n", s.names.items[s.ops.items[0].a]);
     try std.testing.expectEqualStrings("vdd", s.names.items[s.ops.items[1].a]);
     s = .{};
-    try compileAll(test_num, arena.allocator(), &s, "v(out)");
+    try compileAll(lines.ngspice, arena.allocator(), &s, "v(out)");
     try std.testing.expectEqual(none, s.ops.items[0].b);
 }
 
@@ -790,7 +455,6 @@ test "% and \\ are operators in ngspice and Spectre (%) and refused in HSPICE (#
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const lines = @import("lines.zig");
     // Hand-computed: 10 % 3 = 1, trunc(10 / 3) = 3.
     try std.testing.expectEqual(1, (try testFold(a, "10 % 3")).num);
     try std.testing.expectEqual(3, (try testFold(a, "10 \\ 3")).num);
@@ -807,7 +471,6 @@ test "unary ! is refused in HSPICE, read elsewhere (#203)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const lines = @import("lines.zig");
     // Hand-computed: !0 + 1 = 2.
     try std.testing.expectEqual(2, (try testFold(a, "!0+1")).num);
     var s: Scratch = .{};
@@ -819,5 +482,7 @@ test "unary ! is refused in HSPICE, read elsewhere (#203)" {
 }
 
 test {
+    _ = expr_ops;
+    _ = expr_compile;
     _ = @import("tests/expr.zig");
 }

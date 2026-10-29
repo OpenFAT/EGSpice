@@ -1,198 +1,79 @@
-//! HSPICE pattern sources [SA Ch.9 "Pattern Source"; CR .PAT]: a V or I
-//! card's `PAT (vhi vlo td tr tf tsample data)` is rewritten, before
-//! parsing, into the PWL that draws it. `data` is b-strings (`b10m1`),
-//! `[ ... ]` nested structures and `.pat` names, each followed by optional
-//! `R=` and `RB=`. Each bit holds for `tsample`; a change of level ramps
-//! over `tr` (rising) or `tf` (falling), centred on the bit boundary, so the
-//! first change is at td + N*tsample - tr/2 as the manual gives.
+//! HSPICE pattern sources. In: lowercased logical lines. Out: the same lines,
+//! each V or I card's `PAT (vhi vlo td tr tf tsample data)` replaced by the
+//! PWL that draws it. `data` is b-strings (`b10m1`), `[ ... ]` lists and
+//! `.pat` names, each followed by optional `R=` and `RB=`. Each bit holds
+//! for `tsample`; a change of level ramps over `tr` (rising) or `tf`
+//! (falling), centred on the bit boundary, so the first change is at
+//! td + N*tsample - tr/2.
+//! Cites: HSPICE [SA] Ch.9 "Pattern Source", [CR] .PAT.
+//!
+//! Contents:
+//! - `pub const Error = error{ OutOfMemory, InvalidPattern, UnsupportedPattern }`
+//! - `pub fn rewrite(arena: Allocator, lines: [][]const u8) Error!void`
+
 const std = @import("std");
+const assert = std.debug.assert;
+const mem = std.mem;
+const Allocator = std.mem.Allocator;
+
+/// Every way `rewrite` fails. Lines before the failing card are already
+/// rewritten; the failing card and those after it are not.
+pub const Error = error{
+    OutOfMemory,
+    /// A malformed PAT form or `.pat` line, an undefined name, an 8b/10b
+    /// K-string, `R=-1` (forever), or a pattern past `points_max` PWL
+    /// points, `states_max` states or `depth_max` levels of nesting.
+    InvalidPattern,
+    /// A `Z` (high-impedance) state, which a V or I source cannot drive.
+    UnsupportedPattern,
+};
 
 /// PWL points the source models hold (`pwl_times[0:63]` in vsource.va and
 /// isource.va).
-const max_points = 64;
-/// Expanded states a pattern may reach before it is refused, so `R=` with a
-/// huge count fails fast instead of exhausting memory. A pattern past
-/// `max_points` changes is refused anyway; this only caps long runs.
-const max_states = 1 << 20;
-/// `[ ... ]` nesting a pattern may use, so the recursive reader cannot
-/// overflow the stack.
-const max_depth = 32;
+const points_max = 64;
+/// States a pattern may expand to before it is refused, so `R=` with a huge
+/// count fails fast instead of exhausting memory.
+const states_max = 1 << 20;
+/// `[ ... ]` levels a pattern may nest, so the recursive reader and
+/// `expand` stay within the stack (#67).
+const depth_max = 32;
 
-const Error = error{ OutOfMemory, InvalidPattern, UnsupportedPattern };
+/// `.pat` definitions by name.
+const Defs = std.StringHashMapUnmanaged(Comp);
 
-/// One component: a b-string's bits, or a nested list, repeated `r` more
-/// times from its `rb`-th element (1-based). `depth` counts the `[ ... ]`
-/// levels inside it, through the `.pat` names it reads, so `expand`
-/// recurses at most `max_depth` deep (#67).
+/// One component: a b-string's states or a nested list, repeated `r` more
+/// times from its `rb`-th unit (1-based). `depth` counts the `[ ... ]`
+/// levels inside it, through the `.pat` names it reads.
 const Comp = struct {
-    bits: []const u8 = "",
-    list: []const Comp = &.{},
+    body: union(enum) { bits: []const u8, list: []const Comp },
     r: u32 = 0,
     rb: u32 = 1,
     depth: u8 = 0,
 
     fn units(c: Comp) usize {
-        return if (c.list.len > 0) c.list.len else c.bits.len;
+        return switch (c.body) {
+            .bits => |b| b.len,
+            .list => |l| l.len,
+        };
     }
 
-    /// The component's states, `0`, `1` or `m`, appended to `out`.
-    fn expand(c: Comp, arena: std.mem.Allocator, out: *std.ArrayList(u8)) Error!void {
+    /// Appends the component's states, `0`, `1` or `m`, to `out`.
+    fn expand(c: Comp, arena: Allocator, out: *std.ArrayList(u8)) Error!void {
+        assert(c.rb >= 1);
+        assert(c.rb <= c.units());
         for (0..c.r + 1) |pass| {
             const from = if (pass == 0) 0 else c.rb - 1;
-            if (c.list.len > 0) {
-                for (c.list[from..]) |child| try child.expand(arena, out);
-            } else try out.appendSlice(arena, c.bits[from..]);
-            if (out.items.len > max_states) return error.InvalidPattern;
+            switch (c.body) {
+                .list => |list| for (list[from..]) |child| try child.expand(arena, out),
+                .bits => |bits| try out.appendSlice(arena, bits[from..]),
+            }
+            if (out.items.len > states_max) return error.InvalidPattern;
         }
     }
 };
 
-/// Rewrites, in place, every V/I card in `lines` (lowercased logical lines)
-/// that uses `PAT`; a rewritten line lives in `arena`. UnsupportedPattern
-/// for a `Z` (high-impedance) state, which a V or I source cannot drive;
-/// InvalidPattern for a malformed PAT form or `.pat` line, an undefined
-/// name, an 8b/10b K-string, `R=-1` (forever), a pattern past the PWL's 64
-/// points, over a million states long or nested over 32 deep. Lines before
-/// the failing card are already rewritten when it fails.
-pub fn rewrite(arena: std.mem.Allocator, lines: [][]const u8) Error!void {
-    var defs: std.StringHashMapUnmanaged(Comp) = .empty;
-    for (lines) |line| {
-        if (!std.mem.startsWith(u8, line, ".pat ")) continue;
-        const toks = try tokens(arena, line[5..]);
-        if (toks.len < 3 or !std.mem.eql(u8, toks[1], "=")) return error.InvalidPattern;
-        const def = group(arena, toks[2..], defs) catch |err| return refuse(line, err);
-        try defs.put(arena, toks[0], def);
-    }
-    for (lines) |*line| {
-        if (line.len == 0 or (line.*[0] != 'v' and line.*[0] != 'i')) continue;
-        const at = keyword(line.*) orelse continue;
-        line.* = source(arena, line.*, at, defs) catch |err| return refuse(line.*, err);
-    }
-}
-
-/// Logs why `line` was refused, outside tests, and returns `err`.
-fn refuse(line: []const u8, err: Error) Error {
-    if (!@import("builtin").is_test) switch (err) {
-        error.InvalidPattern => std.log.warn("pattern: cannot read '{s}'", .{line}),
-        error.UnsupportedPattern => std.log.err("pattern: '{s}': a Z (high-impedance) state is not supported", .{line}),
-        error.OutOfMemory => {},
-    };
-    return err;
-}
-
-/// Offset of the `pat` word in a card, past its name and two nodes. Reads
-/// the words in place: most V and I cards have none, and pay no allocation.
-fn keyword(line: []const u8) ?usize {
-    var it: Words = .{ .text = line };
-    for (0..3) |_| _ = it.next() orelse return null;
-    while (it.next()) |t| {
-        if (std.mem.eql(u8, t, "pat") or std.mem.startsWith(u8, t, "pat(")) return t.ptr - line.ptr;
-    }
-    return null;
-}
-
-/// `line` with its PAT form, from `at` on, replaced by the PWL.
-fn source(arena: std.mem.Allocator, line: []const u8, at: usize, defs: std.StringHashMapUnmanaged(Comp)) Error![]const u8 {
-    var body = std.mem.trim(u8, line[at + 3 ..], " \t");
-    if (body.len > 0 and body[0] == '(') {
-        const close = std.mem.lastIndexOfScalar(u8, body, ')') orelse return error.InvalidPattern;
-        body = body[1..close];
-    }
-    const toks = try tokens(arena, body);
-    if (toks.len < 7) return error.InvalidPattern;
-    const p = toks[0..6];
-    var states: std.ArrayList(u8) = .empty;
-    try (try group(arena, toks[6..], defs)).expand(arena, &states);
-    if (states.items.len == 0) return error.InvalidPattern;
-
-    var out: std.ArrayList(u8) = .empty;
-    try out.print(arena, "{s}pwl(0 {s}", .{ line[0..at], try level(arena, p, states.items[0]) });
-    var points: usize = 1;
-    for (states.items[1..], 1..) |s, k| {
-        const prev = states.items[k - 1];
-        if (s == prev) continue;
-        points += 2;
-        if (points > max_points) return error.InvalidPattern;
-        const ramp = if (rank(s) > rank(prev)) p[3] else p[4];
-        const edge = try arena.print("({s})+{d}*({s})", .{ p[2], k, p[5] });
-        try out.print(arena, " '{s}-({s})/2' {s} '{s}+({s})/2' {s}", .{ edge, ramp, try level(arena, p, prev), edge, ramp, try level(arena, p, s) });
-    }
-    try out.append(arena, ')');
-    return out.items;
-}
-
-fn rank(state: u8) u8 {
-    return switch (state) {
-        '0' => 0,
-        'm' => 1,
-        else => 2,
-    };
-}
-
-/// A state's level as a PWL value: vhi, vlo, or their mean for `m`.
-fn level(arena: std.mem.Allocator, p: []const []const u8, state: u8) Error![]const u8 {
-    return switch (state) {
-        '1' => try arena.print("'{s}'", .{p[0]}),
-        '0' => try arena.print("'{s}'", .{p[1]}),
-        else => try arena.print("'0.5*(({s})+({s}))'", .{ p[0], p[1] }),
-    };
-}
-
-/// A component sequence; one component stands for itself, several form a
-/// list. `R=`/`RB=` apply to the component before them.
-fn group(arena: std.mem.Allocator, toks: []const []const u8, defs: std.StringHashMapUnmanaged(Comp)) Error!Comp {
-    var i: usize = 0;
-    const list = try sequence(arena, toks, &i, defs, 0);
-    if (i != toks.len or list.len == 0) return error.InvalidPattern;
-    return if (list.len == 1) list[0] else .{ .list = list, .depth = maxDepth(list) };
-}
-
-fn maxDepth(list: []const Comp) u8 {
-    var d: u8 = 0;
-    for (list) |c| d = @max(d, c.depth);
-    return d;
-}
-
-fn sequence(arena: std.mem.Allocator, toks: []const []const u8, i: *usize, defs: std.StringHashMapUnmanaged(Comp), depth: u8) Error![]Comp {
-    var out: std.ArrayList(Comp) = .empty;
-    while (i.* < toks.len) {
-        const t = toks[i.*];
-        if (std.mem.eql(u8, t, "]")) break;
-        i.* += 1;
-        if (std.mem.eql(u8, t, "[")) {
-            if (depth == max_depth) return error.InvalidPattern;
-            const list = try sequence(arena, toks, i, defs, depth + 1);
-            if (i.* == toks.len or list.len == 0) return error.InvalidPattern;
-            i.* += 1;
-            try out.append(arena, .{ .list = list, .depth = 1 + maxDepth(list) });
-        } else if ((std.mem.eql(u8, t, "r") or std.mem.eql(u8, t, "rb")) and i.* + 1 < toks.len and std.mem.eql(u8, toks[i.*], "=")) {
-            const n = std.fmt.parseInt(i32, toks[i.* + 1], 10) catch return error.InvalidPattern;
-            i.* += 2;
-            if (out.items.len == 0) return error.InvalidPattern;
-            const last = &out.items[out.items.len - 1];
-            if (t.len == 1) {
-                // ponytail: R=-1 repeats forever; needs the PWL's own repeat.
-                if (n == -1) return error.InvalidPattern;
-                last.r = @intCast(@max(n, 0));
-            } else {
-                last.rb = @intCast(@max(n, 1));
-                if (last.rb > last.units()) return error.InvalidPattern;
-            }
-        } else if (t[0] == 'b' and t.len > 1 and std.mem.indexOfNone(u8, t[1..], "01m") == null) {
-            try out.append(arena, .{ .bits = t[1..] });
-        } else if (t[0] == 'b' and t.len > 1 and std.mem.indexOfNone(u8, t[1..], "01mz") == null) {
-            return error.UnsupportedPattern;
-        } else {
-            const def = defs.get(t) orelse return error.InvalidPattern;
-            if (depth + def.depth > max_depth) return error.InvalidPattern;
-            try out.append(arena, def);
-        }
-    }
-    return out.items;
-}
-
-/// Blank-separated words of `text`, with `[`, `]` and `=` as words of
-/// their own; a quoted run stays inside its word. Borrows `text`.
+/// Blank- or comma-separated words of `text`, with `[`, `]` and `=` as words
+/// of their own; a quoted run stays inside its word. Borrows `text`.
 const Words = struct {
     text: []const u8,
     pos: usize = 0,
@@ -216,20 +97,177 @@ const Words = struct {
                     if (b == q) quote = null;
                 } else if (b == '\'' or b == '"') {
                     quote = b;
-                } else if (std.mem.indexOfScalar(u8, " \t,[]=", b) != null) break;
+                } else if (mem.indexOfScalar(u8, " \t,[]=", b) != null) break;
             }
         }
+        assert(i > start);
         w.pos = i;
         return text[start..i];
     }
 };
 
+/// Rewrites, in place, every V or I card in `lines` that uses `PAT`; a
+/// rewritten line lives in `arena`. Fails per `Error`, logged with the card
+/// outside tests.
+pub fn rewrite(arena: Allocator, lines: [][]const u8) Error!void {
+    var defs: Defs = .empty;
+    for (lines) |line| {
+        if (!mem.startsWith(u8, line, ".pat ")) continue;
+        const toks = try tokens(arena, line[5..]);
+        if (toks.len < 3 or !mem.eql(u8, toks[1], "=")) return error.InvalidPattern;
+        const def = group(arena, toks[2..], defs) catch |err| return refuse(line, err);
+        try defs.put(arena, toks[0], def);
+    }
+    for (lines) |*line| {
+        if (line.len == 0 or (line.*[0] != 'v' and line.*[0] != 'i')) continue;
+        const at = keyword(line.*) orelse continue;
+        line.* = pwl(arena, line.*, at, defs) catch |err| return refuse(line.*, err);
+        assert(mem.indexOf(u8, line.*, "pwl(") != null);
+    }
+}
+
+// ---- private ----
+
+/// Logs why `line` was refused, outside tests, and returns `err`.
+fn refuse(line: []const u8, err: Error) Error {
+    if (!@import("builtin").is_test) switch (err) {
+        error.InvalidPattern => std.log.warn("pattern: cannot read '{s}'", .{line}),
+        error.UnsupportedPattern => std.log.err("pattern: '{s}': a Z (high-impedance) state is not supported", .{line}),
+        error.OutOfMemory => {},
+    };
+    return err;
+}
+
+/// Offset of the `pat` word in a card, past its name and two nodes. Reads
+/// the words in place: most V and I cards have none and allocate nothing.
+fn keyword(line: []const u8) ?usize {
+    var it: Words = .{ .text = line };
+    for (0..3) |_| _ = it.next() orelse return null;
+    while (it.next()) |t| {
+        if (mem.eql(u8, t, "pat") or mem.startsWith(u8, t, "pat(")) return t.ptr - line.ptr;
+    }
+    return null;
+}
+
+/// `line` with its PAT form, from `at` on, replaced by the PWL.
+fn pwl(arena: Allocator, line: []const u8, at: usize, defs: Defs) Error![]const u8 {
+    assert(mem.startsWith(u8, line[at..], "pat"));
+    var body = mem.trim(u8, line[at + 3 ..], " \t");
+    if (body.len > 0 and body[0] == '(') {
+        const close = mem.lastIndexOfScalar(u8, body, ')') orelse return error.InvalidPattern;
+        body = body[1..close];
+    }
+    const toks = try tokens(arena, body);
+    if (toks.len < 7) return error.InvalidPattern;
+    const p = toks[0..6]; // vhi vlo td tr tf tsample
+    var states: std.ArrayList(u8) = .empty;
+    try (try group(arena, toks[6..], defs)).expand(arena, &states);
+    if (states.items.len == 0) return error.InvalidPattern;
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "{s}pwl(0 {s}", .{ line[0..at], try level(arena, p, states.items[0]) });
+    var points: usize = 1;
+    for (states.items[1..], 1..) |s, k| {
+        const prev = states.items[k - 1];
+        if (s == prev) continue;
+        points += 2;
+        if (points > points_max) return error.InvalidPattern;
+        const ramp = if (rank(s) > rank(prev)) p[3] else p[4];
+        const edge = try arena.print("({s})+{d}*({s})", .{ p[2], k, p[5] });
+        try out.print(arena, " '{s}-({s})/2' {s} '{s}+({s})/2' {s}", .{ edge, ramp, try level(arena, p, prev), edge, ramp, try level(arena, p, s) });
+    }
+    try out.append(arena, ')');
+    assert(points <= points_max);
+    return out.items;
+}
+
+fn rank(state: u8) u8 {
+    return switch (state) {
+        '0' => 0,
+        'm' => 1,
+        else => 2,
+    };
+}
+
+/// A state's level as a PWL value: vhi, vlo, or their mean for `m`.
+fn level(arena: Allocator, p: []const []const u8, state: u8) Error![]const u8 {
+    assert(p.len == 6);
+    return switch (state) {
+        '1' => try arena.print("'{s}'", .{p[0]}),
+        '0' => try arena.print("'{s}'", .{p[1]}),
+        else => try arena.print("'0.5*(({s})+({s}))'", .{ p[0], p[1] }),
+    };
+}
+
+/// A component sequence; one component stands for itself, several form a
+/// list. `R=`/`RB=` apply to the component before them.
+fn group(arena: Allocator, toks: []const []const u8, defs: Defs) Error!Comp {
+    var i: usize = 0;
+    const list = try sequence(arena, toks, &i, defs, 0);
+    if (i != toks.len or list.len == 0) return error.InvalidPattern;
+    return if (list.len == 1) list[0] else .{ .body = .{ .list = list }, .depth = depthOf(list) };
+}
+
+fn depthOf(list: []const Comp) u8 {
+    var d: u8 = 0;
+    for (list) |c| d = @max(d, c.depth);
+    return d;
+}
+
+/// Reads components from `toks[i.*..]` up to a `]` or the end. Recursion
+/// is bounded: each `[` adds a level and `depth_max` caps them.
+fn sequence(arena: Allocator, toks: []const []const u8, i: *usize, defs: Defs, depth: u8) Error![]Comp {
+    assert(depth <= depth_max);
+    var out: std.ArrayList(Comp) = .empty;
+    while (i.* < toks.len) {
+        const t = toks[i.*];
+        if (mem.eql(u8, t, "]")) break;
+        i.* += 1;
+        if (mem.eql(u8, t, "[")) {
+            if (depth == depth_max) return error.InvalidPattern;
+            const list = try sequence(arena, toks, i, defs, depth + 1);
+            if (i.* == toks.len or list.len == 0) return error.InvalidPattern;
+            i.* += 1;
+            try out.append(arena, .{ .body = .{ .list = list }, .depth = 1 + depthOf(list) });
+        } else if ((mem.eql(u8, t, "r") or mem.eql(u8, t, "rb")) and i.* + 1 < toks.len and mem.eql(u8, toks[i.*], "=")) {
+            const n = std.fmt.parseInt(i32, toks[i.* + 1], 10) catch return error.InvalidPattern;
+            i.* += 2;
+            if (out.items.len == 0) return error.InvalidPattern;
+            const last = &out.items[out.items.len - 1];
+            if (t.len == 1) {
+                // ponytail: R=-1 repeats forever; needs the PWL's own repeat.
+                if (n == -1) return error.InvalidPattern;
+                last.r = @intCast(@max(n, 0));
+            } else {
+                last.rb = @intCast(@max(n, 1));
+                if (last.rb > last.units()) return error.InvalidPattern;
+            }
+        } else if (t[0] == 'b' and t.len > 1 and mem.indexOfNone(u8, t[1..], "01m") == null) {
+            try out.append(arena, .{ .body = .{ .bits = t[1..] } });
+        } else if (t[0] == 'b' and t.len > 1 and mem.indexOfNone(u8, t[1..], "01mz") == null) {
+            return error.UnsupportedPattern;
+        } else {
+            const def = defs.get(t) orelse return error.InvalidPattern;
+            if (depth + def.depth > depth_max) return error.InvalidPattern;
+            try out.append(arena, def);
+        }
+    }
+    return out.items;
+}
+
 /// Every word of `text` (`Words`), in `arena`.
-fn tokens(arena: std.mem.Allocator, text: []const u8) Error![]const []const u8 {
+fn tokens(arena: Allocator, text: []const u8) Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var it: Words = .{ .text = text };
     while (it.next()) |t| try out.append(arena, t);
     return out.items;
+}
+
+fn rewriteAll(gpa: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var cards = [_][]const u8{ ".pat a1=b10 r=1", "v1 1 0 pat (5 0 1n 1n 2n 5n [a1 b0m] r=1 rb=2)", "i1 1 0 pat 1 0 0 1n 1n 1n b01" };
+    try rewrite(arena.allocator(), &cards);
 }
 
 test "pattern sources expand as the manual's examples" {
@@ -244,9 +282,8 @@ test "pattern sources expand as the manual's examples" {
         .{ "a1 a2 r=2 rb=2", "10101010" ++ "0101" ++ "101" ++ "101" },
         .{ "[n1 b0011] r=1 rb=1", "10100101" ++ "0011" ++ "10100101" ++ "0011" },
     }) |case| {
-        var lines = [_][]const u8{ defs_src[0], defs_src[1], defs_src[2] };
-        var defs: std.StringHashMapUnmanaged(Comp) = .empty;
-        for (&lines) |l| {
+        var defs: Defs = .empty;
+        for (defs_src) |l| {
             const t = try tokens(a, l[5..]);
             try defs.put(a, t[0], try group(a, t[2..], defs));
         }
@@ -272,7 +309,7 @@ test "pattern corner cases" {
     // `m` is the mid level, reached on the rising ramp.
     var mid = [_][]const u8{"i1 1 0 pat (5 0 0 1n 2n 1n b0m)"};
     try rewrite(a, &mid);
-    try std.testing.expect(std.mem.indexOf(u8, mid[0], "-(1n)/2' '0' '(0)+1*(1n)+(1n)/2' '0.5*((5)+(0))')") != null);
+    try std.testing.expect(mem.indexOf(u8, mid[0], "-(1n)/2' '0' '(0)+1*(1n)+(1n)/2' '0.5*((5)+(0))')") != null);
     // Cards without PAT, and PAT in a node position, are left alone.
     var plain = [_][]const u8{ "v1 1 0 pwl(0 0)", "vpat pat 0 1", "r1 pat 0 1" };
     try rewrite(a, &plain);
@@ -333,13 +370,6 @@ test "words split on blanks, commas and the bracket and `=` bytes; quotes hold" 
     try std.testing.expectEqual(null, keyword("v1 a"));
     try std.testing.expectEqual(null, keyword("v1 a 0"));
     try std.testing.expectEqual(@as(?usize, 7), keyword("v1 a 0 pat(1 0 0 1n 1n 1n b1)"));
-}
-
-fn rewriteAll(gpa: std.mem.Allocator) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var cards = [_][]const u8{ ".pat a1=b10 r=1", "v1 1 0 pat (5 0 1n 1n 2n 5n [a1 b0m] r=1 rb=2)", "i1 1 0 pat 1 0 0 1n 1n 1n b01" };
-    try rewrite(arena.allocator(), &cards);
 }
 
 test "rewrite: every allocation failure surfaces as OutOfMemory" {

@@ -1,12 +1,25 @@
-//! Analysis cards and deck options to resolved queries. Node references
-//! arrive as circuit rows; source and card names resolve against the
-//! construction bindings, which outlive the parse. Cites ngspice's card
-//! readers and defaults (cktsopt.c, cktntask.c, traninit.c, dctran.c,
-//! distoan.c, noisean.c, spiceif.c, inpgval.c) and, for the HSPICE forms,
-//! the manuals [CR, SA, RF], at the code that follows each.
+//! Analysis cards and deck options to resolved queries. In: the deck's
+//! analysis and config cards, nets already circuit rows, and the
+//! construction bindings source and card names resolve against. Out: the
+//! query list, fanned out over the deck's variants and `.temp` list. Each
+//! card is read by analysis_card.zig; options by analysis_options.zig.
+//! Cites: ngspice cktsopt.c, cktntask.c, traninit.c, dctran.c, distoan.c,
+//! noisean.c, spiceif.c, inpgval.c; HSPICE [CR, SA, RF], at the code that
+//! follows each.
+//!
+//! Contents:
+//! - `pub const NO_NODE`, `CardContext` (analysis_args.zig)
+//! - `pub const DeckOptions`, `deckOptions`, `applyDeckOptions` (analysis_options.zig)
+//! - `pub const buildJob` (analysis_card.zig), `dcTarget` (analysis_time.zig)
+//! - `pub const Fanout = struct`
+//! - `pub const Span = struct`
+//! - `pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, appended: bool, sources: core.QueryBindings, card_refs: []const requests.CardRef, deck_opts: DeckOptions, fanout: Fanout) ![]const Job`
+
 const std = @import("std");
+const assert = std.debug.assert;
+const testing = std.testing;
+const Allocator = std.mem.Allocator;
 const core = @import("core");
-const Library = @import("device").Library;
 const requests = core.query;
 const numerics = core.numerics;
 const netlist = @import("netlist");
@@ -15,8 +28,28 @@ const nameAt = Value.nameAt;
 const numberAt = Value.numberAt;
 const Job = requests.Query;
 const GROUND = core.GROUND;
+const Library = @import("device").Library;
+const analysis_args = @import("analysis_args.zig");
+const analysis_options = @import("analysis_options.zig");
+const analysis_time = @import("analysis_time.zig");
+const analysis_small = @import("analysis_small.zig");
+const analysis_rf = @import("analysis_rf.zig");
+const analysis_card = @import("analysis_card.zig");
+
 /// Unresolved or absent node row.
-pub const NO_NODE = netlist.none;
+pub const NO_NODE = analysis_args.NO_NODE;
+/// What a card borrows from the rest of the deck.
+pub const CardContext = analysis_args.CardContext;
+/// Parsed `.options` overrides, in deck order.
+pub const DeckOptions = analysis_options.DeckOptions;
+/// Folds the deck's `.options` and `.temp` cards.
+pub const deckOptions = analysis_options.deckOptions;
+/// Copies deck options into one query.
+pub const applyDeckOptions = analysis_options.applyDeckOptions;
+/// The query one analysis card asks for.
+pub const buildJob = analysis_card.buildJob;
+/// A `.dc` sweep target.
+pub const dcTarget = analysis_time.dcTarget;
 
 /// How `queries` copies jobs over `Deck.variants` rows.
 pub const Fanout = struct {
@@ -53,7 +86,7 @@ pub const Fanout = struct {
 /// `.hbac`-family card with no `.hb` tone to take, or a `.temp` list value
 /// that is not a temperature above -273.15 degC (not logged);
 /// `OutOfMemory` also covers a fan-out count too large for `usize`.
-pub fn queries(arena: std.mem.Allocator, cards: []const netlist.Analysis, n_rows: u32, appended: bool, sources: core.QueryBindings, card_refs: []const requests.CardRef, deck_opts: DeckOptions, fanout: Fanout) ![]const Job {
+pub fn queries(arena: Allocator, cards: []const netlist.Analysis, n_rows: u32, appended: bool, sources: core.QueryBindings, card_refs: []const requests.CardRef, deck_opts: analysis_options.DeckOptions, fanout: Fanout) ![]const Job {
     for (cards) |c| {
         const args = c.args;
         const arg: usize = if (c.kind == .four) 1 else 0;
@@ -65,32 +98,32 @@ pub fn queries(arena: std.mem.Allocator, cards: []const netlist.Analysis, n_rows
     }
     // What HSPICE forms borrow from the other cards: the first `.ac`,
     // `.tran` and `.sn`. A malformed one reports on its own turn below.
-    var ctx: CardContext = .{ .arena = arena, .variations = deck_opts.variations, .card_names = deck_opts.card_names };
+    var ctx: analysis_args.CardContext = .{ .arena = arena, .variations = deck_opts.variations, .card_names = deck_opts.card_names };
     // Fan-out ceiling: `.disto` gives up to four plots per line (two-tone),
     // `.op t1 t2 ...` one per time.
     var fan: usize = 4;
     for (cards) |c| switch (c.kind) {
         .ac => if (ctx.ac == null) {
-            if (acGrid(arena, c.args, 0)) |g| {
+            if (analysis_args.acGrid(arena, c.args, 0)) |g| {
                 ctx.ac = g.sweep;
                 ctx.ac.?.land_on_stop = true; // the grid the `.ac` card runs
             } else |_| {}
         },
         .tran => if (ctx.tran == null) {
-            if (buildJob(c, sources, card_refs, ctx)) |job| {
+            if (analysis_card.buildJob(c, sources, card_refs, ctx)) |job| {
                 var tran = job.?;
-                applyDeckOptions(&tran, deck_opts);
+                analysis_options.applyDeckOptions(&tran, deck_opts);
                 ctx.tran = tran.tran;
             } else |_| {}
         },
         .pss => if (c.sn and ctx.sn_f0 == null) {
-            if (buildJob(c, sources, card_refs, ctx)) |job| ctx.sn_f0 = 1 / job.?.pss.period else |_| {}
+            if (analysis_card.buildJob(c, sources, card_refs, ctx)) |job| ctx.sn_f0 = 1 / job.?.pss.period else |_| {}
         },
         .op => fan = @max(fan, c.args.len),
-        .tran_noise => fan = @max(fan, tranNoiseSamples(c.args)),
+        .tran_noise => fan = @max(fan, analysis_time.tranNoiseSamples(c.args)),
         .pnoise => if (c.sn and std.ascii.startsWithIgnoreCase(c.line, ".ptdnoise")) {
             var k: usize = 2;
-            if (ptdTimes(arena, c.args, &k)) |times| fan = @max(fan, times.len) else |_| {}
+            if (analysis_time.ptdTimes(arena, c.args, &k)) |times| fan = @max(fan, times.len) else |_| {}
         },
         else => {},
     };
@@ -111,7 +144,7 @@ pub fn queries(arena: std.mem.Allocator, cards: []const netlist.Analysis, n_rows
     // `.hbosc` card unless the card gives its own.
     var hb: ?requests.Hb = null;
     for (cards) |c| if (c.kind == .hb) {
-        hb = ((buildJob(c, sources, card_refs, ctx) catch |err| return cardError(c.line, err)).?).hb;
+        hb = ((analysis_card.buildJob(c, sources, card_refs, ctx) catch |err| return cardError(c.line, err)).?).hb;
     };
     var xf_sources: ?[]const requests.XfSource = null;
     for (cards, 0..) |c, ci| {
@@ -119,13 +152,13 @@ pub fn queries(arena: std.mem.Allocator, cards: []const netlist.Analysis, n_rows
         const span: Fanout.Span = if (ci < fanout.cards.len) fanout.cards[ci] else .{};
         if (span.lanes) |lanes| {
             var job: Job = .{ .mc = .{ .variants = .{ .first = span.first, .count = span.count }, .axis = lanes.axis, .dc_plot = lanes.dc_plot } };
-            applyDeckOptions(&job, deck_opts);
+            analysis_options.applyDeckOptions(&job, deck_opts);
             jobs[n] = job;
             n += 1;
             continue;
         }
         const first = n;
-        var job = (buildJob(c, sources, card_refs, ctx) catch |err| return cardError(c.line, err)) orelse continue;
+        var job = (analysis_card.buildJob(c, sources, card_refs, ctx) catch |err| return cardError(c.line, err)) orelse continue;
         switch (job) {
             inline .hbac, .hbxf, .hbnoise, .hblin => |*o, kind| if (o.f0 == 0) {
                 const tone = hb orelse return cardError(c.line, error.InvalidAnalysisArguments);
@@ -151,25 +184,25 @@ pub fn queries(arena: std.mem.Allocator, cards: []const netlist.Analysis, n_rows
                 o.osc_node = tone.osc_node;
             },
             inline .dcxf, .acxf => |*o| {
-                if (xf_sources == null) xf_sources = try xfSources(arena, sources);
+                if (xf_sources == null) xf_sources = try analysis_small.xfSources(arena, sources);
                 o.sources = xf_sources.?;
             },
             else => {},
         }
-        applyDeckOptions(&job, deck_opts);
+        analysis_options.applyDeckOptions(&job, deck_opts);
         // Query validation stays the API's backstop; a card it would refuse
         // fails here, with its line (#108).
         core.validate.validate(job, n_rows) catch return cardError(c.line, error.InvalidAnalysisArguments);
         // HSPICE `.op t1 t2 ...` [CR .OP]: one operating point per time, a
         // transient snapshot past t = 0.
-        if (job == .op and hasNumber(c.args)) {
+        if (job == .op and analysis_args.hasNumber(c.args)) {
             for (c.args) |v| {
                 const t = switch (v) {
                     .num => |t| t,
                     else => continue,
                 };
                 jobs[n] = if (t == 0) job else snapshot(t, ctx.tran);
-                applyDeckOptions(&jobs[n], deck_opts);
+                analysis_options.applyDeckOptions(&jobs[n], deck_opts);
                 n += 1;
             }
             n = first + copyVariants(jobs[first..], n - first, span);
@@ -178,7 +211,7 @@ pub fn queries(arena: std.mem.Allocator, cards: []const netlist.Analysis, n_rows
         // HSPICE `.trannoise ... SAMPLES=n`: one run per Monte Carlo index
         // from SEED on; index 1 is noiseless [RF Ch.9].
         if (job == .tran_noise and c.args.len > 0 and c.args[0] != .num) {
-            const runs = tranNoiseSamples(c.args);
+            const runs = analysis_time.tranNoiseSamples(c.args);
             const base = job.tran_noise;
             for (0..runs) |k| {
                 var o = base;
@@ -196,7 +229,7 @@ pub fn queries(arena: std.mem.Allocator, cards: []const netlist.Analysis, n_rows
         // strobe is the upgrade if long time sweeps get slow.
         if (job == .pnoise and job.pnoise.strobe != null) {
             var k: usize = 2;
-            for (try ptdTimes(arena, c.args, &k)) |t| {
+            for (try analysis_time.ptdTimes(arena, c.args, &k)) |t| {
                 jobs[n] = job;
                 jobs[n].pnoise.strobe = t;
                 n += 1;
@@ -255,28 +288,7 @@ pub fn queries(arena: std.mem.Allocator, cards: []const netlist.Analysis, n_rows
     return jobs[base..][0..n];
 }
 
-/// What a card borrows from the rest of the deck: HSPICE's `.noise` and
-/// `.lstb` run over the `.ac` sweep, `.fft` and `.op <time>` over the `.tran`, and
-/// `.snac`/`.snnoise`/`.snxf` at the `.sn` fundamental.
-pub const CardContext = struct {
-    /// Owns the point lists and labels a card allocates.
-    arena: std.mem.Allocator,
-    /// The first `.ac` card's grid.
-    ac: ?numerics.FreqSweep = null,
-    /// The first `.tran` card, deck options applied.
-    tran: ?requests.Tran = null,
-    /// The first `.sn` card's fundamental, in Hz.
-    sn_f0: ?f64 = null,
-    /// The deck's variation groups (`DeckOptions.variations`).
-    variations: requests.Variations = .{},
-    /// The deck's card names (`DeckOptions.card_names`).
-    card_names: requests.CardNames = .empty,
-};
-
-fn hasNumber(args: []const Value) bool {
-    for (args) |v| if (v == .num) return true;
-    return false;
-}
+// ---- private ----
 
 /// A transient that publishes only its state at `t` (HSPICE `.op <time>`),
 /// stepping as the deck's `.tran` does and at most t / 50.
@@ -318,1450 +330,13 @@ fn cardError(line: []const u8, err: anytype) @TypeOf(err) {
     return err;
 }
 
-/// Parsed `.options` overrides, in deck order: a later card wins.
-pub const DeckOptions = struct {
-    /// The `.options` tolerances and iteration limits, copied into every
-    /// query by `applyDeckOptions`.
-    tol: numerics.Tolerances = .{},
-    /// `.options method`; null keeps each query's default.
-    method: ?requests.Method = null,
-    /// `.temp` or `.options temp` in degrees Celsius; null when not given.
-    temp_c: ?f64 = null,
-    /// An HSPICE `.temp t1 t2 ...` list: every query runs at each.
-    temp_list: []const Value = &.{},
-    /// `.options delmax`: the transient step cap when the `.tran` card sets
-    /// none.
-    delmax: ?f64 = null,
-    /// `.options tran_ceiling=duration|compatibility`; null keeps the
-    /// `.tran` query's own policy.
-    tran_ceiling: ?@FieldType(requests.Tran, "ceiling_policy") = null,
-    /// `.options xmu`: the trapezoidal damping weight; null keeps 0.5.
-    xmu: ?f64 = null,
-    /// `.options tnom=<degC>`: the temperature model cards were extracted at
-    /// (ngspice cktsopt.c:71-73 takes the card in Celsius; default 27 degC
-    /// from cktntask.c:127). Unlike `temp`, where the circuit runs, it reaches
-    /// the devices at build time, so no sweep can move it.
-    tnom_c: f64 = 27.0,
-    /// HSPICE `.options runlvl`, `accurate` or `fast`: the transient's LTE
-    /// factor `trtol` (see `runlvl_trtol`); null when none is set or
-    /// `runlvl=0`.
-    trtol: ?f64 = null,
-    /// The variation block as `.dcmatch`, `.acmatch` and `.dcsens` groups.
-    variations: requests.Variations = .{},
-    /// HSPICE `.sample`, set on every `.noise` spectrum.
-    sample: ?requests.NoiseSample = null,
-    /// The deck's card names, for `.noise` and `.sens` labels.
-    card_names: requests.CardNames = .empty,
-};
-
-/// `trtol` at HSPICE RUNLVL 1..6 [CR .OPTION RUNLVL]. HSPICE scales its
-/// tolerances by level without publishing the factors, so these are
-/// ESPice's: level 3 is the default 7 and each level halves or doubles the
-/// LTE bound (dev/analysis/tolerance-system.md has the measurements).
-const runlvl_trtol = [6]f64{ 28, 14, 7, 3.5, 1.75, 0.875 };
-
-/// Option names outside this list (and the ones `foldOptions` passes on to
-/// other readers) are not simulated, and each draws a warning in every
-/// dialect. `gshunt`, `cshunt` and `rshunt` are read by the netlist.
-const Option = enum(u8) { method, tran_ceiling, reltol, abstol, vntol, gmin, trtol, chgtol, itl1, itl2, itl4, maxord, temp, tnom, delmax, xmu, gshunt, cshunt, rshunt };
-
-/// Folds the deck's `.options` and `.temp` cards; `InvalidAnalysisArguments`
-/// on a value out of range, logged with its card. The last `.temp` card
-/// wins, whether it is one value or a list. The HSPICE dialect defaults TNOM to 25 degC and
-/// runs the circuit at TNOM [SA Ch.20]; ngspice defaults both to 27 degC.
-pub fn deckOptions(config: []const netlist.Config, dialect: netlist.Dialect) !DeckOptions {
-    // The card being folded, named by any error it raises.
-    var line: []const u8 = "";
-    return foldOptions(config, dialect, &line) catch |err| {
-        // The test runner fails any test that logs an error.
-        if (!@import("builtin").is_test) std.log.err("options: {s}: {s}", .{ line, @errorName(err) });
-        return err;
+/// Sets HSPICE `.sample` on every `.noise` spectrum of `jobs`; the
+/// integrated plot keeps the plain band.
+fn sampleNoise(jobs: []Job, sample: requests.NoiseSample) void {
+    for (jobs) |*q| if (q.* == .noise and !q.noise.integrated) {
+        q.noise.sample = sample;
     };
 }
-
-fn foldOptions(config: []const netlist.Config, dialect: netlist.Dialect, line: *[]const u8) !DeckOptions {
-    // HSPICE spellings: ABSV/RELV/ABSI are VNTOL/RELTOL/ABSTOL, GMINDC the DC
-    // gmin (ESPice has one gmin), METHOD=BDF its Gear.
-    const names = std.StaticStringMap(Option).initComptime(.{
-        .{ "method", .method }, .{ "reltol", .reltol },             .{ "abstol", .abstol },
-        .{ "vntol", .vntol },   .{ "gmin", .gmin },                 .{ "trtol", .trtol },
-        .{ "chgtol", .chgtol }, .{ "itl1", .itl1 },                 .{ "itl2", .itl2 },
-        .{ "itl4", .itl4 },     .{ "maxord", .maxord },             .{ "temp", .temp },
-        .{ "tnom", .tnom },     .{ "absv", .vntol },                .{ "relv", .reltol },
-        .{ "absi", .abstol },   .{ "gmindc", .gmin },               .{ "delmax", .delmax },
-        .{ "gshunt", .gshunt }, .{ "cshunt", .cshunt },             .{ "xmu", .xmu },
-        .{ "rshunt", .rshunt }, .{ "tran_ceiling", .tran_ceiling },
-    });
-    const methods = std.StaticStringMap(requests.Method).initComptime(.{
-        .{ "gear", .gear_2 }, .{ "trap", .trapezoidal }, .{ "trapezoidal", .trapezoidal }, .{ "bdf", .gear_2 },
-    });
-    var o: DeckOptions = .{ .tnom_c = if (dialect == .hspice) 25 else 27 };
-    var maxord: ?f64 = null;
-    var runlvl: ?f64 = null;
-    var accurate = false;
-    var fast = false;
-    for (config) |card| {
-        line.* = card.line;
-        const args = card.args;
-        if (card.temp) {
-            // The last `.temp` card wins, list or single value.
-            if (args.len > 1) {
-                o.temp_list = args;
-                o.temp_c = null;
-                continue;
-            }
-            o.temp_c = try number(args, 0);
-            o.temp_list = &.{};
-            if (o.temp_c.? <= -273.15) return error.InvalidAnalysisArguments;
-            continue;
-        }
-        var lower: [16]u8 = undefined;
-        var i: usize = 0;
-        while (i < args.len) : (i += 1) {
-            const key = nameAt(args, i) orelse continue;
-            // Monte Carlo draws read these (frontend/variants.zig), EM_AVG
-            // measures the third (frontend/measure.zig), frontend/source.zig
-            // `search`, and model binning `scale` and `wnflag` (netlist.zig).
-            if (std.ascii.eqlIgnoreCase(key, "seed") or std.ascii.eqlIgnoreCase(key, "sampling_method") or std.ascii.eqlIgnoreCase(key, "em_recovery") or
-                std.ascii.eqlIgnoreCase(key, "search") or std.ascii.eqlIgnoreCase(key, "scale") or std.ascii.eqlIgnoreCase(key, "wnflag"))
-            {
-                i += 1;
-                continue;
-            }
-            // RUNLVL alone is level 3; ACCURATE and FAST are flags with an
-            // optional 0|1.
-            const preset = std.ascii.eqlIgnoreCase(key, "runlvl") or std.ascii.eqlIgnoreCase(key, "accurate") or std.ascii.eqlIgnoreCase(key, "fast");
-            if (preset) {
-                const given = numberAt(args, i + 1);
-                if (given != null) i += 1;
-                const on = (given orelse 1) != 0;
-                if (std.ascii.eqlIgnoreCase(key, "accurate")) accurate = on else if (std.ascii.eqlIgnoreCase(key, "fast")) fast = on else {
-                    const level = @floor(0.5 + (given orelse 3));
-                    // Negated so a NaN level fails here, not in @intFromFloat.
-                    if (!(level >= 0 and level <= 6)) return error.InvalidAnalysisArguments;
-                    runlvl = level;
-                }
-                continue;
-            }
-            const known = if (key.len <= lower.len) names.get(std.ascii.lowerString(lower[0..key.len], key)) else null;
-            const option = known orelse {
-                std.log.warn("options: ignoring unsupported option '{s}'", .{key});
-                continue;
-            };
-            i += 1;
-            if (option == .tran_ceiling) {
-                const value = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-                if (std.ascii.eqlIgnoreCase(value, "duration")) {
-                    o.tran_ceiling = .duration;
-                } else if (std.ascii.eqlIgnoreCase(value, "compatibility")) {
-                    o.tran_ceiling = .compatibility;
-                } else return error.InvalidAnalysisArguments;
-                continue;
-            }
-            if (option == .method) {
-                const method = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-                if (method.len > lower.len) return error.InvalidAnalysisArguments;
-                o.method = methods.get(std.ascii.lowerString(lower[0..method.len], method)) orelse return error.InvalidAnalysisArguments;
-                continue;
-            }
-            const raw = try number(args, i);
-            // ngspice reads an IF_INTEGER option as floor(0.5 + x)
-            // (spiceif.c:501, inpgval.c:31), so itl4=1.5 is 2.
-            const value = switch (option) {
-                .itl1, .itl2, .itl4, .maxord => @floor(0.5 + raw),
-                else => raw,
-            };
-            switch (option) {
-                .method, .tran_ceiling => unreachable,
-                .temp, .tnom => {
-                    if (value <= -273.15) return error.InvalidAnalysisArguments;
-                    if (option == .temp) o.temp_c = value else o.tnom_c = value;
-                },
-                .itl1, .itl2, .itl4 => {
-                    if (value < 1 or value > std.math.maxInt(u16)) return error.InvalidAnalysisArguments;
-                    const iterations: u16 = @intFromFloat(value);
-                    switch (option) {
-                        .itl1 => o.tol.itl1 = iterations,
-                        .itl2 => o.tol.itl2 = iterations,
-                        .itl4 => o.tol.itl4 = iterations,
-                        else => unreachable,
-                    }
-                },
-                .maxord => {
-                    if (value < 1) return error.InvalidAnalysisArguments;
-                    maxord = value;
-                },
-                .delmax => {
-                    if (!(value > 0)) return error.InvalidAnalysisArguments;
-                    o.delmax = value;
-                },
-                .xmu => {
-                    if (!(value >= 0 and value <= 0.5)) return error.InvalidAnalysisArguments;
-                    o.xmu = value;
-                },
-                .gshunt, .cshunt, .rshunt => if (value < 0) return error.InvalidAnalysisArguments,
-                // A zero reltol or trtol leaves no step a transient can take
-                // (ngspice aborts "timestep too small"), so the card fails here.
-                .reltol, .trtol => {
-                    if (!(value > 0)) return error.InvalidAnalysisArguments;
-                    if (option == .reltol) o.tol.reltol = value else o.tol.trtol = value;
-                },
-                inline else => |field| {
-                    if (value < 0) return error.InvalidAnalysisArguments;
-                    @field(o.tol, @tagName(field)) = value;
-                },
-            }
-        }
-    }
-    // ngspice raises the order only from 1 to 2 and only when maxord > 1
-    // (dctran.c:900), so maxord=1 is backward Euler under trap as under gear,
-    // and gear with maxord 3..6 stays Gear-2.
-    if (maxord != null and maxord.? < 2) o.method = .backward_euler;
-    // ACCURATE lifts any level to at least 5; FAST is level 1 when no
-    // RUNLVL is given; RUNLVL=0 turns the presets off.
-    var level = runlvl orelse if (fast and !accurate) @as(f64, 1) else 0;
-    if (accurate and runlvl != 0) level = @max(level, 5);
-    if (level != 0) o.trtol = runlvl_trtol[@as(usize, @intFromFloat(level)) - 1];
-    if (dialect == .hspice and o.temp_c == null and o.temp_list.len == 0) o.temp_c = o.tnom_c;
-    return o;
-}
-
-/// Copies the deck tolerances into `job`, and into a `.tran` also the
-/// integration method, XMU and RUNLVL's TRTOL, each only when set. A
-/// `.tran` keeps a `dt_max` it already has; otherwise it takes DELMAX,
-/// then ngspice's min(tstep, (tstop - tstart) / 50).
-pub fn applyDeckOptions(job: *Job, o: DeckOptions) void {
-    switch (job.*) {
-        inline else => |*opts| {
-            if (comptime @hasField(@TypeOf(opts.*), "tol")) opts.tol = o.tol;
-            if (comptime @hasField(@TypeOf(opts.*), "dc_options")) opts.dc_options.tol = o.tol;
-        },
-    }
-    if (job.* == .tran) {
-        const t = &job.tran;
-        if (o.method) |m| t.method = m;
-        if (o.xmu) |x| t.xmu = x;
-        // RUNLVL overrides TRTOL wherever it sits [CR .OPTION RUNLVL].
-        if (o.trtol) |trtol| t.tol.trtol = trtol;
-        // ngspice's default tmax, min(tstep, (tstop - tstart) / 50)
-        // (traninit.c:29-34).
-        if (o.tran_ceiling) |policy| t.ceiling_policy = policy;
-        t.dt_max = t.dt_max orelse o.delmax;
-        t.dt_max = t.requestedCeiling(.deck);
-    }
-}
-
-fn number(args: []const Value, i: usize) !f64 {
-    const n = numberAt(args, i) orelse return error.InvalidAnalysisArguments;
-    if (!std.math.isFinite(n)) return error.InvalidAnalysisArguments;
-    return n;
-}
-
-fn positive(args: []const Value, i: usize) !f64 {
-    const n = try number(args, i);
-    if (n <= 0) return error.InvalidAnalysisArguments;
-    return n;
-}
-
-fn count(comptime T: type, args: []const Value, i: usize, default: T) !T {
-    if (i >= args.len) return default;
-    const n = try positive(args, i);
-    if (n != @trunc(n) or n > std.math.maxInt(T)) return error.InvalidAnalysisArguments;
-    return @intFromFloat(n);
-}
-
-fn arity(args: []const Value, min: usize, max: usize) !void {
-    if (args.len < min or args.len > max) return error.InvalidAnalysisArguments;
-}
-
-/// One case-insensitive keyword argument, lowered into caller storage so the
-/// `StaticStringMap` lookup that follows stays allocation-free.
-fn keyword(args: []const Value, i: usize, buf: []u8) ![]const u8 {
-    const name = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-    if (name.len > buf.len) return error.InvalidAnalysisArguments;
-    return std.ascii.lowerString(buf[0..name.len], name);
-}
-
-/// `uic` is a trailing keyword, not a positional: `.tran 1n 100n uic` and
-/// `.tran 1n 100n 0 1n uic` are both legal, so scan rather than index.
-fn hasUic(args: []const Value) bool {
-    for (args) |a| switch (a) {
-        .name => |n| if (std.ascii.eqlIgnoreCase(n, "uic")) return true,
-        else => {},
-    };
-    return false;
-}
-
-fn outputNode(node: u32) !u32 {
-    if (node == NO_NODE or node == GROUND) return error.AnalysisNodeNotFound;
-    return node;
-}
-
-/// `v(a,b)` second node. Absent (single-ended) resolves to GROUND, which is
-/// what every consumer already means by "no reference node"; a name the deck
-/// never defines is a typo, not a ground reference.
-fn outputNeg(node: u32) !u32 {
-    if (node == NO_NODE) return GROUND;
-    return node;
-}
-
-/// `i(name)`: a branch-current probe, as opposed to a `v(...)` output.
-fn currentProbeName(args: []const Value, i: usize) ?[]const u8 {
-    if (i >= args.len) return null;
-    return switch (args[i]) {
-        .group => |g| if (std.ascii.eqlIgnoreCase(g.name(), "i") and g.args().len == 1)
-            switch (g.args()[0]) {
-                .name => |n| n,
-                else => null,
-            }
-        else
-            null,
-        else => null,
-    };
-}
-
-/// Every independent source, V cards then I cards, in card order.
-fn xfSources(arena: std.mem.Allocator, sources: core.QueryBindings) ![]const requests.XfSource {
-    var out: std.ArrayList(requests.XfSource) = try .initCapacity(arena, sources.v_names.len + sources.i_names.len);
-    for (sources.v_names, sources.v_branches) |name, br| out.appendAssumeCapacity(.{ .name = name, .branch = br });
-    for (sources.i_names, sources.i_pos, sources.i_neg) |name, p, m| out.appendAssumeCapacity(.{ .name = name, .branch = null, .nodes = .{ p, m } });
-    return out.items;
-}
-
-/// `.lstb mode=single|diff|comm vsource=v1[,v2] [localgnd=n] [dec|oct|lin
-/// N f1 f2]` [CR .LSTB]: the first three letters of the mode count. Without
-/// a sweep the card takes the deck's `.ac` frequencies, `ac`. `local_gnd`
-/// is the `localgnd` row `netlist.resolve` found, GROUND without one.
-fn lstbJob(args: []const Value, sources: core.QueryBindings, ac: ?numerics.FreqSweep, local_gnd: u32) !requests.Lstb {
-    const Key = enum { mode, vsource, localgnd, dec, oct, lin };
-    const keys = std.StaticStringMap(Key).initComptime(.{
-        .{ "mode", .mode }, .{ "vsource", .vsource }, .{ "localgnd", .localgnd },
-        .{ "dec", .dec },   .{ "oct", .oct },         .{ "lin", .lin },
-    });
-    if (local_gnd == NO_NODE) return error.AnalysisNodeNotFound;
-    const modes = std.StaticStringMap(requests.Lstb.Mode).initComptime(.{
-        .{ "sin", .single }, .{ "dif", .diff }, .{ "com", .comm },
-    });
-    var sweep = ac;
-    var opts: requests.Lstb = .{ .sweep = undefined, .probes = undefined, .local_gnd = local_gnd };
-    var n_probes: usize = 0;
-    var buf: [16]u8 = undefined;
-    var i: usize = 0;
-    while (i < args.len) {
-        const key = keys.get(try keyword(args, i, &buf)) orelse return error.InvalidAnalysisArguments;
-        switch (key) {
-            .mode => {
-                const m = try keyword(args, i + 1, &buf);
-                opts.mode = modes.get(m[0..@min(m.len, 3)]) orelse return error.InvalidAnalysisArguments;
-                i += 2;
-            },
-            .localgnd => i += 2,
-            .vsource => {
-                i += 1;
-                while (i < args.len) : (i += 1) {
-                    if (keys.has(keyword(args, i, &buf) catch "")) break;
-                    if (n_probes == 2) return error.InvalidAnalysisArguments;
-                    const v = try voltageSource(args, i, sources);
-                    opts.probes[n_probes] = .{ .p = sources.v_pos[v], .n = sources.v_neg[v], .branch = sources.v_branches[v] };
-                    n_probes += 1;
-                }
-            },
-            .dec, .oct, .lin => {
-                try arity(args, i + 4, i + 4);
-                sweep = try frequencySweep(args, i);
-                i += 4;
-            },
-        }
-    }
-    if (n_probes != @as(usize, if (opts.mode == .single) 1 else 2)) return error.InvalidAnalysisArguments;
-    if (n_probes == 1) opts.probes[1] = opts.probes[0];
-    opts.sweep = sweep orelse return error.MissingAnalysisCard;
-    return opts;
-}
-
-/// The `v(out)`, `v(a,b)` or `i(Vmeasure)` output of `.dcxf`/`.acxf`, and
-/// whether a trailing `tf` asks for transfer functions only.
-fn xfOutput(comptime T: type, args: []const Value, node: u32, neg: u32, sources: core.QueryBindings) !T {
-    var opts: T = if (T == requests.Acxf)
-        .{ .sweep = try frequencySweep(args, 1), .output_node = GROUND, .sources = &.{} }
-    else
-        .{ .output_node = GROUND, .sources = &.{} };
-    if (currentProbeName(args, 0)) |probe| {
-        opts.output_branch = sources.v_branches[netlist.nameIndex(sources.v_names, probe) orelse return error.AnalysisSourceNotFound];
-    } else {
-        opts.output_node = try outputNode(node);
-        opts.output_neg = try outputNeg(neg);
-    }
-    const last = args.len - 1;
-    if (last > 0) if (nameAt(args, last)) |word| {
-        if (!std.ascii.eqlIgnoreCase(word, "tf")) return error.InvalidAnalysisArguments;
-        opts.tf_only = true;
-    };
-    return opts;
-}
-
-/// A noise card's input source `args[i]`: a V or I card the deck has. It
-/// names the input but does not drive the solve.
-fn inputSource(args: []const Value, i: usize, sources: core.QueryBindings) !void {
-    const name = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-    if (netlist.nameIndex(sources.v_names, name) == null and netlist.nameIndex(sources.i_names, name) == null) return error.AnalysisSourceNotFound;
-}
-
-/// An output the card reads single-ended: `v(a,b)` with b not ground is
-/// `UnsupportedAnalysisOutput`, never silently v(a) (#57).
-fn singleEnded(node_neg: u32) !void {
-    if (node_neg != NO_NODE and node_neg != GROUND) return error.UnsupportedAnalysisOutput;
-}
-
-fn voltageSource(args: []const Value, i: usize, sources: core.QueryBindings) !usize {
-    const name = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-    return netlist.nameIndex(sources.v_names, name) orelse error.AnalysisSourceNotFound;
-}
-
-/// The swept quantity of `.dc <card|TEMP> start stop step`, as the
-/// (device type, instance index, parameter) key `ParamRef` uses. Card names
-/// match case-insensitively, first card first. `InvalidAnalysisArguments`
-/// when `args[i]` is no name, `AnalysisSourceNotFound` when no card has it.
-pub fn dcTarget(args: []const Value, i: usize, cards: []const requests.CardRef) !requests.Dc.SweepTarget {
-    const name = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-    if (std.ascii.eqlIgnoreCase(name, "temp")) return .temp;
-    for (cards) |c| {
-        if (!std.ascii.eqlIgnoreCase(c.name, name)) continue;
-        // ngspice sweeps a card's primary value: `dc` on a source, the
-        // element value on a passive.
-        const param: []const u8 = switch (c.type) {
-            Library.builtin("resistor") => "r",
-            Library.builtin("capacitor") => "c",
-            Library.builtin("inductor") => "l",
-            else => "dc",
-        };
-        return .{ .device = .{ .type = c.type, .index = c.index, .param_name = param } };
-    }
-    return error.AnalysisSourceNotFound;
-}
-
-fn checkStep(start: f64, stop: f64, step: f64) !void {
-    const intervals = (stop - start) / step;
-    if (step == 0 or !std.math.isFinite(intervals) or intervals < 0 or
-        intervals >= @as(f64, @floatFromInt(std.math.maxInt(usize)))) return error.InvalidAnalysisArguments;
-}
-
-/// The `dec|oct|lin N fstart fstop` grid every frequency-domain card shares,
-/// read from `offset`. Only `lin` admits fstart = 0.
-fn frequencySweep(args: []const Value, offset: usize) !numerics.FreqSweep {
-    const mode = nameAt(args, offset) orelse return error.InvalidAnalysisArguments;
-    const kinds = std.StaticStringMap(numerics.SweepKind).initComptime(.{
-        .{ "dec", .dec }, .{ "oct", .oct }, .{ "lin", .lin },
-    });
-    var lower: [8]u8 = undefined;
-    if (mode.len > lower.len) return error.UnsupportedFrequencySweep;
-    const kind = kinds.get(std.ascii.lowerString(lower[0..mode.len], mode)) orelse return error.UnsupportedFrequencySweep;
-    const first = if (kind == .lin) try number(args, offset + 2) else try positive(args, offset + 2);
-    const last = try positive(args, offset + 3);
-    if (first < 0 or last < first) return error.InvalidAnalysisArguments;
-    return .{ .f_start = first, .f_stop = last, .points = try count(u32, args, offset + 1, 10), .kind = kind };
-}
-
-/// A frequency grid at `args[offset..]` and the index past it: the
-/// `dec|oct|lin N fstart fstop` grid, or HSPICE's `POI n f1 ... fn` [CR .AC]
-/// with its frequencies ascending and positive, allocated in `arena`.
-fn acGrid(arena: std.mem.Allocator, args: []const Value, offset: usize) !struct { sweep: numerics.FreqSweep, end: usize } {
-    var lower: [4]u8 = undefined;
-    const poi = nameAt(args, offset) != null and std.mem.eql(u8, keyword(args, offset, &lower) catch "", "poi");
-    if (!poi) return .{ .sweep = try frequencySweep(args, offset), .end = offset + 4 };
-    const n = try count(u32, args, offset + 1, 0);
-    // Checked before the allocation: `poi 4e9 1` must not ask for 32 GB.
-    if (n == 0 or args.len < offset + 2 + n) return error.InvalidAnalysisArguments;
-    const list = try arena.alloc(f64, n);
-    for (list, 0..) |*f, k| {
-        f.* = try positive(args, offset + 2 + k);
-        if (k > 0 and !(f.* > list[k - 1])) return error.InvalidAnalysisArguments;
-    }
-    return .{ .sweep = .{ .kind = .poi, .points = n, .list = list, .f_start = list[0], .f_stop = list[n - 1] }, .end = offset + 2 + n };
-}
-
-/// One `.dc` axis, read from `args[i.*..]` and `i` advanced past it:
-/// `start stop incr`, HSPICE `START= STOP= STEP=`, `LIN|DEC|OCT np start
-/// stop` or `POI np v1 ... vn` [CR .DC]. The typed grids become explicit
-/// `points`, allocated in `arena`.
-const Axis = struct { start: f64 = 0, stop: f64 = 0, step: f64 = 1, points: []const f64 = &.{} };
-
-fn dcAxis(arena: std.mem.Allocator, args: []const Value, i: *usize) !Axis {
-    const Word = enum { lin, dec, oct, poi, start, stop, step };
-    const words = std.StaticStringMap(Word).initComptime(.{
-        .{ "lin", .lin },     .{ "dec", .dec },   .{ "oct", .oct },   .{ "poi", .poi },
-        .{ "start", .start }, .{ "stop", .stop }, .{ "step", .step },
-    });
-    const wordAt = struct {
-        fn f(a: []const Value, at: usize) ?Word {
-            var lower: [8]u8 = undefined;
-            const name = nameAt(a, at) orelse return null;
-            if (name.len > lower.len) return null;
-            return words.get(std.ascii.lowerString(lower[0..name.len], name));
-        }
-    }.f;
-    var axis: Axis = .{};
-    switch (wordAt(args, i.*) orelse {
-        axis = .{ .start = try number(args, i.*), .stop = try number(args, i.* + 1), .step = try number(args, i.* + 2) };
-        try checkStep(axis.start, axis.stop, axis.step);
-        i.* += 3;
-        return axis;
-    }) {
-        .start, .stop, .step => {
-            var seen: u3 = 0;
-            while (wordAt(args, i.*)) |key| : (i.* += 2) {
-                const v = try number(args, i.* + 1);
-                switch (key) {
-                    .start => axis.start = v,
-                    .stop => axis.stop = v,
-                    .step => axis.step = v,
-                    else => return error.InvalidAnalysisArguments,
-                }
-                seen |= @as(u3, 1) << @intCast(@backingInt(key) - @backingInt(Word.start));
-            }
-            if (seen != 0b111) return error.InvalidAnalysisArguments;
-            try checkStep(axis.start, axis.stop, axis.step);
-        },
-        .poi => {
-            const n = try count(u32, args, i.* + 1, 0);
-            if (n == 0 or args.len < i.* + 2 + n) return error.InvalidAnalysisArguments;
-            const points = try arena.alloc(f64, n);
-            for (points, 0..) |*p, k| p.* = try number(args, i.* + 2 + k);
-            i.* += 2 + n;
-            axis.points = points;
-        },
-        .lin, .dec, .oct => |kind| {
-            const grid: numerics.FreqSweep = .{
-                .kind = if (kind == .lin) .lin else if (kind == .dec) .dec else .oct,
-                .points = try count(u32, args, i.* + 1, 0),
-                .f_start = try number(args, i.* + 2),
-                .f_stop = try number(args, i.* + 3),
-            };
-            if (grid.points == 0) return error.InvalidAnalysisArguments;
-            if (kind != .lin and !(grid.f_start > 0 and grid.f_stop >= grid.f_start)) return error.InvalidAnalysisArguments;
-            // ponytail: a 10M-point ceiling keeps a typo from allocating the heap.
-            // A finite f64 span is under 2100 octaves, so 1e6 points per
-            // octave or decade keeps `count()` inside u32 before it is checked.
-            if ((kind != .lin and grid.points > 1_000_000) or grid.count() > 10_000_000) return error.InvalidAnalysisArguments;
-            const points = try arena.alloc(f64, grid.count());
-            for (points, 0..) |*p, k| p.* = grid.at(@intCast(k));
-            i.* += 4;
-            axis.points = points;
-        },
-    }
-    if (axis.points.len > 0) {
-        axis.start = axis.points[0];
-        axis.stop = axis.points[axis.points.len - 1];
-    }
-    return axis;
-}
-
-/// HSPICE `.tran tstep1 tstop1 [tstep2 tstop2 ...] [START=t] [UIC]` [CR
-/// .TRAN]: one run to the last tstop. A double-point card whose tstep2 and
-/// tstop2 are both below tstop1, with no START=, is the SPICE form
-/// `tstep tstop tstart delmax`, as is a three-number card.
-fn hspiceTran(args: []const Value) !requests.Tran {
-    var nums: [32]f64 = undefined;
-    var n: usize = 0;
-    var start: ?f64 = null;
-    var uic = false;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        var lower: [8]u8 = undefined;
-        switch (args[i]) {
-            .num => |v| {
-                if (n == nums.len or !std.math.isFinite(v)) return error.InvalidAnalysisArguments;
-                nums[n] = v;
-                n += 1;
-            },
-            .name => {
-                const word = try keyword(args, i, &lower);
-                if (std.mem.eql(u8, word, "uic")) {
-                    uic = true;
-                } else if (std.mem.eql(u8, word, "start")) {
-                    i += 1;
-                    start = try number(args, i);
-                } else return error.InvalidAnalysisArguments;
-            },
-            else => return error.InvalidAnalysisArguments,
-        }
-    }
-    if (n < 2 or !(nums[0] > 0) or !(nums[1] > 0)) return error.InvalidAnalysisArguments;
-    var t: requests.Tran = .{ .t_stop = nums[1], .dt_init = nums[0], .uic = uic, .dt_max = null };
-    if (n == 3 or (n == 4 and start == null and nums[2] < nums[1] and nums[3] < nums[1])) {
-        t.t_start = nums[2];
-        if (n == 4) t.dt_max = if (nums[3] > 0) nums[3] else return error.InvalidAnalysisArguments;
-    } else {
-        if (n % 2 != 0) return error.InvalidAnalysisArguments;
-        // ponytail: the finest tstep caps the whole run; a per-segment cap
-        // would save steps in the coarse segments.
-        var k: usize = 2;
-        while (k < n) : (k += 2) {
-            if (!(nums[k] > 0) or !(nums[k + 1] > nums[k - 1])) return error.InvalidAnalysisArguments;
-            t.dt_init = @min(t.dt_init, nums[k]);
-            t.t_stop = nums[k + 1];
-        }
-    }
-    t.t_start = start orelse t.t_start;
-    if (!(t.t_start >= 0) or t.t_start >= t.t_stop) return error.InvalidAnalysisArguments;
-    return t;
-}
-
-/// True when `line` is the dot card `name` (HSPICE `.lin` and `.net` run
-/// as `.sp` queries).
-fn cardIs(line: []const u8, name: []const u8) bool {
-    const head = line[@min(line.len, 1) .. std.mem.indexOfAny(u8, line, " \t") orelse line.len];
-    return std.ascii.eqlIgnoreCase(head, name);
-}
-
-/// HSPICE `.net input [RIN=r]`, `.net input r` and `.net output input
-/// [ROUT=r] [RIN=r]` [CR App.A], obsolete, over the `.ac` sweep: the S, Y,
-/// Z and H of the network between the input source's terminals (port 1)
-/// and the output, `v(n1[,n2])` or `i(Vx)` (port 2), each port driven as
-/// what it is (a V card's voltage, an I card's or node pair's current) and
-/// S taken against RIN and ROUT, which default to 1 ohm. A V card's port
-/// keeps its branch; the others have `Port.no_branch`.
-fn net(a: netlist.Analysis, sources: core.QueryBindings, ctx: CardContext) !requests.Sp {
-    const args = a.args;
-    const ports = try ctx.arena.alloc(requests.Port, 2);
-    var n_ports: usize = 1;
-    var i: usize = 0;
-    if (args.len > 0 and args[0] == .group) {
-        // Two-port: the output first.
-        ports[1] = if (currentProbeName(args, 0)) |probe| blk: {
-            const v = netlist.nameIndex(sources.v_names, probe) orelse return error.AnalysisSourceNotFound;
-            break :blk .{ .node = sources.v_pos[v], .neg = sources.v_neg[v], .branch = sources.v_branches[v] };
-        } else .{ .node = a.pos, .neg = if (a.neg == netlist.none) GROUND else a.neg, .branch = requests.Port.no_branch };
-        if (ports[1].node == netlist.none) return error.AnalysisNodeNotFound;
-        n_ports = 2;
-        i = 1;
-    }
-    const input = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-    // An I card delivers its current into n-, so that is the port's + terminal.
-    ports[0] = if (netlist.nameIndex(sources.v_names, input)) |v|
-        .{ .node = sources.v_pos[v], .neg = sources.v_neg[v], .branch = sources.v_branches[v] }
-    else if (netlist.nameIndex(sources.i_names, input)) |k|
-        .{ .node = sources.i_neg[k], .neg = sources.i_pos[k], .branch = requests.Port.no_branch }
-    else
-        return error.AnalysisSourceNotFound;
-    i += 1;
-    var z0 = [2]f64{ 1, 1 };
-    if (n_ports == 1 and i < args.len and args[i] == .num) {
-        z0[0] = try positive(args, i);
-        i += 1;
-    }
-    while (i < args.len) : (i += 2) {
-        const at: usize = if (isKey(args, i, "rin")) 0 else if (n_ports == 2 and isKey(args, i, "rout")) 1 else return error.InvalidAnalysisArguments;
-        z0[at] = try positive(args, i + 1);
-    }
-    for (ports[0..n_ports], z0[0..n_ports]) |*p, z| p.z0 = z;
-    return .{ .sweep = ctx.ac orelse return error.MissingAnalysisCard, .ports = ports[0..n_ports], .lin = .{}, .net = true };
-}
-
-fn isKey(args: []const Value, i: usize, key: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(nameAt(args, i) orelse return false, key);
-}
-
-/// HSPICE `.lin [sparcalc=1] [noisecalc=0|1|2] [gdcalc=0|1]
-/// [mixedmode2port=xy] [format= filename= dataformat= modelname= ...]`
-/// [CR .LIN] over the `.ac` sweep. S is always computed. noisecalc=2 (the
-/// N-port correlation matrix) publishes the two-port parameters only.
-/// mixedmode2port names port 1's and port 2's mode in the two-port
-/// measurements: `s` for a single-ended port, `d` or `c` for a balanced
-/// one; any other pairing is InvalidAnalysisArguments.
-/// `format=touchstone|touchstone2` also writes a Touchstone 1.0 file named
-/// by `filename=`; the other formats (`selem`, `citi`) and the listing
-/// keywords are checked for a value and unused.
-fn lin(args: []const Value, ports: []const requests.Port) !requests.Sp.Lin {
-    const Key = enum { sparcalc, noisecalc, gdcalc, mixedmode2port, format, filename, dataformat, modelname, freqdigit, spardigit, listfreq, listcount, listfloor, listsources };
-    var o: requests.Sp.Lin = .{};
-    var i: usize = 0;
-    while (i < args.len) : (i += 2) {
-        var lower: [16]u8 = undefined;
-        const key = std.meta.stringToEnum(Key, try keyword(args, i, &lower)) orelse return error.InvalidAnalysisArguments;
-        if (i + 1 >= args.len) return error.InvalidAnalysisArguments;
-        switch (key) {
-            .sparcalc, .noisecalc, .gdcalc => {
-                const v = try number(args, i + 1);
-                if (v != @trunc(v) or v < 0 or v > @as(f64, if (key == .noisecalc) 2 else 1)) return error.InvalidAnalysisArguments;
-                if (key == .noisecalc) o.noise = v != 0;
-                if (key == .gdcalc) o.group_delay = v != 0;
-            },
-            .mixedmode2port => {
-                const mode = nameAt(args, i + 1) orelse return error.InvalidAnalysisArguments;
-                if (mode.len != 2) return error.InvalidAnalysisArguments;
-                for (mode, 0..) |c, k| {
-                    const balanced = k < ports.len and ports[k].balanced != null;
-                    switch (std.ascii.toLower(c)) {
-                        's' => if (balanced) return error.InvalidAnalysisArguments,
-                        'd', 'c' => if (!balanced) return error.InvalidAnalysisArguments,
-                        else => return error.InvalidAnalysisArguments,
-                    }
-                    o.common[k] = std.ascii.toLower(c) == 'c';
-                }
-            },
-            .format => {
-                const f = nameAt(args, i + 1) orelse return error.InvalidAnalysisArguments;
-                o.touchstone = std.ascii.startsWithIgnoreCase(f, "touchstone");
-            },
-            .filename => o.file = nameAt(args, i + 1) orelse return error.InvalidAnalysisArguments,
-            else => {},
-        }
-    }
-    return o;
-}
-
-/// HSPICE `.ptdnoise v(out) TIME=t|<sweep> [TDELTA=dt] <sweep> [LISTFREQ=
-/// LISTCOUNT= LISTFLOOR= LISTSOURCES=]` [CR .PTDNOISE] at the `.sn`
-/// fundamental: the noise density at time t of the period, with `strobe`
-/// set to the first time (`ptdTimes` lists them all). A `.meas` name for
-/// TIME is `UnsupportedAnalysisOutput`; TDELTA only feeds HSPICE's
-/// strobed-jitter measure and the LIST keywords its listing, so they are
-/// checked and unused.
-fn ptdNoise(ctx: CardContext, args: []const Value, pos: u32, neg: u32) !requests.Pnoise {
-    const f0 = ctx.sn_f0 orelse return error.MissingAnalysisCard;
-    var lower: [16]u8 = undefined;
-    var k: usize = 2;
-    const t = (try ptdTimes(ctx.arena, args, &k))[0];
-    if (k < args.len and args[k] == .name and std.mem.eql(u8, try keyword(args, k, &lower), "tdelta")) {
-        _ = try positive(args, k + 1);
-        k += 2;
-    }
-    const grid = try acGrid(ctx.arena, args, k);
-    const lists = std.StaticStringMap(void).initComptime(.{ .{"listfreq"}, .{"listcount"}, .{"listfloor"}, .{"listsources"} });
-    var i = grid.end;
-    while (i < args.len) : (i += 2) if (!lists.has(try keyword(args, i, &lower))) return error.InvalidAnalysisArguments;
-    return .{ .out_node = try outputNode(pos), .out_neg = try outputNeg(neg), .sweep = grid.sweep, .f_fundamental = f0, .strobe = t };
-}
-
-/// The TIME values of a `.ptdnoise` card, one number or a LIN/DEC/OCT/POI
-/// sweep starting at `args[k.*]`, `k` advanced past them. Allocated in
-/// `arena`; never empty.
-fn ptdTimes(arena: std.mem.Allocator, args: []const Value, k: *usize) ![]const f64 {
-    var lower: [16]u8 = undefined;
-    if (args.len < 3 or args[0] != .group or !std.mem.eql(u8, try keyword(args, 1, &lower), "time")) return error.InvalidAnalysisArguments;
-    const times = if (args[2] == .num) blk: {
-        k.* = 3;
-        break :blk try arena.dupe(f64, &.{try number(args, 2)});
-    } else blk: {
-        const sweeps = std.StaticStringMap(void).initComptime(.{ .{"lin"}, .{"dec"}, .{"oct"}, .{"poi"} });
-        if (!sweeps.has(try keyword(args, 2, &lower))) return error.UnsupportedAnalysisOutput;
-        k.* = 2;
-        break :blk (try dcAxis(arena, args, k)).points;
-    };
-    for (times) |t| if (!(t >= 0)) return error.InvalidAnalysisArguments;
-    return times;
-}
-
-/// HSPICE `.trannoise out [METHOD=MC|SDE] [SEED=] [SAMPLES=] [TIME=all|t]
-/// [AUTOCORRELATION=] [FMIN=] [FMAX=] [SCALE=]` [CR .TRANNOISE] over the
-/// deck's `.tran`, stepped at 1/(2 FMAX), the bandwidth that carries the
-/// white noise up to FMAX (default 1/TSTEP). SEED is the Monte Carlo index
-/// of the first run (default 2); `queries` turns the SAMPLES runs into one
-/// query each and index 1 into the noiseless run. The output
-/// names v(out) for SDE's `onoise`; a sampled run records every probe.
-fn hspiceTranNoise(ctx: CardContext, args: []const Value, pos: u32, neg: u32) !requests.TranNoise {
-    const tran = ctx.tran orelse return error.MissingAnalysisCard;
-    if (args[0] != .group) return error.InvalidAnalysisArguments;
-    var o: requests.TranNoise = .{ .tol = tran.tol, .t_stop = tran.t_stop, .seed = 2 };
-    var f_max = 1 / tran.dt_init;
-    const Key = enum { method, seed, samples, autocorrelation, fmin, fmax, scale, time };
-    var i: usize = 1;
-    while (i < args.len) : (i += 2) {
-        var lower: [16]u8 = undefined;
-        const key = std.meta.stringToEnum(Key, try keyword(args, i, &lower)) orelse return error.InvalidAnalysisArguments;
-        if (i + 1 >= args.len) return error.InvalidAnalysisArguments;
-        switch (key) {
-            .method => {
-                const m = try keyword(args, i + 1, &lower);
-                if (std.mem.eql(u8, m, "sde")) o.sde = true else if (!std.mem.eql(u8, m, "mc")) return error.InvalidAnalysisArguments;
-            },
-            .seed => o.seed = try count(u32, args, i + 1, 1),
-            .samples => _ = try count(u32, args, i + 1, 1),
-            .autocorrelation => {},
-            .fmin => o.f_min = try positive(args, i + 1),
-            .fmax => f_max = try positive(args, i + 1),
-            .scale => o.scale = try positive(args, i + 1),
-            .time => if (args[i + 1] == .num) {
-                o.t_break = try positive(args, i + 1);
-            } else if (!std.mem.eql(u8, try keyword(args, i + 1, &lower), "all")) return error.InvalidAnalysisArguments,
-        }
-    }
-    if (o.sde) {
-        if (tranNoiseSamples(args) != 1) return error.InvalidAnalysisArguments;
-        o.out_node = try outputNode(pos);
-        o.out_neg = try outputNeg(neg);
-    }
-    o.dt_max = 0.5 / f_max;
-    o.dt_init = o.dt_max;
-    return o;
-}
-
-/// SAMPLES= of an HSPICE `.trannoise` card, 1 when absent or malformed
-/// (`hspiceTranNoise` reports the malformed card).
-fn tranNoiseSamples(args: []const Value) u32 {
-    var i: usize = 1;
-    while (i + 1 < args.len) : (i += 2) {
-        var lower: [16]u8 = undefined;
-        if (std.mem.eql(u8, keyword(args, i, &lower) catch return 1, "samples")) return count(u32, args, i + 1, 1) catch 1;
-    }
-    return 1;
-}
-
-/// HSPICE `.hb TONES=f0 [f1 ...] [NHARMS=h0 [h1 ...]] [INTMODMAX=n]
-/// [SUBHARMS=s] [SS_TONE=i]` [CR .HB]. NHARMS takes one count per tone and
-/// defaults every tone to INTMODMAX; INTMODMAX defaults to the largest
-/// NHARMS. One of them is required. SUBHARMS=s puts the lowest tone f's
-/// lines at multiples of f/s up to its NHARMS·f; that tone becomes `f0`,
-/// the first of the list. SS_TONE=i (from 1) takes tone
-/// i out of the large-signal spectrum: it is the small-signal tone, whose
-/// frequency the `.hbac`, `.hbxf` or `.hbnoise` sweep supplies.
-fn hbTones(arena: std.mem.Allocator, args: []const Value) !requests.Hb {
-    const Key = enum { tones, nharms, intmodmax, subharms, ss_tone };
-    var tones: std.ArrayList(f64) = .empty;
-    var nharms: std.ArrayList(u16) = .empty;
-    var single: [3]?u16 = @splat(null); // INTMODMAX, SUBHARMS, SS_TONE
-    var key: ?Key = null;
-    for (args, 0..) |v, i| switch (v) {
-        .name => {
-            var lower: [16]u8 = undefined;
-            key = std.meta.stringToEnum(Key, try keyword(args, i, &lower)) orelse return error.InvalidAnalysisArguments;
-        },
-        .num => switch (key orelse return error.InvalidAnalysisArguments) {
-            .tones => try tones.append(arena, try positive(args, i)),
-            .nharms => try nharms.append(arena, try count(u16, args, i, 0)),
-            inline .intmodmax, .subharms, .ss_tone => |k| {
-                const slot = &single[@backingInt(k) - @backingInt(Key.intmodmax)];
-                if (slot.* != null) return error.InvalidAnalysisArguments;
-                slot.* = try count(u16, args, i, 0);
-            },
-        },
-        else => return error.InvalidAnalysisArguments,
-    };
-    const intmod, const sub, const ss = single;
-    const n = tones.items.len;
-    if (n == 0 or (nharms.items.len != 0 and nharms.items.len != n)) return error.InvalidAnalysisArguments;
-    if (nharms.items.len == 0) {
-        const h = intmod orelse return error.InvalidAnalysisArguments;
-        try nharms.appendNTimes(arena, h, n);
-    }
-    if (ss) |i| {
-        if (i > n or n == 1) return error.InvalidAnalysisArguments;
-        _ = tones.orderedRemove(i - 1);
-        _ = nharms.orderedRemove(i - 1);
-    }
-    const s = sub orelse 1;
-    if (s != 1) {
-        const lo = std.mem.indexOfMin(f64, tones.items);
-        std.mem.swap(f64, &tones.items[0], &tones.items[lo]);
-        std.mem.swap(u16, &nharms.items[0], &nharms.items[lo]);
-    }
-    return .{
-        .f0 = tones.items[0] / @as(f64, @floatFromInt(s)),
-        .n_harmonics = std.math.mul(u16, nharms.items[0], s) catch return error.InvalidAnalysisArguments,
-        .extra_tones = tones.items[1..],
-        .extra_harmonics = nharms.items[1..],
-        .intmodmax = intmod orelse std.mem.max(u16, nharms.items),
-        .subharms = s,
-        .phasors = true,
-    };
-}
-
-/// HSPICE `.sn TRES= PERIOD=` or `.sn TONE= NHARMS=` [CR .SN] as `.pss`:
-/// the period, and PERIOD/TRES steps when TRES is given. TRINIT,
-/// MAXTRINITCYCLES and NUMPEROUT are read and unused: `.pss` shoots from
-/// the operating point and publishes one period.
-fn shootingNewton(args: []const Value) !requests.Pss {
-    const Key = enum { tres, period, tone, nharms, trinit, maxtrinitcycles, numperout };
-    var given: [@typeInfo(Key).@"enum".field_names.len]?f64 = @splat(null);
-    var i: usize = 0;
-    while (i < args.len) : (i += 2) {
-        var lower: [16]u8 = undefined;
-        const key = std.meta.stringToEnum(Key, try keyword(args, i, &lower)) orelse return error.InvalidAnalysisArguments;
-        given[@backingInt(key)] = try positive(args, i + 1);
-    }
-    const period = given[@backingInt(Key.period)] orelse
-        1 / (given[@backingInt(Key.tone)] orelse return error.InvalidAnalysisArguments);
-    var pss: requests.Pss = .{ .period = period };
-    if (given[@backingInt(Key.tres)]) |tres| {
-        const steps = @round(period / tres);
-        if (!(steps >= 1) or steps > std.math.maxInt(u32) - 1) return error.InvalidAnalysisArguments;
-        pss.n_samples = @intFromFloat(steps);
-    }
-    return pss;
-}
-
-/// HSPICE `.fft v(a[,b]) [START=|FROM=] [STOP=|TO=] [NP=] [FORMAT=NORM|UNORM]
-/// [WINDOW=] [ALFA=] [FREQ=] [FMIN=] [FMAX=]` [CR .FFT] over the deck's
-/// `.tran`, whose window START and STOP default to. NP rounds up to a power
-/// of two. FREQ, FMIN and FMAX only shape HSPICE's printed listing; they are
-/// checked and not stored.
-fn fft(ctx: CardContext, args: []const Value, pos: u32, neg: u32) !requests.Fft {
-    const tran = ctx.tran orelse return error.MissingAnalysisCard;
-    if (args.len == 0) return error.InvalidAnalysisArguments;
-    if (currentProbeName(args, 0) != null) return error.UnsupportedAnalysisOutput;
-    var o: requests.Fft = .{
-        .tran = tran,
-        .out_pos = try outputNode(pos),
-        .out_neg = try outputNeg(neg),
-        .start = tran.t_start,
-        .stop = tran.t_stop,
-        .label = try outputLabel(ctx.arena, args[0]),
-    };
-    const Key = enum { start, from, stop, to, np, format, window, alfa, freq, fmin, fmax };
-    var i: usize = 1;
-    while (i < args.len) : (i += 2) {
-        var lower: [8]u8 = undefined;
-        const key = std.meta.stringToEnum(Key, try keyword(args, i, &lower)) orelse return error.InvalidAnalysisArguments;
-        switch (key) {
-            .start, .from => o.start = try number(args, i + 1),
-            .stop, .to => o.stop = try number(args, i + 1),
-            .np => {
-                const np = try positive(args, i + 1);
-                if (np > 1 << 27) return error.InvalidAnalysisArguments;
-                o.np = std.math.ceilPowerOfTwoAssert(u32, @intFromFloat(@max(@ceil(np), 4)));
-            },
-            .format => {
-                const word = try keyword(args, i + 1, &lower);
-                o.normalized = if (std.mem.eql(u8, word, "norm")) true else if (std.mem.eql(u8, word, "unorm")) false else return error.InvalidAnalysisArguments;
-            },
-            .window => o.window = std.meta.stringToEnum(requests.Fft.Window, try keyword(args, i + 1, &lower)) orelse return error.InvalidAnalysisArguments,
-            .alfa => {
-                o.alfa = try number(args, i + 1);
-                if (o.alfa < 1 or o.alfa > 20) return error.InvalidAnalysisArguments;
-            },
-            .freq, .fmin, .fmax => if (try number(args, i + 1) < 0) return error.InvalidAnalysisArguments,
-        }
-    }
-    if (o.start < tran.t_start or o.stop > tran.t_stop or !(o.stop > o.start)) return error.InvalidAnalysisArguments;
-    return o;
-}
-
-/// An output as the card wrote it, `v(a)` or `v(a,b)`, allocated in `arena`.
-fn outputLabel(arena: std.mem.Allocator, value: Value) ![]const u8 {
-    const g = switch (value) {
-        .group => |g| g,
-        else => return error.InvalidAnalysisArguments,
-    };
-    var out: std.Io.Writer.Allocating = .init(arena);
-    const w = &out.writer;
-    w.print("{s}(", .{g.name()}) catch return error.OutOfMemory;
-    for (g.args(), 0..) |v, k| {
-        if (k > 0) w.writeByte(',') catch return error.OutOfMemory;
-        switch (v) {
-            .name => |n| w.writeAll(n) catch return error.OutOfMemory,
-            .num => |n| w.print("{d}", .{n}) catch return error.OutOfMemory,
-            else => return error.InvalidAnalysisArguments,
-        }
-    }
-    w.writeByte(')') catch return error.OutOfMemory;
-    return out.written();
-}
-
-/// The query one analysis card asks for; null for a card that only
-/// configures the deck (single-value `.temp`). Errors name the argument
-/// that is wrong: `InvalidAnalysisArguments`, `AnalysisNodeNotFound`,
-/// `AnalysisSourceNotFound`, `UnsupportedFrequencySweep`,
-/// `UnsupportedAnalysisOutput`, and `MissingAnalysisCard` for an HSPICE form
-/// whose deck lacks the card it reads (`ctx`). Point lists and labels are
-/// allocated in `ctx.arena`; `OutOfMemory` when it fails.
-pub fn buildJob(a: netlist.Analysis, sources: core.QueryBindings, cards: []const requests.CardRef, ctx: CardContext) !?Job {
-    var args = a.args;
-    const id = a.kind;
-    const node_id = a.pos;
-    const node_neg = a.neg;
-    const ports = a.ports;
-    switch (id) {
-        .op => {
-            // HSPICE `.op [format] [time ...]` [CR .OP]; `queries` turns the
-            // times into snapshots.
-            const formats = std.StaticStringMap(void).initComptime(.{
-                .{"all"}, .{"brief"}, .{"current"}, .{"debug"}, .{"none"}, .{"voltage"},
-            });
-            var lower: [8]u8 = undefined;
-            for (args, 0..) |v, i| switch (v) {
-                .num => |t| if (!(t >= 0) or !std.math.isFinite(t)) return error.InvalidAnalysisArguments,
-                .name => if (!formats.has(try keyword(args, i, &lower))) return error.InvalidAnalysisArguments,
-                else => return error.InvalidAnalysisArguments,
-            };
-            return .{ .op = .{} };
-        },
-        .tran, .tran_noise, .matex => {
-            if (id == .tran and a.dialect == .hspice) return .{ .tran = try hspiceTran(args) };
-            if (id == .tran_noise and args.len > 0 and args[0] != .num) return .{ .tran_noise = try hspiceTranNoise(ctx, args, node_id, node_neg) };
-            try arity(args, 2, if (id == .tran) 5 else 2);
-            const step = try positive(args, 0);
-            const stop = try positive(args, 1);
-            if (id == .matex) return .{ .matex = .{ .t_stop = stop, .h_output_cap = step } };
-            if (id == .tran_noise) return .{ .tran_noise = .{ .t_stop = stop, .dt_init = step, .dt_max = step } };
-            var numeric_end = args.len;
-            const uic = hasUic(args);
-            if (uic) numeric_end -= 1;
-            if (numeric_end > 4) return error.InvalidAnalysisArguments;
-            // ngspice tstart: suppresses OUTPUT before it, never the solve.
-            const t_start = if (numeric_end > 2) try number(args, 2) else 0;
-            if (!(t_start >= 0) or t_start >= stop) return error.InvalidAnalysisArguments;
-            return .{ .tran = .{ .t_stop = stop, .dt_init = step, .t_start = t_start, .dt_max = if (numeric_end > 3) try positive(args, 3) else null, .uic = uic } };
-        },
-        .ac => {
-            const grid = try acGrid(ctx.arena, args, 0);
-            if (grid.end != args.len) return error.InvalidAnalysisArguments;
-            var sweep = grid.sweep;
-            sweep.land_on_stop = true;
-            return .{ .ac = .{ .sweep = sweep } };
-        },
-        .disto => {
-            try arity(args, 4, 5);
-            const grid = try frequencySweep(args, 0);
-            var opts: requests.Disto = .{ .sweep = grid, .output_node = try outputNode(node_id) };
-            // `f2overf1` asks for the intermodulation products; ngspice then
-            // wants a DISTOF2 source (E_NOF2SRC, distoan.c:425).
-            if (args.len == 5) {
-                opts.f2_ratio = try positive(args, 4);
-                for (sources.v_distof2, 0..) |d, i| {
-                    if (d[0] == 0) continue;
-                    opts.drive2_branch = sources.v_branches[i];
-                    opts.ac2_magnitude = d[0];
-                    opts.ac2_phase = d[1];
-                    break;
-                } else return error.AnalysisSourceNotFound;
-            }
-            // ngspice cktdisto.c:100-117: the F1 drive is the card carrying
-            // DISTOF1, not the first source, on that card's branch row
-            // (`disto/bjt_ce`: Vcc comes first, DISTOF1 is on Vin).
-            // ponytail: first such card only. ngspice sums every DISTOF1
-            // source into one RHS; sum here when a deck has two.
-            for (sources.v_branches, sources.v_distof1) |br, d| {
-                if (d[0] == 0) continue;
-                opts.drive_branch = br;
-                opts.ac_magnitude = d[0];
-                opts.ac_phase = d[1];
-                break;
-            }
-            return .{ .disto = opts };
-        },
-        .dc => {
-            var opts: requests.Dc = .{ .target = try dcTarget(args, 0, cards) };
-            var i: usize = 1;
-            const inner = try dcAxis(ctx.arena, args, &i);
-            opts.start = inner.start;
-            opts.stop = inner.stop;
-            opts.step = inner.step;
-            opts.points = inner.points;
-            if (i < args.len) {
-                opts.target2 = try dcTarget(args, i, cards);
-                i += 1;
-                const outer = try dcAxis(ctx.arena, args, &i);
-                opts.start2 = outer.start;
-                opts.stop2 = outer.stop;
-                opts.step2 = outer.step;
-                opts.points2 = outer.points;
-            }
-            if (i != args.len) return error.InvalidAnalysisArguments;
-            return .{ .dc = opts };
-        },
-        .noise => {
-            // ngspice: `v(out) [src] dec|oct|lin N f1 f2 [pts]`; HSPICE:
-            // `v(out) src [inter]` over the `.ac` sweep [CR .NOISE]. A
-            // nonzero pts or inter asks for the per-device contributions.
-            // The input reference source does not drive the noise solve, but
-            // a name no card carries is still an error, not a silent success.
-            // HSPICE `.acphasenoise out in [interval] carrier= [LIST...=]`
-            // [CR .ACPHASENOISE] is the same solve read as phase noise; the
-            // carrier only scales HSPICE's jitter listing, unused here.
-            const phase = std.ascii.startsWithIgnoreCase(a.line, ".acphasenoise");
-            if (phase) {
-                const keys = std.StaticStringMap(void).initComptime(.{ .{"carrier"}, .{"listfreq"}, .{"listcount"}, .{"listfloor"}, .{"listsources"} });
-                var k: usize = 2;
-                while (k < args.len and args[k] == .num) k += 1;
-                var carrier = false;
-                var kw: [16]u8 = undefined;
-                var j = k;
-                while (j < args.len) : (j += 2) {
-                    const key = try keyword(args, j, &kw);
-                    if (!keys.has(key) or j + 1 >= args.len) return error.InvalidAnalysisArguments;
-                    if (std.mem.eql(u8, key, "carrier")) {
-                        _ = try positive(args, j + 1);
-                        carrier = true;
-                    }
-                }
-                if (!carrier) return error.InvalidAnalysisArguments;
-                args = args[0..k];
-            }
-            var i: usize = 1;
-            var in_branch: ?u32 = null;
-            const grid_words = std.StaticStringMap(void).initComptime(.{ .{"dec"}, .{"oct"}, .{"lin"}, .{"poi"} });
-            var lower: [4]u8 = undefined;
-            const isGrid = struct {
-                fn f(words: anytype, xs: []const Value, at: usize, buf: *[4]u8) bool {
-                    const name = nameAt(xs, at) orelse return false;
-                    return name.len <= buf.len and words.has(std.ascii.lowerString(buf[0..name.len], name));
-                }
-            }.f;
-            var in_nodes: ?[2]u32 = null;
-            if (i < args.len and !isGrid(grid_words, args, i, &lower)) {
-                // A V or an I card (ngspice noisean.c: VSRC or ISRC).
-                const name = nameAt(args, i) orelse return error.InvalidAnalysisArguments;
-                if (netlist.nameIndex(sources.v_names, name)) |v| {
-                    in_branch = sources.v_branches[v];
-                } else if (netlist.nameIndex(sources.i_names, name)) |k| {
-                    in_nodes = .{ sources.i_pos[k], sources.i_neg[k] };
-                } else return error.AnalysisSourceNotFound;
-                i += 1;
-            }
-            var sweep: numerics.FreqSweep = undefined;
-            if (i < args.len and isGrid(grid_words, args, i, &lower)) {
-                const g = try acGrid(ctx.arena, args, i);
-                sweep = g.sweep;
-                i = g.end;
-            } else sweep = ctx.ac orelse return error.MissingAnalysisCard;
-            const contributions = i < args.len and try number(args, i) > 0;
-            if (i < args.len) i += 1;
-            if (i != args.len) return error.InvalidAnalysisArguments;
-            return .{ .noise = .{
-                .out_node = try outputNode(node_id),
-                .out_neg = try outputNeg(node_neg),
-                .in_branch = in_branch,
-                .in_nodes = in_nodes,
-                .sweep = sweep,
-                .contributions = contributions and !phase,
-                .card_names = ctx.card_names,
-                .phase = phase,
-            } };
-        },
-        .pnoise => {
-            // HSPICE `.snnoise v(out) insrc <sweep> [n1 +/-1]` [CR .SNNOISE]
-            // at the `.sn` fundamental. Only the n1 = 0 band, the input's
-            // own frequency, is the band `.pnoise` measures.
-            if (a.sn and std.ascii.startsWithIgnoreCase(a.line, ".ptdnoise")) return .{ .pnoise = try ptdNoise(ctx, args, node_id, node_neg) };
-            if (a.sn) {
-                const f0 = ctx.sn_f0 orelse return error.MissingAnalysisCard;
-                try inputSource(args, 1, sources);
-                const grid = try acGrid(ctx.arena, args, 2);
-                if (args.len > grid.end + 2) return error.InvalidAnalysisArguments;
-                if (grid.end < args.len and try number(args, grid.end) != 0) return error.InvalidAnalysisArguments;
-                return .{ .pnoise = .{ .out_node = try outputNode(node_id), .out_neg = try outputNeg(node_neg), .sweep = grid.sweep, .f_fundamental = f0 } };
-            }
-            try arity(args, 7, 8);
-            try inputSource(args, 1, sources);
-            const sweep = try frequencySweep(args, 2);
-            const sidebands = if (args.len == 8) try number(args, 7) else 7;
-            if (sidebands < 0 or sidebands != @trunc(sidebands) or sidebands > 31) return error.InvalidAnalysisArguments;
-            return .{ .pnoise = .{ .out_node = try outputNode(node_id), .out_neg = try outputNeg(node_neg), .sweep = sweep, .f_fundamental = try positive(args, 6), .n_sidebands = @intFromFloat(sidebands) } };
-        },
-        .tf => {
-            try arity(args, 2, 2);
-            var opts: requests.Tf = .{ .output_node = GROUND };
-            // `.tf i(Vmeasure) ...` measures a branch current.
-            if (currentProbeName(args, 0)) |probe| {
-                opts.output_branch = sources.v_branches[netlist.nameIndex(sources.v_names, probe) orelse return error.AnalysisSourceNotFound];
-            } else {
-                opts.output_node = try outputNode(node_id);
-                opts.output_neg = try outputNeg(node_neg);
-            }
-            // The drive is a V card (branch row) or an I card (node pair).
-            const drive = nameAt(args, 1) orelse return error.InvalidAnalysisArguments;
-            if (netlist.nameIndex(sources.v_names, drive)) |v| {
-                opts.input_branch = sources.v_branches[v];
-            } else if (netlist.nameIndex(sources.i_names, drive)) |i_idx| {
-                opts.input_nodes = .{ sources.i_pos[i_idx], sources.i_neg[i_idx] };
-            } else return error.AnalysisSourceNotFound;
-            return .{ .tf = opts };
-        },
-        .sens, .dcmatch => {
-            try arity(args, 1, 1);
-            const node = try outputNode(node_id);
-            const neg = try outputNeg(node_neg);
-            if (id == .sens) return .{ .sens = .{ .output_node = node, .output_neg = neg, .card_names = ctx.card_names } };
-            return .{ .dcmatch = .{ .output_node = node, .output_neg = neg, .variations = ctx.variations } };
-        },
-        .acmatch, .dcsens => {
-            // HSPICE `.acmatch v(out) [THRESHOLD= FILE= INTERVAL=
-            // VIRTUAL_SENSITIVITY= SENS_THRESHOLD=]` over the `.ac` sweep, and
-            // `.dcsens v(out) [FILE= PERTURBATION= INTERVAL= THRESHOLD=
-            // GROUPBYDEVICE=]` [CR .ACMATCH, .DCSENS]. Every group is
-            // published, so the listing keywords are checked and unused;
-            // the derivative is the adjoint one, so PERTURBATION is too.
-            if (args.len == 0 or args.len % 2 != 1) return error.InvalidAnalysisArguments;
-            const keys = std.StaticStringMap(void).initComptime(.{
-                .{"threshold"},      .{"file"},         .{"interval"},      .{"virtual_sensitivity"}, .{"virtual_sens"},
-                .{"sens_threshold"}, .{"perturbation"}, .{"groupbydevice"},
-            });
-            var i: usize = 1;
-            while (i < args.len) : (i += 2) {
-                var lower: [24]u8 = undefined;
-                if (!keys.has(try keyword(args, i, &lower))) return error.InvalidAnalysisArguments;
-            }
-            const node = try outputNode(node_id);
-            const neg = try outputNeg(node_neg);
-            if (id == .dcsens) return .{ .dcsens = .{ .output_node = node, .output_neg = neg, .variations = ctx.variations } };
-            return .{ .acmatch = .{ .sweep = ctx.ac orelse return error.MissingAnalysisCard, .output_node = node, .output_neg = neg, .variations = ctx.variations } };
-        },
-        .four => {
-            try arity(args, 2, 3);
-            return .{ .four = .{
-                .f_fundamental = try positive(args, 0),
-                .output_node = try outputNode(node_id),
-                .output_neg = try outputNeg(node_neg),
-                .n_harmonics = try count(u16, args, 2, 9),
-                .label = if (a.split) try outputLabel(ctx.arena, args[1]) else "",
-                .tran_opts = ctx.tran,
-            } };
-        },
-        .fft => return .{ .fft = try fft(ctx, args, node_id, node_neg) },
-        .pz => {
-            // Bare `.pz` asks for the circuit's own poles and names no transfer.
-            if (args.len == 0) return .{ .pz = .{} };
-            // HSPICE `.pz v(out[,ref]) src` [CR .PZ]: the input is the
-            // source's own node pair, `vol` for a V card and `cur` for an I
-            // card; poles and zeros both.
-            if (args.len == 2) {
-                if (currentProbeName(args, 0) != null) return error.UnsupportedAnalysisOutput;
-                var opts: requests.Pz = .{ .out_pos = try outputNode(node_id), .out_neg = try outputNeg(node_neg), .want = .both };
-                const name = nameAt(args, 1) orelse return error.InvalidAnalysisArguments;
-                if (netlist.nameIndex(sources.v_names, name)) |v| {
-                    opts.in_pos = sources.v_pos[v];
-                    opts.in_neg = sources.v_neg[v];
-                    opts.drive_branch = sources.v_branches[v];
-                } else if (netlist.nameIndex(sources.i_names, name)) |v| {
-                    opts.in_pos = sources.i_pos[v];
-                    opts.in_neg = sources.i_neg[v];
-                } else return error.AnalysisSourceNotFound;
-                // The drive's node pair is unordered for poles and zeros;
-                // keep the grounded side second, as the SPICE form must.
-                if (opts.in_pos == GROUND) std.mem.swap(u32, &opts.in_pos, &opts.in_neg);
-                _ = try outputNode(opts.in_pos);
-                return .{ .pz = opts };
-            }
-            try arity(args, 6, 6);
-            const drive_kind = std.StaticStringMap(enum { vol, cur })
-                .initComptime(.{ .{ "vol", .vol }, .{ "cur", .cur } });
-            const wanted = std.StaticStringMap(requests.Pz.Want)
-                .initComptime(.{ .{ "pol", .poles }, .{ "zer", .zeros }, .{ "pz", .both } });
-            var lower: [4]u8 = undefined;
-            const kind = drive_kind.get(try keyword(args, 4, &lower)) orelse return error.InvalidAnalysisArguments;
-            const want = wanted.get(try keyword(args, 5, &lower)) orelse return error.InvalidAnalysisArguments;
-            var opts: requests.Pz = .{
-                .in_pos = try outputNode(ports[0]),
-                .in_neg = try outputNeg(ports[1]),
-                .out_pos = try outputNode(ports[2]),
-                .out_neg = try outputNeg(ports[3]),
-                .want = want,
-            };
-            // A `vol` transfer is driven by the voltage source the deck already
-            // put across the input port: its branch row is the column the
-            // numerator's Cramer rule needs, and its presence in the nulled
-            // matrix is the short the denominator needs. `cur` needs no card:
-            // a current injection is just the node pair.
-            if (kind == .vol) {
-                opts.drive_branch = for (sources.v_pos, sources.v_neg, sources.v_branches) |p, m, br| {
-                    if ((p == opts.in_pos and m == opts.in_neg) or (p == opts.in_neg and m == opts.in_pos)) break br;
-                } else return error.AnalysisSourceNotFound;
-            }
-            return .{ .pz = opts };
-        },
-        .pss => {
-            try singleEnded(node_neg);
-            if (a.sn) return .{ .pss = try shootingNewton(args) };
-            // `.pss v(osc) f [n [settle]]` (HSPICE `.snosc`) solves an
-            // oscillator: f is the first guess and osc the phase node.
-            const osc = args.len != 0 and args[0] == .group;
-            const at: usize = @intFromBool(osc);
-            try arity(args, at + 1, at + @as(usize, if (osc) 3 else 2));
-            var opts: requests.Pss = .{ .period = 1 / try positive(args, at), .n_samples = try count(u32, args, at + 1, 256) };
-            if (osc) {
-                opts.osc_node = try outputNode(node_id);
-                opts.osc_settle_periods = try count(u16, args, at + 2, 30);
-            }
-            return .{ .pss = opts };
-        },
-        .hb => {
-            try singleEnded(node_neg);
-            // HB drives from whatever sources the deck has, current ones
-            // included, so it names none. `.hb v(osc) f [K]` (HSPICE
-            // `.hbosc`) solves an oscillator from the first guess f.
-            if (nameAt(args, 0) != null) return .{ .hb = try hbTones(ctx.arena, args) };
-            const osc = args.len != 0 and args[0] == .group;
-            const at: usize = @intFromBool(osc);
-            try arity(args, at + 1, at + 2);
-            return .{ .hb = .{
-                .f0 = try positive(args, at),
-                .n_harmonics = try count(u16, args, at + 1, 8),
-                .osc_node = if (osc) try outputNode(node_id) else GROUND,
-            } };
-        },
-        .qpss => {
-            // Like HB, QPSS drives from every source the deck stamps.
-            try arity(args, 2, 4);
-            return .{ .qpss = .{ .f1 = try positive(args, 0), .f2 = try positive(args, 1), .k1 = try count(u16, args, 2, 5), .k2 = try count(u16, args, 3, 5) } };
-        },
-        .hbac, .hbxf, .hbnoise => {
-            // `.hbac sweep`, `.hbxf v(out) sweep` and
-            // `.hbnoise v(out[,ref]) [Vsrc] sweep`, each optionally followed
-            // by `f0 [K]` (`.hbnoise`: `f0 [K [M]]`). Without f0, `queries`
-            // fills the tone from the deck's `.hb` card, as HSPICE does.
-            var at: usize = @intFromBool(id != .hbac);
-            // As in `.pnoise`, the input source is checked but does not
-            // drive the solve.
-            if (id == .hbnoise and nameAt(args, at) != null and std.meta.isError(frequencySweep(args, at))) {
-                _ = try voltageSource(args, at, sources);
-                at += 1;
-            }
-            const grid = try frequencySweep(args, at);
-            at += 4;
-            try arity(args, at, at + @as(usize, if (id == .hbnoise) 3 else 2));
-            if (id != .hbnoise and node_neg != NO_NODE) return error.InvalidAnalysisArguments;
-            var opts: requests.HbLptv = .{ .f0 = 0, .sweep = grid, .out_node = try outputNode(node_id), .out_neg = try outputNeg(node_neg) };
-            if (at < args.len) {
-                opts.f0 = try positive(args, at);
-                opts.n_harmonics = try count(u16, args, at + 1, 8);
-                opts.n_sidebands = opts.n_harmonics;
-                if (at + 2 < args.len) {
-                    const m = try number(args, at + 2);
-                    if (m < 0 or m != @trunc(m) or m > 31) return error.InvalidAnalysisArguments;
-                    opts.n_sidebands = @intFromFloat(m);
-                }
-            }
-            return switch (id) {
-                .hbac => .{ .hbac = opts },
-                .hbxf => .{ .hbxf = opts },
-                else => .{ .hbnoise = opts },
-            };
-        },
-        .hblin => {
-            // HSPICE RF `.hblin <sweep> [NOISECALC=0|1] [FILENAME= DATAFORMAT=
-            // MIXEDMODE2PORT=ss]` [CR .HBLIN] at the `.hb` card's tone, over
-            // the deck's P elements. The file keywords are checked and
-            // unused; mixed mode is refused.
-            const grid = try acGrid(ctx.arena, args, 0);
-            var noise = false;
-            var i: usize = grid.end;
-            while (i < args.len) : (i += 2) {
-                var lower: [16]u8 = undefined;
-                const key = try keyword(args, i, &lower);
-                if (i + 1 >= args.len) return error.InvalidAnalysisArguments;
-                if (std.mem.eql(u8, key, "noisecalc")) {
-                    noise = if (numberAt(args, i + 1)) |v| v != 0 else !std.ascii.eqlIgnoreCase(nameAt(args, i + 1) orelse "", "no");
-                } else if (std.mem.eql(u8, key, "mixedmode2port")) {
-                    if (!std.ascii.eqlIgnoreCase(nameAt(args, i + 1) orelse "", "ss")) return error.UnsupportedAnalysisOutput;
-                } else if (!std.mem.eql(u8, key, "filename") and !std.mem.eql(u8, key, "dataformat")) return error.InvalidAnalysisArguments;
-            }
-            if (sources.ports.len == 0) return error.MissingAnalysisCard;
-            // ponytail: mixed-mode P cards only in `.lin`; `.hblin` would
-            // need the leg drives in every band.
-            for (sources.ports) |p| if (p.balanced != null) return error.UnsupportedAnalysisOutput;
-            return .{ .hblin = .{ .f0 = 0, .sweep = grid.sweep, .ports = sources.ports, .noise = noise } };
-        },
-        .phasenoise => {
-            // `.phasenoise v(out) sweep [f0 [K]] [METHOD=0|1|2]
-            // [CARRIERINDEX=k] [LIST...=] [SPURIOUS=0]` [RF Ch.7]: without
-            // f0 the oscillator is the deck's `.hbosc`; with it, v(out) is
-            // the phase node. The LIST keywords shape HSPICE's listing and
-            // are checked and unused.
-            try singleEnded(node_neg);
-            const out = try outputNode(node_id);
-            var o: requests.PhaseNoise = .{ .f0 = 0, .osc_node = out, .sweep = try frequencySweep(args, 1) };
-            var i: usize = 5;
-            if (i < args.len and args[i] == .num) {
-                o.f0 = try positive(args, i);
-                // K is optional: a keyword after f0 starts the pairs.
-                if (numberAt(args, i + 1) != null) o.n_harmonics = try count(u16, args, i + 1, 8);
-                i += if (i + 1 < args.len and args[i + 1] == .num) 2 else 1;
-            }
-            const Key = enum { method, carrierindex, listfreq, listcount, listfloor, listsources, spurious };
-            while (i < args.len) : (i += 2) {
-                var lower: [16]u8 = undefined;
-                const key = std.meta.stringToEnum(Key, try keyword(args, i, &lower)) orelse return error.InvalidAnalysisArguments;
-                if (i + 1 >= args.len) return error.InvalidAnalysisArguments;
-                switch (key) {
-                    .method => {
-                        const m = try number(args, i + 1);
-                        if (m != 0 and m != 1 and m != 2) return error.InvalidAnalysisArguments;
-                        o.method = @fromBackingInt(@intCast(@as(u2, @intFromFloat(m))));
-                    },
-                    .carrierindex => o.carrier = try count(u16, args, i + 1, 1),
-                    .spurious => if (try number(args, i + 1) != 0) return error.UnsupportedAnalysisOutput,
-                    .listfreq, .listcount, .listfloor, .listsources => {},
-                }
-            }
-            return .{ .phasenoise = o };
-        },
-        .pac, .pxf => {
-            try singleEnded(node_neg);
-            // HSPICE `.snac <sweep>` and `.snxf v(out) <sweep>` [CR .SNAC,
-            // .SNXF] run at the `.sn` fundamental.
-            var opts: requests.Pac = undefined;
-            if (a.sn) {
-                const lo = ctx.sn_f0 orelse return error.MissingAnalysisCard;
-                const grid = try acGrid(ctx.arena, args, @intFromBool(id == .pxf));
-                if (grid.end != args.len) return error.InvalidAnalysisArguments;
-                opts = .{ .f_lo = lo, .sweep = grid.sweep, .out_node = try outputNode(node_id) };
-            } else {
-                try arity(args, 5, 5);
-                const sweep = try frequencySweep(args, 1);
-                opts = .{ .f_lo = try positive(args, 0), .sweep = sweep, .out_node = try outputNode(node_id) };
-            }
-            return if (id == .pac) .{ .pac = opts } else .{ .pxf = opts };
-        },
-        .sp => {
-            if (cardIs(a.line, "net")) return .{ .sp = try net(a, sources, ctx) };
-            if (cardIs(a.line, "lin")) return .{ .sp = .{ .sweep = ctx.ac orelse return error.MissingAnalysisCard, .ports = sources.ports, .lin = try lin(args, sources.ports) } };
-            try arity(args, 4, 4);
-            return .{ .sp = .{ .sweep = try frequencySweep(args, 0), .ports = sources.ports } };
-        },
-        .stb => {
-            // `.stb Vprobe dec N fstart fstop`: the named 0 V source is the
-            // loop break; the sweep drives its branch row directly.
-            try arity(args, 5, 5);
-            const probe = try voltageSource(args, 0, sources);
-            return .{ .stb = .{
-                .sweep = try frequencySweep(args, 1),
-                .probe_p = sources.v_pos[probe],
-                .probe_n = sources.v_neg[probe],
-                .probe_branch = sources.v_branches[probe],
-            } };
-        },
-        .lstb => return .{ .lstb = try lstbJob(args, sources, ctx.ac, node_id) },
-        .dcxf => {
-            try arity(args, 1, 2);
-            return .{ .dcxf = try xfOutput(requests.Dcxf, args, node_id, node_neg, sources) };
-        },
-        .acxf => {
-            try arity(args, 5, 6);
-            return .{ .acxf = try xfOutput(requests.Acxf, args, node_id, node_neg, sources) };
-        },
-        .dcinc => {
-            try arity(args, 0, 0);
-            return .{ .dcinc = .{} };
-        },
-        .envelope => {
-            try arity(args, 2, 2);
-            return .{ .envelope = .{ .t_carrier = try positive(args, 0), .t_stop = try positive(args, 1) } };
-        },
-        .mc => {
-            try arity(args, 1, 2);
-            var opts: requests.Mc = .{ .n_trials = try count(u16, args, 0, 100) };
-            if (args.len == 2) opts.variation = try number(args, 1);
-            if (opts.variation < 0) return error.InvalidAnalysisArguments;
-            return .{ .mc = opts };
-        },
-        .temp => {
-            // A single-temperature card is deck configuration.
-            if (args.len == 1) {
-                if (try number(args, 0) <= -273.15) return error.InvalidAnalysisArguments;
-                return null;
-            }
-            try arity(args, 3, 3);
-            const opts: requests.Temp = .{ .t_start = try number(args, 0), .t_stop = try number(args, 1), .t_step = try number(args, 2) };
-            try checkStep(opts.t_start, opts.t_stop, opts.t_step);
-            if (opts.t_step <= 0 or (opts.t_stop - opts.t_start) / opts.t_step >= std.math.maxInt(u32) or
-                @min(opts.t_start, opts.t_stop) <= -273.15) return error.InvalidAnalysisArguments;
-            return .{ .temp = opts };
-        },
-    }
-}
-
-const testing = std.testing;
 
 /// A comptime argument list: strings become names, numbers numbers.
 fn argv(comptime xs: anytype) []const Value {
@@ -1771,14 +346,6 @@ fn argv(comptime xs: anytype) []const Value {
         break :blk out;
     };
     return &final;
-}
-
-/// Sets HSPICE `.sample` on every `.noise` spectrum of `jobs`; the
-/// integrated plot keeps the plain band.
-fn sampleNoise(jobs: []Job, sample: requests.NoiseSample) void {
-    for (jobs) |*q| if (q.* == .noise and !q.noise.integrated) {
-        q.noise.sample = sample;
-    };
 }
 
 test sampleNoise {
@@ -1808,154 +375,18 @@ test copyVariants {
     try testing.expectEqual(@as(usize, 0), copyVariants(&jobs, 2, .{ .nominal = false }));
 }
 
-test checkStep {
-    try checkStep(0, 1, 0.1);
-    try checkStep(1, 0, -0.1);
-    try checkStep(1, 1, 0.5);
-    for ([_][3]f64{ .{ 0, 1, 0 }, .{ 0, 1, -0.1 }, .{ 0, std.math.nan(f64), 1 }, .{ 0, 1e300, 1e-300 } }) |c|
-        try testing.expectError(error.InvalidAnalysisArguments, checkStep(c[0], c[1], c[2]));
-}
-
-test frequencySweep {
-    const lin_grid = try frequencySweep(argv(.{ "LIN", 5, 0, 10 }), 0);
-    try testing.expectEqual(numerics.SweepKind.lin, lin_grid.kind);
-    try testing.expectEqual(@as(u32, 5), lin_grid.points);
-    try testing.expectError(error.InvalidAnalysisArguments, frequencySweep(argv(.{ "dec", 5, 0, 10 }), 0));
-    try testing.expectError(error.InvalidAnalysisArguments, frequencySweep(argv(.{ "lin", 5, -1, 10 }), 0));
-    try testing.expectError(error.UnsupportedFrequencySweep, frequencySweep(argv(.{ "log", 5, 1, 10 }), 0));
-    try testing.expectError(error.UnsupportedFrequencySweep, frequencySweep(argv(.{ "decadesss", 5, 1, 10 }), 0));
-    try testing.expectError(error.InvalidAnalysisArguments, frequencySweep(argv(.{"dec"}), 0));
-}
-
-test acGrid {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const poi = try acGrid(a, argv(.{ "x", "POI", 3, 1, 2, 3 }), 1);
-    try testing.expectEqual(numerics.SweepKind.poi, poi.sweep.kind);
-    try testing.expectEqual(@as(usize, 6), poi.end);
-    try testing.expectEqual(@as(f64, 3), poi.sweep.f_stop);
-    try testing.expectEqual(@as(usize, 4), (try acGrid(a, argv(.{ "dec", 2, 10, 100 }), 0)).end);
-    // Not ascending, a zero count, and a count the card does not carry
-    // (which must fail before it allocates 4e9 points).
-    for ([_][]const Value{ argv(.{ "poi", 2, 2, 1 }), argv(.{ "poi", 0 }), argv(.{ "poi", 4e9, 1 }), argv(.{ "poi", 3, 1, 2 }) }) |args|
-        try testing.expectError(error.InvalidAnalysisArguments, acGrid(a, args, 0));
-}
-
-test dcAxis {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var i: usize = 0;
-    const plain = try dcAxis(a, argv(.{ 0, 1, 0.5, "v2" }), &i);
-    try testing.expectEqual(@as(usize, 3), i);
-    try testing.expectEqual(@as(f64, 0.5), plain.step);
-    i = 1;
-    const keyed = try dcAxis(a, argv(.{ "v1", "STEP", 0.25, "start", 1, "stop", 2 }), &i);
-    try testing.expectEqual(@as(usize, 7), i);
-    try testing.expectEqual(@as(f64, 1), keyed.start);
-    try testing.expectEqual(@as(f64, 0.25), keyed.step);
-    i = 0;
-    const poi = try dcAxis(a, argv(.{ "poi", 3, 5, -1, 2 }), &i);
-    try testing.expectEqual(@as(usize, 5), i);
-    try testing.expectEqual(@as(f64, 5), poi.start);
-    try testing.expectEqual(@as(f64, 2), poi.stop);
-    i = 0;
-    const lin_axis = try dcAxis(a, argv(.{ "lin", 3, 1, 0 }), &i);
-    try testing.expectEqualSlices(f64, &.{ 1, 0.5, 0 }, lin_axis.points);
-    i = 0;
-    const dec = try dcAxis(a, argv(.{ "dec", 1, 1, 100 }), &i);
-    try testing.expectEqual(@as(usize, 3), dec.points.len);
-    for ([_][]const Value{
-        argv(.{ "start", 0, "stop", 1 }), // no STEP
-        argv(.{ "poi", 4e9, 1 }), // more points than given
-        argv(.{ "lin", 0, 0, 1 }),
-        argv(.{ "dec", 1, 0, 100 }),
-        argv(.{ "dec", 2e6, 1, 10 }), // past the per-decade cap
-        argv(.{ "dec", 1e6, 1e-300, 1e300 }), // past the 10M point cap, without trapping in count()
-        argv(.{ 0, 1 }),
-    }) |args| {
-        i = 0;
-        try testing.expectError(error.InvalidAnalysisArguments, dcAxis(a, args, &i));
-    }
-}
-
-test hspiceTran {
-    const two = try hspiceTran(argv(.{ 1e-9, 1e-6 }));
-    try testing.expectEqual(@as(f64, 1e-6), two.t_stop);
-    try testing.expectEqual(@as(?f64, null), two.dt_max);
-    // Three numbers, and four whose second pair sits below tstop1, are
-    // the SPICE `tstep tstop tstart [delmax]`.
-    try testing.expectEqual(@as(f64, 2e-7), (try hspiceTran(argv(.{ 1e-9, 1e-6, 2e-7 }))).t_start);
-    const spice = try hspiceTran(argv(.{ 1e-9, 1e-6, 2e-7, 5e-9 }));
-    try testing.expectEqual(@as(f64, 2e-7), spice.t_start);
-    try testing.expectEqual(@as(?f64, 5e-9), spice.dt_max);
-    // Segments: the finest tstep for the whole run, to the last tstop.
-    const segs = try hspiceTran(argv(.{ 1e-9, 1e-6, 1e-10, 2e-6, "START", 1e-7, "uic" }));
-    try testing.expectEqual(@as(f64, 1e-10), segs.dt_init);
-    try testing.expectEqual(@as(f64, 2e-6), segs.t_stop);
-    try testing.expectEqual(@as(f64, 1e-7), segs.t_start);
-    try testing.expect(segs.uic);
-    for ([_][]const Value{
-        argv(.{1e-9}),
-        argv(.{ 0, 1e-6 }),
-        argv(.{ 1e-9, 1e-6, 1e-9, 2e-6, 1e-9 }), // odd segment count
-        argv(.{ 1e-9, 1e-6, 1e-9, 5e-7, "start", 0 }), // tstop2 before tstop1
-        argv(.{ 1e-9, 1e-6, "start", 1e-6 }), // start at the stop
-        argv(.{ 1e-9, 1e-6, "start" }),
-        argv(.{ 1e-9, 1e-6, "bogus" }),
-    }) |args| try testing.expectError(error.InvalidAnalysisArguments, hspiceTran(args));
-}
-
-test hbTones {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const two = try hbTones(a, argv(.{ "tones", 1e3, 3e3, "nharms", 4, 2 }));
-    try testing.expectEqual(@as(f64, 1e3), two.f0);
-    try testing.expectEqual(@as(u16, 4), two.n_harmonics);
-    try testing.expectEqualSlices(f64, &.{3e3}, two.extra_tones);
-    try testing.expectEqual(@as(u16, 4), two.intmodmax);
-    // INTMODMAX alone fills NHARMS; SS_TONE takes its tone out.
-    const ss = try hbTones(a, argv(.{ "tones", 1e3, 3e3, "intmodmax", 5, "ss_tone", 2 }));
-    try testing.expectEqual(@as(u16, 5), ss.n_harmonics);
-    try testing.expectEqual(@as(usize, 0), ss.extra_tones.len);
-    // SUBHARMS puts the lowest tone first and divides it.
-    const sub = try hbTones(a, argv(.{ "tones", 3e3, 1e3, "nharms", 2, 3, "subharms", 2 }));
-    try testing.expectEqual(@as(f64, 500), sub.f0);
-    try testing.expectEqual(@as(u16, 6), sub.n_harmonics);
-    try testing.expectEqualSlices(f64, &.{3e3}, sub.extra_tones);
-    for ([_][]const Value{
-        argv(.{ "tones", 1e3 }), // neither NHARMS nor INTMODMAX
-        argv(.{ "tones", 1e3, 2e3, "nharms", 3 }), // one count for two tones
-        argv(.{ "tones", 1e3, "intmodmax", 3, "ss_tone", 1 }), // no large-signal tone left
-        argv(.{ "tones", 1e3, "intmodmax", 3, "intmodmax", 4 }),
-        argv(.{ "tones", 1e3, "nharms", 40000, "subharms", 2 }), // harmonics past u16
-        argv(.{ 1e3, "tones" }),
-        argv(.{ "tone", 1e3 }),
-    }) |args| try testing.expectError(error.InvalidAnalysisArguments, hbTones(a, args));
-}
-
-test shootingNewton {
-    try testing.expectEqual(@as(f64, 1e-3), (try shootingNewton(argv(.{ "tone", 1e3, "nharms", 8 }))).period);
-    try testing.expectEqual(@as(u32, 2000), (try shootingNewton(argv(.{ "period", 2e-6, "tres", 1e-9 }))).n_samples);
-    try testing.expectError(error.InvalidAnalysisArguments, shootingNewton(argv(.{ "period", 1e-9, "tres", 1e-8 })));
-    try testing.expectError(error.InvalidAnalysisArguments, shootingNewton(argv(.{ "tres", 1e-9 })));
-    try testing.expectError(error.InvalidAnalysisArguments, shootingNewton(argv(.{ "period", -1 })));
-}
-
 test "deckOptions: a NaN RUNLVL fails, and the last .temp card wins" {
     const nan = comptime std.math.nan(f64);
-    try testing.expectError(error.InvalidAnalysisArguments, deckOptions(&.{.{ .temp = false, .args = argv(.{ "runlvl", nan }) }}, .hspice));
-    try testing.expectError(error.InvalidAnalysisArguments, deckOptions(&.{.{ .temp = false, .args = argv(.{ "runlvl", 7 }) }}, .hspice));
-    const list_then_one = try deckOptions(&.{ .{ .temp = true, .args = argv(.{ 0, 50 }) }, .{ .temp = true, .args = argv(.{85}) } }, .hspice);
+    try testing.expectError(error.InvalidAnalysisArguments, analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "runlvl", nan }) }}, .hspice));
+    try testing.expectError(error.InvalidAnalysisArguments, analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "runlvl", 7 }) }}, .hspice));
+    const list_then_one = try analysis_options.deckOptions(&.{ .{ .temp = true, .args = argv(.{ 0, 50 }) }, .{ .temp = true, .args = argv(.{85}) } }, .hspice);
     try testing.expectEqual(@as(usize, 0), list_then_one.temp_list.len);
     try testing.expectEqual(@as(?f64, 85), list_then_one.temp_c);
-    const one_then_list = try deckOptions(&.{ .{ .temp = true, .args = argv(.{85}) }, .{ .temp = true, .args = argv(.{ 0, 50 }) } }, .ngspice);
+    const one_then_list = try analysis_options.deckOptions(&.{ .{ .temp = true, .args = argv(.{85}) }, .{ .temp = true, .args = argv(.{ 0, 50 }) } }, .ngspice);
     try testing.expectEqual(@as(usize, 2), one_then_list.temp_list.len);
     try testing.expectEqual(@as(?f64, null), one_then_list.temp_c);
     // Unknown and over-long option names are skipped, not fatal.
-    _ = try deckOptions(&.{.{ .temp = false, .args = argv(.{ "a_very_long_option_name", 1, "bogus", 2 }) }}, .ngspice);
+    _ = try analysis_options.deckOptions(&.{.{ .temp = false, .args = argv(.{ "a_very_long_option_name", 1, "bogus", 2 }) }}, .ngspice);
 }
 
 test queries {
@@ -1992,23 +423,11 @@ test queries {
     try testing.expect(only[0] == .dcinc);
 }
 
-test outputLabel {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectEqualStrings("v(a,2)", try outputLabel(arena.allocator(), .{ .group = .{ .items = argv(.{ "v", "a", 2 }) } }));
-    try testing.expectError(error.InvalidAnalysisArguments, outputLabel(arena.allocator(), .{ .name = "v" }));
-}
-
-test cardIs {
-    try testing.expect(cardIs(".LIN sparcalc=1", "lin"));
-    try testing.expect(cardIs(".net\tvin", "net"));
-    try testing.expect(!cardIs(".linx", "lin"));
-    try testing.expect(!cardIs("", "lin"));
-}
-
-test tranNoiseSamples {
-    const out: Value = .{ .group = .{ .items = argv(.{ "v", "o" }) } };
-    try testing.expectEqual(@as(u32, 4), tranNoiseSamples(&[_]Value{ out, .{ .name = "seed" }, .{ .num = 3 }, .{ .name = "samples" }, .{ .num = 4 } }));
-    try testing.expectEqual(@as(u32, 1), tranNoiseSamples(&[_]Value{ out, .{ .name = "samples" }, .{ .num = -4 } }));
-    try testing.expectEqual(@as(u32, 1), tranNoiseSamples(&[_]Value{out}));
+test {
+    _ = analysis_args;
+    _ = analysis_options;
+    _ = analysis_time;
+    _ = analysis_small;
+    _ = analysis_rf;
+    _ = analysis_card;
 }

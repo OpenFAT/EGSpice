@@ -1,20 +1,40 @@
-//! `.meas` card text to a `core.Measure`, after ngspice com_measure2.c
-//! (measure_parse_trigtarg, _find, _when and _stdParams). The caller
-//! evaluates the numbers, so a value may be a parameter expression. HSPICE
-//! forms ride along: an omitted analysis type, INTEGRAL/DERIVATIVE, PARAM=
-//! and ERR/ERR1/ERR2/ERR3, the `_CONT` analyses, EM_AVG, `par('expr')`
-//! waveforms, values naming earlier results, TARG's `TD=TRIG` and
-//! inherited TD, and the DCMATCH, ACMATCH, LSTB, PHASENOISE and PTDNOISE
-//! analyses, which read those plots' columns by name [CR .MEASURE].
-//! `parseCheck` turns HSPICE `.check`, `.dout` and `.biaschk` cards into
-//! measures the same evaluator runs [CR .CHECK, .DOUT, .BIASCHK].
+//! `.meas` cards. In: the card text after `.meas`, lowercased. Out: a
+//! `core.Measure`, after ngspice com_measure2.c (measure_parse_trigtarg,
+//! _find, _when and _stdParams). The caller evaluates the numbers, so a
+//! value may be a parameter expression. HSPICE forms ride along: an omitted
+//! analysis type, INTEGRAL/DERIVATIVE, PARAM= and ERR/ERR1/ERR2/ERR3, the
+//! `_CONT` analyses, EM_AVG, `par('expr')` waveforms, values naming earlier
+//! results, TARG's `TD=TRIG` and inherited TD, and the DCMATCH, ACMATCH,
+//! LSTB, PHASENOISE and PTDNOISE analyses, which read those plots' columns
+//! by name. `.check`, `.dout` and `.biaschk` cards are measure_check.zig's.
+//! Cites: ngspice com_measure2.c; HSPICE [CR] .MEASURE.
+//!
+//! `ctx` is a comptime interface (axis: who evaluates values; cases today:
+//! the netlist reader for each dialect, and the test contexts): it has
+//! `measureValue(text) !f64`, `measureExpr(text) ![]const core.MeasureOp`
+//! and `measureOption(name) ?f64`. Its errors pass through, so the error
+//! sets here are inferred from it.
+//!
+//! Contents:
+//! - `pub const Levels = measure_check.Levels`
+//! - `pub const parseCheck = measure_check.parseCheck`
+//! - `pub fn parse(arena: Allocator, text: []const u8, ctx: anytype, default: ?Kind, hspice: bool) !core.Measure`
+
 const std = @import("std");
+const assert = std.debug.assert;
+const mem = std.mem;
+const Allocator = std.mem.Allocator;
 const core = @import("core");
+const measure_words = @import("measure_words.zig");
+const measure_check = @import("measure_check.zig");
 const Kind = core.query.Kind;
 const Clause = core.MeasureClause;
+const Word = measure_words.Word;
 
-/// `lhs`, or `lhs=rhs` with blanks around the `=` dropped.
-const Word = struct { lhs: []const u8, rhs: ?[]const u8 = null };
+/// Logic thresholds of `.check` cards (measure_check.zig).
+pub const Levels = measure_check.Levels;
+/// The `.check`, `.dout` and `.biaschk` reader (measure_check.zig).
+pub const parseCheck = measure_check.parseCheck;
 
 const analyses = std.StaticStringMap(Kind).initComptime(.{
     .{ "tran", .tran },       .{ "ac", .ac },                .{ "dc", .dc },
@@ -43,22 +63,33 @@ const funcs = std.StaticStringMap(core.MeasureFunc).initComptime(.{
     .{ "jitter", .jitter },
 });
 
-/// Parses `text`, the card after `.meas`, lowercased. `ctx.measureValue(text)
-/// !f64` evaluates a value, `ctx.measureExpr(text) ![]const core.MeasureOp`
-/// compiles a PARAM= or `par()` expression and `ctx.measureOption(name) ?f64`
-/// reads an `.option`. A card without an analysis type reads `default`,
-/// HSPICE's last analysis card; `hspice` selects HSPICE's TARG TD
-/// inheritance. Strings in the result are slices of `text` or allocated in
-/// `arena`. ParseError for anything neither simulator accepts; the errors
-/// of `ctx`'s callbacks pass through.
-pub fn parse(arena: std.mem.Allocator, text: []const u8, ctx: anytype, default: ?Kind, hspice: bool) !core.Measure {
-    const typed = try words(arena, text);
+/// The test context: numbers by `std.fmt.parseFloat`, one stand-in expression, and every
+/// `.option` at 0.5.
+const Ctx = struct {
+    pub fn measureValue(_: Ctx, t: []const u8) !f64 {
+        return std.fmt.parseFloat(f64, t) catch error.ParseError;
+    }
+    pub fn measureExpr(_: Ctx, _: []const u8) ![]const core.MeasureOp {
+        return &.{.{ .measure = 0 }};
+    }
+    pub fn measureOption(_: Ctx, _: []const u8) ?f64 {
+        return 0.5;
+    }
+};
+
+/// Parses `text`, the card after `.meas`, lowercased. A card without an
+/// analysis type reads `default`, HSPICE's last analysis card; `hspice`
+/// selects HSPICE's TARG TD inheritance. Strings in the result are slices
+/// of `text` or allocated in `arena`. ParseError for anything neither
+/// simulator accepts; the errors of `ctx`'s callbacks pass through.
+pub fn parse(arena: Allocator, text: []const u8, ctx: anytype, default: ?Kind, hspice: bool) !core.Measure {
+    const typed = try measure_words.words(arena, text);
     if (typed.len < 2) return error.ParseError;
     const cont = cont_analyses.get(typed[0].lhs);
     const given = analyses.get(typed[0].lhs) orelse cont;
     const analysis = given orelse default orelse return error.ParseError;
     // `w[0]` is the analysis type's slot either way.
-    const w = if (given != null) typed else try std.mem.concat(arena, Word, &.{ &.{.{ .lhs = "" }}, typed });
+    const w = if (given != null) typed else try mem.concat(arena, Word, &.{ &.{.{ .lhs = "" }}, typed });
     if (w.len < 3) return error.ParseError;
     if (analysis == .lstb and w.len == 3 and lstb_margins.has(w[2].lhs))
         return .{ .analysis = analysis, .name = w[1].lhs, .func = .find, .first = .{ .vec = w[2].lhs } };
@@ -75,7 +106,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, ctx: anytype, default: 
     const rest = w[3..];
     switch (func) {
         .trig_targ => {
-            const t = find(rest, "targ") orelse return error.ParseError;
+            const t = measure_words.find(rest, "targ") orelse return error.ParseError;
             try trigTarg(arena, &m.first, analysis, rest[0..t], ctx);
             try trigTarg(arena, &m.second, analysis, rest[t + 1 ..], ctx);
             for ([_]Clause{ m.first, m.second }) |c| {
@@ -106,11 +137,11 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, ctx: anytype, default: 
             try stdParams(arena, &m.first, analysis, rest[2..], ctx);
         },
         .find, .deriv => {
-            const k = find(rest, "when") orelse rest.len;
+            const k = measure_words.find(rest, "when") orelse rest.len;
             if (k == 0 or rest[0].rhs != null) return error.ParseError;
             m.first.vec = try vector(arena, &m.first, analysis, rest[0].lhs, ctx);
             if (k > 1) {
-                if (!std.mem.eql(u8, rest[1].lhs, "at") or rest[1].rhs == null) return error.ParseError;
+                if (!mem.eql(u8, rest[1].lhs, "at") or rest[1].rhs == null) return error.ParseError;
                 try stdParams(arena, &m.first, analysis, rest[1..k], ctx);
             }
             if (!hasAt(m.first)) {
@@ -125,7 +156,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, ctx: anytype, default: 
         // [CR .JITTER], read as `.meas <kind> <name> jitter TRIG ...`.
         .jitter => {
             if (analysis != .tran and analysis != .tran_noise) return error.ParseError;
-            if (rest.len == 0 or !std.mem.eql(u8, rest[0].lhs, "trig")) return error.ParseError;
+            if (rest.len == 0 or !mem.eql(u8, rest[0].lhs, "trig")) return error.ParseError;
             try trigTarg(arena, &m.first, analysis, rest[1..], ctx);
         },
         // `.meas fft name THD|SNR|SNDR|ENOB|SFDR v(out) [NBHARM=] [MAXFREQ=]
@@ -141,8 +172,11 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8, ctx: anytype, default: 
         if (analysis != .tran) return error.ParseError;
         m.first.val = ctx.measureOption("em_recovery") orelse 1;
     }
+    assert(m.name.len > 0);
     return m;
 }
+
+// ---- private ----
 
 fn hasRef(c: Clause, field: core.MeasureRef.Field) bool {
     for (c.refs) |r| if (r.field == field) return true;
@@ -154,26 +188,22 @@ fn hasAt(c: Clause) bool {
     return c.at != core.measure_no_at or hasRef(c, .at);
 }
 
-fn find(w: []const Word, key: []const u8) ?usize {
-    for (w, 0..) |x, i| if (x.rhs == null and std.mem.eql(u8, x.lhs, key)) return i;
-    return null;
-}
-
 /// An optional vector, then parameters.
-fn trigTarg(arena: std.mem.Allocator, c: *Clause, analysis: Kind, w: []const Word, ctx: anytype) !void {
+fn trigTarg(arena: Allocator, c: *Clause, analysis: Kind, w: []const Word, ctx: anytype) !void {
     if (w.len == 0) return error.ParseError;
-    const has_vec = !std.mem.startsWith(u8, w[0].lhs, "at");
+    assert(w[0].lhs.len > 0);
+    const has_vec = !mem.startsWith(u8, w[0].lhs, "at");
     if (has_vec) c.vec = try vector(arena, c, analysis, w[0].lhs, ctx);
     try stdParams(arena, c, analysis, w[@intFromBool(has_vec)..], ctx);
 }
 
 /// `vec=level` or `vec=vec2`, then parameters.
-fn when(arena: std.mem.Allocator, c: *Clause, analysis: Kind, w: []const Word, ctx: anytype) !void {
+fn when(arena: Allocator, c: *Clause, analysis: Kind, w: []const Word, ctx: anytype) !void {
     if (w.len == 0) return error.ParseError;
     const rhs = w[0].rhs orelse return error.ParseError;
     c.vec = try vector(arena, c, analysis, w[0].lhs, ctx);
     // A result variable is always `v(..)`/`i(..)`/`par(..)`: a `(` names one.
-    if (std.mem.indexOfScalar(u8, rhs, '(') != null) {
+    if (mem.indexOfScalar(u8, rhs, '(') != null) {
         var other: Clause = .{};
         c.vec2 = try vector(arena, &other, analysis, rhs, ctx);
         c.ops2 = other.ops;
@@ -183,24 +213,25 @@ fn when(arena: std.mem.Allocator, c: *Clause, analysis: Kind, w: []const Word, c
 
 /// `vdb(out)` reads `v(out)` in dB for AC (ngspice correct_vec), `lstb(db)`
 /// `loop_gain` in dB; `par('expr')` compiles into `c.ops`.
-fn vector(arena: std.mem.Allocator, c: *Clause, analysis: Kind, name: []const u8, ctx: anytype) ![]const u8 {
-    if (std.mem.startsWith(u8, name, "par(") and name[name.len - 1] == ')') {
+fn vector(arena: Allocator, c: *Clause, analysis: Kind, name: []const u8, ctx: anytype) ![]const u8 {
+    assert(name.len > 0);
+    if (mem.startsWith(u8, name, "par(") and name[name.len - 1] == ')') {
         c.ops = try ctx.measureExpr(name[4 .. name.len - 1]);
         return name;
     }
-    if (analysis == .lstb and std.mem.startsWith(u8, name, "lstb(") and name[name.len - 1] == ')') {
+    if (analysis == .lstb and mem.startsWith(u8, name, "lstb(") and name[name.len - 1] == ')') {
         c.vectype = lstb_types.get(name[5 .. name.len - 1]) orelse return error.ParseError;
         return "loop_gain";
     }
     if ((analysis != .ac and analysis != .fft and analysis != .sp) or name.len < 2 or name[0] != 'v' or name[1] == '(') return name;
-    const paren = std.mem.indexOfScalar(u8, name, '(') orelse return name;
+    const paren = mem.indexOfScalar(u8, name, '(') orelse return name;
     c.vectype = name[1];
-    return std.mem.concat(arena, u8, &.{ "v", name[paren..] });
+    return mem.concat(arena, u8, &.{ "v", name[paren..] });
 }
 
 /// Sets `field` of `c` from `text`: a number or parameter expression, or,
 /// in HSPICE, an expression over earlier `.meas` results kept as a ref.
-fn setValue(arena: std.mem.Allocator, c: *Clause, field: core.MeasureRef.Field, text: []const u8, ctx: anytype) !void {
+fn setValue(arena: Allocator, c: *Clause, field: core.MeasureRef.Field, text: []const u8, ctx: anytype) !void {
     const v = ctx.measureValue(text) catch |err| {
         if (err == error.OutOfMemory) return err;
         var refs: std.ArrayList(core.MeasureRef) = .empty;
@@ -218,13 +249,13 @@ fn setValue(arena: std.mem.Allocator, c: *Clause, field: core.MeasureRef.Field, 
     }
 }
 
-fn stdParams(arena: std.mem.Allocator, c: *Clause, analysis: Kind, w: []const Word, ctx: anytype) !void {
+fn stdParams(arena: Allocator, c: *Clause, analysis: Kind, w: []const Word, ctx: anytype) !void {
     for (w) |x| {
         const rhs = x.rhs orelse {
             // REVERSE lets the target precede the trigger, which a
             // negative result already reports.
-            if (std.mem.eql(u8, x.lhs, "reverse")) continue;
-            if (!std.mem.eql(u8, x.lhs, "last")) return error.ParseError;
+            if (mem.eql(u8, x.lhs, "reverse")) continue;
+            if (!mem.eql(u8, x.lhs, "last")) return error.ParseError;
             c.cross = core.measure_last;
             c.rise = core.measure_unset;
             c.fall = core.measure_unset;
@@ -235,7 +266,7 @@ fn stdParams(arena: std.mem.Allocator, c: *Clause, analysis: Kind, w: []const Wo
         const key = std.meta.stringToEnum(Key, x.lhs) orelse return error.ParseError;
         switch (key) {
             .val, .td, .from, .to, .at => {
-                if (key == .td and std.mem.eql(u8, rhs, "trig")) {
+                if (key == .td and mem.eql(u8, rhs, "trig")) {
                     c.td_trig = true;
                 } else try setValue(arena, c, std.meta.stringToEnum(core.MeasureRef.Field, x.lhs).?, rhs, ctx);
                 continue;
@@ -247,8 +278,8 @@ fn stdParams(arena: std.mem.Allocator, c: *Clause, analysis: Kind, w: []const Wo
             '>' => .above,
             else => .equal,
         };
-        const text = if (bound == .equal) rhs else std.mem.trim(u8, rhs[1..], " \t");
-        const v: f64 = if (std.mem.eql(u8, text, "last")) core.measure_last else try ctx.measureValue(text);
+        const text = if (bound == .equal) rhs else mem.trim(u8, rhs[1..], " \t");
+        const v: f64 = if (mem.eql(u8, text, "last")) core.measure_last else try ctx.measureValue(text);
         switch (key) {
             .rise, .fall, .cross => {
                 const n = std.math.lossyCast(i32, @floor(v + 0.5));
@@ -275,263 +306,8 @@ fn stdParams(arena: std.mem.Allocator, c: *Clause, analysis: Kind, w: []const Wo
             },
         }
     }
-    if (analysis == .dc and c.to < c.from) std.mem.swap(f64, &c.from, &c.to);
+    if (analysis == .dc and c.to < c.from) mem.swap(f64, &c.from, &c.to);
 }
-
-/// Blank- or comma-separated words; `{..}`, `'..'` and `(..)` stay whole,
-/// and blanks around `=` join its sides. Every `lhs` is non-empty: a
-/// leading `=` has no key and is a ParseError.
-fn words(arena: std.mem.Allocator, text: []const u8) ![]Word {
-    var out: std.ArrayList(Word) = .empty;
-    var i: usize = 0;
-    var pending_eq = false;
-    while (i < text.len) {
-        const c = text[i];
-        if (c == ' ' or c == '\t' or c == ',') {
-            i += 1;
-            continue;
-        }
-        const start = i;
-        var depth: u32 = 0;
-        var quote = false;
-        while (i < text.len) : (i += 1) {
-            const b = text[i];
-            if (b == '\'' or b == '"') quote = !quote;
-            if (quote) continue;
-            if (b == '{' or b == '(') depth += 1;
-            if ((b == '}' or b == ')') and depth > 0) depth -= 1;
-            if (depth == 0 and (b == ' ' or b == '\t' or b == ',')) break;
-        }
-        const tok = text[start..i];
-        const eq = std.mem.indexOfScalar(u8, tok, '=');
-        if (tok[0] == '=' and out.items.len == 0) return error.ParseError;
-        if (pending_eq or tok[0] == '=') {
-            // `a =b`, `a = b` or `a= b`: this token completes the last word.
-            const last = &out.items[out.items.len - 1];
-            const value = if (tok[0] == '=') tok[1..] else tok;
-            pending_eq = value.len == 0;
-            // `goal > v`: the rhs runs from the operator to the value.
-            const op = last.rhs orelse "";
-            last.rhs = if (op.len != 0 and (op[0] == '<' or op[0] == '>')) text[@intFromPtr(op.ptr) - @intFromPtr(text.ptr) .. i] else value;
-            continue;
-        }
-        if ((tok[0] == '<' or tok[0] == '>') and out.items.len > 0 and out.items[out.items.len - 1].rhs == null and
-            std.mem.eql(u8, out.items[out.items.len - 1].lhs, "goal"))
-        {
-            // HSPICE `GOAL < v` / `GOAL > v` [SA Ch.27]: the operator stays in the rhs.
-            out.items[out.items.len - 1].rhs = tok;
-            pending_eq = tok.len == 1;
-            continue;
-        }
-        if (eq) |e| {
-            pending_eq = e + 1 == tok.len;
-            try out.append(arena, .{ .lhs = tok[0..e], .rhs = tok[e + 1 ..] });
-        } else try out.append(arena, .{ .lhs = tok });
-    }
-    if (pending_eq) return error.ParseError;
-    return out.items;
-}
-
-/// Logic thresholds of `.check` cards: low at or below `lo`, high at or
-/// above `hi`.
-pub const Levels = struct { lo: f64, hi: f64 };
-
-/// Appends the measures an HSPICE `.check`, `.dout` or `.biaschk` card
-/// expands to, one per node, to `out` [CR .CHECK, .DOUT, .BIASCHK]. `card`
-/// is the card name without its dot and `text` the rest, lowercased.
-/// `.check global_level` only sets `global`, which later cards default to.
-/// `serial` numbers the card in its measures' names (`setup2_v1`).
-/// ParseError for a form ESPice does not read: a node wildcard, an element
-/// or region `.biaschk`, a `.biaschk` outside the transient; the errors of
-/// `ctx`'s callbacks pass through. Invalidates element pointers of `out`
-/// if it grows.
-pub fn parseCheck(arena: std.mem.Allocator, card: []const u8, text: []const u8, ctx: anytype, global: *?Levels, serial: u32, out: *std.ArrayList(core.Measure)) !void {
-    const w = try words(arena, text);
-    if (w.len == 0) return error.ParseError;
-    var m: core.Measure = .{ .analysis = .tran, .name = "", .func = .check_slew, .first = .{}, .second = .{} };
-    if (std.mem.eql(u8, card, "biaschk")) {
-        // `'expr' [limit=] [max=] [min=] [simulation=tr] [tstart=] [tstop=] ...`
-        if (w[0].lhs[0] != '\'' and w[0].lhs[0] != '"') return error.ParseError;
-        m.func = .check_level;
-        m.first.ops = try ctx.measureExpr(w[0].lhs);
-        m.first.vec = w[0].lhs;
-        for (w[1..]) |x| {
-            const rhs = x.rhs orelse continue; // `autostop`
-            if (std.mem.eql(u8, x.lhs, "simulation")) {
-                if (!std.mem.eql(u8, rhs, "tr")) return error.ParseError;
-            } else if (std.mem.eql(u8, x.lhs, "limit") or std.mem.eql(u8, x.lhs, "max")) {
-                m.check.max = try ctx.measureValue(rhs);
-            } else if (std.mem.eql(u8, x.lhs, "min")) {
-                m.check.min = try ctx.measureValue(rhs);
-            } else if (std.mem.eql(u8, x.lhs, "tstart")) {
-                m.first.from = try ctx.measureValue(rhs);
-            } else if (std.mem.eql(u8, x.lhs, "tstop")) {
-                m.first.to = try ctx.measureValue(rhs);
-            } else if (!std.mem.eql(u8, x.lhs, "noise") and !std.mem.eql(u8, x.lhs, "interval")) return error.ParseError;
-        }
-        m.name = try arena.print("biaschk{d}", .{serial});
-        return out.append(arena, m);
-    }
-    if (std.mem.eql(u8, card, "dout")) {
-        // `nd [nd ...] [VTH | VLO VHI] (time state [state ...] ...)`; the
-        // group may touch the last word (`vth(0n 1 ...)`).
-        var last = w[w.len - 1].lhs;
-        const open = std.mem.indexOfScalar(u8, last, '(') orelse return error.ParseError;
-        const head = last[0..open];
-        last = last[open..];
-        var names: std.ArrayList([]const u8) = .empty;
-        var levels: std.ArrayList(f64) = .empty;
-        for (w[0 .. w.len - 1]) |x| try names.append(arena, x.lhs);
-        if (head.len > 0) try names.append(arena, head);
-        // The first word is a node; values after it are thresholds.
-        while (names.items.len > 1) {
-            const v = ctx.measureValue(names.items[names.items.len - 1]) catch |e| {
-                if (e == error.OutOfMemory) return e;
-                break;
-            };
-            try levels.insert(arena, 0, v);
-            _ = names.pop();
-        }
-        // ponytail: no threshold given reads the .vec VTH default, 1.65 V.
-        const lo, const hi = switch (levels.items.len) {
-            0 => .{ 1.65, 1.65 },
-            1 => .{ levels.items[0], levels.items[0] },
-            2 => .{ levels.items[0], levels.items[1] },
-            else => return error.ParseError,
-        };
-        const row = try groupWords(arena, last);
-        const width = names.items.len + 1;
-        if (row.len == 0 or row.len % width != 0) return error.ParseError;
-        for (names.items, 0..) |node, k| {
-            var expect: std.ArrayList([2]f64) = .empty;
-            var r: usize = 0;
-            while (r < row.len) : (r += width) {
-                const state = row[r + 1 + k].lhs;
-                if (std.mem.eql(u8, state, "0") or std.mem.eql(u8, state, "1"))
-                    try expect.append(arena, .{ try ctx.measureValue(row[r].lhs), if (state[0] == '1') 1 else 0 });
-            }
-            var d = m;
-            d.func = .dout;
-            d.check = .{ .lo = lo, .hi = hi, .expect = expect.items };
-            try appendNode(arena, d, "dout", serial, node, out);
-        }
-        return;
-    }
-    if (!std.mem.eql(u8, card, "check") or w.len < 2) return error.ParseError;
-    const Kind_ = enum { global_level, rise, fall, slew, setup, hold, edge, irdrop };
-    const kind = std.meta.stringToEnum(Kind_, w[0].lhs) orelse return error.ParseError;
-    const spec = try groupWords(arena, w[1].lhs);
-    var nodes = w[2..];
-    var levels = global.*;
-    if (nodes.len > 0 and nodes[nodes.len - 1].lhs[0] == '(') {
-        levels = try parseLevels(arena, nodes[nodes.len - 1].lhs, ctx);
-        nodes = nodes[0 .. nodes.len - 1];
-    }
-    if (kind == .global_level) {
-        global.* = try parseLevels(arena, w[1].lhs, ctx);
-        return;
-    }
-    if (nodes.len == 0) return error.ParseError;
-    switch (kind) {
-        .global_level => unreachable,
-        // `(min max)`
-        .rise, .fall, .slew => {
-            if (spec.len != 2) return error.ParseError;
-            m.check.min = try ctx.measureValue(spec[0].lhs);
-            m.check.max = try ctx.measureValue(spec[1].lhs);
-            m.check.edge = switch (kind) {
-                .rise => .rise,
-                .fall => .fall,
-                else => .both,
-            };
-        },
-        // `(ref RISE|FALL duration RISE|FALL)`, `(ref RISE|FALL min max RISE|FALL)`
-        .setup, .hold, .edge => {
-            if (spec.len != @as(usize, if (kind == .edge) 5 else 4)) return error.ParseError;
-            m.second.vec = try nodeVector(arena, spec[0].lhs);
-            m.check.ref_edge = try edgeOf(spec[1].lhs);
-            m.check.edge = try edgeOf(spec[spec.len - 1].lhs);
-            const a = try ctx.measureValue(spec[2].lhs);
-            m.func = if (kind == .edge) .check_require else .check_forbid;
-            m.check.min, m.check.max = switch (kind) {
-                .setup => .{ -a, 0 },
-                .hold => .{ 0, a },
-                else => .{ a, try ctx.measureValue(spec[3].lhs) },
-            };
-        },
-        // `(volt duration)`: below a negative level, above a positive one.
-        .irdrop => {
-            if (spec.len != 2) return error.ParseError;
-            const v = try ctx.measureValue(spec[0].lhs);
-            m.func = .check_level;
-            m.check.dur = try ctx.measureValue(spec[1].lhs);
-            if (v < 0) m.check.min = v else m.check.max = v;
-        },
-    }
-    if (m.func != .check_level) {
-        const l = levels orelse return error.ParseError;
-        m.check.lo = l.lo;
-        m.check.hi = l.hi;
-    }
-    for (nodes) |x| try appendNode(arena, m, @tagName(kind), serial, x.lhs, out);
-}
-
-/// `m` reading node `node`, named `<kind><serial>_<node>`.
-fn appendNode(arena: std.mem.Allocator, m: core.Measure, kind: []const u8, serial: u32, node: []const u8, out: *std.ArrayList(core.Measure)) !void {
-    var one = m;
-    one.first.vec = try nodeVector(arena, node);
-    one.name = try arena.print("{s}{d}_{s}", .{ kind, serial, node });
-    try out.append(arena, one);
-}
-
-/// A bare node name as its result label, `v(node)`; a `v(..)` or `i(..)`
-/// stays as written.
-fn nodeVector(arena: std.mem.Allocator, node: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, node, '*') != null) return error.ParseError;
-    if (std.mem.indexOfScalar(u8, node, '(') != null) return node;
-    return arena.print("v({s})", .{node});
-}
-
-fn edgeOf(word: []const u8) !core.Check.Edge {
-    if (std.mem.eql(u8, word, "rise")) return .rise;
-    if (std.mem.eql(u8, word, "fall")) return .fall;
-    return error.ParseError;
-}
-
-/// The words inside a `( ... )` group.
-fn groupWords(arena: std.mem.Allocator, group: []const u8) ![]Word {
-    if (group.len < 2 or group[0] != '(' or group[group.len - 1] != ')') return error.ParseError;
-    return words(arena, group[1 .. group.len - 1]);
-}
-
-/// `(hi lo hi_th lo_th)`; a threshold ending in `%` is that share of the
-/// swing above `lo`.
-fn parseLevels(arena: std.mem.Allocator, group: []const u8, ctx: anytype) !Levels {
-    const g = try groupWords(arena, group);
-    if (g.len != 4) return error.ParseError;
-    const hi = try ctx.measureValue(g[0].lhs);
-    const lo = try ctx.measureValue(g[1].lhs);
-    var th: [2]f64 = undefined;
-    for (g[2..], &th) |x, *t| {
-        const s = x.lhs;
-        t.* = if (s[s.len - 1] == '%') lo + (hi - lo) * try ctx.measureValue(s[0 .. s.len - 1]) / 100 else try ctx.measureValue(s);
-    }
-    return .{ .lo = th[1], .hi = th[0] };
-}
-
-/// Numbers by `std.fmt.parseFloat`, one stand-in expression, and every
-/// `.option` at 0.5.
-const Ctx = struct {
-    fn measureValue(_: Ctx, t: []const u8) !f64 {
-        return std.fmt.parseFloat(f64, t) catch error.ParseError;
-    }
-    fn measureExpr(_: Ctx, _: []const u8) ![]const core.MeasureOp {
-        return &.{.{ .measure = 0 }};
-    }
-    fn measureOption(_: Ctx, _: []const u8) ?f64 {
-        return 0.5;
-    }
-};
 
 test "meas cards parse like ngspice's word lists" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -659,10 +435,10 @@ test "malformed measure cards are a ParseError, not a crash" {
     try std.testing.expectEqual(0, out.items.len);
     // An allocation failure is not a node name (#69).
     const Oom = struct {
-        fn measureValue(_: @This(), _: []const u8) !f64 {
+        pub fn measureValue(_: @This(), _: []const u8) !f64 {
             return error.OutOfMemory;
         }
-        fn measureExpr(_: @This(), _: []const u8) ![]const core.MeasureOp {
+        pub fn measureExpr(_: @This(), _: []const u8) ![]const core.MeasureOp {
             return error.OutOfMemory;
         }
     };
@@ -679,5 +455,6 @@ test "malformed measure cards are a ParseError, not a crash" {
 }
 
 test {
+    _ = measure_words;
     _ = @import("tests/measure.zig");
 }
