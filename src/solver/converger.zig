@@ -19,6 +19,34 @@
 //! Cites ngspice NIiter (maths/ni/niiter.c), NIconvTest (maths/ni/niconv.c)
 //! and CKTload's nodeset hold (cktload.c); dev/solvers/gpu-lu.md (the device
 //! factor); #3, #53, #152 (the runaway bound and the branch-row gate).
+//!
+//! Contents:
+//! - `pub const SolverPin = enum`
+//!   - `pub const names = std.StaticStringMap(SolverPin).initComptime(.{`
+//! - `pub const Knobs = struct`
+//! - `pub const Workspace = newton_workspace.Workspace`
+//! - `pub const LaneWorkspace = newton_workspace.LaneWorkspace`
+//! - `pub const Prof = newton_workspace.Prof`
+//! - `pub const jfnk = jfnk_mod.jfnk`
+//! - `pub const Tolerances = num.Tolerances`
+//! - `pub const Options = struct`
+//! - `pub const force_g = 1e10`
+//! - `pub const Force = struct`
+//! - `pub const GminStamp = struct`
+//! - `pub const Result = struct`
+//! - `pub const x_plausible = 1e9`
+//! - `pub const test_access = if (@import("builtin").is_test) .{ .updateAndNorm = struct {`
+//! - `pub fn optionsFromTolerances(tol: Tolerances, max_iter_override: ?u16) Options`
+//! - `pub fn newton(...)`
+//! - `pub fn WorkspaceOf(comptime W: usize) type`
+//! - `pub fn ResultOf(comptime W: usize) type`
+//! - `pub fn LaneResult(comptime W: usize) type`
+//! - `pub fn newtonLanes(...)`
+//! - `pub fn loadExtras(sys: anytype, v: anytype, x: anytype, opts: Options) void`
+//! - `pub fn residualGate(opts: Options, diag: anytype, xi: @TypeOf(diag)) @TypeOf(diag)`
+//! - `pub fn plausibleLimit(sys: anytype, x: anytype, f: anytype, vals: anytype) @TypeOf(x[0])`
+//! - `pub fn run(...)`
+//! - `pub fn updateAndNorm(comptime W: usize, x: []Lanes(W).V, dx: []const Lanes(W).V, x_old: []Lanes(W).V, current_row: []const bool, reltol: f64, abstol: f64, vntol: f64, active: Lanes(W).Mask) Lanes(W).V`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -30,6 +58,9 @@ const Execution = num.Execution;
 const lanes = @import("lane/lanes.zig");
 const Lanes = lanes.Lanes;
 const LaneSolver = @import("lane/solver.zig").LaneSolver;
+const newton_sys = @import("newton_sys.zig");
+const newton_workspace = @import("newton_workspace.zig");
+const jfnk_mod = @import("jfnk.zig");
 
 /// `ESPICE_SOLVER` overrides `run`'s choice: direct, jfnk (LU-preconditioned
 /// GMRES) or jfnk-nolu (Jacobi-preconditioned, no factorization at all).
@@ -56,44 +87,20 @@ pub const Knobs = struct {
     newton_debug: bool = false,
 };
 
-/// Which gate refused an iterate, for the `ZP_OPDBG` trace. ngspice's
-/// NIconvTest (maths/ni/niconv.c) has only the delta test, the first-iterate
-/// floor and the device limiting flag; `.residual` and `.runaway` are ours.
-/// Disabling `.residual` on vacask/mul changed the Newton count by 0.01%.
-/// ngspice's CKTconvTest device tests are dead in 44.2: they bump
-/// CKTnoncon, then NIiter assigns NIconvTest's return over it, and
-/// CKTconvTest returns OK (niiter.c:288).
-const Reject = enum { converged, first_iter, delta, limited, flipped, residual, device, runaway };
+/// Per-circuit Newton scratch (`newton_workspace.zig`).
+pub const Workspace = newton_workspace.Workspace;
 
-fn Deref(comptime P: type) type {
-    return if (@typeInfo(P) == .pointer) @typeInfo(P).pointer.child else P;
-}
+/// Newton scratch for W lanes (`newton_workspace.zig`).
+pub const LaneWorkspace = newton_workspace.LaneWorkspace;
 
-/// The BBD factor scheduler `sys` carries as `solver_execution`; serial
-/// for a system without one.
-fn executionOf(sys: anytype) Execution {
-    return if (comptime @hasField(Deref(@TypeOf(sys)), "solver_execution")) sys.solver_execution else .{};
-}
+/// `--timing-in-depth` wall-time split of `newton` (`newton_workspace.zig`).
+pub const Prof = newton_workspace.Prof;
+
+/// Jacobian-free Newton-Krylov (`jfnk.zig`).
+pub const jfnk = jfnk_mod.jfnk;
 
 /// The user-facing accuracy profile (SPICE .options).
 pub const Tolerances = num.Tolerances;
-
-/// Newton options for `tol`, with `max_iter_override` replacing ITL1. The
-/// cap is never below 100: ngspice's NIiter raises any smaller maxIter to
-/// 100 (niiter.c:38), so ITL2 and ITL4 only steer the callers' own
-/// iteration-count heuristics, never the Newton loop itself.
-pub fn optionsFromTolerances(tol: Tolerances, max_iter_override: ?u16) Options {
-    return .{
-        .max_iter = @max(max_iter_override orelse tol.itl1, 100),
-        .abstol = tol.abstol,
-        .reltol = tol.reltol,
-        .vntol = tol.vntol,
-        .residual_tol = tol.residual_tol,
-        // Diagonal gmin is opt-in (the op gmin-stepping rung). ngspice's
-        // NIiter loads none; junction gmin lives in the device models.
-        .gmin = 0,
-    };
-}
 
 /// Controls for one nonlinear solve.
 pub const Options = struct {
@@ -131,17 +138,61 @@ pub const Force = struct { slot: u32, row: u32, value: f64 };
 /// One `gmin` load: `vals[slot] += gmin` and `rhs[row] += gmin * x[col]`,
 /// the residual form of a conductance at (row, col).
 pub const GminStamp = struct { slot: u32, row: u32, col: u32 };
-comptime {
-    // Per-entry tables the loads walk: no padding.
-    assert(@sizeOf(Force) == 16);
-    assert(@sizeOf(GminStamp) == 12);
-}
 
 /// Outcome of a nonlinear solve.
 pub const Result = struct {
     converged: bool,
     iterations: u16,
 };
+
+/// The floor of the largest |x| an accepted iterate may hold. Every
+/// acceptance test is relative: the delta test to |x|, the residual gate to
+/// the diagonal conductance. A Newton that ran away carries both with it (a
+/// FET fed from a current source at 0 V reached 5e24 V with 1e45 S
+/// diagonals, and its 3e39 A residual passed), so a runaway iterate is
+/// refused outright (#3).
+pub const x_plausible = 1e9;
+
+/// Private kernels for tests.zig; void outside test builds.
+pub const test_access = if (@import("builtin").is_test) .{ .updateAndNorm = struct {
+    fn f(x: []f64, dx: []const f64, x_old: []f64, current_row: []const bool, reltol: f64, abstol: f64, vntol: f64) f64 {
+        return updateAndNorm(1, x, dx, x_old, current_row, reltol, abstol, vntol, true);
+    }
+}.f } else {};
+
+/// Which gate refused an iterate, for the `ZP_OPDBG` trace. ngspice's
+/// NIconvTest (maths/ni/niconv.c) has only the delta test, the first-iterate
+/// floor and the device limiting flag; `.residual` and `.runaway` are ours.
+/// Disabling `.residual` on vacask/mul changed the Newton count by 0.01%.
+/// ngspice's CKTconvTest device tests are dead in 44.2: they bump
+/// CKTnoncon, then NIiter assigns NIconvTest's return over it, and
+/// CKTconvTest returns OK (niiter.c:288).
+const Reject = enum { converged, first_iter, delta, limited, flipped, residual, device, runaway };
+
+comptime {
+    // Per-entry tables the loads walk: no padding.
+    assert(@sizeOf(Force) == 16);
+    assert(@sizeOf(GminStamp) == 12);
+}
+
+const inf = std.math.inf(f64);
+
+/// Newton options for `tol`, with `max_iter_override` replacing ITL1. The
+/// cap is never below 100: ngspice's NIiter raises any smaller maxIter to
+/// 100 (niiter.c:38), so ITL2 and ITL4 only steer the callers' own
+/// iteration-count heuristics, never the Newton loop itself.
+pub fn optionsFromTolerances(tol: Tolerances, max_iter_override: ?u16) Options {
+    return .{
+        .max_iter = @max(max_iter_override orelse tol.itl1, 100),
+        .abstol = tol.abstol,
+        .reltol = tol.reltol,
+        .vntol = tol.vntol,
+        .residual_tol = tol.residual_tol,
+        // Diagonal gmin is opt-in (the op gmin-stepping rung). ngspice's
+        // NIiter loads none; junction gmin lives in the device models.
+        .gmin = 0,
+    };
+}
 
 /// Direct Newton: assemble, factor, solve, accept. Errors are the factorization's and the checkpoint's.
 ///
@@ -206,7 +257,7 @@ pub fn newtonLanes(
     hook: anytype,
 ) !ResultOf(W) {
     const L = Lanes(W);
-    const S = Deref(@TypeOf(sys));
+    const S = newton_sys.Deref(@TypeOf(sys));
     assert(ws.slv.n == sys.n);
     assert(ws.dx.len >= sys.n);
     assert(ws.x_old.len >= sys.n);
@@ -251,7 +302,7 @@ pub fn newtonLanes(
             // solve; false leaves both to the host.
             const on_device = if (comptime @hasDecl(S, "deviceSolve")) sys.deviceSolve(slv, v, dx) orelse false else false;
             if (!on_device) {
-                slv.factor(v, executionOf(sys)) catch |e| {
+                slv.factor(v, newton_sys.executionOf(sys)) catch |e| {
                     if (ws.knobs.opdbg) {
                         var nan_cnt: usize = 0;
                         for (v[0..sys.nnz]) |vi| {
@@ -266,7 +317,7 @@ pub fn newtonLanes(
                 slv.solveNeg(sys.rhs, dx);
             }
         } else {
-            const bad = try slv.factorSolveNeg(v, sys.rhs[0..sys.n], dx, active, executionOf(sys));
+            const bad = try slv.factorSolveNeg(v, sys.rhs[0..sys.n], dx, active, newton_sys.executionOf(sys));
             out.singular |= bad;
             active &= ~bad;
             prof.lap(.factor);
@@ -285,8 +336,8 @@ pub fn newtonLanes(
                 if (@abs(sys.rhs[i]) > @abs(sys.rhs[fi])) fi = i;
                 if (@abs(dx[i]) > @abs(dx[di])) di = i;
             }
-            const name_fi = sysNodeName(sys, @intCast(fi));
-            const name_di = sysNodeName(sys, @intCast(di));
+            const name_fi = newton_sys.sysNodeName(sys, @intCast(fi));
+            const name_di = newton_sys.sysNodeName(sys, @intCast(di));
             std.debug.print("  newton it={d} |F|={e:.3}@{d}({s}) dx={e:.3}@{d}({s}) x={e:.3} scaled={e:.3} conv={} why={s}\n", .{ iter, norm_f, fi, name_fi, dx[di], di, name_di, x[di], st.scaled, L.any(st.converged), @tagName(st.why) });
         };
         // INITFIX lanes that passed switch to INITFLOAT; the rest are done.
@@ -322,7 +373,7 @@ pub fn loadExtras(sys: anytype, v: anytype, x: anytype, opts: Options) void {
     const L = lanes.Of(@TypeOf(v[0]));
     assert(x.len >= sys.n);
     assert(v.len >= sys.nnz);
-    loadGmin(L.V, sys, v, sys.rhs[0..sys.n], x, opts);
+    newton_sys.loadGmin(L.V, sys, v, sys.rhs[0..sys.n], x, opts);
     for (opts.force) |f| {
         v[f.slot] += L.splat(force_g);
         sys.rhs[f.row] += L.splat(force_g) * (x[f.row] - L.splat(f.value));
@@ -345,26 +396,6 @@ pub fn residualGate(opts: Options, diag: anytype, xi: @TypeOf(diag)) @TypeOf(dia
     return @max(L.splat(opts.residual_tol), L.splat(10.0) * s * (L.splat(opts.reltol) * @abs(xi) + L.splat(opts.vntol)));
 }
 
-fn sysNodeName(sys: anytype, idx: u32) []const u8 {
-    const S = Deref(@TypeOf(sys));
-    if (comptime @hasDecl(S, "nodeName")) return sys.nodeName(idx);
-    return "?";
-}
-
-/// `finalizeStep`'s verdict: the lanes it accepted and each lane's delta
-/// score; `why` names the first gate that refused, read by the W = 1 trace.
-fn Step(comptime W: usize) type {
-    return struct { converged: Lanes(W).Mask, scaled: Lanes(W).V, why: Reject = .converged };
-}
-
-/// The floor of the largest |x| an accepted iterate may hold. Every
-/// acceptance test is relative: the delta test to |x|, the residual gate to
-/// the diagonal conductance. A Newton that ran away carries both with it (a
-/// FET fed from a current source at 0 V reached 5e24 V with 1e45 S
-/// diagonals, and its 3e39 A residual passed), so a runaway iterate is
-/// refused outright (#3).
-pub const x_plausible = 1e9;
-
 /// The runaway bound of one solve, read off its first assembly: 1e3 times
 /// the scale the circuit sets there, the start |x| or the drive |F| times
 /// the largest diagonal conductance, between `x_plausible` and 1e21. A 1e12 V
@@ -381,6 +412,90 @@ pub fn plausibleLimit(sys: anytype, x: anytype, f: anytype, vals: anytype) @Type
     const scale = @min(@max(normInf(L.V, x), normInf(L.V, f) * g), L.splat(1e18));
     // Negated, so a NaN start keeps the floor.
     return L.select(L.not(L.cmp(.gt, L.splat(1e3) * scale, L.splat(x_plausible))), L.splat(x_plausible), L.splat(1e3) * scale);
+}
+
+/// Solves with `newton`, or with `jfnk` under an `ESPICE_SOLVER` pin (falling
+/// back to `newton` when it fails). Clears device limiting on exit.
+pub fn run(
+    sys: anytype,
+    ws: *Workspace,
+    x: []f64,
+    t: f64,
+    opts: Options,
+    hook: anytype,
+) !Result {
+    const S = newton_sys.Deref(@TypeOf(sys));
+    // Function scope: a defer inside an `if` block would run before the solve.
+    defer if (comptime @hasDecl(S, "clearLimits")) sys.clearLimits();
+
+    const pin = ws.knobs.pin;
+    if ((pin == .jfnk or pin == .jfnk_nolu) and sys.n > 0) {
+        if (jfnk_mod.jfnk(sys, ws, x, t, opts, hook)) |r| {
+            if (r.converged) return r;
+        } else |err| if (err == error.QueryCancelled) return err;
+    }
+    // Direct Newton is the default because it was faster on every fixture
+    // size, both backends, op and tran alike (best-of-2 wall seconds):
+    //
+    //   fixture                unkn  backend  direct   jfnk  jfnk-nolu
+    //   resistor_grid_32x32     ~1k  cpu        0.01   0.02       0.16
+    //   resistor_grid_100x100  ~10k  cpu        0.19   0.21      10.76
+    //   rc_ladder_1k            ~1k  cpu        0.22   5.65       8.74
+    //   rc_ladder_10k          ~10k  cpu        2.19   4.76      39.40
+    //   rc_ladder_10k          ~10k  cuda       2.03   4.77      39.88
+    //
+    // JFNK still factors the Jacobian as its preconditioner and adds up to
+    // 30 full device sweeps per step. It is not a superset either:
+    // scaling/parallel_inverters_100 converges only under JFNK, and only when
+    // JFNK drives the whole op ladder, while convergence/diode_bridge goes the
+    // other way. An automatic retry after a failed direct solve cost 10x on
+    // ensemble/pvt_corners, because `run` is called per rung and per
+    // timestep. ponytail: the pin is the interface until the op ladder itself
+    // learns to restart under JFNK.
+    return newton(sys, ws, x, t, opts, hook);
+}
+
+/// The delta gate: x_old = x; x += dx; returns max |dx| / (reltol *
+/// max(|x|, |x_old|) + atol), atol = abstol on current rows, vntol
+/// elsewhere, per lane. Lanes outside `active` keep x and x_old (their score
+/// is garbage). A row whose new x or dx is NaN or infinite scores inf; a
+/// zero step on a zero tolerance (0/0) scores 0. The max runs on the i64
+/// bit patterns of the nonnegative scores: exact and order-independent, and
+/// the loop vectorizes (float `@max` keeps it scalar: 1.2 against 0.8 ns per
+/// row).
+pub fn updateAndNorm(comptime W: usize, x: []Lanes(W).V, dx: []const Lanes(W).V, x_old: []Lanes(W).V, current_row: []const bool, reltol: f64, abstol: f64, vntol: f64, active: Lanes(W).Mask) Lanes(W).V {
+    const L = Lanes(W);
+    const I = if (W == 1) i64 else @Vector(W, i64);
+    // Up front, so the loop carries no per-slice bounds checks.
+    assert(dx.len >= x.len);
+    assert(x_old.len >= x.len);
+    assert(current_row.len >= x.len);
+    var worst: I = if (W == 1) 0 else @splat(0);
+    for (x, dx[0..x.len], x_old[0..x.len], current_row[0..x.len]) |*xi, d, *xoi, cur| {
+        const xo = xi.*;
+        const xn = L.select(active, xo + d, xo);
+        xoi.* = L.select(active, xo, xoi.*);
+        xi.* = xn;
+        const tol = L.splat(reltol) * @max(@abs(xn), @abs(xo)) + L.splat(if (cur) abstol else vntol);
+        // A lazy `and` at W = 1: LLVM turns it into an integer finite test
+        // and the eager `both` into a float compare pair, which is not
+        // the scalar kernel's code (gen_update_and_norm).
+        const finite = if (W == 1) @abs(xn) < inf and @abs(d) < inf else L.both(L.cmp(.lt, @abs(xn), L.splat(inf)), L.cmp(.lt, @abs(d), L.splat(inf)));
+        const q = @abs(d) / tol;
+        const score = L.select(L.not(finite), L.splat(inf), L.select(L.cmp(.eq, q, q), q, L.splat(0)));
+        worst = @max(worst, @as(I, @bitCast(score)));
+    }
+    const result: L.V = @bitCast(worst);
+    assert(!L.any(L.cmp(.lt, result, L.splat(0))));
+    return result;
+}
+
+// ---- private ----
+
+/// `finalizeStep`'s verdict: the lanes it accepted and each lane's delta
+/// score; `why` names the first gate that refused, read by the W = 1 trace.
+fn Step(comptime W: usize) type {
+    return struct { converged: Lanes(W).Mask, scaled: Lanes(W).V, why: Reject = .converged };
 }
 
 /// `num.normInf` per lane: the max of |x_i|'s bit patterns, NaN winning.
@@ -469,7 +584,7 @@ fn finalizeStep(
     active: Lanes(W).Mask,
 ) Step(W) {
     const L = Lanes(W);
-    const S = Deref(@TypeOf(sys));
+    const S = newton_sys.Deref(@TypeOf(sys));
     const n = sys.n;
     assert(residual.len >= n);
     assert(vals.len >= sys.nnz);
@@ -521,471 +636,6 @@ fn finalizeStep(
     return .{ .converged = ok, .scaled = scaled };
 }
 
-const gmres_restart = 30;
-const sqrt_eps: f64 = 0x1p-26; // sqrt(f64 machine epsilon)
-const inf = std.math.inf(f64);
-
-/// Jacobian-free Newton-Krylov: each step solves J dx = -F by one unrestarted cycle of
-/// GMRES(min(30, n)) (`gmres.Gmres`) with finite-difference products J v,
-/// left-preconditioned by the factored Jacobian (Jacobi only under
-/// ESPICE_SOLVER=jfnk-nolu). A cycle that stops short is taken as it stands.
-/// Same gates as `newton`, with the residual gate on F, but a converged `x`
-/// is x_k+1. A failed checkpoint returns `error.QueryCancelled`; the first
-/// call on a workspace allocates its GMRES scratch (`error.OutOfMemory`).
-/// Asserts that `ws` and `x_full` are sized for `sys` and that `sys` has an
-/// unknown.
-pub fn jfnk(
-    sys: anytype,
-    ws: *Workspace,
-    x_full: []f64,
-    t: f64,
-    opts: Options,
-    hook: anytype,
-) !Result {
-    const S = Deref(@TypeOf(sys));
-    const n: usize = sys.n;
-    assert(n > 0);
-    assert(ws.slv.n == n);
-    assert(x_full.len >= n);
-    const krylov = try ws.ensureKrylov();
-    const x_pert = ws.jf[0..n];
-    const f0 = ws.jf[n..][0..n]; // F(x) + gmin * x at the outer iterate
-    const b = ws.jf[2 * n ..][0..n]; // -M^-1 f0, the Krylov right-hand side
-    const diag = ws.jf[3 * n ..][0..n]; // Jacobi inverse diagonal
-    const r = ws.dx[0..n]; // becomes dx after the Krylov solve
-    const x_old = ws.x_old[0..n];
-    const x = x_full[0..n];
-    // A null solver is what makes this matrix-free.
-    const slv: ?*direct.Solver = if (ws.knobs.pin == .jfnk_nolu) null else &ws.slv;
-
-    // w = M^-1 (F(x + eps v) - f0) / eps, eps = sqrt(eps_mach) * max(||x||, 1) / ||v||:
-    // left preconditioning inside the operator, so GMRES's residual and
-    // stop are on M^-1 (F + J dx), as the hand-rolled solver's were.
-    // Right preconditioning (a `precond` decl) left the 2x2 circle test
-    // (solver tests) 1e-6 from its root; the hand-rolled left form landed
-    // within 1e-8.
-    const Sys = @TypeOf(sys);
-    const Hook = @TypeOf(hook);
-    const FdOp = struct {
-        sys: Sys,
-        hook: Hook,
-        x: []const f64,
-        x_norm: f64 = 0,
-        x_pert: []f64,
-        f0: []const f64,
-        diag: []const f64,
-        slv: ?*direct.Solver,
-        t: f64,
-        opts: Options,
-
-        pub fn matvec(op: *@This(), v: []const f64, w: []f64) void {
-            const v_norm = num.norm2(v);
-            // J 0 = 0 exactly: GMRES's initial residual costs no device eval.
-            if (v_norm == 0) {
-                @memset(w, 0);
-                return;
-            }
-            const eps = if (v_norm > 1e-30) sqrt_eps * op.x_norm / v_norm else sqrt_eps;
-            @memcpy(op.x_pert, op.x);
-            num.axpy(op.x_pert, eps, v);
-            assembleShifted(op.sys, op.x_pert, op.t, op.opts, op.hook);
-            // The finite-difference product; a plain loop LLVM vectorizes.
-            const inv = 1.0 / eps;
-            for (w, op.sys.rhs[0..w.len], op.f0[0..w.len]) |*wi, fi, f0i| wi.* = (fi - f0i) * inv;
-            applyPreconditioner(w, op.diag, op.slv);
-        }
-    };
-    var op: FdOp = .{ .sys = sys, .hook = hook, .x = x, .x_pert = x_pert, .f0 = f0, .diag = diag, .slv = slv, .t = t, .opts = opts };
-
-    if (comptime @hasDecl(S, "beginSolve")) sys.beginSolve();
-    @memcpy(x_old, x);
-
-    var limit: f64 = x_plausible;
-    var iter: u16 = 0;
-    while (iter < opts.max_iter) : (iter += 1) {
-        if (comptime @hasDecl(S, "checkpoint")) if (iter != 0) {
-            sys.checkpoint(.{ .phase = .nonlinear, .completed = iter, .total = opts.max_iter }) catch
-                return error.QueryCancelled;
-        };
-        if (comptime @hasDecl(S, "advanceIteration")) if (iter != 0) sys.advanceIteration(x_old);
-
-        assembleShifted(sys, x, t, opts, hook);
-        @memcpy(f0, sys.rhs[0..n]);
-        const v = hook.vals(sys);
-        if (iter == 0) limit = plausibleLimit(sys, x, f0, v);
-        loadGmin(f64, sys, v, null, x, opts);
-        // Before the factor, which may overwrite `v`.
-        const load_ok = if (comptime @hasDecl(S, "loadCheck")) sys.loadCheck(x, v, f0, opts.reltol, opts.abstol) else true;
-        buildDiagPreconditioner(sys, v, diag);
-        if (slv) |s| s.factor(v, executionOf(sys)) catch {};
-
-        // ||M^-1 f0||: the preconditioned step already within abstol.
-        // b = -M^-1 f0, beta = ||b||.
-        num.scale(b, -1, f0);
-        applyPreconditioner(b, diag, slv);
-        const beta = num.norm2(b);
-        if (beta < opts.abstol and residualConverged(sys, hook, x, f0, opts, limit)) {
-            @memset(r, 0);
-            @memcpy(x_old, x);
-            const limited = applyLimits(sys, x, x_old);
-            if (iter > 0 and !limited and load_ok and acceptStep(sys, x))
-                return .{ .converged = true, .iterations = iter + 1 };
-            continue;
-        }
-
-        // GMRES stops at ||M^-1 (F + J dx)|| <= abstol / 10, but takes at
-        // least one Arnoldi step: a beta already under that would otherwise
-        // return dx = 0 and stall on the residual gate.
-        @memset(r, 0);
-        op.x_norm = @max(num.norm2(x), 1.0);
-        _ = krylov.solve(&op, b, r, @min(0.1 * opts.abstol / beta, 0.5), 0);
-
-        // Limiting may clamp x, so it runs before the residual gate.
-        const scaled = updateAndNorm(1, x, r, x_old, sys.current_row[0..n], opts.reltol, opts.abstol, opts.vntol, true);
-        const limited = applyLimits(sys, x, x_old);
-        const residual_ok = residualConverged(sys, hook, x, f0, opts, limit);
-        // Publishes x_k+1: JFNK is not ngspice's iteration, and its inexact
-        // steps leave x_k further out than a direct solve does.
-        if (iter > 0 and scaled < 1.0 and residual_ok and !limited and load_ok and acceptStep(sys, x))
-            return .{ .converged = true, .iterations = iter + 1 };
-    }
-    return .{ .converged = false, .iterations = opts.max_iter };
-}
-
-/// Solves with `newton`, or with `jfnk` under an `ESPICE_SOLVER` pin (falling
-/// back to `newton` when it fails). Clears device limiting on exit.
-pub fn run(
-    sys: anytype,
-    ws: *Workspace,
-    x: []f64,
-    t: f64,
-    opts: Options,
-    hook: anytype,
-) !Result {
-    const S = Deref(@TypeOf(sys));
-    // Function scope: a defer inside an `if` block would run before the solve.
-    defer if (comptime @hasDecl(S, "clearLimits")) sys.clearLimits();
-
-    const pin = ws.knobs.pin;
-    if ((pin == .jfnk or pin == .jfnk_nolu) and sys.n > 0) {
-        if (jfnk(sys, ws, x, t, opts, hook)) |r| {
-            if (r.converged) return r;
-        } else |err| if (err == error.QueryCancelled) return err;
-    }
-    // Direct Newton is the default because it was faster on every fixture
-    // size, both backends, op and tran alike (best-of-2 wall seconds):
-    //
-    //   fixture                unkn  backend  direct   jfnk  jfnk-nolu
-    //   resistor_grid_32x32     ~1k  cpu        0.01   0.02       0.16
-    //   resistor_grid_100x100  ~10k  cpu        0.19   0.21      10.76
-    //   rc_ladder_1k            ~1k  cpu        0.22   5.65       8.74
-    //   rc_ladder_10k          ~10k  cpu        2.19   4.76      39.40
-    //   rc_ladder_10k          ~10k  cuda       2.03   4.77      39.88
-    //
-    // JFNK still factors the Jacobian as its preconditioner and adds up to
-    // 30 full device sweeps per step. It is not a superset either:
-    // scaling/parallel_inverters_100 converges only under JFNK, and only when
-    // JFNK drives the whole op ladder, while convergence/diode_bridge goes the
-    // other way. An automatic retry after a failed direct solve cost 10x on
-    // ensemble/pvt_corners, because `run` is called per rung and per
-    // timestep. ponytail: the pin is the interface until the op ladder itself
-    // learns to restart under JFNK.
-    return newton(sys, ws, x, t, opts, hook);
-}
-
-/// Loads `opts.gmin` as `Options` documents: at each of `gmin_stamps`, or
-/// on every diagonal when there are none. Adds it to `vals` when non-null
-/// and its residual form, gmin * x[col], to `rhs` when non-null.
-fn loadGmin(comptime V: type, sys: anytype, vals: ?[]V, rhs: ?[]V, x: []const V, opts: Options) void {
-    if (!(opts.gmin > 0)) return;
-    const gmin = lanes.Of(V).splat(opts.gmin);
-    const stamps = opts.gmin_stamps;
-    if (vals) |v| {
-        if (stamps.len > 0) {
-            for (stamps) |g| v[g.slot] += gmin;
-        } else for (sys.diag_slots[0..sys.n]) |slot| v[slot] += gmin;
-    }
-    if (rhs) |r| {
-        if (stamps.len > 0) {
-            for (stamps) |g| r[g.row] += gmin * x[g.col];
-        } else for (r[0..sys.n], x[0..sys.n]) |*ri, xi| ri.* += gmin * xi;
-    }
-}
-
-/// Residual at x plus the gmin load into `sys.rhs`.
-fn assembleShifted(sys: anytype, x: []const f64, t: f64, opts: Options, hook: anytype) void {
-    assert(x.len == sys.n);
-    if (@hasDecl(@TypeOf(hook), "residual"))
-        hook.residual(sys, x, t)
-    else
-        hook.assemble(sys, x, t);
-    loadGmin(f64, sys, null, sys.rhs[0..x.len], x, opts);
-}
-
-/// Inverse diagonal of `vals`, which already carries the gmin load.
-fn buildDiagPreconditioner(sys: anytype, vals: []const f64, diag: []f64) void {
-    assert(diag.len >= sys.n);
-    for (0..sys.n) |i| {
-        const d = vals[sys.diag_slots[i]];
-        diag[i] = if (@abs(d) > 1e-30) 1.0 / d else 1.0;
-    }
-}
-
-/// r = M^-1 r: the LU when it factored, else the Jacobi diagonal.
-fn applyPreconditioner(r: []f64, diag: []const f64, slv: ?*direct.Solver) void {
-    assert(diag.len >= r.len);
-    if (slv) |s| {
-        if (s.factored) {
-            s.solve(r, r);
-            return;
-        }
-    }
-    for (r, diag[0..r.len]) |*ri, di| ri.* *= di;
-}
-
-fn applyLimits(sys: anytype, x: []f64, x_old: []f64) bool {
-    return if (comptime @hasDecl(Deref(@TypeOf(sys)), "applyLimits")) sys.applyLimits(x, x_old) else false;
-}
-
-/// Device convergence, then state staging; false refuses the iterate.
-fn acceptStep(sys: anytype, x: []f64) bool {
-    const S = Deref(@TypeOf(sys));
-    if (comptime @hasDecl(S, "checkConvergence")) {
-        if (!sys.checkConvergence(x)) return false;
-    }
-    if (comptime @hasDecl(S, "updateStates")) {
-        if (sys.updateStates(x) != null) return false;
-    }
-    return true;
-}
-
-/// Row-scaled residual gate, as in `finalizeStep`, that also rejects a
-/// non-finite residual or an iterate past `limit`. A row with no diagonal
-/// (a V source's branch row) holds its KVL residual in volts to
-/// 10 (reltol |x| + vntol): JFNK has no delta test to govern it, and
-/// skipping the row accepted a cold x = 0 whose only residual was the
-/// source's own value (#152).
-fn residualConverged(sys: anytype, hook: anytype, x: []const f64, residual: []const f64, opts: Options, limit: f64) bool {
-    assert(x.len == sys.n);
-    var ok = true;
-    for (x, residual, 0..) |xi, ri, i| {
-        const rt = residualGate(opts, hook.diagAt(sys, sys.diag_slots[i]), xi);
-        // Negated comparisons reject NaN too.
-        if (!(@abs(ri) <= rt) or !(@abs(xi) <= limit)) ok = false;
-    }
-    return ok;
-}
-
-/// Private kernels for tests.zig; void outside test builds.
-pub const test_access = if (@import("builtin").is_test) .{ .updateAndNorm = struct {
-    fn f(x: []f64, dx: []const f64, x_old: []f64, current_row: []const bool, reltol: f64, abstol: f64, vntol: f64) f64 {
-        return updateAndNorm(1, x, dx, x_old, current_row, reltol, abstol, vntol, true);
-    }
-}.f } else {};
-
-/// The delta gate: x_old = x; x += dx; returns max |dx| / (reltol *
-/// max(|x|, |x_old|) + atol), atol = abstol on current rows, vntol
-/// elsewhere, per lane. Lanes outside `active` keep x and x_old (their score
-/// is garbage). A row whose new x or dx is NaN or infinite scores inf; a
-/// zero step on a zero tolerance (0/0) scores 0. The max runs on the i64
-/// bit patterns of the nonnegative scores: exact and order-independent, and
-/// the loop vectorizes (float `@max` keeps it scalar: 1.2 against 0.8 ns per
-/// row).
-pub fn updateAndNorm(comptime W: usize, x: []Lanes(W).V, dx: []const Lanes(W).V, x_old: []Lanes(W).V, current_row: []const bool, reltol: f64, abstol: f64, vntol: f64, active: Lanes(W).Mask) Lanes(W).V {
-    const L = Lanes(W);
-    const I = if (W == 1) i64 else @Vector(W, i64);
-    // Up front, so the loop carries no per-slice bounds checks.
-    assert(dx.len >= x.len);
-    assert(x_old.len >= x.len);
-    assert(current_row.len >= x.len);
-    var worst: I = if (W == 1) 0 else @splat(0);
-    for (x, dx[0..x.len], x_old[0..x.len], current_row[0..x.len]) |*xi, d, *xoi, cur| {
-        const xo = xi.*;
-        const xn = L.select(active, xo + d, xo);
-        xoi.* = L.select(active, xo, xoi.*);
-        xi.* = xn;
-        const tol = L.splat(reltol) * @max(@abs(xn), @abs(xo)) + L.splat(if (cur) abstol else vntol);
-        // A lazy `and` at W = 1: LLVM turns it into an integer finite test
-        // and the eager `both` into a float compare pair, which is not
-        // the scalar kernel's code (gen_update_and_norm).
-        const finite = if (W == 1) @abs(xn) < inf and @abs(d) < inf else L.both(L.cmp(.lt, @abs(xn), L.splat(inf)), L.cmp(.lt, @abs(d), L.splat(inf)));
-        const q = @abs(d) / tol;
-        const score = L.select(L.not(finite), L.splat(inf), L.select(L.cmp(.eq, q, q), q, L.splat(0)));
-        worst = @max(worst, @as(I, @bitCast(score)));
-    }
-    const result: L.V = @bitCast(worst);
-    assert(!L.any(L.cmp(.lt, result, L.splat(0))));
-    return result;
-}
-
-/// `--timing-in-depth` wall-time split of `newton`, summed over every solve
-/// on one workspace. Off (no clock reads) until `io` is set.
-pub const Prof = struct {
-    io: ?std.Io = null,
-    /// Nanoseconds per phase, indexed by `Phase`.
-    ns: [5]u64 = @splat(0),
-    /// Newton iterations and the factorizations among them.
-    counts: [2]u64 = @splat(0),
-    last: std.Io.Timestamp = .zero,
-
-    /// eval: device evaluation plus companion stamps (`hook.assemble`).
-    /// load: the combined G + ag0*C matrix and gmin. update: the step,
-    /// limiting and the convergence gates.
-    pub const Phase = enum(u3) { eval, load, factor, solve, update };
-
-    /// Opens one Newton iteration: stamps the clock and counts it. A no-op
-    /// while `io` is null.
-    pub fn start(p: *Prof) void {
-        const io = p.io orelse return;
-        p.last = .now(io, .awake);
-        p.counts[0] += 1;
-    }
-
-    /// Charges the time since the last `start` or `lap` to `phase`; a
-    /// `.factor` lap also counts a factorization. A no-op while `io` is null.
-    pub fn lap(p: *Prof, phase: Phase) void {
-        comptime assert(@typeInfo(Phase).@"enum".field_names.len == @typeInfo(@FieldType(Prof, "ns")).array.len);
-        const io = p.io orelse return;
-        const now: std.Io.Timestamp = .now(io, .awake);
-        p.ns[@backingInt(phase)] += @intCast(p.last.durationTo(now).nanoseconds);
-        p.last = now;
-        if (phase == .factor) p.counts[1] += 1;
-    }
-};
-
-/// Per-circuit Newton scratch: the direct solver on the circuit pattern plus
-/// step vectors. GMRES and combined-matrix buffers grow on first use.
-pub const Workspace = struct {
-    slv: direct.Solver,
-    dx: []f64,
-    x_old: []f64,
-    /// `jfnk`'s GMRES and its four n-vectors (x_pert, f0, b, diag), made
-    /// on its first call.
-    krylov: ?Gmres = null,
-    jf: []f64 = &.{},
-    /// tran's G + alpha*C values, grown by `ensureAVals`.
-    a_vals: []f64 = &.{},
-    prof: Prof = .{},
-    knobs: Knobs,
-
-    /// Borrows `col_ptr` and `row_idx` for the workspace's lifetime. Caller
-    /// frees with `deinit` and the same allocator. Fails as
-    /// `direct.Solver.init` does (out of memory, or the ordering's
-    /// `OutOfWorkspace`), leaving nothing allocated. Asserts that `col_ptr`
-    /// has n + 1 entries.
-    pub fn init(gpa: std.mem.Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?BbdInfo, knobs: Knobs, lu_knobs: direct.Knobs) !Workspace {
-        return initOrdered(gpa, n, col_ptr, row_idx, bbd, knobs, lu_knobs, null);
-    }
-
-    /// `init` with a column order to reuse (`direct.Solver.initOrdered`).
-    pub fn initOrdered(gpa: std.mem.Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?BbdInfo, knobs: Knobs, lu_knobs: direct.Knobs, order: ?[]const u32) !Workspace {
-        assert(col_ptr.len == @as(usize, n) + 1);
-        const dx = try gpa.alloc(f64, n);
-        errdefer gpa.free(dx);
-        const x_old = try gpa.alloc(f64, n);
-        errdefer gpa.free(x_old);
-        return .{
-            .slv = try direct.Solver.initOrdered(gpa, n, col_ptr, row_idx, bbd, lu_knobs, order),
-            .dx = dx,
-            .x_old = x_old,
-            .knobs = knobs,
-        };
-    }
-
-    /// Returns the workspace to its state right after `initOrdered`,
-    /// keeping its allocations (`direct.Solver.reset`; `bbd` must be what
-    /// `init` got). The GMRES and combined-value buffers are scratch every
-    /// call rewrites, so they stay.
-    pub fn reset(self: *Workspace, bbd: ?BbdInfo) std.mem.Allocator.Error!void {
-        try self.slv.reset(bbd);
-        self.prof = .{};
-    }
-
-    fn ensureKrylov(self: *Workspace) !*Gmres {
-        if (self.krylov == null) {
-            const gpa = self.slv.gpa;
-            const n = self.slv.n;
-            const jf = try gpa.alloc(f64, 4 * @as(usize, n));
-            errdefer gpa.free(jf);
-            self.krylov = try Gmres.init(gpa, n, @min(gmres_restart, n));
-            self.jf = jf;
-        }
-        return &self.krylov.?;
-    }
-
-    /// Scratch of length `nnz` for tran's combined G + alpha*C values, reused
-    /// across runs; the slice is invalidated by the next call that grows it.
-    pub fn ensureAVals(self: *Workspace, nnz: u32) ![]f64 {
-        if (self.a_vals.len < nnz) {
-            self.slv.gpa.free(self.a_vals);
-            // Empty before the alloc so a failure cannot double-free in deinit.
-            self.a_vals = &.{};
-            self.a_vals = try self.slv.gpa.alloc(f64, nnz);
-        }
-        return self.a_vals[0..nnz];
-    }
-
-    /// Frees every buffer, the lazily grown ones included; `gpa` must be the
-    /// allocator `init` got.
-    pub fn deinit(self: *Workspace, gpa: std.mem.Allocator) void {
-        self.slv.deinit();
-        gpa.free(self.dx);
-        gpa.free(self.x_old);
-        if (self.krylov) |*k| k.deinit(gpa);
-        gpa.free(self.jf);
-        gpa.free(self.a_vals);
-        self.* = undefined;
-    }
-};
-
-/// Newton scratch for W lanes: lane l's own `Workspace` (its solver,
-/// borrowed into `slv`), plus lane-major step vectors. Lane l's scalar
-/// workspace stays usable between lane solves: peeling a lane to W = 1 runs
-/// `newton` on it directly.
-pub fn LaneWorkspace(comptime W: usize) type {
-    return struct {
-        const Self = @This();
-        const L = Lanes(W);
-
-        /// Lane l's scalar workspace, borrowed; must outlive self.
-        lanes: [W]*Workspace,
-        slv: LaneSolver(W),
-        dx: []L.V,
-        x_old: []L.V,
-        prof: Prof = .{},
-        knobs: Knobs,
-
-        /// Fails only on allocation. Asserts that the lanes share n.
-        pub fn init(gpa: std.mem.Allocator, ws: [W]*Workspace) !Self {
-            const n = ws[0].slv.n;
-            for (ws) |w| assert(w.slv.n == n);
-            var solvers: [W]*direct.Solver = undefined;
-            for (&solvers, ws) |*s, w| s.* = &w.slv;
-            var slv = try LaneSolver(W).init(gpa, solvers);
-            errdefer slv.deinit();
-            const dx = try gpa.alloc(L.V, n);
-            errdefer gpa.free(dx);
-            return .{ .lanes = ws, .slv = slv, .dx = dx, .x_old = try gpa.alloc(L.V, n), .knobs = ws[0].knobs };
-        }
-
-        /// Frees what `init` allocated; the lanes' workspaces stay theirs.
-        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
-            self.slv.deinit();
-            gpa.free(self.dx);
-            gpa.free(self.x_old);
-            self.* = undefined;
-        }
-    };
-}
-
-test "the Jacobi preconditioner scales each row by its inverse diagonal" {
-    var r = [_]f64{ 2, -3, 4, std.math.nan(f64) };
-    const diag = [_]f64{ 0.5, 2, -0.25, 1, 9 };
-    applyPreconditioner(&r, &diag, null);
-    try std.testing.expectEqualSlices(f64, &.{ 1, -6, -1 }, r[0..3]);
-    try std.testing.expect(std.math.isNan(r[3]));
-}
-
 test "plausible and residualMisses match a scalar oracle at every length, NaN and inf included" {
     var prng = std.Random.DefaultPrng.init(0xC0);
     const r = prng.random();
@@ -1029,26 +679,4 @@ test "plausible and residualMisses match a scalar oracle at every length, NaN an
         try std.testing.expectEqual(want_plausible, plausible(x[0..n], 5));
         try std.testing.expectEqual(want_misses, residualMisses(opts, res[0..n], x[0..n], &vals, slots[0..n]));
     };
-}
-
-test "loadGmin stamps the diagonal or the listed stamps, into vals and rhs independently" {
-    const Sys = struct { n: u32 = 3, diag_slots: []const u32 = &.{ 0, 4, 8 } };
-    const sys: Sys = .{};
-    const x = [_]f64{ 1, -2, 3 };
-    var vals: [9]f64 = @splat(0);
-    var rhs: [3]f64 = @splat(1);
-    loadGmin(f64, &sys, &vals, &rhs, &x, .{ .gmin = 0.5 });
-    try std.testing.expectEqualSlices(f64, &.{ 0.5, 0, 0, 0, 0.5, 0, 0, 0, 0.5 }, &vals);
-    try std.testing.expectEqualSlices(f64, &.{ 1.5, 0, 2.5 }, &rhs);
-    // Stamps: (row 0, col 2) at slot 6, twice; rhs only.
-    const stamps = [_]GminStamp{ .{ .slot = 6, .row = 0, .col = 2 }, .{ .slot = 6, .row = 0, .col = 2 } };
-    loadGmin(f64, &sys, null, &rhs, &x, .{ .gmin = 0.25, .gmin_stamps = &stamps });
-    try std.testing.expectEqualSlices(f64, &.{ 3, 0, 2.5 }, &rhs);
-    loadGmin(f64, &sys, &vals, null, &x, .{ .gmin = 0.25, .gmin_stamps = &stamps });
-    try std.testing.expectEqual(@as(f64, 0.5), vals[6]);
-    // Zero, negative and NaN gmin load nothing.
-    const before = vals;
-    for ([_]f64{ 0, -1, std.math.nan(f64) }) |g| loadGmin(f64, &sys, &vals, &rhs, &x, .{ .gmin = g });
-    try std.testing.expectEqualSlices(f64, &before, &vals);
-    try std.testing.expectEqualSlices(f64, &.{ 3, 0, 2.5 }, &rhs);
 }

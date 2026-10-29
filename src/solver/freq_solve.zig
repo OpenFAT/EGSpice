@@ -8,6 +8,50 @@
 //! dev/solvers/overview.md and dev/solvers/gilbert-peierls-lu.md ("Two
 //! replay thresholds", #44); #43 (held singular ω in `factorEach`), #83
 //! (allocation failure is not a numerical one).
+//!
+//! Contents:
+//! - `pub const Dyn = struct`
+//!   - `pub fn at(self: Dyn, e: usize, k: usize) struct { re: f64, im: f64 }`
+//! - `pub const Stacked = freq_fill.Stacked`
+//! - `pub const ComplexFill = freq_fill.ComplexFill`
+//! - `pub const StackedPoints = freq_fill.StackedPoints`
+//! - `pub const FreqSolver = struct`
+//!   - `pub const W = std.simd.suggestVectorLength(f64) orelse 1`
+//!   - `pub const Dense = struct`
+//!   - `pub const Sparse = struct`
+//!   - `pub const Complex = struct`
+//!     - `pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) !?Complex`
+//!     - `pub fn deinit(self: *Complex, gpa: Allocator) void`
+//!   - `pub fn fromPlanes(allocator: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, g: []const f64, c: []const f64) !Self`
+//!   - `pub fn fromCircuit(allocator: Allocator, ckt: anytype, x_op: []const f64) !Self`
+//!   - `pub fn initDense(allocator: Allocator, n: u32, g: []f64, c: []f64) !Self`
+//!   - `pub fn deinit(self: *Self) void`
+//!   - `pub fn solve(self: *Self, omega: f64, rhs: []const f64, x_out: []f64) !void`
+//!   - `pub fn setOmegaDyn(self: *Self, omega: f64, dyn: Dyn, k: usize) !void`
+//!   - `pub fn solveRhs(self: *Self, rhs: []const f64, x_out: []f64) void`
+//!   - `pub fn solveRhsT(self: *Self, rhs: []const f64, x_out: []f64) void`
+//!   - `pub fn addDiagG(self: *Self, i: u32, v: f64) void`
+//!   - `pub const solveBatch = freq_batch.solveBatch`
+//!   - `pub const ComplexChunk = freq_batch.ComplexChunk`
+//!   - `pub const beginComplexChunk = freq_batch.beginComplexChunk`
+//!   - `pub const finishComplexChunk = freq_batch.finishComplexChunk`
+//!   - `pub const LaneChunk = freq_batch.LaneChunk`
+//!   - `pub const beginLaneChunk = freq_batch.beginLaneChunk`
+//!   - `pub const finishLaneChunk = freq_batch.finishLaneChunk`
+//!   - `pub const heldTape = freq_held.heldTape`
+//!   - `pub const beginHeldTape = freq_held.beginHeldTape`
+//!   - `pub const finishHeldTape = freq_held.finishHeldTape`
+//!   - `pub const replayCurrentHeld = freq_held.replayCurrentHeld`
+//!   - `pub const completeHeldPolicy = freq_held.completeHeldPolicy`
+//!   - `pub const ensureHeldOnHost = freq_held.ensureHeldOnHost`
+//!   - `pub const packHeld = freq_held.packHeld`
+//!   - `pub fn setPlanes(self: *Self, g: []const f64, c: []const f64) void`
+//!   - `pub const factorEach = freq_held.factorEach`
+//!   - `pub const solveEach = freq_held.solveEach`
+//!   - `pub const test_access = if (@import("builtin").is_test) .{`
+//! - `pub fn slotCol(col_ptr: []const u32, slot: u32) usize`
+//! - `pub fn stackedPos(src_col_ptr: []const u32, slot: u32) [4]usize`
+//! - `pub fn addDense(n: usize, nn: usize, a: []f64, row: usize, col: usize, re: f64, im: f64) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,12 +62,11 @@ const ComplexLaneLu = @import("lane/clu.zig").ComplexLaneLu;
 const order_mod = @import("order.zig");
 const SparseLu = @import("sparse_lu.zig").SparseLu;
 const num = @import("core").numerics;
-
 const Allocator = std.mem.Allocator;
-
-// Dense only wins for tiny systems. medium/ladder_filter (n = 41) spent 90%
-// of its run in dense 82^3/3 factors per omega; the sparse refactor is O(nnz).
-const dense_threshold: u32 = 16;
+const freq_batch = @import("freq_batch.zig");
+const freq_held = @import("freq_held.zig");
+const freq_fill = @import("freq_fill.zig");
+const testing = std.testing;
 
 /// The part of A(ω) beyond G + jωC over the ω of one `solveBatch` call:
 /// entry e adds re + j·im at source CSC slot `slots[e]`, its term at
@@ -35,7 +78,7 @@ pub const Dyn = struct {
     im: []const f64 = &.{},
 
     /// Entry e's term at ω index k.
-    fn at(self: Dyn, e: usize, k: usize) struct { re: f64, im: f64 } {
+    pub fn at(self: Dyn, e: usize, k: usize) struct { re: f64, im: f64 } {
         assert(e < self.slots.len);
         assert(k < self.re.len / self.slots.len);
         const i = e * (self.re.len / self.slots.len) + k;
@@ -43,13 +86,19 @@ pub const Dyn = struct {
     }
 };
 
+/// The stacked-real lane source of A(ω) (`freq_fill.zig`).
+pub const Stacked = freq_fill.Stacked;
+
+/// The complex n x n lane source of A(ω) (`freq_fill.zig`).
+pub const ComplexFill = freq_fill.ComplexFill;
+
+/// The per-point lane source of A(ω) (`freq_fill.zig`).
+pub const StackedPoints = freq_fill.StackedPoints;
+
 /// Frequency-domain solver. Solution and right-hand side
 /// vectors are length 2n: real parts, then imaginary parts.
 pub const FreqSolver = struct {
     const Self = @This();
-    /// Frequencies per LaneLu pass; `solveBatch` groups its ω from the
-    /// first in runs of W.
-    pub const W = std.simd.suggestVectorLength(f64) orelse 1;
 
     /// Every allocation the solver owns or makes later (`factorEach`,
     /// `deinit`) uses this, the allocator it was built with (#13).
@@ -76,15 +125,14 @@ pub const FreqSolver = struct {
     /// default: a device provider reads stacked held tapes (`heldTape`).
     complex_held: bool = false,
 
-    const Strategy = union(enum) {
-        dense: Dense,
-        sp: Sparse,
-    };
+    /// Frequencies per LaneLu pass; `solveBatch` groups its ω from the
+    /// first in runs of W.
+    pub const W = std.simd.suggestVectorLength(f64) orelse 1;
 
     /// n <= dense_threshold: owned n x n row-major G and C, assembled per
     /// frequency into the reused 2n x 2n LU slab. The borrowed source
     /// pattern places `Dyn` entries; empty from `initDense`.
-    const Dense = struct {
+    pub const Dense = struct {
         src_col_ptr: []const u32 = &.{},
         src_row_idx: []const u32 = &.{},
         g_dense: []f64,
@@ -98,7 +146,7 @@ pub const FreqSolver = struct {
 
     /// Owns the 2n stacked-real CSC, its solver and a snapshot of the
     /// circuit's G and C planes; borrows only the frozen source pattern.
-    const Sparse = struct {
+    pub const Sparse = struct {
         g_vals: []f64,
         c_vals: []f64,
         src_col_ptr: []const u32,
@@ -133,7 +181,7 @@ pub const FreqSolver = struct {
     /// centre is the pivot tape, and `ComplexLaneLu` replays W frequencies
     /// of A(ω) on it with its own growth test. A lane that fails takes the
     /// stacked-real scalar path and the next chunk lays a fresh tape.
-    const Complex = struct {
+    pub const Complex = struct {
         q: []u32,
         proxy: []f64,
         lu: SparseLu,
@@ -143,7 +191,9 @@ pub const FreqSolver = struct {
         /// b re, b im, x re, x im: n lanes each.
         work: []@Vector(W, f64),
 
-        fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) !?Complex {
+        /// Orders the source pattern and lays the proxy tape; null when the
+        /// ordering's fill cap refuses it. Free with `deinit`.
+        pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) !?Complex {
             const q = try gpa.alloc(u32, n);
             errdefer gpa.free(q);
             {
@@ -166,7 +216,8 @@ pub const FreqSolver = struct {
             return .{ .q = q, .proxy = proxy, .lu = lu, .work = work };
         }
 
-        fn deinit(self: *Complex, gpa: Allocator) void {
+        /// Frees the tape, the lanes and the work planes.
+        pub fn deinit(self: *Complex, gpa: Allocator) void {
             if (self.lanes) |*l| l.deinit(gpa);
             self.lu.deinit(gpa);
             gpa.free(self.q);
@@ -236,6 +287,224 @@ pub const FreqSolver = struct {
         return initSparse(allocator, n, ckt);
     }
 
+    /// Dense solver over row-major n x n `g` and `c`, allocated with
+    /// `allocator`; takes ownership of both, also on error. Asserts that `g`
+    /// and `c` are n x n.
+    pub fn initDense(allocator: Allocator, n: u32, g: []f64, c: []f64) !Self {
+        assert(g.len == @as(usize, n) * n);
+        assert(c.len == g.len);
+        errdefer allocator.free(g);
+        errdefer allocator.free(c);
+        const nn: u32 = 2 * n;
+        const nnu: usize = nn;
+        const a_lu = try allocator.alloc(f64, nnu * nnu);
+        errdefer allocator.free(a_lu);
+        const piv = try allocator.alloc(u32, nnu);
+
+        return .{
+            .gpa = allocator,
+            .n = n,
+            .nn = nn,
+            .strategy = .{ .dense = .{
+                .g_dense = g,
+                .c_mat = c,
+                .a_lu = a_lu,
+                .piv = piv,
+            } },
+        };
+    }
+
+    /// Frees everything the solver owns.
+    pub fn deinit(self: *Self) void {
+        const allocator = self.gpa;
+        self.held_id.deinit(allocator);
+        switch (self.strategy) {
+            .dense => |*d| {
+                allocator.free(d.held);
+                allocator.free(d.held_piv);
+                allocator.free(d.g_dense);
+                allocator.free(d.c_mat);
+                allocator.free(d.a_lu);
+                allocator.free(d.piv);
+            },
+            .sp => |*s| {
+                freq_held.freeHeld(allocator, s);
+                freq_held.freeComplexHeld(allocator, s);
+                if (s.cx) |*c| c.deinit(allocator);
+                if (s.lanes) |*l| l.deinit(allocator);
+                allocator.free(s.lane_work);
+                allocator.free(s.dyn_ptr);
+                allocator.free(s.dyn_ent);
+                s.slv.deinit();
+                allocator.free(s.col_ptr);
+                allocator.free(s.row_idx);
+                allocator.free(s.vals);
+                allocator.free(s.g_vals);
+                allocator.free(s.c_vals);
+            },
+        }
+    }
+
+    /// Factors A(ω) = G + jωC and solves one stacked right-hand side; `rhs`
+    /// and `x_out` are 2n long and may alias. Fails with `error.Singular`
+    /// (dense) or `error.SingularMatrix` (sparse) on a singular A(ω), or
+    /// `OutOfMemory`, leaving `x_out` untouched and no usable factor. Asserts
+    /// that both slices hold 2n entries.
+    pub fn solve(self: *Self, omega: f64, rhs: []const f64, x_out: []f64) !void {
+        assert(rhs.len >= self.nn);
+        assert(x_out.len >= self.nn);
+        try self.setOmega(omega);
+        self.solveRhs(rhs, x_out);
+    }
+
+    /// `setOmega` plus `dyn`'s terms at ω index `k`.
+    pub fn setOmegaDyn(self: *Self, omega: f64, dyn: Dyn, k: usize) !void {
+        self.held_location = .invalid;
+        if (dyn.slots.len != 0) assert(k < dyn.re.len / dyn.slots.len);
+        switch (self.strategy) {
+            .dense => |*d| try freq_fill.setOmegaDense(self.n, self.nn, d, omega, dyn, k),
+            .sp => |*s| try freq_fill.setOmegaSparse(self.n, s, omega, dyn, k),
+        }
+    }
+
+    // Solves with the current factorization, which `setOmega` must have
+    // left; both slices are 2n long and may alias.
+    /// Solves A(ω) x = rhs for the ω the last `setOmega` filled.
+    pub fn solveRhs(self: *Self, rhs: []const f64, x_out: []f64) void {
+        self.held_location = .invalid;
+        switch (self.strategy) {
+            .dense => |*d| dense_lu.solveFactored(self.nn, d.a_lu, d.piv, rhs, x_out),
+            .sp => |*s| s.slv.solve(rhs, x_out),
+        }
+    }
+
+    // Adjoint solve with the current factorization: the transpose of the
+    // stacked-real system, which as a complex system is A^H x = rhs
+    // (A = G + jωC, so A^H = G^T − jωC^T). A caller that needs A^T's
+    // solution conjugates this one; |x| is the same either way.
+    /// Solves A(ω)^T x = rhs for the ω the last `setOmega` filled.
+    pub fn solveRhsT(self: *Self, rhs: []const f64, x_out: []f64) void {
+        self.held_location = .invalid;
+        switch (self.strategy) {
+            .dense => |*d| dense_lu.solveFactoredT(self.nn, d.a_lu, d.piv, rhs, x_out),
+            .sp => |*s| s.slv.solveT(rhs, x_out),
+        }
+    }
+
+    /// Adds `v` to entry (i, i) of the solver's copy of G; the circuit is
+    /// untouched. Call it before the first solve: a factorization already
+    /// held does not see it. Asserts that `i < n`.
+    pub fn addDiagG(self: *Self, i: u32, v: f64) void {
+        self.held_location = .invalid;
+        assert(i < self.n);
+        switch (self.strategy) {
+            .dense => |*d| d.g_dense[@as(usize, i) * self.n + i] += v,
+            .sp => |*s| {
+                // Stacked column i opens with source column i's rows.
+                const cs = s.src_col_ptr[i];
+                const rows = s.row_idx[s.col_ptr[i]..][0 .. s.src_col_ptr[i + 1] - cs];
+                // Circuit.freeze guarantees every diagonal is in the pattern.
+                s.g_vals[cs + std.mem.indexOfScalar(u32, rows, i).?] += v;
+            },
+        }
+    }
+
+    /// See `freq_batch.solveBatch`.
+    pub const solveBatch = freq_batch.solveBatch;
+
+    /// See `freq_batch.ComplexChunk`.
+    pub const ComplexChunk = freq_batch.ComplexChunk;
+
+    /// See `freq_batch.beginComplexChunk`.
+    pub const beginComplexChunk = freq_batch.beginComplexChunk;
+
+    /// See `freq_batch.finishComplexChunk`.
+    pub const finishComplexChunk = freq_batch.finishComplexChunk;
+
+    /// See `freq_batch.LaneChunk`.
+    pub const LaneChunk = freq_batch.LaneChunk;
+
+    /// See `freq_batch.beginLaneChunk`.
+    pub const beginLaneChunk = freq_batch.beginLaneChunk;
+
+    /// See `freq_batch.finishLaneChunk`.
+    pub const finishLaneChunk = freq_batch.finishLaneChunk;
+
+    /// See `freq_held.heldTape`.
+    pub const heldTape = freq_held.heldTape;
+
+    /// See `freq_held.beginHeldTape`.
+    pub const beginHeldTape = freq_held.beginHeldTape;
+
+    /// See `freq_held.finishHeldTape`.
+    pub const finishHeldTape = freq_held.finishHeldTape;
+
+    /// See `freq_held.replayCurrentHeld`.
+    pub const replayCurrentHeld = freq_held.replayCurrentHeld;
+
+    /// See `freq_held.completeHeldPolicy`.
+    pub const completeHeldPolicy = freq_held.completeHeldPolicy;
+
+    /// See `freq_held.ensureHeldOnHost`.
+    pub const ensureHeldOnHost = freq_held.ensureHeldOnHost;
+
+    /// See `freq_held.packHeld`.
+    pub const packHeld = freq_held.packHeld;
+
+    /// Replaces the solver's G and C with `g` and `c`, indexed by CSC slot
+    /// of the source pattern (a circuit's `g_vals`/`c_vals` layout). The
+    /// dense strategy places them through the pattern `fromCircuit`
+    /// borrowed. Asserts that the solver has that pattern (not
+    /// `initDense`'s) and that `g` and `c` cover it.
+    pub fn setPlanes(self: *Self, g: []const f64, c: []const f64) void {
+        self.held_location = .invalid;
+        assert(g.len == c.len);
+        switch (self.strategy) {
+            .dense => |*d| {
+                const n: usize = self.n;
+                assert(d.src_col_ptr.len == n + 1);
+                assert(g.len >= d.src_col_ptr[n]);
+                @memset(d.g_dense, 0);
+                @memset(d.c_mat, 0);
+                for (0..n) |j| for (d.src_col_ptr[j]..d.src_col_ptr[j + 1]) |p| {
+                    const at = @as(usize, d.src_row_idx[p]) * n + j;
+                    d.g_dense[at] += g[p];
+                    d.c_mat[at] += c[p];
+                };
+            },
+            .sp => |*s| {
+                assert(g.len >= s.g_vals.len);
+                @memcpy(s.g_vals, g[0..s.g_vals.len]);
+                @memcpy(s.c_vals, c[0..s.c_vals.len]);
+            },
+        }
+    }
+
+    /// See `freq_held.factorEach`.
+    pub const factorEach = freq_held.factorEach;
+
+    /// See `freq_held.solveEach`.
+    pub const solveEach = freq_held.solveEach;
+
+    /// Private kernels and types for tests.zig; void outside test builds.
+    pub const test_access = if (@import("builtin").is_test) .{
+        .W = W,
+        .setOmega = setOmega,
+        .solveRhs = solveRhs,
+        .solveRhsT = solveRhsT,
+        .solveBatchSerial = freq_batch.solveBatchSerial,
+        .setOmegaSparse = freq_fill.setOmegaSparse,
+        .indexDyn = freq_fill.indexDyn,
+        .Sparse = Sparse,
+    } else {};
+
+    // ---- private ----
+
+    const Strategy = union(enum) {
+        dense: Dense,
+        sp: Sparse,
+    };
+
     fn initSparse(allocator: Allocator, n: u32, ckt: anytype) !Self {
         const nn: u32 = 2 * n;
         const src_nnz: usize = ckt.nnz;
@@ -289,76 +558,6 @@ pub const FreqSolver = struct {
         };
     }
 
-    /// Dense solver over row-major n x n `g` and `c`, allocated with
-    /// `allocator`; takes ownership of both, also on error. Asserts that `g`
-    /// and `c` are n x n.
-    pub fn initDense(allocator: Allocator, n: u32, g: []f64, c: []f64) !Self {
-        assert(g.len == @as(usize, n) * n);
-        assert(c.len == g.len);
-        errdefer allocator.free(g);
-        errdefer allocator.free(c);
-        const nn: u32 = 2 * n;
-        const nnu: usize = nn;
-        const a_lu = try allocator.alloc(f64, nnu * nnu);
-        errdefer allocator.free(a_lu);
-        const piv = try allocator.alloc(u32, nnu);
-
-        return .{
-            .gpa = allocator,
-            .n = n,
-            .nn = nn,
-            .strategy = .{ .dense = .{
-                .g_dense = g,
-                .c_mat = c,
-                .a_lu = a_lu,
-                .piv = piv,
-            } },
-        };
-    }
-
-    /// Frees everything the solver owns.
-    pub fn deinit(self: *Self) void {
-        const allocator = self.gpa;
-        self.held_id.deinit(allocator);
-        switch (self.strategy) {
-            .dense => |*d| {
-                allocator.free(d.held);
-                allocator.free(d.held_piv);
-                allocator.free(d.g_dense);
-                allocator.free(d.c_mat);
-                allocator.free(d.a_lu);
-                allocator.free(d.piv);
-            },
-            .sp => |*s| {
-                freeHeld(allocator, s);
-                freeComplexHeld(allocator, s);
-                if (s.cx) |*c| c.deinit(allocator);
-                if (s.lanes) |*l| l.deinit(allocator);
-                allocator.free(s.lane_work);
-                allocator.free(s.dyn_ptr);
-                allocator.free(s.dyn_ent);
-                s.slv.deinit();
-                allocator.free(s.col_ptr);
-                allocator.free(s.row_idx);
-                allocator.free(s.vals);
-                allocator.free(s.g_vals);
-                allocator.free(s.c_vals);
-            },
-        }
-    }
-
-    /// Factors A(ω) = G + jωC and solves one stacked right-hand side; `rhs`
-    /// and `x_out` are 2n long and may alias. Fails with `error.Singular`
-    /// (dense) or `error.SingularMatrix` (sparse) on a singular A(ω), or
-    /// `OutOfMemory`, leaving `x_out` untouched and no usable factor. Asserts
-    /// that both slices hold 2n entries.
-    pub fn solve(self: *Self, omega: f64, rhs: []const f64, x_out: []f64) !void {
-        assert(rhs.len >= self.nn);
-        assert(x_out.len >= self.nn);
-        try self.setOmega(omega);
-        self.solveRhs(rhs, x_out);
-    }
-
     // Assembles and factors G + jωC. Right-hand sides at this ω then
     // need only `solveRhs`/`solveRhsT`. Fails with `error.Singular`
     // (dense) or `error.SingularMatrix` (sparse) on a singular A(ω), after
@@ -366,1211 +565,42 @@ pub const FreqSolver = struct {
     fn setOmega(self: *Self, omega: f64) !void {
         try self.setOmegaDyn(omega, .{}, 0);
     }
-
-    /// `setOmega` plus `dyn`'s terms at ω index `k`.
-    fn setOmegaDyn(self: *Self, omega: f64, dyn: Dyn, k: usize) !void {
-        self.held_location = .invalid;
-        if (dyn.slots.len != 0) assert(k < dyn.re.len / dyn.slots.len);
-        switch (self.strategy) {
-            .dense => |*d| try setOmegaDense(self.n, self.nn, d, omega, dyn, k),
-            .sp => |*s| try setOmegaSparse(self.n, s, omega, dyn, k),
-        }
-    }
-
-    // Solves with the current factorization, which `setOmega` must have
-    // left; both slices are 2n long and may alias.
-    fn solveRhs(self: *Self, rhs: []const f64, x_out: []f64) void {
-        self.held_location = .invalid;
-        switch (self.strategy) {
-            .dense => |*d| dense_lu.solveFactored(self.nn, d.a_lu, d.piv, rhs, x_out),
-            .sp => |*s| s.slv.solve(rhs, x_out),
-        }
-    }
-
-    // Adjoint solve with the current factorization: the transpose of the
-    // stacked-real system, which as a complex system is A^H x = rhs
-    // (A = G + jωC, so A^H = G^T − jωC^T). A caller that needs A^T's
-    // solution conjugates this one; |x| is the same either way.
-    fn solveRhsT(self: *Self, rhs: []const f64, x_out: []f64) void {
-        self.held_location = .invalid;
-        switch (self.strategy) {
-            .dense => |*d| dense_lu.solveFactoredT(self.nn, d.a_lu, d.piv, rhs, x_out),
-            .sp => |*s| s.slv.solveT(rhs, x_out),
-        }
-    }
-
-    /// Adds `v` to entry (i, i) of the solver's copy of G; the circuit is
-    /// untouched. Call it before the first solve: a factorization already
-    /// held does not see it. Asserts that `i < n`.
-    pub fn addDiagG(self: *Self, i: u32, v: f64) void {
-        self.held_location = .invalid;
-        assert(i < self.n);
-        switch (self.strategy) {
-            .dense => |*d| d.g_dense[@as(usize, i) * self.n + i] += v,
-            .sp => |*s| {
-                // Stacked column i opens with source column i's rows.
-                const cs = s.src_col_ptr[i];
-                const rows = s.row_idx[s.col_ptr[i]..][0 .. s.src_col_ptr[i + 1] - cs];
-                // Circuit.freeze guarantees every diagonal is in the pattern.
-                s.g_vals[cs + std.mem.indexOfScalar(u32, rows, i).?] += v;
-            },
-        }
-    }
-
-    /// Solves every ω in `omegas` against each right-hand side in `rhs`
-    /// (nr stacked 2n vectors), with `dyn`'s terms added to each A(ω), W
-    /// frequencies per LaneLu pass;
-    /// `x_out[(k*nr + r)*2n..][0..2n]` receives ω_k for rhs r, so one
-    /// factorization serves every rhs. `adjoint` solves the transpose of the
-    /// stacked-real system, A^H = G^T − jωC^T, not A^T: conjugate the
-    /// solution for A^T's (|x| is the same either way). The dense
-    /// strategy, a non-LU engine and any lane whose refactor fails take the
-    /// per-ω scalar path. The scalar factorization afterwards holds some ω
-    /// of the batch. Allocates the lane planes on first use. Fails with
-    /// `error.Singular` or `error.SingularMatrix` when an ω the scalar path
-    /// takes is singular, with some ω's rows of `x_out` already written.
-    /// Asserts that `rhs` is a positive multiple of 2n long, that `x_out`
-    /// holds `omegas.len` times that, and that `dyn` has one term per entry
-    /// per ω.
-    pub fn solveBatch(self: *Self, omegas: []const f64, dyn: Dyn, rhs: []const f64, x_out: []f64, adjoint: bool) !void {
-        self.held_location = .invalid;
-        const nn: usize = self.nn;
-        const m = rhs.len;
-        assert(m > 0);
-        assert(m % nn == 0);
-        assert(x_out.len == omegas.len * m);
-        if (omegas.len == 0) return;
-        assert(dyn.re.len == dyn.slots.len * omegas.len);
-        assert(dyn.im.len == dyn.re.len);
-        const sp: *Sparse = switch (self.strategy) {
-            .sp => |*s| s,
-            .dense => return self.solveBatchSerial(omegas, dyn, 0, omegas.len, rhs, x_out, adjoint),
-        };
-
-        const gpa = sp.slv.gpa;
-        const LL = lane_lu.LaneLu(W);
-        try indexDyn(gpa, sp, dyn);
-        var base: usize = if (self.complex_lanes) try self.complexBatch(sp, omegas, dyn, rhs, x_out, adjoint) else 0;
-        if (base == omegas.len) return;
-        try ensureLaneWork(gpa, sp, nn);
-        const b_plane = sp.lane_work[0..nn];
-        const x_plane = sp.lane_work[nn..];
-
-        while (base < omegas.len) : (base += W) {
-            const cnt = @min(W, omegas.len - base);
-            const omega_vec: @Vector(W, f64) = chunkOmegas(omegas, base, cnt);
-
-            // The lanes replay the current pivot sequence; only the first
-            // chunk, or one after a failed factor, pays a scalar factor.
-            // A lane whose pivots decay fails the scalar growth monitor,
-            // and its serial full factor repivots for the next chunk.
-            // A singular centre point falls back to the serial path; an
-            // allocation failure is the caller's, not a numerical one (#83).
-            const lu = (try self.chunkTape(sp, omegas, dyn, base, cnt, rhs, x_out, adjoint)) orelse continue;
-
-            // A full factor can change the L/U lengths; rebuild then.
-            if (sp.lanes) |*l| {
-                if (l.lx.len != lu.lx.items.len or l.ux.len != lu.ux.items.len) {
-                    l.deinit(gpa);
-                    sp.lanes = null;
-                }
-            }
-            if (sp.lanes == null) sp.lanes = try LL.init(gpa, lu);
-            sp.lanes.?.base = lu;
-
-            const src = Stacked(W).of(sp, omega_vec, dyn, base, cnt);
-            const bad = sp.lanes.?.refactor(src, sp.slv.params.refactor_growth_limit);
-
-            var r: usize = 0;
-            while (r < m) : (r += nn) {
-                for (rhs[r..][0..nn], b_plane) |value, *lane| lane.* = @splat(value);
-                if (adjoint) sp.lanes.?.solveT(b_plane, x_plane) else sp.lanes.?.solve(b_plane, x_plane);
-                for (0..cnt) |l| {
-                    if ((bad >> @intCast(l)) & 1 != 0) continue;
-                    const dst = x_out[(base + l) * m + r ..][0..nn];
-                    for (0..nn) |i| {
-                        const row: [W]f64 = x_plane[i];
-                        dst[i] = row[l];
-                    }
-                }
-            }
-            // After every lane solve: a failed lane's full factor may
-            // repivot the tape the lanes replay.
-            try self.chunkPeel(omegas, dyn, base, cnt, bad, rhs, x_out, adjoint);
-        }
-    }
-
-    /// `solveBatch` on the complex lanes, chunk by chunk from the first ω.
-    /// Returns where the stacked lanes take over: `omegas.len` when every
-    /// chunk is solved, earlier once the proxy tape fails at its own ω,
-    /// which turns the complex lanes off for good (`complex_lanes`).
-    fn complexBatch(self: *Self, sp: *Sparse, omegas: []const f64, dyn: Dyn, rhs: []const f64, x_out: []f64, adjoint: bool) !usize {
-        const gpa = sp.slv.gpa;
-        const n: usize = self.n;
-        const nn: usize = self.nn;
-        const m = rhs.len;
-        if (!try self.ensureComplex(gpa, sp)) {
-            self.complex_lanes = false;
-            return 0;
-        }
-        const cx = &sp.cx.?;
-        const br = cx.work[0..n];
-        const bi = cx.work[n..][0..n];
-        const xr = cx.work[2 * n ..][0..n];
-        const xi = cx.work[3 * n ..][0..n];
-        var base: usize = 0;
-        while (base < omegas.len) : (base += W) {
-            const cnt = @min(W, omegas.len - base);
-            const fresh = (try self.complexChunkTape(sp, omegas, dyn, base, cnt, rhs, x_out, adjoint)) orelse continue;
-            if (cx.lanes) |*l| if (!l.fits()) {
-                l.deinit(gpa);
-                cx.lanes = null;
-            };
-            if (cx.lanes == null) cx.lanes = try ComplexLaneLu(W).init(gpa, &cx.lu);
-            const lanes = &cx.lanes.?;
-            const bad = lanes.refactor(ComplexFill(W).of(sp, chunkOmegas(omegas, base, cnt), dyn, base, cnt), sp.slv.params.refactor_growth_limit);
-            if (self.complexOwnFailure(fresh, cnt, bad)) return base;
-            var r: usize = 0;
-            while (r < m) : (r += nn) {
-                for (rhs[r..][0..n], rhs[r + n ..][0..n], br, bi) |a, b, *va, *vb| {
-                    va.* = @splat(a);
-                    vb.* = @splat(b);
-                }
-                if (adjoint) lanes.solveH(br, bi, xr, xi) else lanes.solve(br, bi, xr, xi);
-                for (xr, xi, 0..) |vr, vi, i| {
-                    const ar: [W]f64 = vr;
-                    const ai: [W]f64 = vi;
-                    for (0..cnt) |l| {
-                        if ((bad >> @intCast(l)) & 1 != 0) continue;
-                        const dst = x_out[(base + l) * m + r ..][0..nn];
-                        dst[i] = ar[l];
-                        dst[n + i] = ai[l];
-                    }
-                }
-            }
-            try self.complexChunkPeel(omegas, dyn, base, cnt, bad, rhs, x_out, adjoint);
-        }
-        return omegas.len;
-    }
-
-    /// `complexBatch`'s chunk head: lays the proxy tape at the chunk's
-    /// centre ω when none is current. Returns whether it is fresh, or null
-    /// when the proxy is singular and the chunk took the serial path, its
-    /// rows of `x_out` written. Asserts that `sp.cx` exists.
-    fn complexChunkTape(self: *Self, sp: *Sparse, omegas: []const f64, dyn: Dyn, base: usize, cnt: usize, rhs: []const f64, x_out: []f64, adjoint: bool) !?bool {
-        const cx = &sp.cx.?;
-        if (cx.tape) return false;
-        // The tape: a real factor of the moduli at the centre ω.
-        const centre = base + cnt / 2;
-        const g = sp.g_vals;
-        const c = sp.c_vals;
-        for (cx.proxy, g, c) |*v, gv, cv| v.* = std.math.hypot(gv, omegas[centre] * cv);
-        if (dyn.slots.len != 0) {
-            // Add dyn as complex terms, then take the modulus again.
-            for (dyn.slots, 0..) |slot, e| if (slot < g.len) {
-                const t = dyn.at(e, centre);
-                cx.proxy[slot] = std.math.hypot(g[slot] + t.re, omegas[centre] * c[slot] + t.im);
-            };
-        }
-        cx.lu.factor(sp.slv.gpa, sp.src_col_ptr, sp.src_row_idx, cx.proxy, direct.pivot_tol) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            error.SingularMatrix => {
-                try self.solveBatchSerial(omegas, dyn, base, cnt, rhs, x_out, adjoint);
-                return null;
-            },
-        };
-        cx.tape = true;
-        return true;
-    }
-
-    /// True when a fresh tape's lanes fail at its own centre ω: a matrix
-    /// whose pivoting the moduli do not predict. The complex lanes turn off
-    /// for good and the stacked lanes redo the chunk from `base`.
-    fn complexOwnFailure(self: *Self, fresh: bool, cnt: usize, bad: u64) bool {
-        if (!fresh or (bad >> @intCast(cnt / 2)) & 1 == 0) return false;
-        self.strategy.sp.cx.?.tape = false;
-        self.complex_lanes = false;
-        return true;
-    }
-
-    /// `complexBatch`'s chunk tail: the lanes `bad` marks solve on the
-    /// serial path in lane order, and the next chunk lays a fresh tape.
-    fn complexChunkPeel(self: *Self, omegas: []const f64, dyn: Dyn, base: usize, cnt: usize, bad: u64, rhs: []const f64, x_out: []f64, adjoint: bool) !void {
-        if (bad == 0) return;
-        self.strategy.sp.cx.?.tape = false;
-        try self.chunkPeel(omegas, dyn, base, cnt, bad, rhs, x_out, adjoint);
-    }
-
-    /// Borrowed inputs to a complex frequency lane replay (`ComplexLaneLu`
-    /// on the n x n proxy tape): valid until the next factor or peel on
-    /// this solver.
-    pub const ComplexChunk = struct {
-        lu: *const SparseLu,
-        src_col_ptr: []const u32,
-        g: []const f64,
-        c: []const f64,
-        growth: f64,
-        /// The chunk laid this tape (`finishComplexChunk` needs it).
-        fresh: bool,
-
-        /// Equal layouts and pivot operations.
-        pub fn sameTape(a: ComplexChunk, b: ComplexChunk) bool {
-            const x = a.lu;
-            const y = b.lu;
-            return a.growth == b.growth and
-                std.mem.eql(u32, a.src_col_ptr, b.src_col_ptr) and
-                std.mem.eql(u32, x.prow, y.prow) and
-                std.mem.eql(u32, x.q, y.q) and std.mem.eql(u32, x.pinv, y.pinv) and
-                std.mem.eql(u32, x.lp, y.lp) and std.mem.eql(u32, x.li.items, y.li.items) and
-                std.mem.eql(u32, x.up, y.up) and std.mem.eql(u32, x.ui.items, y.ui.items) and
-                std.mem.eql(bool, x.scaled_pivot, y.scaled_pivot);
-        }
-    };
-
-    /// Starts one `complexBatch` chunk without `Dyn` terms for a device
-    /// provider: the same tape decisions as the host's complex lanes, so a
-    /// replay that matches `ComplexLaneLu`'s arithmetic is bitwise the
-    /// host's. Null when the chunk is not the complex lanes': it was solved
-    /// serially (a singular proxy) when `complex_lanes` is still set, else
-    /// the complex lanes are off and the caller takes `beginLaneChunk`.
-    /// Asserts that `complex_lanes` is set. The caller solves every lane,
-    /// then calls `finishComplexChunk` before this point's next chunk.
-    pub fn beginComplexChunk(self: *Self, omegas: []const f64, base: usize, cnt: usize, rhs: []const f64, x_out: []f64, adjoint: bool) !?ComplexChunk {
-        self.held_location = .invalid;
-        assert(self.complex_lanes);
-        assert(cnt > 0 and cnt <= W and base + cnt <= omegas.len);
-        assert(rhs.len > 0 and rhs.len % self.nn == 0);
-        assert(x_out.len == omegas.len * rhs.len);
-        const sp = switch (self.strategy) {
-            .sp => |*s| s,
-            .dense => {
-                self.complex_lanes = false;
-                return null;
-            },
-        };
-        if (!try self.ensureComplex(sp.slv.gpa, sp)) {
-            self.complex_lanes = false;
-            return null;
-        }
-        const fresh = (try self.complexChunkTape(sp, omegas, .{}, base, cnt, rhs, x_out, adjoint)) orelse return null;
-        const lu = &sp.cx.?.lu;
-        // The host lanes fail every lane on a fabricated pivot, the
-        // centre's included, and only a fresh tape can carry one.
-        if (std.mem.indexOfScalar(bool, lu.void_col, true) != null) {
-            assert(fresh);
-            const off = self.complexOwnFailure(fresh, cnt, std.math.maxInt(u64));
-            assert(off);
-            return null;
-        }
-        return .{ .lu = lu, .src_col_ptr = sp.src_col_ptr, .g = sp.g_vals, .c = sp.c_vals, .growth = sp.slv.params.refactor_growth_limit, .fresh = fresh };
-    }
-
-    /// Ends a device provider's complex chunk as `complexBatch` does.
-    /// False when the fresh tape failed at its own centre ω: the complex
-    /// lanes are off and the chunk's rows are void; the caller redoes it
-    /// from `base` with `beginLaneChunk`. Else the failed lanes peel.
-    pub fn finishComplexChunk(self: *Self, omegas: []const f64, base: usize, cnt: usize, bad: u64, fresh: bool, rhs: []const f64, x_out: []f64, adjoint: bool) !bool {
-        assert(cnt > 0 and cnt <= W and base + cnt <= omegas.len);
-        if (self.complexOwnFailure(fresh, cnt, bad)) return false;
-        try self.complexChunkPeel(omegas, .{}, base, cnt, bad, rhs, x_out, adjoint);
-        return true;
-    }
-
-    /// `solveBatch`'s chunk head: the pivot tape lanes `[base, base + cnt)`
-    /// replay, laid by a scalar factor at the chunk's centre ω when none is
-    /// current. Null when the chunk took the serial path instead (a
-    /// singular centre or a non-LU engine), its rows of `x_out` written. An
-    /// allocation failure is the caller's, not a numerical one (#83). The
-    /// GPU lane backend runs it per point per round.
-    fn chunkTape(self: *Self, sp: *Sparse, omegas: []const f64, dyn: Dyn, base: usize, cnt: usize, rhs: []const f64, x_out: []f64, adjoint: bool) !?*SparseLu {
-        const centre = base + cnt / 2;
-        if (!sp.slv.factored) setOmegaSparse(self.n, sp, omegas[centre], dyn, centre) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => { // else: a numerical factor failure takes the serial path
-                try self.solveBatchSerial(omegas, dyn, base, cnt, rhs, x_out, adjoint);
-                return null;
-            },
-        };
-        // LaneLu replays SparseLu only, not the tridiagonal engine.
-        return sp.slv.sparse() orelse {
-            try self.solveBatchSerial(omegas, dyn, base, cnt, rhs, x_out, adjoint);
-            return null;
-        };
-    }
-
-    /// `solveBatch`'s chunk tail: each lane `bad` marks solves on the serial
-    /// path, in lane order, after every lane solve: a failed lane's full
-    /// factor may repivot the tape the next chunk replays.
-    fn chunkPeel(self: *Self, omegas: []const f64, dyn: Dyn, base: usize, cnt: usize, bad: u64, rhs: []const f64, x_out: []f64, adjoint: bool) !void {
-        for (0..cnt) |l| if ((bad >> @intCast(l)) & 1 != 0)
-            try self.solveBatchSerial(omegas, dyn, base + l, 1, rhs, x_out, adjoint);
-    }
-
-    /// Borrowed inputs to a frequency lane replay. Valid until the next
-    /// factor/peel on this solver. Device providers retain one solver per
-    /// point, so grouping equal tapes never changes a point's pivot history.
-    pub const LaneChunk = struct {
-        lu: *const SparseLu,
-        src_col_ptr: []const u32,
-        col_ptr: []const u32,
-        row_idx: []const u32,
-        g: []const f64,
-        c: []const f64,
-        growth: f64,
-
-        /// Equal layouts and pivot operations, including fabricated pivots.
-        pub fn sameTape(a: LaneChunk, b: LaneChunk) bool {
-            const x = a.lu;
-            const y = b.lu;
-            return a.growth == b.growth and
-                std.mem.eql(u32, a.col_ptr, b.col_ptr) and
-                std.mem.eql(u32, a.row_idx, b.row_idx) and
-                std.mem.eql(u32, a.src_col_ptr, b.src_col_ptr) and
-                std.mem.eql(u32, x.q, y.q) and std.mem.eql(u32, x.pinv, y.pinv) and
-                std.mem.eql(u32, x.lp, y.lp) and std.mem.eql(u32, x.li.items, y.li.items) and
-                std.mem.eql(u32, x.up, y.up) and std.mem.eql(u32, x.ui.items, y.ui.items) and
-                std.mem.eql(bool, x.void_col, y.void_col) and
-                std.mem.eql(bool, x.scaled_pivot, y.scaled_pivot) and
-                std.mem.eql(u32, x.void_slots.items, y.void_slots.items);
-        }
-    };
-
-    /// Starts exactly one `solveBatch` chunk without frequency-dependent
-    /// `Dyn` terms. Null means the CPU already solved it (dense strategy,
-    /// unsupported replay engine, or singular centre). The caller solves
-    /// every returned lane, then calls `finishLaneChunk` before starting
-    /// this point's next chunk. The view must not outlive that call.
-    pub fn beginLaneChunk(self: *Self, omegas: []const f64, base: usize, cnt: usize, rhs: []const f64, x_out: []f64, adjoint: bool) !?LaneChunk {
-        self.held_location = .invalid;
-        assert(cnt > 0 and cnt <= W and base + cnt <= omegas.len);
-        assert(rhs.len > 0 and rhs.len % self.nn == 0);
-        assert(x_out.len == omegas.len * rhs.len);
-        const sp = switch (self.strategy) {
-            .sp => |*s| s,
-            .dense => {
-                try self.solveBatchSerial(omegas, .{}, base, cnt, rhs, x_out, adjoint);
-                return null;
-            },
-        };
-        const lu = (try self.chunkTape(sp, omegas, .{}, base, cnt, rhs, x_out, adjoint)) orelse return null;
-        // LaneLu peels every fabricated pivot; the device must make the
-        // same per-point decision before it groups tapes.
-        if (std.mem.indexOfScalar(bool, lu.void_col, true) != null) {
-            try self.solveBatchSerial(omegas, .{}, base, cnt, rhs, x_out, adjoint);
-            return null;
-        }
-        return laneChunk(sp, lu);
-    }
-
-    fn laneChunk(sp: *const Sparse, lu: *const SparseLu) LaneChunk {
-        return .{
-            .lu = lu,
-            .src_col_ptr = sp.src_col_ptr,
-            .col_ptr = sp.col_ptr,
-            .row_idx = sp.row_idx,
-            .g = sp.g_vals,
-            .c = sp.c_vals,
-            .growth = sp.slv.params.refactor_growth_limit,
-        };
-    }
-
-    /// Ends a provider's chunk in the scalar oracle's order: failed
-    /// frequencies solve and repivot one at a time, in ascending lane order.
-    pub fn finishLaneChunk(self: *Self, omegas: []const f64, base: usize, cnt: usize, bad: u64, rhs: []const f64, x_out: []f64, adjoint: bool) !void {
-        assert(cnt > 0 and cnt <= W and base + cnt <= omegas.len);
-        try self.chunkPeel(omegas, .{}, base, cnt, bad, rhs, x_out, adjoint);
-    }
-
-    /// The frozen tape of the most recent `factorEach`, for a device
-    /// preconditioner. Dense blocks and an all-identity factorization have
-    /// no sparse tape and stay on the host.
-    pub fn heldTape(self: *const Self) ?LaneChunk {
-        const sp = switch (self.strategy) {
-            .sp => |*s| s,
-            .dense => return null,
-        };
-        if (sp.held.len == 0) return null;
-        return laneChunk(sp, sp.held[0].base);
-    }
-
-    /// Host pivot-selection boundary for a resident factorEach provider.
-    /// It lays the same fresh candidate tape as replayTape, but leaves
-    /// numeric harmonic replay to the provider. Null means every harmonic
-    /// is identity because the candidate is singular or has a void pivot.
-    /// Until ordinary factorEach rebuilds host factors, solveEach is
-    /// unavailable.
-    pub fn beginHeldTape(self: *Self, omegas: []const f64, tape: usize) !?LaneChunk {
-        self.held_location = .invalid;
-        assert(omegas.len > 0 and tape < omegas.len);
-        const sp = switch (self.strategy) {
-            .sp => |*s| s,
-            .dense => return error.UnsupportedPeriodicPreconditioner,
-        };
-        self.held_id.ensureTotalCapacity(self.gpa, omegas.len) catch |err| {
-            self.held_location = .recovery_failed;
-            return err;
-        };
-        freeHeld(self.gpa, sp);
-        freeComplexHeld(self.gpa, sp);
-        self.held_id.clearRetainingCapacity();
-        sp.slv.factored = false;
-        setOmegaSparse(self.n, sp, omegas[tape], .{}, 0) catch |err| {
-            if (err != error.SingularMatrix) {
-                // A failed full factor may already have changed its
-                // prior pivots. Do not retry from that changed history.
-                if (err == error.OutOfMemory) self.held_location = .recovery_failed;
-                return err;
-            }
-            for (0..omegas.len) |k| self.held_id.appendAssumeCapacity(@intCast(k));
-            return null;
-        };
-        const lu = sp.slv.sparse() orelse return error.UnsupportedEngine;
-        // LaneLu rejects an entire replay when the base contains a
-        // fabricated pivot. The Newton device kernel can replay those,
-        // but factorEach must preserve LaneLu's identity decision.
-        for (lu.void_col) |is_void| if (is_void) {
-            for (0..omegas.len) |k| self.held_id.appendAssumeCapacity(@intCast(k));
-            return null;
-        };
-        return laneChunk(sp, lu);
-    }
-
-    /// Publish one provider replay's failed harmonics in ascending order,
-    /// for factorEach's point-local choice of its next candidate tape.
-    pub fn finishHeldTape(self: *Self, failed: []const u8) void {
-        assert(self.held_id.capacity >= failed.len);
-        self.held_id.clearRetainingCapacity();
-        for (failed, 0..) |bad, k| if (bad != 0)
-            self.held_id.appendAssumeCapacity(@intCast(k));
-    }
-
-    /// Materializes numeric harmonic blocks from the current full-factor
-    /// tape without selecting or refactoring any pivot. A device provider
-    /// uses this after a failed launch, then continues its original
-    /// tried/best-candidate policy from the same position.
-    pub fn replayCurrentHeld(self: *Self, omegas: []const f64) Allocator.Error!usize {
-        assert(omegas.len > 0 and self.strategy == .sp);
-        const sp = &self.strategy.sp;
-        assert(sp.slv.factored);
-        const lu = sp.slv.sparse().?;
-        errdefer self.held_location = .recovery_failed;
-        try self.held_id.ensureTotalCapacity(self.gpa, omegas.len);
-        try ensureLaneWork(self.gpa, sp, self.nn);
-        freeHeld(self.gpa, sp);
-        freeComplexHeld(self.gpa, sp);
-        self.held_id.clearRetainingCapacity();
-        return self.replayHeldNumbers(sp, lu, omegas);
-    }
-
-    /// Records only the final result of the complete candidate policy.
-    /// `on_host` distinguishes recovered numeric factors from resident
-    /// factors; neither path may run factorEach again for these planes.
-    pub fn completeHeldPolicy(self: *Self, count: usize, on_host: bool) void {
-        assert(count > 0 and self.held_id.items.len <= count);
-        self.held_count = count;
-        self.held_location = if (on_host) .host else .device;
-    }
-
-    /// Makes the current completed policy available to solveEach. The
-    /// caller passes the same frequencies until setPlanes or another
-    /// factor/solve invalidates it. Untouched points follow factorEach.
-    pub fn ensureHeldOnHost(self: *Self, omegas: []const f64) !void {
-        switch (self.held_location) {
-            .invalid => return self.factorEach(omegas),
-            .recovery_failed => return error.OutOfMemory,
-            .host, .device => {
-                assert(self.held_count == omegas.len);
-                errdefer self.held_location = .recovery_failed;
-                if (self.strategy == .sp) try ensureLaneWork(self.gpa, &self.strategy.sp, self.nn);
-                // A singular final candidate may have no usable LU tape.
-                // solveEach already copies every all-identity RHS.
-                if (self.held_location == .device and self.held_id.items.len != omegas.len)
-                    _ = try self.replayCurrentHeld(omegas);
-                self.held_location = .host;
-            },
-        }
-    }
-
-    /// Packs `factorEach`'s retained factors with harmonics innermost,
-    /// omitting SIMD padding. Identity harmonics get finite dummy factors;
-    /// consumers mask `held_id` and copy the original right-hand side.
-    /// The caller sized the slices from `heldTape` and `count`.
-    pub fn packHeld(self: *const Self, count: usize, lower: []f64, upper: []f64, diag: []f64) void {
-        const sp = &self.strategy.sp;
-        const tape = self.heldTape().?;
-        assert(count > 0 and sp.held.len == (count + W - 1) / W);
-        assert(lower.len == tape.lu.lx.items.len * count);
-        assert(upper.len == tape.lu.ux.items.len * count);
-        assert(diag.len == self.nn * count);
-        var held: usize = 0;
-        for (0..count) |k| {
-            if (held < self.held_id.items.len and self.held_id.items[held] == k) {
-                for (0..lower.len / count) |i| lower[i * count + k] = 0;
-                for (0..upper.len / count) |i| upper[i * count + k] = 0;
-                for (0..self.nn) |i| diag[i * count + k] = 1;
-                held += 1;
-                continue;
-            }
-            const group = sp.held[k / W];
-            const lane = k % W;
-            for (group.lx, 0..) |v, i| {
-                const values: [W]f64 = v;
-                lower[i * count + k] = values[lane];
-            }
-            for (group.ux, 0..) |v, i| {
-                const values: [W]f64 = v;
-                upper[i * count + k] = values[lane];
-            }
-            for (group.udiag, 0..) |v, i| {
-                const values: [W]f64 = v;
-                diag[i * count + k] = values[lane];
-            }
-        }
-    }
-
-    /// Replaces the solver's G and C with `g` and `c`, indexed by CSC slot
-    /// of the source pattern (a circuit's `g_vals`/`c_vals` layout). The
-    /// dense strategy places them through the pattern `fromCircuit`
-    /// borrowed. Asserts that the solver has that pattern (not
-    /// `initDense`'s) and that `g` and `c` cover it.
-    pub fn setPlanes(self: *Self, g: []const f64, c: []const f64) void {
-        self.held_location = .invalid;
-        assert(g.len == c.len);
-        switch (self.strategy) {
-            .dense => |*d| {
-                const n: usize = self.n;
-                assert(d.src_col_ptr.len == n + 1);
-                assert(g.len >= d.src_col_ptr[n]);
-                @memset(d.g_dense, 0);
-                @memset(d.c_mat, 0);
-                for (0..n) |j| for (d.src_col_ptr[j]..d.src_col_ptr[j + 1]) |p| {
-                    const at = @as(usize, d.src_row_idx[p]) * n + j;
-                    d.g_dense[at] += g[p];
-                    d.c_mat[at] += c[p];
-                };
-            },
-            .sp => |*s| {
-                assert(g.len >= s.g_vals.len);
-                @memcpy(s.g_vals, g[0..s.g_vals.len]);
-                @memcpy(s.c_vals, c[0..s.c_vals.len]);
-            },
-        }
-    }
-
-    /// Factors G + jω_k C for every ω_k in `omegas` and keeps all of them,
-    /// so `solveEach` can solve a different right-hand side per ω as often
-    /// as it likes: the block-diagonal preconditioner shape. The sparse
-    /// strategy holds ceil(len/W) LaneLu groups replaying one pivot tape,
-    /// taken at the middle ω. When lanes fail to replay it, up to two more
-    /// tapes are laid at the first failed ω not yet tried, and the tape
-    /// that held the fewest lanes is kept. A lane that still fails (every
-    /// lane when A at each tape ω is singular), or a singular dense block,
-    /// is held as the identity and listed in `held_id`, ascending. Any
-    /// other factor or solve on `self` invalidates the held
-    /// factors. Asserts that `omegas` is not empty; the sparse strategy
-    /// fails with `error.UnsupportedEngine` when the 2n system did not get
-    /// the sparse LU, the only engine LaneLu replays.
-    pub fn factorEach(self: *Self, omegas: []const f64) !void {
-        self.held_location = .invalid;
-        const allocator = self.gpa;
-        assert(omegas.len > 0);
-        self.held_id.clearRetainingCapacity();
-        // Every ω at most is held, so no append below allocates.
-        try self.held_id.ensureTotalCapacity(allocator, omegas.len);
-        switch (self.strategy) {
-            .dense => |*d| {
-                const nn: usize = self.nn;
-                if (d.held.len != omegas.len * nn * nn) {
-                    // Both before either is replaced: a held block without its
-                    // pivot rows passed this length check on the next call.
-                    const held = try allocator.alloc(f64, omegas.len * nn * nn);
-                    errdefer allocator.free(held);
-                    const held_piv = try allocator.alloc(u32, omegas.len * nn);
-                    allocator.free(d.held);
-                    allocator.free(d.held_piv);
-                    d.held = held;
-                    d.held_piv = held_piv;
-                }
-                assert(d.held_piv.len * nn == d.held.len);
-                for (omegas, 0..) |omega, k| {
-                    const a = d.held[k * nn * nn ..][0 .. nn * nn];
-                    const piv = d.held_piv[k * nn ..][0..nn];
-                    dense_lu.buildComplexAdmittance(self.n, self.nn, d.g_dense, d.c_mat, omega, a);
-                    dense_lu.pinVoid(nn, a);
-                    dense_lu.factorize(nn, a, piv) catch {
-                        // A failed factor leaves `piv` partial; the identity
-                        // is a factor `solveEach` can read.
-                        @memset(a, 0);
-                        for (piv, 0..) |*p, i| {
-                            p.* = @intCast(i);
-                            a[i * nn + i] = 1;
-                        }
-                        self.held_id.appendAssumeCapacity(@intCast(k));
-                    };
-                }
-            },
-            .sp => |*sp| try self.factorEachSparse(sp, omegas),
-        }
-        assert(self.held_id.items.len <= omegas.len);
-        self.completeHeldPolicy(omegas.len, true);
-    }
-
-    fn factorEachSparse(self: *Self, sp: *Sparse, omegas: []const f64) !void {
-        const gpa = self.gpa;
-        // The sparse solver was built from the same gpa.
-        assert(sp.slv.gpa.ptr == gpa.ptr);
-        if (self.complex_held and try self.factorEachComplex(sp, omegas)) return;
-        freeComplexHeld(gpa, sp);
-        try ensureLaneWork(gpa, sp, self.nn);
-        var tried: [3]usize = undefined;
-        var tries: usize = 0;
-        var best: usize = undefined;
-        var best_held: usize = std.math.maxInt(usize);
-        var tape = omegas.len / 2;
-        while (tries < tried.len) {
-            tried[tries] = tape;
-            tries += 1;
-            const held = try self.replayTape(sp, omegas, tape);
-            if (held < best_held) {
-                best = tape;
-                best_held = held;
-            }
-            if (held == 0) return;
-            tape = for (self.held_id.items) |k| {
-                if (std.mem.indexOfScalar(usize, tried[0..tries], k) == null) break k;
-            } else break;
-        }
-        // A full factor can depend on the previous pivots (the re-pivot fill
-        // cap), so the replayed best may hold a different count.
-        if (best != tried[tries - 1]) _ = try self.replayTape(sp, omegas, best);
-    }
-
-    /// Lays a fresh pivot tape by a full factor at `omegas[tape]` and
-    /// replays it into every LaneLu group. `held_id` receives the ω it
-    /// cannot replay, every ω when A(omegas[tape]) is singular (no group is
-    /// built then). Returns how many ω that holds. Asserts that `held_id`
-    /// has room for every ω (`factorEach` reserves it).
-    fn replayTape(self: *Self, sp: *Sparse, omegas: []const f64, tape: usize) !usize {
-        const gpa = self.gpa;
-        // The groups stay allocated across tapes: `replayHeldNumbers`
-        // reuses them while the L/U lengths hold (an HB Newton step or a
-        // PAC frequency used to reallocate every one).
-        self.held_id.clearRetainingCapacity();
-        assert(self.held_id.capacity >= omegas.len);
-        sp.slv.factored = false;
-        setOmegaSparse(self.n, sp, omegas[tape], .{}, 0) catch |err| {
-            freeHeld(gpa, sp);
-            if (err != error.SingularMatrix) return err;
-            for (0..omegas.len) |k| self.held_id.appendAssumeCapacity(@intCast(k));
-            return omegas.len;
-        };
-        const lu = sp.slv.sparse() orelse return error.UnsupportedEngine;
-        return self.replayHeldNumbers(sp, lu, omegas);
-    }
-
-    fn replayHeldNumbers(self: *Self, sp: *Sparse, lu: *SparseLu, omegas: []const f64) Allocator.Error!usize {
-        const gpa = self.gpa;
-        const groups = (omegas.len + W - 1) / W;
-        const reuse = sp.held.len == groups and for (sp.held) |h| {
-            if (h.lx.len != lu.lx.items.len or h.ux.len != lu.ux.items.len) break false;
-        } else true;
-        if (reuse) {
-            for (sp.held) |*h| h.base = lu;
-        } else {
-            freeHeld(gpa, sp);
-            sp.held = try initGroups(lane_lu.LaneLu(W), gpa, lu, groups);
-        }
-        for (sp.held, 0..) |*h, g| {
-            const base = g * W;
-            const cnt = @min(W, omegas.len - base);
-            const bad = h.refactor(Stacked(W).of(sp, chunkOmegas(omegas, base, cnt), .{}, base, cnt), sp.slv.params.refactor_growth_limit);
-            for (0..cnt) |l| if ((bad >> @intCast(l)) & 1 != 0)
-                self.held_id.appendAssumeCapacity(@intCast(base + l));
-        }
-        return self.held_id.items.len;
-    }
-
-    /// Solves right-hand side k (the stacked 2n vector at `rhs[k*2n..]`)
-    /// against `factorEach`'s factor k into the same rows of `x_out`, for
-    /// every held ω; `adjoint` solves the stacked-real transpose, which is
-    /// A^H. The identity lanes copy their right-hand side, so `rhs` and
-    /// `x_out` must not overlap. Asserts that `rhs` holds exactly one
-    /// vector per ω `factorEach` was given and `x_out` as many, and that
-    /// the two do not overlap.
-    pub fn solveEach(self: *Self, rhs: []const f64, x_out: []f64, adjoint: bool) void {
-        const nn: usize = self.nn;
-        if (nn == 0) return;
-        assert(rhs.len % nn == 0);
-        assert(x_out.len >= rhs.len);
-        const r0 = @intFromPtr(rhs.ptr);
-        const x0 = @intFromPtr(x_out.ptr);
-        assert(r0 + rhs.len * @sizeOf(f64) <= x0 or x0 + rhs.len * @sizeOf(f64) <= r0);
-        switch (self.strategy) {
-            .dense => |d| assert(d.held_piv.len == rhs.len),
-            // No groups when no tape could be laid; every ω is held then (#43).
-            .sp => |sp| assert(sp.held.len == (rhs.len / nn + W - 1) / W or sp.cx_held.len == (rhs.len / nn + W - 1) / W or self.held_id.items.len == rhs.len / nn),
-        }
-        switch (self.strategy) {
-            .dense => |*d| for (0..d.held_piv.len / nn) |k| {
-                const lu = d.held[k * nn * nn ..][0 .. nn * nn];
-                const piv = d.held_piv[k * nn ..][0..nn];
-                const b = rhs[k * nn ..][0..nn];
-                const x = x_out[k * nn ..][0..nn];
-                if (adjoint) dense_lu.solveFactoredT(nn, lu, piv, b, x) else dense_lu.solveFactored(nn, lu, piv, b, x);
-            },
-            .sp => |*sp| if (sp.cx_held.len != 0) self.solveEachComplex(sp, rhs, x_out, adjoint) else {
-                const b_plane = sp.lane_work[0..nn];
-                const x_plane = sp.lane_work[nn..];
-                const m = rhs.len / nn;
-                for (sp.held, 0..) |*h, g| {
-                    const base = g * W;
-                    const cnt = @min(W, m - base);
-                    for (b_plane, 0..) |*lane, i| {
-                        var row: [W]f64 = undefined;
-                        for (0..W) |l| row[l] = rhs[(base + @min(l, cnt - 1)) * nn + i];
-                        lane.* = row;
-                    }
-                    if (adjoint) h.solveT(b_plane, x_plane) else h.solve(b_plane, x_plane);
-                    for (x_plane, 0..) |lane, i| {
-                        const row: [W]f64 = lane;
-                        for (0..cnt) |l| x_out[(base + l) * nn + i] = row[l];
-                    }
-                }
-            },
-        }
-        for (self.held_id.items) |k| @memcpy(x_out[k * nn ..][0..nn], rhs[k * nn ..][0..nn]);
-    }
-
-    fn freeHeld(gpa: Allocator, sp: *Sparse) void {
-        for (sp.held) |*h| h.deinit(gpa);
-        gpa.free(sp.held);
-        sp.held = &.{};
-    }
-
-    fn freeComplexHeld(gpa: Allocator, sp: *Sparse) void {
-        for (sp.cx_held) |*h| h.deinit(gpa);
-        gpa.free(sp.cx_held);
-        sp.cx_held = &.{};
-    }
-
-    /// The lane RHS and solution planes, 2 * nn lanes, on first use.
-    fn ensureLaneWork(gpa: Allocator, sp: *Sparse, nn: usize) Allocator.Error!void {
-        if (sp.lane_work.len == 0) sp.lane_work = try gpa.alloc(@Vector(W, f64), 2 * nn);
-    }
-
-    /// `groups` lane factors on `lu`'s tape; on failure none is left.
-    fn initGroups(comptime T: type, gpa: Allocator, lu: *SparseLu, groups: usize) Allocator.Error![]T {
-        const out = try gpa.alloc(T, groups);
-        for (out, 0..) |*h, g| h.* = T.init(gpa, lu) catch |err| {
-            for (out[0..g]) |*done| done.deinit(gpa);
-            gpa.free(out);
-            return err;
-        };
-        return out;
-    }
-
-    /// `factorEach` on the complex tape: one proxy factor at the middle ω,
-    /// every group replayed on it. False, with no complex groups left, when
-    /// the tape cannot be laid or some ω fails to replay it; the caller
-    /// then runs the stacked policy, so its tries and identity holds are
-    /// unchanged. On success the stacked groups are freed and no ω is held.
-    fn factorEachComplex(self: *Self, sp: *Sparse, omegas: []const f64) !bool {
-        const gpa = self.gpa;
-        if (!try self.ensureComplex(gpa, sp)) {
-            self.complex_held = false;
-            return false;
-        }
-        const cx = &sp.cx.?;
-        // `solveBatch`'s lanes replay this tape no more.
-        cx.tape = false;
-        const mid = omegas[omegas.len / 2];
-        for (cx.proxy, sp.g_vals, sp.c_vals) |*v, gv, cv| v.* = std.math.hypot(gv, mid * cv);
-        cx.lu.factor(gpa, sp.src_col_ptr, sp.src_row_idx, cx.proxy, direct.pivot_tol) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            error.SingularMatrix => {
-                freeComplexHeld(gpa, sp);
-                return false;
-            },
-        };
-        const groups = (omegas.len + W - 1) / W;
-        const reuse = sp.cx_held.len == groups and for (sp.cx_held) |h| {
-            if (h.lr.len != cx.lu.lx.items.len or h.ur.len != cx.lu.ux.items.len) break false;
-        } else true;
-        if (!reuse) {
-            freeComplexHeld(gpa, sp);
-            sp.cx_held = try initGroups(ComplexLaneLu(W), gpa, &cx.lu, groups);
-        }
-        for (sp.cx_held, 0..) |*h, g| {
-            const base = g * W;
-            const cnt = @min(W, omegas.len - base);
-            const bad = h.refactor(ComplexFill(W).of(sp, chunkOmegas(omegas, base, cnt), .{}, base, cnt), sp.slv.params.refactor_growth_limit);
-            if (bad != 0) {
-                freeComplexHeld(gpa, sp);
-                return false;
-            }
-        }
-        freeHeld(gpa, sp);
-        self.held_id.clearRetainingCapacity();
-        return true;
-    }
-
-    /// `solveEach` on the complex groups.
-    fn solveEachComplex(self: *Self, sp: *Sparse, rhs: []const f64, x_out: []f64, adjoint: bool) void {
-        const n: usize = self.n;
-        const nn: usize = self.nn;
-        const cx = &sp.cx.?;
-        const br = cx.work[0..n];
-        const bi = cx.work[n..][0..n];
-        const xr = cx.work[2 * n ..][0..n];
-        const xi = cx.work[3 * n ..][0..n];
-        const m = rhs.len / nn;
-        for (sp.cx_held, 0..) |*h, g| {
-            const base = g * W;
-            const cnt = @min(W, m - base);
-            for (br, bi, 0..) |*vr, *vi, i| {
-                var re: [W]f64 = undefined;
-                var im: [W]f64 = undefined;
-                for (0..W) |l| {
-                    const b = rhs[(base + @min(l, cnt - 1)) * nn ..];
-                    re[l] = b[i];
-                    im[l] = b[n + i];
-                }
-                vr.* = re;
-                vi.* = im;
-            }
-            if (adjoint) h.solveH(br, bi, xr, xi) else h.solve(br, bi, xr, xi);
-            for (xr, xi, 0..) |vr, vi, i| {
-                const re: [W]f64 = vr;
-                const im: [W]f64 = vi;
-                for (0..cnt) |l| {
-                    const x = x_out[(base + l) * nn ..];
-                    x[i] = re[l];
-                    x[n + i] = im[l];
-                }
-            }
-        }
-    }
-
-    /// Private kernels and types for tests.zig; void outside test builds.
-    pub const test_access = if (@import("builtin").is_test) .{
-        .W = W,
-        .setOmega = setOmega,
-        .solveRhs = solveRhs,
-        .solveRhsT = solveRhsT,
-        .solveBatchSerial = solveBatchSerial,
-        .setOmegaSparse = setOmegaSparse,
-        .indexDyn = indexDyn,
-        .Sparse = Sparse,
-    } else {};
-
-    /// The ω of lanes `[base, base + cnt)`, a ragged tail padded by repeating
-    /// its last ω.
-    fn chunkOmegas(omegas: []const f64, base: usize, cnt: usize) [W]f64 {
-        var ow: [W]f64 = undefined;
-        for (0..W) |l| ow[l] = omegas[base + @min(l, cnt - 1)];
-        return ow;
-    }
-
-    /// Builds `sp.cx` on first use; false when the ordering's fill cap
-    /// refuses it, which leaves the stacked lanes as the only path.
-    fn ensureComplex(self: *const Self, gpa: Allocator, sp: *Sparse) !bool {
-        if (sp.cx == null) sp.cx = try Complex.init(gpa, self.n, sp.src_col_ptr, sp.src_row_idx);
-        return sp.cx != null;
-    }
-
-    /// The lane path's oracle: `setOmega` with `dyn` and a solve per ω, over
-    /// `omegas[first..][0..count]`, into the `x_out` rows `solveBatch` uses.
-    fn solveBatchSerial(self: *Self, omegas: []const f64, dyn: Dyn, first: usize, count: usize, rhs: []const f64, x_out: []f64, adjoint: bool) !void {
-        const nn: usize = self.nn;
-        const m = rhs.len;
-        assert(first + count <= omegas.len);
-        assert(m % nn == 0);
-        for (first..first + count) |k| {
-            try self.setOmegaDyn(omegas[k], dyn, k);
-            var r: usize = 0;
-            while (r < m) : (r += nn) {
-                const b = rhs[r..][0..nn];
-                const x = x_out[k * m + r ..][0..nn];
-                if (adjoint) self.solveRhsT(b, x) else self.solveRhs(b, x);
-            }
-        }
-    }
-
-    /// Groups `dyn`'s entries by source column into `dyn_ptr`/`dyn_ent`
-    /// with a counting sort, so each column keeps entry order. An empty
-    /// `dyn` leaves them alone: `Stacked.of` ignores them then.
-    fn indexDyn(gpa: Allocator, s: *Sparse, dyn: Dyn) !void {
-        if (dyn.slots.len == 0) return;
-        const n = s.src_col_ptr.len - 1;
-        const nnz = s.src_col_ptr[n];
-        if (s.dyn_ptr.len != n + 1) {
-            gpa.free(s.dyn_ptr);
-            s.dyn_ptr = &.{};
-            s.dyn_ptr = try gpa.alloc(u32, n + 1);
-        }
-        const ptr = s.dyn_ptr;
-        @memset(ptr, 0);
-        for (dyn.slots) |slot| if (slot < nnz) {
-            ptr[slotCol(s.src_col_ptr, slot) + 1] += 1;
-        };
-        for (1..n + 1) |j| ptr[j] += ptr[j - 1];
-        if (s.dyn_ent.len != ptr[n]) {
-            gpa.free(s.dyn_ent);
-            s.dyn_ent = &.{};
-            s.dyn_ent = try gpa.alloc(u32, ptr[n]);
-        }
-        // Backwards from each column's end leaves ptr[j + 1] at column j's
-        // start; one shift down restores the starts.
-        var e = dyn.slots.len;
-        while (e > 0) {
-            e -= 1;
-            const slot = dyn.slots[e];
-            if (slot >= nnz) continue;
-            const j = slotCol(s.src_col_ptr, slot);
-            ptr[j + 1] -= 1;
-            s.dyn_ent[ptr[j + 1]] = @intCast(e);
-        }
-        std.mem.copyForwards(u32, ptr[0..n], ptr[1..]);
-        ptr[n] = @intCast(s.dyn_ent.len);
-        assert(ptr[0] == 0);
-    }
-
-    fn setOmegaDense(n: u32, nn: u32, d: *Dense, omega: f64, dyn: Dyn, k: usize) !void {
-        dense_lu.buildComplexAdmittance(n, nn, d.g_dense, d.c_mat, omega, d.a_lu);
-        for (dyn.slots, 0..) |slot, e| {
-            if (slot >= d.src_row_idx.len) continue;
-            const t = dyn.at(e, k);
-            addDense(n, nn, d.a_lu, d.src_row_idx[slot], slotCol(d.src_col_ptr, slot), t.re, t.im);
-        }
-        dense_lu.pinVoid(nn, d.a_lu);
-        try dense_lu.factorize(nn, d.a_lu, d.piv);
-    }
-
-    /// Fills the 2n stacked-real values, column j < n as [G | ωC] and
-    /// column n + j as [-ωC | G], adds `dyn` at ω index `k`, then factors.
-    fn setOmegaSparse(n: u32, s: *Sparse, omega: f64, dyn: Dyn, k: usize) !void {
-        const nu: usize = n;
-        const neg_omega = -omega;
-        var p: usize = 0;
-
-        for (0..nu) |j| {
-            const cs = s.src_col_ptr[j];
-            const len = s.src_col_ptr[j + 1] - cs;
-            const lenu: usize = len;
-            @memcpy(s.vals[p..][0..lenu], s.g_vals[cs..][0..lenu]);
-            p += lenu;
-            num.scale(s.vals[p..][0..lenu], omega, s.c_vals[cs..][0..lenu]);
-            p += lenu;
-        }
-        for (0..nu) |j| {
-            const cs = s.src_col_ptr[j];
-            const len = s.src_col_ptr[j + 1] - cs;
-            const lenu: usize = len;
-            num.scale(s.vals[p..][0..lenu], neg_omega, s.c_vals[cs..][0..lenu]);
-            p += lenu;
-            @memcpy(s.vals[p..][0..lenu], s.g_vals[cs..][0..lenu]);
-            p += lenu;
-        }
-        for (dyn.slots, 0..) |slot, e| {
-            if (slot >= s.g_vals.len) continue;
-            const q = stackedPos(s.src_col_ptr, slot);
-            const t = dyn.at(e, k);
-            s.vals[q[0]] += t.re;
-            s.vals[q[1]] += t.im;
-            s.vals[q[2]] -= t.im;
-            s.vals[q[3]] += t.re;
-        }
-        assert(p == s.vals.len);
-
-        try s.slv.factor(s.vals, .{});
-    }
 };
 
-/// The stacked-real A(ω) = [G, -ωC; ωC, G] (plus `Dyn`) for L frequencies,
-/// as a `LaneLu(L).refactor` source: each column is computed from the G and
-/// C snapshots as the refactor reads it, so no lane value plane exists. Same
-/// products and adds, in the same order per entry, as `setOmegaSparse`, so
-/// lane l is bitwise that scalar fill at ω index `base + min(l, cnt - 1)`.
-/// `Stacked(1)` is the scalar oracle of the fill.
-pub fn Stacked(comptime L: usize) type {
-    return struct {
-        const V = @Vector(L, f64);
-        src_col_ptr: []const u32,
-        col_ptr: []const u32,
-        g: []const f64,
-        c: []const f64,
-        omega: V,
-        dyn: Dyn,
-        dyn_ptr: []const u32,
-        dyn_ent: []const u32,
-        base: usize,
-        cnt: usize,
+// Dense only wins for tiny systems. medium/ladder_filter (n = 41) spent 90%
+// of its run in dense 82^3/3 factors per omega; the sparse refactor is O(nnz).
+const dense_threshold: u32 = 16;
 
-        /// The fill of `sp` at `omega`; `dyn` must be the one `indexDyn`
-        /// grouped into `sp`, with lane l at ω index `base + min(l, cnt - 1)`.
-        /// Asserts that 1 <= cnt <= L.
-        pub fn of(sp: anytype, omega: V, dyn: Dyn, base: usize, cnt: usize) @This() {
-            assert(cnt >= 1);
-            assert(cnt <= L);
-            return .{
-                .src_col_ptr = sp.src_col_ptr,
-                .col_ptr = sp.col_ptr,
-                .g = sp.g_vals,
-                .c = sp.c_vals,
-                .omega = omega,
-                .dyn = dyn,
-                .dyn_ptr = sp.dyn_ptr,
-                .dyn_ent = if (dyn.slots.len == 0) &.{} else sp.dyn_ent,
-                .base = base,
-                .cnt = cnt,
-            };
-        }
+/// G = 2 on the diagonal and -1 between ring neighbours (0 and n - 1
+/// included), C = `c_diag` on the diagonal: a pattern no structured engine
+/// takes, so the stacked 2n system gets the sparse LU.
+const Ring = struct {
+    const n_max = 24;
+    col_ptr: [n_max + 1]u32 = undefined,
+    row_idx: [3 * n_max]u32 = undefined,
+    g: [3 * n_max]f64 = undefined,
+    c: [3 * n_max]f64 = undefined,
 
-        /// Stacked column `col`: for col = j < n, G then ωC of source column
-        /// j; for col = n + j, -ωC then G. Entry p lands at `w[prow[p]]`.
-        pub inline fn load(s: @This(), col: usize, w: []V, prow: []const u32) void {
-            const n = s.src_col_ptr.len - 1;
-            const top = col < n;
-            const j = if (top) col else col - n;
-            const cs = s.src_col_ptr[j];
-            const len: usize = s.src_col_ptr[j + 1] - cs;
-            const rows = prow[s.col_ptr[col]..][0 .. 2 * len];
-            const g = s.g[cs..][0..len];
-            const c = s.c[cs..][0..len];
-            if (top) {
-                for (rows[0..len], g) |r, v| w[r] = @splat(v);
-                for (rows[len..], c) |r, v| w[r] = s.omega * @as(V, @splat(v));
-            } else {
-                const neg = -s.omega;
-                for (rows[0..len], c) |r, v| w[r] = neg * @as(V, @splat(v));
-                for (rows[len..], g) |r, v| w[r] = @splat(v);
-            }
-            if (s.dyn_ent.len == 0) return;
-            for (s.dyn_ent[s.dyn_ptr[j]..s.dyn_ptr[j + 1]]) |e| {
-                var re: [L]f64 = undefined;
-                var im: [L]f64 = undefined;
-                for (0..L) |l| {
-                    const t = s.dyn.at(e, s.base + @min(l, s.cnt - 1));
-                    re[l] = t.re;
-                    im[l] = t.im;
-                }
-                const at = s.dyn.slots[e] - cs;
-                const rv: V = re;
-                const iv: V = im;
-                if (top) {
-                    w[rows[at]] += rv;
-                    w[rows[len + at]] += iv;
-                } else {
-                    w[rows[at]] -= iv;
-                    w[rows[len + at]] += rv;
-                }
+    fn init(n: u32, c_diag: f64) Ring {
+        assert(n >= 3);
+        assert(n <= n_max);
+        var r: Ring = .{};
+        var p: u32 = 0;
+        for (0..n) |j| {
+            r.col_ptr[j] = p;
+            var rows = [3]u32{ @intCast((j + n - 1) % n), @intCast(j), @intCast((j + 1) % n) };
+            std.mem.sort(u32, &rows, {}, std.sort.asc(u32));
+            for (rows) |i| {
+                r.row_idx[p] = i;
+                r.g[p] = if (i == j) 2 else -1;
+                r.c[p] = if (i == j) c_diag else 0;
+                p += 1;
             }
         }
-    };
-}
-
-/// A(ω) = G + jωC (plus `Dyn`) for L frequencies on the n x n source
-/// pattern, as a `ComplexLaneLu(L).refactor` source: each column is
-/// computed from the G and C snapshots as the refactor reads it.
-pub fn ComplexFill(comptime L: usize) type {
-    return struct {
-        const V = @Vector(L, f64);
-        src_col_ptr: []const u32,
-        g: []const f64,
-        c: []const f64,
-        omega: V,
-        dyn: Dyn,
-        dyn_ptr: []const u32,
-        dyn_ent: []const u32,
-        base: usize,
-        cnt: usize,
-
-        /// As `Stacked.of`.
-        pub fn of(sp: anytype, omega: V, dyn: Dyn, base: usize, cnt: usize) @This() {
-            assert(cnt >= 1);
-            assert(cnt <= L);
-            return .{
-                .src_col_ptr = sp.src_col_ptr,
-                .g = sp.g_vals,
-                .c = sp.c_vals,
-                .omega = omega,
-                .dyn = dyn,
-                .dyn_ptr = sp.dyn_ptr,
-                .dyn_ent = if (dyn.slots.len == 0) &.{} else sp.dyn_ent,
-                .base = base,
-                .cnt = cnt,
-            };
-        }
-
-        /// Source column `col`, entry p at row `prow[p]`.
-        pub inline fn load(s: @This(), col: usize, wr: []V, wi: []V, prow: []const u32) void {
-            const cs = s.src_col_ptr[col];
-            const ce = s.src_col_ptr[col + 1];
-            for (prow[cs..ce], s.g[cs..ce], s.c[cs..ce]) |r, gv, cv| {
-                wr[r] = @splat(gv);
-                wi[r] = s.omega * @as(V, @splat(cv));
-            }
-            if (s.dyn_ent.len == 0) return;
-            for (s.dyn_ent[s.dyn_ptr[col]..s.dyn_ptr[col + 1]]) |e| {
-                var re: [L]f64 = undefined;
-                var im: [L]f64 = undefined;
-                for (0..L) |l| {
-                    const t = s.dyn.at(e, s.base + @min(l, s.cnt - 1));
-                    re[l] = t.re;
-                    im[l] = t.im;
-                }
-                const r = prow[s.dyn.slots[e]];
-                wr[r] += @as(V, re);
-                wi[r] += @as(V, im);
-            }
-        }
-    };
-}
-
-/// `Stacked` over lanes from several points on one stacked pattern: lane l
-/// fills from `g[l]`/`c[l]`, one point's source-slot G and C snapshot, at
-/// `omega[l]`. Same products, in the same order per entry, as `Stacked`,
-/// so lane l is bitwise `Stacked(1)` of its own point. No `Dyn`: a deck
-/// with `acDyn` terms solves per point. The host oracle of the GPU lane
-/// backend's (point, ω) fill (phase 4); every point must share the pattern
-/// `src_col_ptr`/`col_ptr`.
-pub fn StackedPoints(comptime L: usize) type {
-    return struct {
-        const V = @Vector(L, f64);
-        src_col_ptr: []const u32,
-        col_ptr: []const u32,
-        g: [L][]const f64,
-        c: [L][]const f64,
-        omega: V,
-
-        /// Stacked column `col` per lane, as `Stacked.load`.
-        pub inline fn load(s: @This(), col: usize, w: []V, prow: []const u32) void {
-            const n = s.src_col_ptr.len - 1;
-            const top = col < n;
-            const j = if (top) col else col - n;
-            const cs = s.src_col_ptr[j];
-            const len: usize = s.src_col_ptr[j + 1] - cs;
-            const rows = prow[s.col_ptr[col]..][0 .. 2 * len];
-            for (0..len) |i| {
-                var ga: [L]f64 = undefined;
-                var ca: [L]f64 = undefined;
-                for (0..L) |l| {
-                    ga[l] = s.g[l][cs + i];
-                    ca[l] = s.c[l][cs + i];
-                }
-                const gv: V = ga;
-                const cv: V = ca;
-                if (top) {
-                    w[rows[i]] = gv;
-                    w[rows[len + i]] = s.omega * cv;
-                } else {
-                    w[rows[i]] = -s.omega * cv;
-                    w[rows[len + i]] = gv;
-                }
-            }
-        }
-    };
-}
+        r.col_ptr[n] = p;
+        return r;
+    }
+};
 
 /// The column of CSC slot `slot` in the pattern `col_ptr` describes, by
 /// binary search (O(log n)); empty columns are skipped. A slot at or past
@@ -1589,7 +619,7 @@ pub fn slotCol(col_ptr: []const u32, slot: u32) usize {
 
 /// Source slot `slot`'s four stacked-real positions: column j's G and ωC
 /// entries, then column n + j's -ωC and G entries.
-fn stackedPos(src_col_ptr: []const u32, slot: u32) [4]usize {
+pub fn stackedPos(src_col_ptr: []const u32, slot: u32) [4]usize {
     assert(slot < src_col_ptr[src_col_ptr.len - 1]);
     const j = slotCol(src_col_ptr, slot);
     const cs: usize = src_col_ptr[j];
@@ -1611,6 +641,8 @@ pub fn addDense(n: usize, nn: usize, a: []f64, row: usize, col: usize, re: f64, 
     a[row * nn + n + col] -= im;
     a[(n + row) * nn + n + col] += re;
 }
+
+// ---- private ----
 
 /// Writes the 2n x 2n stacked-real CSC pattern: each column j and n + j gets
 /// column j's rows r followed by r + n. `sr_col_ptr` has 2n + 1 entries,
@@ -1643,39 +675,6 @@ inline fn buildStackedRealPattern(
     }
     assert(p == sr_row_idx.len);
 }
-
-const testing = std.testing;
-
-/// G = 2 on the diagonal and -1 between ring neighbours (0 and n - 1
-/// included), C = `c_diag` on the diagonal: a pattern no structured engine
-/// takes, so the stacked 2n system gets the sparse LU.
-const Ring = struct {
-    const n_max = 24;
-    col_ptr: [n_max + 1]u32 = undefined,
-    row_idx: [3 * n_max]u32 = undefined,
-    g: [3 * n_max]f64 = undefined,
-    c: [3 * n_max]f64 = undefined,
-
-    fn init(n: u32, c_diag: f64) Ring {
-        assert(n >= 3);
-        assert(n <= n_max);
-        var r: Ring = .{};
-        var p: u32 = 0;
-        for (0..n) |j| {
-            r.col_ptr[j] = p;
-            var rows = [3]u32{ @intCast((j + n - 1) % n), @intCast(j), @intCast((j + 1) % n) };
-            std.mem.sort(u32, &rows, {}, std.sort.asc(u32));
-            for (rows) |i| {
-                r.row_idx[p] = i;
-                r.g[p] = if (i == j) 2 else -1;
-                r.c[p] = if (i == j) c_diag else 0;
-                p += 1;
-            }
-        }
-        r.col_ptr[n] = p;
-        return r;
-    }
-};
 
 fn everyEntryPoint(gpa: Allocator, n: u32) !void {
     const ring: Ring = .init(n, 1e-3);

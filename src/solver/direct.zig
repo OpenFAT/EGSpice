@@ -12,6 +12,27 @@
 //! residual bars), dev/solvers/gilbert-peierls-lu.md ("Two replay
 //! thresholds"), dev/solvers/gpu-lu.md ("Multicore host refactor"); #44,
 //! #45, #136.
+//!
+//! Contents:
+//! - `pub const instrument = sparse_lu.instrument`
+//! - `pub const pivot_tol: f64 = 1e-3`
+//! - `pub const Params = struct`
+//! - `pub const Knobs = struct`
+//! - `pub const InitError = error`
+//! - `pub const FactorError = InitError || error{SingularMatrix}`
+//! - `pub const Engine = union`
+//! - `pub const Solver = struct`
+//!   - `pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs) InitError!Self`
+//!   - `pub fn initOrdered(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs, order: ?[]const u32) InitError!Self`
+//!   - `pub fn reset(self: *Self, bbd: ?num.BbdInfo) Allocator.Error!void`
+//!   - `pub fn sparse(self: *Self) ?*SparseLu`
+//!   - `pub fn deinit(self: *Self) void`
+//!   - `pub fn factor(self: *Self, vals: []const f64, execution: num.Execution) FactorError!void`
+//!   - `pub fn unchanged(self: *const Self, vals: []const f64) bool`
+//!   - `pub fn dropBypass(self: *Self) void`
+//!   - `pub fn solveNeg(self: *Self, rhs: []const f64, x: []f64) void`
+//!   - `pub fn solve(self: *Self, rhs: []const f64, x: []f64) void`
+//!   - `pub fn solveT(self: *Self, rhs: []const f64, x: []f64) void`
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,9 +42,10 @@ const order_mod = @import("order.zig");
 const bbd_mod = @import("bbd.zig");
 const lu_kernels = @import("kernels/lu.zig");
 const subtree = @import("subtree.zig");
+const lu_census = @import("lu_census.zig");
 const num = @import("core").numerics;
-
 const Allocator = std.mem.Allocator;
+const testing = std.testing;
 
 /// `-Dlu-instrument`: the `ZP_LU_STATS` census is compiled in.
 pub const instrument = sparse_lu.instrument;
@@ -31,14 +53,6 @@ pub const instrument = sparse_lu.instrument;
 /// Threshold partial pivoting keeps the diagonal while
 /// |diag| >= pivot_tol * column max (KLU's default 0.001).
 pub const pivot_tol: f64 = 1e-3;
-/// A re-pivot whose L plus U outgrows this multiple of the fresh factor's
-/// restarts on the previous pivots (`SparseLu.fill_cap`).
-const repivot_fill_cap: f64 = 3;
-/// A BBD factor whose `Bbd.growth` exceeds this is probed: a refined solve
-/// each way (A and A^T) whose scaled residual misses `probe_ratio_max`
-/// demotes it to the general LU, else every solve on it is refined (#136).
-/// Below it the certificate's ratio stayed under 0.04 (`residual_tests.zig`).
-const bbd_refine_growth: f64 = 1e3;
 
 /// Pivoting knobs. The defaults are the production settings.
 pub const Params = struct {
@@ -54,14 +68,6 @@ pub const Params = struct {
     refactor_growth_limit: f64 = 1e-12,
 };
 
-/// Refinement steps after a BBD solve at most (LAPACK dgerfs' ITMAX).
-const refine_max = 5;
-/// The probe's bar on ||b - A x|| / (||A|| ||x|| n eps): LAWN 41's 30
-/// over 30, since one right-hand side only samples the error. On the
-/// certificate's BBD family a probe at 27.7 let a solve through at 67;
-/// refined solves that keep BBD probe at 0.2 or less (#136).
-const probe_ratio_max = 1;
-
 /// Developer switches. The facade reads them from the environment once
 /// (`espice.zig`); the solver reads no environment.
 pub const Knobs = struct {
@@ -74,6 +80,20 @@ pub const Knobs = struct {
     par: ?bool = null,
     /// `ESPICE_LU_PAR_STATS`: print the multicore refactor's admission.
     par_stats: bool = false,
+};
+
+/// Every way building a solver fails; nothing is left allocated after it.
+pub const InitError = error{
+    /// An engine's tables, the ordering's slab or the value copy.
+    OutOfMemory,
+    /// The ordering's slab (`order.wsSize`) was too small for the pattern's fill.
+    OutOfWorkspace,
+};
+
+/// Every way `Solver.factor` fails; no usable factorization is left after it.
+pub const FactorError = InitError || error{
+    /// The general LU met a pivot it could not keep under threshold pivoting.
+    SingularMatrix,
 };
 
 /// One linear engine, picked from the pattern by `Solver.init`.
@@ -136,7 +156,7 @@ pub const Solver = struct {
     /// `col_ptr` and `row_idx`, which must outlive the solver; free with
     /// `deinit`. Asserts that `col_ptr` has n + 1 entries and `row_idx`
     /// covers them.
-    pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs) !Self {
+    pub fn init(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs) InitError!Self {
         return initOrdered(gpa, n, col_ptr, row_idx, bbd, knobs, null);
     }
 
@@ -144,7 +164,7 @@ pub const Solver = struct {
     /// same pattern, copied) when the engine is the sparse LU: a sweep's
     /// queries share one pattern, and BTF + AMD cost 95M instructions a
     /// call on a 100k-node ladder.
-    pub fn initOrdered(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs, order: ?[]const u32) !Self {
+    pub fn initOrdered(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs, order: ?[]const u32) InitError!Self {
         assert(col_ptr.len == @as(usize, n) + 1);
         assert(row_idx.len >= col_ptr[n]);
         var self: Self = .{ .n = n, .col_ptr = col_ptr, .row_idx = row_idx, .engine = undefined, .gpa = gpa, .knobs = knobs };
@@ -214,71 +234,6 @@ pub const Solver = struct {
         };
     }
 
-    /// Orders the pattern (once) and builds the general LU on it.
-    fn initLu(self: *Self) !SparseLu {
-        const gpa = self.gpa;
-        const n = self.n;
-        if (instrument and self.knobs.stats) btfCensus(gpa, n, self.col_ptr, self.row_idx) catch {};
-        // One slab for the ordering and the fill bound; both restore it.
-        const ws_buf = try gpa.alloc(u32, order_mod.wsSize(n, self.col_ptr[n]));
-        defer gpa.free(ws_buf);
-        var ws = order_mod.Ws.init(ws_buf);
-        if (self.q.len == 0) {
-            const q = try gpa.alloc(u32, n);
-            errdefer gpa.free(q);
-            try order_mod.order(n, self.col_ptr, self.row_idx, q, &ws);
-            self.q = q;
-        }
-        assert(self.q.len == n);
-        // At least nnz(A): a diagonal matrix bounds nothing.
-        const diag_fill = @max(try order_mod.diagFill(n, self.col_ptr, self.row_idx, self.q, &ws), self.col_ptr[n]);
-        assert(ws.used == 0);
-        var lu = try SparseLu.init(gpa, n, self.col_ptr, self.q);
-        lu.stats = self.knobs.stats;
-        lu.diag_fill = diag_fill;
-        return lu;
-    }
-
-    /// Swaps a singular structured engine for the general LU, for good. The
-    /// LU is built first, so out of memory leaves the old engine live.
-    fn demote(self: *Self) !void {
-        const lu = try self.initLu();
-        switch (self.engine) {
-            .lu => unreachable,
-            .tri => |*tri| tri.deinit(self.gpa),
-            .bbd => |*eng| eng.deinit(),
-        }
-        self.engine = .{ .lu = lu };
-        self.factored = false;
-        assert(self.sparse() != null);
-    }
-
-    fn initBbd(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs) !?BbdEng {
-        const info = bbd orelse {
-            if (instrument and knobs.stats) std.debug.print("lu-census: no BbdInfo\n", .{});
-            return null;
-        };
-        if (knobs.no_bbd) return null;
-        const eng = BbdEng.init(gpa, n, col_ptr, row_idx, info, .{}) catch |err| switch (err) {
-            error.NotApplicable => {
-                if (instrument and knobs.stats) std.debug.print("lu-census: BbdInfo emitted; Bbd.init declined (NotApplicable)\n", .{});
-                return null;
-            },
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        if (instrument and knobs.stats) std.debug.print("lu-census: BbdInfo emitted; Bbd.init accepted\n", .{});
-        return eng;
-    }
-
-    /// Frees the multicore and subtree refactor plans of the current pivot
-    /// epoch; the next `refactorLu` on a new epoch prices them again.
-    fn dropPlans(self: *Self) void {
-        if (self.par) |*p| p.deinit(self.gpa);
-        self.par = null;
-        if (self.sub) |*p| p.deinit(self.gpa);
-        self.sub = null;
-    }
-
     /// Frees every engine and copy; the borrowed pattern stays the caller's.
     pub fn deinit(self: *Self) void {
         self.dropPlans();
@@ -307,11 +262,11 @@ pub const Solver = struct {
     /// `SingularMatrix` leaves no usable factorization, and neither does
     /// `OutOfMemory`: solve only after a successful `factor`. Asserts that
     /// `vals` holds at least the pattern's nnz entries.
-    pub fn factor(self: *Self, vals: []const f64, execution: num.Execution) !void {
+    pub fn factor(self: *Self, vals: []const f64, execution: num.Execution) FactorError!void {
         assert(vals.len >= self.col_ptr[self.n]);
         const nnz = self.vcopy.len;
         if (nnz != 0 and self.factored and !self.host_stale and simdEql(self.vcopy, vals[0..nnz])) return;
-        if (instrument and self.knobs.stats and self.factored and nnz != 0) if (self.sparse()) |lu| reachCensus(self.gpa, lu, self.col_ptr, self.vcopy, vals) catch {};
+        if (instrument and self.knobs.stats and self.factored and nnz != 0) if (self.sparse()) |lu| lu_census.reachCensus(self.gpa, lu, self.col_ptr, self.vcopy, vals) catch |e| std.debug.print("lu-reach: {s}\n", .{@errorName(e)});
         try self.factorInner(vals, execution);
         assert(self.factored);
         self.host_stale = false;
@@ -334,6 +289,105 @@ pub const Solver = struct {
         self.vcopy = &.{};
     }
 
+    /// x = -A^-1 rhs, the Newton step. `rhs` and `x` may alias. Asserts that
+    /// the last `factor` succeeded and that both slices hold n entries.
+    pub fn solveNeg(self: *Self, rhs: []const f64, x: []f64) void {
+        assert(rhs.len >= self.n);
+        assert(x.len >= self.n);
+        num.scale(x[0..self.n], -1, rhs[0..self.n]);
+        self.solveInPlace(x);
+    }
+
+    /// x = A^-1 rhs. `rhs` and `x` may alias. Asserts as `solveNeg` does.
+    pub fn solve(self: *Self, rhs: []const f64, x: []f64) void {
+        assert(rhs.len >= self.n);
+        assert(x.len >= self.n);
+        if (rhs.ptr != x.ptr) @memcpy(x[0..self.n], rhs[0..self.n]);
+        self.solveInPlace(x);
+    }
+
+    /// x = A^-T rhs, for adjoint analyses. `rhs` and `x` may alias. Asserts
+    /// as `solveNeg` does.
+    pub fn solveT(self: *Self, rhs: []const f64, x: []f64) void {
+        assert(self.factored);
+        assert(rhs.len >= self.n);
+        assert(x.len >= self.n);
+        if (rhs.ptr != x.ptr) @memcpy(x[0..self.n], rhs[0..self.n]);
+        self.syncHost();
+        switch (self.engine) {
+            .lu => |*lu| lu.solveT(x[0..self.n], x[0..self.n]),
+            .tri => |*tri| tri.solveT(x[0..self.n]),
+            .bbd => |*eng| self.solveBbd(eng, true, x[0..self.n]),
+        }
+    }
+
+    // ---- private ----
+
+    /// Orders the pattern (once) and builds the general LU on it.
+    fn initLu(self: *Self) InitError!SparseLu {
+        const gpa = self.gpa;
+        const n = self.n;
+        if (instrument and self.knobs.stats) lu_census.btfCensus(gpa, n, self.col_ptr, self.row_idx) catch |e| std.debug.print("lu-btf: {s}\n", .{@errorName(e)});
+        // One slab for the ordering and the fill bound; both restore it.
+        const ws_buf = try gpa.alloc(u32, order_mod.wsSize(n, self.col_ptr[n]));
+        defer gpa.free(ws_buf);
+        var ws = order_mod.Ws.init(ws_buf);
+        if (self.q.len == 0) {
+            const q = try gpa.alloc(u32, n);
+            errdefer gpa.free(q);
+            try order_mod.order(n, self.col_ptr, self.row_idx, q, &ws);
+            self.q = q;
+        }
+        assert(self.q.len == n);
+        // At least nnz(A): a diagonal matrix bounds nothing.
+        const diag_fill = @max(try order_mod.diagFill(n, self.col_ptr, self.row_idx, self.q, &ws), self.col_ptr[n]);
+        assert(ws.used == 0);
+        var lu = try SparseLu.init(gpa, n, self.col_ptr, self.q);
+        lu.stats = self.knobs.stats;
+        lu.diag_fill = diag_fill;
+        return lu;
+    }
+
+    /// Swaps a singular structured engine for the general LU, for good. The
+    /// LU is built first, so out of memory leaves the old engine live.
+    fn demote(self: *Self) InitError!void {
+        const lu = try self.initLu();
+        switch (self.engine) {
+            .lu => unreachable,
+            .tri => |*tri| tri.deinit(self.gpa),
+            .bbd => |*eng| eng.deinit(),
+        }
+        self.engine = .{ .lu = lu };
+        self.factored = false;
+        assert(self.sparse() != null);
+    }
+
+    fn initBbd(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32, bbd: ?num.BbdInfo, knobs: Knobs) Allocator.Error!?BbdEng {
+        const info = bbd orelse {
+            if (instrument and knobs.stats) std.debug.print("lu-census: no BbdInfo\n", .{});
+            return null;
+        };
+        if (knobs.no_bbd) return null;
+        const eng = BbdEng.init(gpa, n, col_ptr, row_idx, info, .{}) catch |err| switch (err) {
+            error.NotApplicable => {
+                if (instrument and knobs.stats) std.debug.print("lu-census: BbdInfo emitted; Bbd.init declined (NotApplicable)\n", .{});
+                return null;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (instrument and knobs.stats) std.debug.print("lu-census: BbdInfo emitted; Bbd.init accepted\n", .{});
+        return eng;
+    }
+
+    /// Frees the multicore and subtree refactor plans of the current pivot
+    /// epoch; the next `refactorLu` on a new epoch prices them again.
+    fn dropPlans(self: *Self) void {
+        if (self.par) |*p| p.deinit(self.gpa);
+        self.par = null;
+        if (self.sub) |*p| p.deinit(self.gpa);
+        self.sub = null;
+    }
+
     /// Brings the LU up to `vcopy` after a device factor. The device ran
     /// this refactor's exact operations and passed its tests, so it cannot
     /// fail here.
@@ -345,7 +399,7 @@ pub const Solver = struct {
         self.host_stale = false;
     }
 
-    fn factorInner(self: *Self, vals: []const f64, execution: num.Execution) !void {
+    fn factorInner(self: *Self, vals: []const f64, execution: num.Execution) FactorError!void {
         // A refactor that fails after overwriting the LU (the probe's OOM)
         // must not leave the old `vcopy` bypassing onto it.
         errdefer self.factored = false;
@@ -399,7 +453,7 @@ pub const Solver = struct {
     /// `FreqSolver` replays at pivot_tol, so it never probes. ponytail: a
     /// device factor (`syncHost`, the device LU's own solve) is not
     /// probed; check on the host after the sync if that path needs it.
-    fn replayHolds(self: *Self, vals: []const f64) !bool {
+    fn replayHolds(self: *Self, vals: []const f64) Allocator.Error!bool {
         const lu = &self.engine.lu;
         comptime assert(pivot_tol > 0);
         // A replay checks only its pivots. A NaN in L fails the bound below
@@ -467,7 +521,7 @@ pub const Solver = struct {
                 self.sub = subtree.Plan.init(self.gpa, lu, self.col_ptr, @min(threads, subtree.max_lanes), .{}) catch null;
                 if (self.knobs.par_stats) if (self.sub) |*p| {
                     std.debug.print("lu-subtree: n={d} lanes={d} phases={d} cut={d} model={d:.2}x tail={d:.2}\n", .{ lu.n, p.width, p.phases(), p.cut, p.speedup, p.tail_share });
-                    if (instrument) benchSubtree(p, lu, self.col_ptr, vals, growth, io);
+                    if (instrument) lu_census.benchSubtree(p, lu, self.col_ptr, vals, growth, io, &maxMultiplier);
                 } else std.debug.print("lu-subtree: n={d} declined\n", .{lu.n});
             }
         }
@@ -568,82 +622,53 @@ pub const Solver = struct {
             num.axpy(x, 1, r);
         }
     }
-
-    /// x = -A^-1 rhs, the Newton step. `rhs` and `x` may alias. Asserts that
-    /// the last `factor` succeeded and that both slices hold n entries.
-    pub fn solveNeg(self: *Self, rhs: []const f64, x: []f64) void {
-        assert(rhs.len >= self.n);
-        assert(x.len >= self.n);
-        num.scale(x[0..self.n], -1, rhs[0..self.n]);
-        self.solveInPlace(x);
-    }
-
-    /// x = A^-1 rhs. `rhs` and `x` may alias. Asserts as `solveNeg` does.
-    pub fn solve(self: *Self, rhs: []const f64, x: []f64) void {
-        assert(rhs.len >= self.n);
-        assert(x.len >= self.n);
-        if (rhs.ptr != x.ptr) @memcpy(x[0..self.n], rhs[0..self.n]);
-        self.solveInPlace(x);
-    }
-
-    /// x = A^-T rhs, for adjoint analyses. `rhs` and `x` may alias. Asserts
-    /// as `solveNeg` does.
-    pub fn solveT(self: *Self, rhs: []const f64, x: []f64) void {
-        assert(self.factored);
-        assert(rhs.len >= self.n);
-        assert(x.len >= self.n);
-        if (rhs.ptr != x.ptr) @memcpy(x[0..self.n], rhs[0..self.n]);
-        self.syncHost();
-        switch (self.engine) {
-            .lu => |*lu| lu.solveT(x[0..self.n], x[0..self.n]),
-            .tri => |*tri| tri.solveT(x[0..self.n]),
-            .bbd => |*eng| self.solveBbd(eng, true, x[0..self.n]),
-        }
-    }
 };
 
-/// `-Dlu-instrument` with `ESPICE_LU_PAR_STATS`: the subtree refactor, and
-/// the same with its tail run serially, against the serial one on this
-/// epoch's first values, medians of 15 interleaved runs each. Leaves `lu`
-/// refactored on `vals` (or failed, as the caller's own refactor would).
-fn benchSubtree(p: *subtree.Plan, lu: *sparse_lu.SparseLu, col_ptr: []const u32, vals: []const f64, growth: f64, io: std.Io) void {
-    const reps = 15;
-    var ser: [reps]u64 = undefined;
-    var par: [reps]u64 = undefined;
-    var scan: [reps]u64 = undefined;
-    var stail: [reps]u64 = undefined;
-    var sink: f64 = 0;
-    const done = p.done;
-    defer p.done = done;
-    for (0..reps) |i| {
-        const t0 = std.Io.Timestamp.now(io, .awake);
-        lu.refactor(col_ptr, vals, growth) catch |e| {
-            std.debug.print("lu-subtree-bench: refactor {s}\n", .{@errorName(e)});
-            return;
-        };
-        const t1 = std.Io.Timestamp.now(io, .awake);
-        p.run(lu, col_ptr, vals, growth, io) catch return;
-        const t2 = std.Io.Timestamp.now(io, .awake);
-        lu.replay_mult = null;
-        sink += maxMultiplier(lu);
-        const t3 = std.Io.Timestamp.now(io, .awake);
-        p.done = &.{};
-        p.run(lu, col_ptr, vals, growth, io) catch return;
-        p.done = done;
-        const t4 = std.Io.Timestamp.now(io, .awake);
-        ser[i] = @intCast(t0.durationTo(t1).nanoseconds);
-        par[i] = @intCast(t1.durationTo(t2).nanoseconds);
-        scan[i] = @intCast(t2.durationTo(t3).nanoseconds);
-        stail[i] = @intCast(t3.durationTo(t4).nanoseconds);
-    }
-    std.sort.pdq(u64, &stail, {}, std.sort.asc(u64));
-    std.debug.print("lu-subtree-bench: serial-tail lanes={d}us\n", .{stail[reps / 2] / 1000});
-    std.mem.doNotOptimizeAway(sink);
-    std.sort.pdq(u64, &scan, {}, std.sort.asc(u64));
-    std.sort.pdq(u64, &ser, {}, std.sort.asc(u64));
-    std.sort.pdq(u64, &par, {}, std.sort.asc(u64));
-    std.debug.print("lu-subtree-bench: serial={d}us lanes={d}us L-scan={d}us speedup={d:.2}x\n", .{ ser[reps / 2] / 1000, par[reps / 2] / 1000, scan[reps / 2] / 1000, @as(f64, @floatFromInt(ser[reps / 2])) / @as(f64, @floatFromInt(par[reps / 2])) });
+/// A re-pivot whose L plus U outgrows this multiple of the fresh factor's
+/// restarts on the previous pivots (`SparseLu.fill_cap`).
+const repivot_fill_cap: f64 = 3;
+
+/// A BBD factor whose `Bbd.growth` exceeds this is probed: a refined solve
+/// each way (A and A^T) whose scaled residual misses `probe_ratio_max`
+/// demotes it to the general LU, else every solve on it is refined (#136).
+/// Below it the certificate's ratio stayed under 0.04 (`residual_tests.zig`).
+const bbd_refine_growth: f64 = 1e3;
+
+/// Refinement steps after a BBD solve at most (LAPACK dgerfs' ITMAX).
+const refine_max = 5;
+
+/// The probe's bar on ||b - A x|| / (||A|| ||x|| n eps): LAWN 41's 30
+/// over 30, since one right-hand side only samples the error. On the
+/// certificate's BBD family a probe at 27.7 let a solve through at 67;
+/// refined solves that keep BBD probe at 0.2 or less (#136).
+const probe_ratio_max = 1;
+
+/// LAPACK's LAWN 41 bar for a backward-stable solve. `replayHolds` divides
+/// it by `pivot_tol`, as the residual certificate does for threshold
+/// pivoting (residual_tests.zig `ratio_max_pivoting`): multipliers up to
+/// 1/pivot_tol are the full factor's own.
+const replay_ratio_max = 30.0;
+
+/// Measured on the post-layout and stress decks, 2 to 8 threads
+/// (dev/solvers/gpu-lu.md, "Multicore host refactor"): F/n = 445 and up
+/// wins at every thread count from F = 0.78M (sram_bsim4_1k); F/n = 152
+/// breaks even at 4 and 8 threads and loses at 2; F/n <= 95 loses up to 12x
+/// (the columns form a chain, and every handoff is a wait). ponytail: one
+/// F/n bar for every thread count; fit per count if a deck lands between.
+const par_min_flops = 500_000;
+
+const par_min_per_col = 300;
+
+/// 4 bytes of tables per flop.
+const par_max_flops = 400_000_000;
+
+comptime {
+    assert(par_min_flops <= par_max_flops);
+    // The multicore tables hold u32 offsets.
+    assert(par_max_flops <= std.math.maxInt(u32));
 }
+
+// ---- private ----
 
 /// The multicore refactor's admission: enough flops per refactor to pay
 /// for the handoffs, and enough per column that the columns are not a
@@ -659,12 +684,6 @@ fn parWorthIt(lu: *const sparse_lu.SparseLu, knobs: Knobs) bool {
         std.debug.print("lu-par: n={d} F={d} F/n={d} admit={}\n", .{ lu.n, flops, flops / @max(lu.n, 1), ok });
     return ok;
 }
-
-/// LAPACK's LAWN 41 bar for a backward-stable solve. `replayHolds` divides
-/// it by `pivot_tol`, as the residual certificate does for threshold
-/// pivoting (residual_tests.zig `ratio_max_pivoting`): multipliers up to
-/// 1/pivot_tol are the full factor's own.
-const replay_ratio_max = 30.0;
 
 /// The largest |L| entry over the steps the refactor's growth monitor
 /// covers, NaN when any L entry is NaN. A replay writes L as v / d, so
@@ -707,89 +726,6 @@ fn probeRhs(b: []f64) void {
     }
 }
 
-/// Measured on the post-layout and stress decks, 2 to 8 threads
-/// (dev/solvers/gpu-lu.md, "Multicore host refactor"): F/n = 445 and up
-/// wins at every thread count from F = 0.78M (sram_bsim4_1k); F/n = 152
-/// breaks even at 4 and 8 threads and loses at 2; F/n <= 95 loses up to 12x
-/// (the columns form a chain, and every handoff is a wait). ponytail: one
-/// F/n bar for every thread count; fit per count if a deck lands between.
-const par_min_flops = 500_000;
-const par_min_per_col = 300;
-/// 4 bytes of tables per flop.
-const par_max_flops = 400_000_000;
-comptime {
-    assert(par_min_flops <= par_max_flops);
-    // The multicore tables hold u32 offsets.
-    assert(par_max_flops <= std.math.maxInt(u32));
-}
-
-/// The census for a partial refactor (TODO 2.8): the share of A entries
-/// that changed since the last factor, and of pivot steps a replay would
-/// have to redo, those whose column changed or whose U names a redone step.
-fn reachCensus(gpa: Allocator, lu: *const sparse_lu.SparseLu, col_ptr: []const u32, old: []const f64, vals: []const f64) !void {
-    const n = lu.n;
-    const redo = try gpa.alloc(bool, n);
-    defer gpa.free(redo);
-    var changed: u64 = 0;
-    var steps: u64 = 0;
-    var flops: u64 = 0;
-    var redo_flops: u64 = 0;
-    for (0..n) |k| {
-        const c = lu.q[k];
-        var r = false;
-        for (col_ptr[c]..col_ptr[c + 1]) |p| if (!(old[p] == vals[p])) {
-            changed += 1;
-            r = true;
-        };
-        var f: u64 = 0;
-        for (lu.ui.items[lu.up[k]..lu.up[k + 1]]) |i| {
-            r = r or redo[i];
-            f += lu.lp[i + 1] - lu.lp[i];
-        }
-        redo[k] = r;
-        flops += f;
-        if (r) {
-            steps += 1;
-            redo_flops += f;
-        }
-    }
-    const pct = struct {
-        fn f(a: u64, b: u64) f64 {
-            return 100 * @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(@max(b, 1)));
-        }
-    }.f;
-    std.debug.print("lu-reach: changed={d:.2}% steps={d:.2}% flops={d:.2}%\n", .{ pct(changed, col_ptr[n]), pct(steps, n), pct(redo_flops, flops) });
-}
-
-/// The census for keeping the BTF blocks through the factor (TODO 2.5):
-/// the block count, singletons, the largest block and the entries outside
-/// every diagonal block, which a block factor would leave unfactored.
-fn btfCensus(gpa: Allocator, n: u32, col_ptr: []const u32, row_idx: []const u32) !void {
-    const buf = try gpa.alloc(u32, 3 * @as(usize, n) + 1 + order_mod.wsSize(n, col_ptr[n]));
-    defer gpa.free(buf);
-    const emit = buf[0..n];
-    const block_ptr = buf[n..][0 .. n + 1];
-    const blk_of = buf[2 * n + 1 ..][0..n];
-    var ws = order_mod.Ws.init(buf[3 * n + 1 ..]);
-    const nb = try order_mod.blocks(n, col_ptr, row_idx, emit, block_ptr, &ws);
-    var largest: u32 = 0;
-    var singletons: u32 = 0;
-    for (0..nb) |b| {
-        const size = block_ptr[b + 1] - block_ptr[b];
-        largest = @max(largest, size);
-        singletons += @intFromBool(size == 1);
-        for (emit[block_ptr[b]..block_ptr[b + 1]]) |v| blk_of[v] = @intCast(b);
-    }
-    var off: u64 = 0;
-    for (0..n) |j| for (row_idx[col_ptr[j]..col_ptr[j + 1]]) |r| {
-        off += @intFromBool(blk_of[r] != blk_of[j]);
-    };
-    std.debug.print("lu-btf: n={d} blocks={d} singletons={d} largest={d} ({d:.1}% of n) off_block_nnz={d} ({d:.1}% of nnz)\n", .{
-        n,                                                                            nb,  singletons,                                                                        largest,
-        100 * @as(f64, @floatFromInt(largest)) / @as(f64, @floatFromInt(@max(n, 1))), off, 100 * @as(f64, @floatFromInt(off)) / @as(f64, @floatFromInt(@max(col_ptr[n], 1))),
-    });
-}
-
 /// IEEE equality per element (-0 == +0, NaN != NaN) and equal lengths,
 /// not `std.mem.eql`'s bytes. Chunked: each 64-entry block is a branchless
 /// OR the loop vectorizer takes, one branch per block: 0.08-0.10 ns per
@@ -808,8 +744,6 @@ fn simdEql(a: []const f64, b: []const f64) bool {
     for (a[i..], b[i..]) |x, y| ne |= @intFromBool(!(x == y));
     return ne == 0;
 }
-
-const testing = std.testing;
 
 test simdEql {
     const Ref = struct {

@@ -334,7 +334,10 @@ pub const Plan = struct {
             var spins: u32 = 0;
             while (self.done[i - self.cut].load(.acquire) != self.stamp) : (spins +%= 1) {
                 // A descheduled worker may hold the awaited step (HostSy.pause).
-                if (spins < 256 or @import("builtin").single_threaded) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+                if (spins < 256 or @import("builtin").single_threaded) std.atomic.spinLoopHint() else std.Thread.yield() catch |err| switch (err) {
+                    // A system that cannot yield keeps spinning.
+                    error.SystemCannotYield => std.atomic.spinLoopHint(),
+                };
             }
         }
 

@@ -7,52 +7,57 @@
 //! refactor-tape-2026-09.md, gpu-lu.md (the census); KLU's threshold
 //! pivoting; ngspice Sparse 1.3 spfactor.c (ExchangeRowsAndCols, the row
 //! exchange the scaled pivot and the want hand-off stand in for); #45.
+//!
+//! Contents:
+//! - `pub const instrument = @import("build_options").lu_instrument`
+//! - `pub const SparseLu = struct`
+//!   - `pub const FactorError = error`
+//!   - `pub fn init(...)`
+//!   - `pub fn deinit(self: *Self, gpa: Allocator) void`
+//!   - `pub fn factor(...)`
+//!   - `pub const test_access = if (@import("builtin").is_test) .{`
+//!   - `pub fn refactor(...)`
+//!   - `pub const Replay = lu_replay.Replay`
+//!   - `pub fn replay(self: *Self, col_ptr: []const u32, vals: []const f64, growth_limit: f64) Replay`
+//!   - `pub fn solve(self: *Self, b: []const f64, x: []f64) void`
+//!   - `pub fn solveT(self: *Self, b: []const f64, x: []f64) void`
+//!   - `pub fn init(gpa: Allocator, r: std.Random, n: u32, density: f64) !TestSystem`
+//!   - `pub fn deinit(self: TestSystem, gpa: Allocator) void`
+//!   - `pub fn residual(self: TestSystem, vals: []const f64, x: []const f64, b: []const f64, comptime transpose: bool) f64`
+//!   - `pub const col_ptr = [_]u32{ 0, 2, 3, 6 }`
+//!   - `pub const row_idx = [_]u32{ 0, 1, 1, 0, 1, 2 }`
+//!   - `pub const q = [_]u32{ 0, 1, 2 }`
+//!   - `pub const benign_vals = [_]f64{ 1, 1, 1, 1, 1, 1 }`
+//!   - `pub const overflow_vals = [_]f64{ 1, 1, 1, 1.5e308, -1.5e308, 1 }`
 
 const std = @import("std");
 const assert = std.debug.assert;
 const num = @import("core").numerics;
-
+const lu_factor = @import("lu_factor.zig");
+const lu_replay = @import("lu_replay.zig");
 /// `-Dlu-instrument`: compiles the `ZP_LU_STATS` fill print and census.
 pub const instrument = @import("build_options").lu_instrument;
 const Allocator = std.mem.Allocator;
-
-const NONE: u32 = std.math.maxInt(u32);
+const testing = std.testing;
 
 /// Sparse LU. Arrays are SoA; the DFS workspace is touched
 /// only by a full `factor`.
 pub const SparseLu = struct {
     const Self = @This();
-
-    /// `SingularMatrix`: some column has no finite nonzero pivot and is
-    /// not a structurally void unknown.
-    pub const FactorError = error{ OutOfMemory, SingularMatrix };
-
-    /// Supernode steps [first, last]. Its rows are L[:,first]'s: first
-    /// the block rows of steps first+1..last (slot t-first-1), then the
-    /// rest. Values are column-major, `nrows` per member step.
-    const Panel = struct { first: u32, last: u32, row_off: u32, val_off: u32 };
-    comptime {
-        assert(@sizeOf(Panel) == 16);
-    }
-    /// A panel opens only on an L column at least this long, and the
-    /// factor switches to its supernodal loop only after one appears.
-    /// Short supernodes (a complex AC entry's 2x2 real block) lose to
-    /// the scalar path: 16 and 8 cost 0.5% and 13% more Ir than 32 on
-    /// the 100x100 grid and the sweep_opamp AC matrix respectively.
-    const panel_min_rows = 32;
+    /// Private kernels for src/solver/tests.zig; empty outside test builds.
+    // The column replay, for this file's tests (`lu_replay.zig`).
+    const refactorColumns = lu_replay.refactorColumns;
 
     n: u32,
     /// Borrowed column ordering: pivot step k factors column q[k].
     q: []const u32,
     /// Original row -> pivot step.
     pinv: []u32,
-
     /// L, strictly lower with unit diagonal, CSC over pivot steps. Row
     /// indices are pivot steps once `factor` returns.
     lp: []u32,
     li: std.ArrayList(u32) = .empty,
     lx: std.ArrayList(f64) = .empty,
-
     /// U, strictly upper, CSC over pivot steps. Each column's rows are in
     /// the topological order the triangular solve visited them, which is
     /// the order `refactor` replays.
@@ -60,16 +65,13 @@ pub const SparseLu = struct {
     ui: std.ArrayList(u32) = .empty,
     ux: std.ArrayList(f64) = .empty,
     udiag: []f64,
-
     /// prow[p] = pinv[row_idx[p]]: A entry p -> its permuted row.
     prow: []u32,
-
     /// Pivot steps that got a fabricated unit pivot (see `voidUnknown`).
     void_col: []bool,
     /// CSC entries in a fabricated pivot's row or column. A replay is
     /// valid only while all of them stay zero.
     void_slots: std.ArrayList(u32) = .empty,
-
     /// Pivot steps whose diagonal passed only the row-scaled threshold
     /// test. Such a pivot sits far below its raw column max, so the
     /// refactor growth monitor skips these steps.
@@ -98,7 +100,6 @@ pub const SparseLu = struct {
     panels: std.ArrayList(Panel) = .empty,
     panel_rows: std.ArrayList(u32) = .empty,
     panel_vals: std.ArrayList(f64) = .empty,
-
     /// Small-matrix refactor tape: one {dst, l, u} slot triple per flop,
     /// `tv[dst] -= tv[l] * tv[u]`, in refactor order. Empty above
     /// `tape_max_flops`, where `refactor` runs the column loop instead.
@@ -111,7 +112,6 @@ pub const SparseLu = struct {
     lsrc: std.ArrayList(u32) = .empty,
     /// Tape slot values: ux ++ udiag ++ lx ++ one discard slot.
     tv: std.ArrayList(f64) = .empty,
-
     /// Dense accumulator, all-zero on entry to and exit from every public
     /// call, errors included. `factor` reads unscattered fill rows as 0,
     /// and `refactor` zeroes each slot as it consumes it rather than
@@ -122,7 +122,6 @@ pub const SparseLu = struct {
     /// rscale[r] = 1 / max_j |A[r][j]| (1 for an all-zero or non-finite
     /// row), by original row. Recomputed by each `factor`.
     rscale: []f64,
-
     /// Full-factor scratch: `want[c]` is the row column c tries first,
     /// `want_of` its inverse. When column c pivots on row r != want[c],
     /// the column that wanted r inherits want[c] (see `factor`).
@@ -150,7 +149,6 @@ pub const SparseLu = struct {
     /// Print every full factor's fill and census (`direct.Knobs.stats`);
     /// read only under `instrument`.
     stats: bool = false,
-
     /// DFS workspace, alive only inside `factor` (`scratch_u32`): the
     /// per-column visit mark (pivot step + 1), the reach in finish order,
     /// the DFS stack, and each stacked row's resume offset into its L
@@ -159,7 +157,6 @@ pub const SparseLu = struct {
     topo: []u32,
     stack: []u32,
     pstack: []u32,
-
     factored: bool = false,
     /// The largest |L| entry over the monitored steps (not `scaled_pivot`)
     /// of the last successful column replay that ran the growth monitor,
@@ -172,6 +169,10 @@ pub const SparseLu = struct {
     /// Bumped by every successful `factor`: a new pattern and pivot
     /// sequence, so device tables built from the old ones are stale.
     pattern_epoch: u32 = 0,
+
+    /// `SingularMatrix`: some column has no finite nonzero pivot and is
+    /// not a structurally void unknown.
+    pub const FactorError = error{ OutOfMemory, SingularMatrix };
 
     /// Allocates every workspace. `q` is borrowed and must outlive the
     /// SparseLu; the row indices arrive with `factor`. Asserts that `q` has
@@ -240,7 +241,7 @@ pub const SparseLu = struct {
     /// Frees every buffer `init` and `factor` allocated; `q` stays the
     /// caller's.
     pub fn deinit(self: *Self, gpa: Allocator) void {
-        self.dropScratch(gpa);
+        lu_factor.dropScratch(self, gpa);
         inline for (.{ self.pinv, self.lp, self.up, self.prow, self.prev, self.void_col, self.scaled_pivot, self.tape_col, self.amap, self.udiag, self.w, self.y }) |s|
             gpa.free(s);
         inline for (.{ &self.tape, &self.lsrc, &self.tv, &self.panels, &self.panel_rows, &self.panel_vals, &self.void_slots, &self.li, &self.lx, &self.ui, &self.ux }) |l|
@@ -285,8 +286,8 @@ pub const SparseLu = struct {
         assert(vals.len >= self.prow.len);
         assert(pivot_tol >= 0);
         assert(pivot_tol <= 1);
-        try self.holdScratch(gpa);
-        defer self.dropScratch(gpa);
+        try lu_factor.holdScratch(self, gpa);
+        defer lu_factor.dropScratch(self, gpa);
         const repivot = self.factored and self.fill_cap > 0 and self.base_lu > 0;
         var cap: usize = std.math.maxInt(usize);
         if (repivot) {
@@ -296,670 +297,26 @@ pub const SparseLu = struct {
             for (self.prev, 0..) |*r, c| r.* = @intCast(c);
             cap = @intFromFloat(@min(self.fill_cap * @as(f64, @floatFromInt(self.diag_fill)), 1e18));
         }
-        if (try self.factorPass(gpa, col_ptr, row_idx, vals, pivot_tol, cap, false)) {
+        if (try lu_factor.factorPass(self, gpa, col_ptr, row_idx, vals, pivot_tol, cap, false)) {
             if (instrument and self.stats)
                 std.debug.print("lu-stats: factor passed {d} L+U entries; keeping the previous (or diagonal) pivots\n", .{cap});
             // The diagonal retry is held to the same cap: values that fill
             // past it even on the diagonal (the cold start above, 48M
             // entries) are no factor worth having, and the caller's
             // continuation (gmin stepping, a smaller step) does better.
-            if (try self.factorPass(gpa, col_ptr, row_idx, vals, pivot_tol, if (repivot) std.math.maxInt(usize) else cap, true))
+            if (try lu_factor.factorPass(self, gpa, col_ptr, row_idx, vals, pivot_tol, if (repivot) std.math.maxInt(usize) else cap, true))
                 return error.SingularMatrix;
         }
         assert(self.factored);
         if (!repivot) self.base_lu = self.li.items.len + self.ui.items.len;
     }
 
-    /// The full factor's own scratch, `n` per array, alive only inside
-    /// `factor`: a refactor or a solve never reads it (n * 44 bytes, 4.4 MB
-    /// at the 100k-node RC ladder).
-    const scratch_u32 = .{ "flag", "topo", "stack", "pstack", "want", "want_of", "lend", "sn_of", "sn_slot", "sn_end" };
-
-    fn holdScratch(self: *Self, gpa: Allocator) Allocator.Error!void {
-        assert(self.flag.len == 0);
-        errdefer self.dropScratch(gpa);
-        inline for (scratch_u32) |name| @field(self, name) = try gpa.alloc(u32, self.n);
-        self.rscale = try gpa.alloc(f64, self.n);
-    }
-
-    fn dropScratch(self: *Self, gpa: Allocator) void {
-        inline for (scratch_u32) |name| {
-            gpa.free(@field(self, name));
-            @field(self, name) = &.{};
-        }
-        gpa.free(self.rscale);
-        self.rscale = &.{};
-    }
-
-    /// One full factor. `keep_prev` starts each column from `prev` and
-    /// takes it while it passes `keep_min`; otherwise from the diagonal under the
-    /// threshold test. Returns true, unfactored, once L plus U exceeds `cap`.
-    fn factorPass(
-        self: *Self,
-        gpa: Allocator,
-        col_ptr: []const u32,
-        row_idx: []const u32,
-        vals: []const f64,
-        pivot_tol: f64,
-        cap: usize,
-        keep_prev: bool,
-    ) FactorError!bool {
-        const n = self.n;
-        assert(self.flag.len == n);
-        assert(self.rscale.len == n);
-        self.factored = false;
-        self.replay_mult = null;
-        @memset(self.pinv, NONE);
-        @memset(self.flag, 0);
-        @memset(self.void_col, false);
-        @memset(self.scaled_pivot, false);
-        self.tv.clearRetainingCapacity();
-        self.panels.clearRetainingCapacity();
-        self.panel_rows.clearRetainingCapacity();
-        self.panel_vals.clearRetainingCapacity();
-        self.void_slots.clearRetainingCapacity();
-        var has_void = false;
-        self.li.clearRetainingCapacity();
-        self.lx.clearRetainingCapacity();
-        self.ui.clearRetainingCapacity();
-        self.ux.clearRetainingCapacity();
-
-        // Threshold pivoting compares candidates in whatever units each
-        // device wrote its row in. Record 1/max|A[r,:]| so the diagonal
-        // test below can retry in a scale-free metric.
-        @memset(self.rscale, 0);
-        // A NaN or inf entry fails the factor: the pivot search skips NaN
-        // and the solve skips zero multipliers, so one left in L or U could
-        // reach x unseen. One vectorized pass, ~0.4% of a circuit factor.
-        // An overflow inside the elimination is caught where L and U are
-        // stored (`nonfinite`).
-        if (!(num.normInf(vals[0..self.prow.len]) <= std.math.floatMax(f64))) return error.SingularMatrix;
-        for (0..n) |j| {
-            for (col_ptr[j]..col_ptr[j + 1]) |p|
-                self.rscale[row_idx[p]] = @max(self.rscale[row_idx[p]], @abs(vals[p]));
-        }
-        for (self.rscale) |*s|
-            s.* = if (s.* > 0 and std.math.isFinite(s.*)) 1 / s.* else 1;
-
-        // Locals, not fields: a store through any slice may alias `self`,
-        // and field access would reload the slice pointers per element.
-        const pinv = self.pinv;
-        const flag = self.flag;
-        const stack = self.stack;
-        const pstack = self.pstack;
-        const topo = self.topo;
-        const lp = self.lp;
-        const w = self.w;
-        const rscale = self.rscale;
-        const lend = self.lend;
-        const want = self.want;
-        const want_of = self.want_of;
-        // Nonzero once an L or U entry stored is NaN or inf; tested once
-        // after the column loop. x - x is +0 for a finite x and NaN
-        // otherwise, so OR-ing its bits costs two ops and no compare.
-        var nonfinite: u64 = 0;
-        for (want, self.prev, 0..) |*a, p, i| a.* = if (keep_prev) p else @intCast(i);
-        for (want, 0..) |r, c| want_of[r] = @intCast(c);
-        // Two copies of the column loop. The plain one runs until an L
-        // column reaches panel_min_rows, which typical circuit matrices
-        // never do. The supernodal copy adds the lend shortcut and panels.
-        var k: usize = 0;
-        inline for (.{ false, true }) |sn| {
-            if (sn) {
-                lp[k] = @intCast(self.li.items.len);
-                for (lend[0..k], lp[1 .. k + 1]) |*e, end| e.* = end;
-                @memset(self.sn_of, NONE);
-                self.sn_dfs = false;
-            }
-            while (k < n) : (k += 1) {
-                const c = self.q[k];
-                lp[k] = @intCast(self.li.items.len);
-                self.up[k] = @intCast(self.ui.items.len);
-                const mark: u32 = @intCast(k + 1);
-                // L may move at the reservation below; re-take it after.
-                const li = self.li.items;
-
-                // Reach of A[:,c] through the graph of L.
-                var nt: u32 = 0;
-                for (col_ptr[c]..col_ptr[c + 1]) |p| {
-                    var r = row_idx[p];
-                    if (flag[r] == mark) continue;
-                    var sp: u32 = 0;
-                    stack[sp] = r;
-                    flag[r] = mark;
-                    // An unpivoted row has no L column: the empty range [0, 0).
-                    pstack[sp] = if (sn) self.enter(r, sp, mark) else if (pinv[r] == NONE) 0 else lp[pinv[r]];
-                    // Terminates: each pass pushes a row not yet marked for
-                    // this column (at most n of them) or finishes the top
-                    // one, so it runs at most 2n times and sp stays below n.
-                    while (true) {
-                        r = stack[sp];
-                        const kc = pinv[r];
-                        const in_panel = sn and kc != NONE and self.sn_end[sp] != NONE;
-                        // A panel row scans the panel's rows below its block.
-                        const adj = if (in_panel) self.panel_rows.items else li;
-                        const end = if (kc == NONE) 0 else if (in_panel) self.panelEnd(kc) else if (sn) lend[kc] else lp[kc + 1];
-                        // Keep the cursor in a register; spill it only on descent.
-                        var pos = pstack[sp];
-                        var descended = false;
-                        while (pos < end) {
-                            const child = adj[pos];
-                            pos += 1;
-                            if (flag[child] != mark) {
-                                pstack[sp] = pos;
-                                flag[child] = mark;
-                                sp += 1;
-                                stack[sp] = child;
-                                pstack[sp] = if (sn) self.enter(child, sp, mark) else if (pinv[child] == NONE) 0 else lp[pinv[child]];
-                                descended = true;
-                                break;
-                            }
-                        }
-                        if (descended) continue;
-                        if (in_panel) {
-                            // The covered steps finish deepest first, so
-                            // the solve meets kc..e in step order.
-                            const pan = self.panels.items[self.sn_of[kc]];
-                            const rows = self.panel_rows.items[pan.row_off..];
-                            var t = self.sn_end[sp];
-                            while (t > kc) : (t -= 1) {
-                                topo[nt] = rows[t - pan.first - 1];
-                                nt += 1;
-                            }
-                        }
-                        topo[nt] = r;
-                        nt += 1;
-                        if (sp == 0) break;
-                        sp -= 1;
-                    }
-                }
-
-                // The reach bounds this column's U and L entries. Reserve
-                // before the scatter so OutOfMemory leaves `w` zero.
-                try self.ui.ensureUnusedCapacity(gpa, nt);
-                try self.ux.ensureUnusedCapacity(gpa, nt);
-                try self.li.ensureUnusedCapacity(gpa, nt);
-                try self.lx.ensureUnusedCapacity(gpa, nt);
-                const lcol = self.li.items;
-                const lval = self.lx.items;
-
-                for (col_ptr[c]..col_ptr[c + 1]) |p| w[row_idx[p]] = vals[p];
-
-                // Triangular solve in reverse finish order.
-                var idx: u32 = nt;
-                while (idx > 0) {
-                    idx -= 1;
-                    const r = topo[idx];
-                    const kc = pinv[r];
-                    if (kc == NONE) continue;
-                    if (sn and self.panels.items.len != 0 and self.sn_of[kc] != NONE) {
-                        idx = self.panelRun(w, topo, idx, kc);
-                        continue;
-                    }
-                    const ukr = w[r];
-                    self.ui.appendAssumeCapacity(kc);
-                    self.ux.appendAssumeCapacity(ukr);
-                    scatterAxpy(w, lcol, lval, lp[kc], lp[kc + 1], ukr);
-                }
-
-                // `amax`, the raw column max, picks the off-diagonal
-                // fallback and gates singularity. `smax` is the same max
-                // under row scaling, the diagonal test's second chance: an
-                // equation decades below the rest may still own its unknown.
-                var amax: f64 = 0;
-                var smax: f64 = 0;
-                var piv: u32 = NONE;
-                for (topo[0..nt]) |r| {
-                    if (pinv[r] != NONE) continue;
-                    const a = @abs(w[r]);
-                    if (a > amax) {
-                        amax = a;
-                        piv = r;
-                    }
-                    smax = @max(smax, a * rscale[r]);
-                }
-                if (piv == NONE or amax == 0 or !std.math.isFinite(amax)) {
-                    // Usually a singular circuit, but a compact model can
-                    // disable part of itself (HICUM's `V(br_sht) <+ 0` at
-                    // flsh = 0, the BSIM4/BSIMSOI/HiSIM self-heating nodes),
-                    // and Verilog-A cannot delete the node: its unknown keeps
-                    // an all-zero row and column. That is a free variable,
-                    // not a singular system. A unit pivot is sound only when
-                    // row c is void too: then x_c = b_c, and a nonzero b_c
-                    // fails the Newton residual gate instead of solving
-                    // silently. Without this, devices/hicum2_output paid the
-                    // whole continuation ladder at each of 1809 DC points.
-                    if (!self.voidUnknown(col_ptr, row_idx, vals, c)) {
-                        // `w` still holds this column's values; restore
-                        // the all-zero invariant.
-                        for (topo[0..nt]) |r| w[r] = 0;
-                        return error.SingularMatrix;
-                    }
-                    self.void_col[k] = true;
-                    has_void = true;
-                    self.udiag[k] = 1;
-                    pinv[c] = @intCast(k);
-                    if (sn) lend[k] = lp[k]; // empty L column
-                    for (topo[0..nt]) |r| w[r] = 0;
-                    continue;
-                }
-                const pr = want[c];
-                if (pinv[pr] == NONE) {
-                    const dmag = @abs(w[pr]);
-                    // `dmag > 0`: a zero tolerance must not accept a zero pivot.
-                    if (keep_prev) {
-                        if (dmag > 0 and dmag >= self.keep_min * amax) piv = pr;
-                    } else if (dmag > 0 and dmag >= pivot_tol * amax) {
-                        piv = pr;
-                    } else if (dmag > 0 and dmag * rscale[pr] >= pivot_tol * smax) {
-                        // The diagonal is the largest entry measured against
-                        // its own equation. A BSIMSOI floating body at default
-                        // junction params: its KCL row is ~1e-18 S while Gmbs
-                        // ~1e-4 S sits in its column on the drain row, and
-                        // pivoting there makes dx_body drain-row rounding noise
-                        // (observed -13.9 V). ngspice avoids it by permuting
-                        // rows and columns together (Sparse 1.3 spfactor.c
-                        // ExchangeRowsAndCols), which a fixed column order
-                        // cannot do.
-                        // ponytail: scales the pivot choice only; full row
-                        // equilibration (KLU scale=2) if the arithmetic needs it.
-                        piv = pr;
-                        self.scaled_pivot[k] = true;
-                    }
-                }
-                if (piv != pr) {
-                    // Row piv was column want_of[piv]'s first choice; hand
-                    // it the row c gave up. Without this, each off-diagonal
-                    // pivot also cost the column whose diagonal it took, and
-                    // that one another: 1,811 of the 2,654 off-diagonal
-                    // pivots in one chain_bsim4_10k re-pivot were such
-                    // cascades. The same 2x2 exchange ngspice's Sparse gets
-                    // from ExchangeRowsAndCols; KLU has no equivalent.
-                    const c2 = want_of[piv];
-                    want[c2] = pr;
-                    want_of[pr] = c2;
-                }
-                const d = w[piv];
-                self.udiag[k] = d;
-                pinv[piv] = @intCast(k);
-
-                // L[:,k] is the unpivoted reach over the pivot; clear w. A
-                // pivoted row's w still holds its U entry (`panelRun`
-                // writes its rows back), so this one pass flags U and L.
-                for (topo[0..nt]) |r| {
-                    const v = w[r];
-                    nonfinite |= @as(u64, @bitCast(v - v));
-                    if (pinv[r] == NONE) {
-                        const l = v / d;
-                        nonfinite |= @as(u64, @bitCast(l - l));
-                        self.li.appendAssumeCapacity(r);
-                        self.lx.appendAssumeCapacity(l);
-                    }
-                    w[r] = 0;
-                }
-                if (self.li.items.len + self.ui.items.len > cap) {
-                    assert(!self.factored);
-                    return true;
-                }
-                if (!sn) {
-                    if (self.li.items.len - lp[k] >= panel_min_rows) {
-                        k += 1;
-                        break;
-                    }
-                    continue;
-                }
-                lend[k] = @intCast(self.li.items.len);
-                // Short columns gain nothing from either shortcut.
-                if (k > 0 and (lp[k] - lp[k - 1] >= panel_min_rows or self.sn_of[k - 1] != NONE))
-                    try self.linkStep(gpa, @intCast(k), piv, mark);
-                // Panels hold most of L so far: a mesh. From here on the
-                // walk visits each panel run once (`enter`).
-                if (self.panel_vals.items.len >= self.li.items.len / 5 * 4) self.sn_dfs = true;
-            }
-        }
-        self.lp[n] = @intCast(self.li.items.len);
-        self.up[n] = @intCast(self.ui.items.len);
-        // Every row pivoted exactly once: k ran to n and each step set one.
-        assert(k == n);
-        if (nonfinite != 0) return error.SingularMatrix;
-
-        for (self.li.items) |*r| r.* = self.pinv[r.*];
-        for (row_idx[0..self.prow.len], self.prow) |r, *pr| pr.* = self.pinv[r];
-
-        if (has_void) {
-            var count: usize = 0;
-            for (self.q, 0..) |c, j| {
-                for (col_ptr[c]..col_ptr[c + 1]) |p|
-                    count += @intFromBool(self.void_col[j] or self.void_col[self.prow[p]]);
-            }
-            try self.void_slots.ensureTotalCapacityPrecise(gpa, count);
-            for (self.q, 0..) |c, j| {
-                for (col_ptr[c]..col_ptr[c + 1]) |p| {
-                    if (self.void_col[j] or self.void_col[self.prow[p]])
-                        self.void_slots.appendAssumeCapacity(@intCast(p));
-                }
-            }
-        }
-
-        try self.buildTape(gpa, col_ptr);
-
-        // ZP_LU_STATS prints n, nnz and fill per full factor, then the
-        // structural census of dev/solvers/gpu-lu.md E1.
-        if (instrument and self.stats) {
-            std.debug.print("lu-stats: n={d} nnz={d} L={d} U={d} fill={d:.1}x\n", .{
-                n,                 col_ptr[n],
-                self.li.items.len, self.ui.items.len,
-                @as(f64, @floatFromInt(self.li.items.len + self.ui.items.len)) /
-                    @as(f64, @floatFromInt(col_ptr[n])),
-            });
-            self.census(gpa, col_ptr, row_idx) catch {};
-        }
-
-        assert(self.lx.items.len == self.li.items.len);
-        assert(self.ux.items.len == self.ui.items.len);
-        self.pattern_epoch +%= 1;
-        self.factored = true;
-        return false;
-    }
-
-    /// E1's census (dev/solvers/gpu-lu.md §5) of the factor just built,
-    /// all O(nnz(L+U)): F, the refactor's multiply-adds (one per U entry
-    /// (j, k) and row of L[:,j]); `S_r`, the §4.2 span of the sync-free
-    /// column kernel; the level count; the solve spans `S_L`/`S_U` as
-    /// longest dependency paths; the widest U column; the share of F in
-    /// levels narrower than 64 columns; A's rows and columns above 1,000
-    /// entries (rails); and the §4.1 epoch bytes.
-    fn census(self: *const Self, gpa: Allocator, col_ptr: []const u32, row_idx: []const u32) Allocator.Error!void {
-        const n = self.n;
-        assert(col_ptr.len == @as(usize, n) + 1);
-        assert(self.lp[n] == self.li.items.len);
-        const scratch = try gpa.alloc(u32, 4 * @as(usize, n));
-        defer gpa.free(scratch);
-        const finish = scratch[0..n];
-        const level = scratch[n .. 2 * n];
-        const span = scratch[2 * n .. 3 * n];
-        const width = scratch[3 * n ..];
-        var flops: u64 = 0;
-        var s_r: u32 = 0;
-        var levels: u32 = 0;
-        var widest: u32 = 0;
-        for (0..n) |k| {
-            var t: u32 = 0;
-            var lv: u32 = 0;
-            const col = self.ui.items[self.up[k]..self.up[k + 1]];
-            for (col) |j| {
-                t = @max(t, finish[j]) + 1;
-                lv = @max(lv, level[j] + 1);
-                flops += self.lp[j + 1] - self.lp[j];
-            }
-            finish[k] = t + 1;
-            level[k] = lv;
-            s_r = @max(s_r, t + 1);
-            levels = @max(levels, lv + 1);
-            widest = @max(widest, @as(u32, @intCast(col.len)));
-        }
-        @memset(width, 0);
-        for (level) |lv| width[lv] += 1;
-        var narrow: u64 = 0;
-        for (0..n) |k| if (width[level[k]] < 64) {
-            for (self.ui.items[self.up[k]..self.up[k + 1]]) |j| narrow += self.lp[j + 1] - self.lp[j];
-        };
-        // Forward solve: y[r] waits on y[k] for each L[r, k], k < r.
-        @memset(span, 0);
-        var s_l: u32 = 0;
-        for (0..n) |k| for (self.li.items[self.lp[k]..self.lp[k + 1]]) |r| {
-            span[r] = @max(span[r], span[k] + 1);
-            s_l = @max(s_l, span[r]);
-        };
-        // Back solve: z[i] waits on z[k] for each U[i, k], i < k.
-        @memset(span, 0);
-        var s_u: u32 = 0;
-        var k = n;
-        while (k > 0) {
-            k -= 1;
-            for (self.ui.items[self.up[k]..self.up[k + 1]]) |i| {
-                span[i] = @max(span[i], span[k] + 1);
-                s_u = @max(s_u, span[i]);
-            }
-        }
-        @memset(width, 0);
-        var rail_cols: u32 = 0;
-        for (0..n) |c| {
-            rail_cols += @intFromBool(col_ptr[c + 1] - col_ptr[c] > 1000);
-            for (row_idx[col_ptr[c]..col_ptr[c + 1]]) |r| width[r] += 1;
-        }
-        var rail_rows: u32 = 0;
-        for (width) |w| rail_rows += @intFromBool(w > 1000);
-        const nl: u64 = self.li.items.len;
-        const nu: u64 = self.ui.items.len;
-        const epoch = 8 * (nu + n + nl + 1) + 4 * (2 * (n + 1) + nu + (nu + 1) + flops + col_ptr[n]) + n +
-            4 * (2 * (n + 1) + 2 * nl + 2 * nu) + 8 * @as(u64, n);
-        std.debug.print("lu-census: F={d} S_r={d} levels={d} S_L={d} S_U={d} widest_U={d} narrow_F={d:.1}% rails={d}r/{d}c epoch={d:.1}MB\n", .{
-            flops,                                                                           s_r,       levels,    s_l,                                  s_u, widest,
-            100 * @as(f64, @floatFromInt(narrow)) / @as(f64, @floatFromInt(@max(flops, 1))), rail_rows, rail_cols, @as(f64, @floatFromInt(epoch)) / 1e6,
-        });
-    }
-
-    /// The supernodal DFS's entry to row `r`, stacked at `sp`: returns its
-    /// scan start. A row whose step kc lies in a panel [first, last]
-    /// reaches every later panel step, whose rows are the block rows, and
-    /// through `last` the rows below the block (L[:,first] is the block
-    /// rows plus L[:,last]). The visit marks the steps kc+1..e up to the
-    /// first already reached (that step was finished with its own reach:
-    /// it is no ancestor, its step being above kc), records e in
-    /// `sn_end`, and scans the rows below the block only when e is
-    /// `last`. One visit then covers the run instead of a walk per step.
-    /// Not the plain walk's order, so the factor's rounding can move: only
-    /// a factor whose panels hold most of L takes it (`sn_dfs`).
-    fn enter(self: *Self, r: u32, sp: u32, mark: u32) u32 {
-        const kc = self.pinv[r];
-        self.sn_end[sp] = NONE;
-        if (kc == NONE) return 0;
-        const id = self.sn_of[kc];
-        if (id == NONE or !self.sn_dfs) return self.lp[kc];
-        const pan = self.panels.items[id];
-        const rows = self.panel_rows.items[pan.row_off..];
-        var e = kc;
-        while (e < pan.last and self.flag[rows[e - pan.first]] != mark) : (e += 1)
-            self.flag[rows[e - pan.first]] = mark;
-        self.sn_end[sp] = e;
-        const m = pan.last - pan.first + 1;
-        return if (e == pan.last) pan.row_off + m - 1 else self.panelEnd(kc);
-    }
-
-    /// End of the rows below the block of step kc's panel, in `panel_rows`.
-    fn panelEnd(self: *const Self, kc: u32) u32 {
-        const pan = self.panels.items[self.sn_of[kc]];
-        return pan.row_off + self.lp[pan.first + 1] - self.lp[pan.first];
-    }
-
-    /// Step k just stored L[:,k] and pivoted row `piv`. Compares L[:,k-1]
-    /// with it: sets lend[k-1], and grows a panel when the two columns
-    /// form a supernode. A row of L[:,k] is exactly a row this column's
-    /// walk reached (flag == mark) that is still unpivoted.
-    fn linkStep(self: *Self, gpa: Allocator, k: u32, piv: u32, mark: u32) Allocator.Error!void {
-        assert(k > 0);
-        assert(k < self.n);
-        const s = k - 1;
-        const col = self.li.items[self.lp[s]..self.lp[k]];
-        var at: u32 = NONE; // piv's offset in L[:,s]
-        var last_out: u32 = NONE; // last offset whose row is not in L[:,k]
-        for (col, 0..) |r, i| {
-            if (r == piv) {
-                at = @intCast(i);
-            } else if (self.flag[r] != mark or self.pinv[r] != NONE) {
-                last_out = @intCast(i);
-            }
-        }
-        if (at == NONE or (last_out != NONE and last_out > at)) return;
-        self.lend[s] = self.lp[s] + at + 1;
-        const joins = last_out == NONE and col.len == self.li.items.len - self.lp[k] + 1;
-        if (joins) try self.growPanel(gpa, k, piv);
-    }
-
-    /// Step k joined step k-1's supernode; `piv` is the row it pivoted.
-    /// Opens a panel at k-1 if none is open, moves `piv` to block slot
-    /// k-first-1 and appends column k.
-    fn growPanel(self: *Self, gpa: Allocator, k: u32, piv: u32) Allocator.Error!void {
-        assert(k > 0);
-        assert(self.sn_of[k] == NONE);
-        const lp = self.lp;
-        const li = self.li.items;
-        const lx = self.lx.items;
-        const slot = self.sn_slot;
-        if (self.sn_of[k - 1] == NONE) {
-            const first = k - 1;
-            const nrows = lp[k] - lp[first];
-            try self.panels.ensureUnusedCapacity(gpa, 1);
-            try self.panel_rows.ensureUnusedCapacity(gpa, nrows);
-            try self.panel_vals.ensureUnusedCapacity(gpa, nrows);
-            self.sn_of[first] = @intCast(self.panels.items.len);
-            self.panels.appendAssumeCapacity(.{
-                .first = first,
-                .last = first,
-                .row_off = @intCast(self.panel_rows.items.len),
-                .val_off = @intCast(self.panel_vals.items.len),
-            });
-            for (li[lp[first]..lp[k]], lx[lp[first]..lp[k]], 0..) |r, v, i| {
-                slot[r] = @intCast(i);
-                self.panel_rows.appendAssumeCapacity(r);
-                self.panel_vals.appendAssumeCapacity(v);
-            }
-        }
-        const pid = self.sn_of[k - 1];
-        const pan = &self.panels.items[pid];
-        const nrows = lp[pan.first + 1] - lp[pan.first];
-        try self.panel_vals.ensureUnusedCapacity(gpa, nrows);
-        const rows = self.panel_rows.items[pan.row_off..][0..nrows];
-        const b = k - pan.first - 1; // piv's block slot
-        const a = slot[piv];
-        if (a != b) {
-            const vals = self.panel_vals.items[pan.val_off..];
-            for (0..k - pan.first) |col| std.mem.swap(f64, &vals[col * nrows + a], &vals[col * nrows + b]);
-            slot[rows[b]] = a;
-            slot[piv] = b;
-            std.mem.swap(u32, &rows[a], &rows[b]);
-        }
-        const dst = self.panel_vals.addManyAsSliceAssumeCapacity(nrows);
-        @memset(dst, 0);
-        // lp[k + 1] is not written yet: column k ends at the list's end.
-        for (li[lp[k]..], lx[lp[k]..]) |r, v| dst[slot[r]] = v;
-        assert(pan.last + 1 == k);
-        pan.last = k;
-        self.sn_of[k] = pid;
-    }
-
-    /// Applies the run of panel steps that starts at topo[idx0] (step kc)
-    /// and continues while the next topo entry is the panel's next step.
-    /// Returns the topo index of the run's last entry. Per row the
-    /// subtractions happen in step order, so the result is bitwise the
-    /// column-at-a-time loop's.
-    fn panelRun(self: *Self, w: []f64, topo: []const u32, idx0: u32, kc: u32) u32 {
-        assert(self.sn_of[kc] != NONE);
-        const pan = self.panels.items[self.sn_of[kc]];
-        const nrows = self.lp[pan.first + 1] - self.lp[pan.first];
-        const m = pan.last - pan.first + 1;
-        const rows = self.panel_rows.items[pan.row_off..][0..nrows];
-        const vals = self.panel_vals.items[pan.val_off..];
-        var len: u32 = 1;
-        while (kc + len <= pan.last and len <= idx0 and self.pinv[topo[idx0 - len]] == kc + len) len += 1;
-
-        // Block rows of steps kc+1..last sit in slots b0..m-2. Copy them
-        // to a dense scratch (`y` is free during factor) so the triangular
-        // part runs as contiguous axpys.
-        const b0 = kc - pan.first;
-        const x = self.y[0 .. m - 1 - b0];
-        for (x, rows[b0 .. m - 1]) |*xi, r| xi.* = w[r];
-        const run0 = self.ux.items.len;
-        for (0..len) |j| {
-            const t: u32 = kc + @as(u32, @intCast(j));
-            const ut = if (j == 0) w[topo[idx0]] else x[j - 1];
-            self.ui.appendAssumeCapacity(t);
-            self.ux.appendAssumeCapacity(ut);
-            const col = vals[(t - pan.first) * nrows ..];
-            subScaled(x[j..], col[b0 + j .. m - 1], ut);
-        }
-        for (x, rows[b0 .. m - 1]) |xi, r| w[r] = xi;
-
-        const u = self.ux.items[run0..];
-        const c0 = b0 * nrows;
-        const W = comptime std.simd.suggestVectorLength(f64) orelse 1;
-        var i: u32 = m - 1;
-        while (i + W <= nrows) : (i += W) panelRows(W, w, rows, vals[c0..], nrows, i, u);
-        while (i < nrows) : (i += 1) panelRows(1, w, rows, vals[c0..], nrows, i, u);
-        assert(len <= m - b0);
-        return idx0 - (len - 1);
-    }
-
-    /// x[i] -= a[i] * f; LLVM vectorizes it behind a runtime alias check.
-    inline fn subScaled(x: []f64, a: []const f64, f: f64) void {
-        for (x, a[0..x.len]) |*xi, ai| xi.* -= ai * f;
-    }
-
-    /// w[rows[i..i+W]] -= sum over j of vals[j*nrows + i..][0..W] * u[j],
-    /// subtracted one j at a time. W == 1 is the scalar oracle.
-    inline fn panelRows(comptime W: usize, w: []f64, rows: []const u32, vals: []const f64, nrows: u32, i: u32, u: []const f64) void {
-        const V = @Vector(W, f64);
-        var acc: V = undefined;
-        inline for (0..W) |l| acc[l] = w[rows[i + l]];
-        for (u, 0..) |uj, j| {
-            const lv: V = vals[j * nrows + i ..][0..W].*;
-            acc -= lv * @as(V, @splat(uj));
-        }
-        inline for (0..W) |l| w[rows[i + l]] = acc[l];
-    }
-
-    /// True when unpivoted unknown `c` appears in no equation and
-    /// equation `c` holds no unknown. Zero-valued structural entries count
-    /// as absent: a disabled branch keeps its slots, only its values
-    /// vanish. O(nnz); runs only on a failed pivot.
-    fn voidUnknown(
-        self: *const Self,
-        col_ptr: []const u32,
-        row_idx: []const u32,
-        vals: []const f64,
-        c: u32,
-    ) bool {
-        assert(c < self.n);
-        if (self.pinv[c] != NONE) return false;
-        for (col_ptr[c]..col_ptr[c + 1]) |p| {
-            if (vals[p] != 0) return false;
-        }
-        for (0..self.n) |j| {
-            if (j == c) continue;
-            for (col_ptr[j]..col_ptr[j + 1]) |p| {
-                if (row_idx[p] == c and vals[p] != 0) return false;
-            }
-        }
-        return true;
-    }
-
-    /// Private kernels for src/solver/tests.zig; empty outside test builds.
     pub const test_access = if (@import("builtin").is_test) .{
-        .scatterAxpy = scatterAxpy,
-        .refactorColumns = refactorColumns,
+        .scatterAxpy = lu_replay.scatterAxpy,
+        .refactorColumns = lu_replay.refactorColumns,
         .TestSystem = TestSystem,
         .overflow_case = overflow_case,
     } else {};
-
-    /// dst[idx[p]] -= src[p] * f for p in [p0, p1): the scatter-axpy of
-    /// the column replay and both `solve` substitutions.
-    ///
-    /// Stepped two at a time by hand because circuit columns are 1 to 3
-    /// entries long (scaling/parallel_inverters_100: 205 of length 1, 200
-    /// of length 2). LLVM unrolls the plain loop by 4, a body that never
-    /// runs, and every call still pays its guard chain. A gather-modify-
-    /// scatter has nothing to widen without AVX-512; a run-vectorized
-    /// variant lost (dev/solvers/refactor-tape-2026-09.md). Pairing is
-    /// bitwise the one-at-a-time loop: a column's rows are distinct.
-    inline fn scatterAxpy(dst: []f64, idx: []const u32, src: []const f64, p0: u32, p1: u32, f: f64) void {
-        var p = p0;
-        while (p + 1 < p1) : (p += 2) {
-            dst[idx[p]] -= src[p] * f;
-            dst[idx[p + 1]] -= src[p + 1] * f;
-        }
-        if (p < p1) dst[idx[p]] -= src[p] * f;
-    }
 
     /// Numeric refactor: the last factor's pattern and pivot sequence,
     /// new values, no allocation. Fails when a pivot is zero or
@@ -982,32 +339,12 @@ pub const SparseLu = struct {
         for (self.void_slots.items) |p| {
             if (vals[p] != 0) return error.SingularMatrix;
         }
-        if (self.tv.items.len != 0) return self.refactorTape(vals, growth_limit);
-        return self.refactorColumns(col_ptr, vals, growth_limit);
+        if (self.tv.items.len != 0) return lu_replay.refactorTape(self, vals, growth_limit);
+        return lu_replay.refactorColumns(self, col_ptr, vals, growth_limit);
     }
 
-    /// Column-at-a-time replay: the path for matrices too big for a tape,
-    /// and the tape's oracle.
-    fn refactorColumns(
-        self: *Self,
-        col_ptr: []const u32,
-        vals: []const f64,
-        growth_limit: f64,
-    ) error{SingularMatrix}!void {
-        const r = self.replay(col_ptr, vals, growth_limit);
-        self.replay_mult = null;
-        // Nonzero once a stored L or U entry is NaN or inf: an off-pivot
-        // one never meets a pivot test, and the solve skips it where its
-        // column's solution is zero. Tested once, after the last column;
-        // ORs the bits of x - x, as `factorPass` does.
-        var nonfinite: u64 = 0;
-        var mult: f64 = 0;
-        for (0..self.n) |k| {
-            if (!r.column(self.w, k, &nonfinite, &mult)) return error.SingularMatrix;
-        }
-        if (nonfinite != 0) return error.SingularMatrix;
-        if (growth_limit > 0) self.replay_mult = mult;
-    }
+    /// One factor's slices for a column replay (`lu_replay.zig`).
+    pub const Replay = lu_replay.Replay;
 
     /// The column replay's inputs for new `vals`, for `refactorColumns` and
     /// for callers that replay columns in their own schedule
@@ -1032,242 +369,6 @@ pub const SparseLu = struct {
             .vals = vals,
             .growth_limit = growth_limit,
         };
-    }
-
-    /// One factor's slices, copied by value so a replay holds them in
-    /// registers: LLVM cannot prove the `ux[p]` store disjoint from a
-    /// `SparseLu`, and the field reloads cost 35% of the replay on
-    /// scaling/parallel_inverters_100.
-    pub const Replay = struct {
-        li: []const u32,
-        lx: []f64,
-        ui: []const u32,
-        ux: []f64,
-        lp: []const u32,
-        up: []const u32,
-        prow: []const u32,
-        udiag: []f64,
-        q: []const u32,
-        void_col: []const bool,
-        scaled_pivot: []const bool,
-        col_ptr: []const u32,
-        vals: []const f64,
-        growth_limit: f64,
-
-        /// Replays pivot step k into its own slots of L, U and `udiag`,
-        /// through the dense accumulator `w` (n entries, all-zero on entry
-        /// and on return, failure included). Reads only the final values of
-        /// the steps in U[:,k], so any schedule that runs those first gets
-        /// the serial loop's bits. ORs a non-finite store into `nonfinite`
-        /// (the caller tests it once), and a monitored step's largest
-        /// multiplier into `mult` (`SparseLu.replay_mult`). False when the
-        /// pivot fails: zero or non-finite, or below `growth_limit` times
-        /// its column max (`scaled_pivot` steps excepted).
-        pub inline fn column(r: Replay, w: []f64, k: usize, nonfinite: *u64, mult: *f64) bool {
-            return r.columnAfter(w, k, nonfinite, mult, struct {
-                inline fn wait(_: @This(), _: u32) void {}
-            }{});
-        }
-
-        /// `column`, calling `ready.wait(i)` before it reads L[:,i] for
-        /// each step i in U[:,k], so a schedule that runs the steps of
-        /// U[:,k] concurrently can block until each is final.
-        pub inline fn columnAfter(r: Replay, w: []f64, k: usize, nonfinite: *u64, mult: *f64, ready: anytype) bool {
-            const li = r.li;
-            const lx = r.lx;
-            const ui = r.ui;
-            const ux = r.ux;
-            const lp = r.lp;
-            const c = r.q[k];
-            const uk0 = r.up[k];
-            const uk1 = r.up[k + 1];
-            const lk0 = lp[k];
-            const lk1 = lp[k + 1];
-            // `w` is all-zero here (see the field doc).
-            for (r.col_ptr[c]..r.col_ptr[c + 1]) |p| w[r.prow[p]] = r.vals[p];
-
-            // Replay the triangular solve in stored topological order.
-            // Zeroing w[i] right after the read is safe: only earlier
-            // entries write row i, since L[r][i] != 0 puts r after i.
-            for (uk0..uk1) |p| {
-                const i = ui[p];
-                const uki = w[i];
-                w[i] = 0;
-                ux[p] = uki;
-                nonfinite.* |= @as(u64, @bitCast(uki - uki));
-                ready.wait(i);
-                scatterAxpy(w, li, lx, lp[i], lp[i + 1], uki);
-            }
-
-            // Void slots were checked by the caller; the fabricated pivot
-            // is valid.
-            if (r.void_col[k]) {
-                r.udiag[k] = 1;
-                for (lk0..lk1) |p| {
-                    lx[p] = 0;
-                    w[li[p]] = 0;
-                }
-                w[k] = 0;
-                // The flops above also hit rows below k, which a void
-                // column keeps no L entry for. Finite factors add exact
-                // zeros there, but a NaN multiplier leaves 0 * NaN behind,
-                // and a replay that fails before those rows' own steps
-                // would hand it to the next call. Void columns are rare.
-                for (ui[uk0..uk1]) |i| for (li[lp[i]..lp[i + 1]]) |row| {
-                    w[row] = 0;
-                };
-                return true;
-            }
-            const d = w[k];
-            w[k] = 0;
-            if (d == 0 or !std.math.isFinite(d)) {
-                for (lk0..lk1) |p| w[li[p]] = 0;
-                return false;
-            }
-            r.udiag[k] = d;
-
-            // A scale-accepted pivot is decades below its raw column max
-            // by design, so the raw monitor would reject every replay.
-            // ponytail: those steps run unmonitored; a row-scaled cmax
-            // needs rscale in permuted coordinates.
-            if (r.growth_limit > 0 and !r.scaled_pivot[k]) {
-                // The max of |v|'s bit patterns: exact, cheaper than a float
-                // @max, and NaN (whose pattern sorts above inf) survives it,
-                // so a non-finite v fails the test below. Every L entry here
-                // is then at most 1 / growth_limit: finite, unflagged.
-                var cbits: i64 = @bitCast(@abs(d));
-                for (lk0..lk1) |p| {
-                    const row = li[p];
-                    const v = w[row];
-                    w[row] = 0;
-                    cbits = @max(cbits, @as(i64, @bitCast(@abs(v))));
-                    lx[p] = v / d;
-                }
-                const cmax: f64 = @bitCast(cbits);
-                if (!(@abs(d) >= r.growth_limit * cmax)) return false;
-                mult.* = @max(mult.*, cmax / @abs(d));
-                return true;
-            }
-            for (lk0..lk1) |p| {
-                const row = li[p];
-                const l = w[row] / d;
-                nonfinite.* |= @as(u64, @bitCast(l - l));
-                lx[p] = l;
-                w[row] = 0;
-            }
-            return true;
-        }
-    };
-
-    /// Factors with at most this many flops get the flat tape, 12 bytes
-    /// per flop, so it stays in L1 between Newton iterates. A larger tape
-    /// streams from L2 and loses to the column loop
-    /// (dev/solvers/refactor-tape-2026-09.md).
-    const tape_max_flops = 2048;
-    comptime {
-        // 24 KB of tape: inside a 32 KB L1d with room for the slot values.
-        assert(@sizeOf([3]u32) == 12);
-        assert(tape_max_flops * @sizeOf([3]u32) <= 24 * 1024);
-    }
-
-    /// Records the refactor as flat slot operations. Every A entry and
-    /// flop target of column k is a slot of column k's pattern (U rows,
-    /// the diagonal, L rows), except below-diagonal rows of a void column,
-    /// which has no L: those go to the discard slot.
-    fn buildTape(self: *Self, gpa: Allocator, col_ptr: []const u32) Allocator.Error!void {
-        const n = self.n;
-        const lp = self.lp;
-        const up = self.up;
-        const li = self.li.items;
-        const ui = self.ui.items;
-        self.tape.clearRetainingCapacity();
-        self.tv.clearRetainingCapacity();
-        var flops: usize = 0;
-        for (ui) |i| flops += lp[i + 1] - lp[i];
-        if (flops > tape_max_flops) return;
-        const nu: u32 = @intCast(ui.len);
-        const lx0 = nu + n;
-        const discard: u32 = lx0 + @as(u32, @intCast(li.len));
-        try self.tape.ensureTotalCapacityPrecise(gpa, flops);
-        try self.lsrc.resize(gpa, li.len);
-        for (0..n) |k| @memset(self.lsrc.items[lp[k]..lp[k + 1]], @intCast(k));
-        try self.tv.resize(gpa, discard + 1);
-        const pos = self.flag; // DFS scratch is free until the next factor
-        for (0..n) |k| {
-            const void_k = self.void_col[k];
-            for (up[k]..up[k + 1]) |p| pos[ui[p]] = @intCast(p);
-            pos[k] = nu + @as(u32, @intCast(k));
-            for (lp[k]..lp[k + 1]) |q| pos[li[q]] = lx0 + @as(u32, @intCast(q));
-            self.tape_col[k] = @intCast(self.tape.items.len);
-            for (up[k]..up[k + 1]) |p| {
-                const i = ui[p];
-                for (lp[i]..lp[i + 1]) |q| {
-                    const r = li[q];
-                    const dst = if (void_k and r > k) discard else pos[r];
-                    self.tape.appendAssumeCapacity(.{ dst, lx0 + @as(u32, @intCast(q)), @intCast(p) });
-                }
-            }
-            const c = self.q[k];
-            for (col_ptr[c]..col_ptr[c + 1]) |a| {
-                const r = self.prow[a];
-                self.amap[a] = if (void_k and r > k) discard else pos[r];
-            }
-        }
-        assert(self.tape.items.len == flops);
-        self.tape_col[n] = @intCast(self.tape.items.len);
-    }
-
-    /// `refactor` through the tape: the column loop's operations per slot
-    /// in the same order, so bitwise its result, without the dense
-    /// scatter and gather. U slots are final before any flop reads them.
-    fn refactorTape(self: *Self, vals: []const f64, growth_limit: f64) error{SingularMatrix}!void {
-        const n = self.n;
-        const tv = self.tv.items;
-        const tape = self.tape.items;
-        const tcol = self.tape_col;
-        const lp = self.lp;
-        const nu = self.ux.items.len;
-        const lx0 = nu + n;
-        const void_col = self.void_col;
-        const scaled_pivot = self.scaled_pivot;
-        assert(tv.len == lx0 + self.lx.items.len + 1);
-        assert(vals.len >= self.amap.len);
-        @memset(tv, 0);
-        for (self.amap, vals[0..self.amap.len]) |s, v| tv[s] = v;
-        for (0..n) |k| {
-            for (tape[tcol[k]..tcol[k + 1]]) |f| tv[f[0]] -= tv[f[1]] * tv[f[2]];
-            const lcol = tv[lx0 + lp[k] .. lx0 + lp[k + 1]];
-            if (void_col[k]) {
-                tv[nu + k] = 1;
-                continue;
-            }
-            const d = tv[nu + k];
-            if (d == 0 or !std.math.isFinite(d)) return error.SingularMatrix;
-            if (growth_limit > 0 and !scaled_pivot[k]) {
-                var cmax: f64 = @abs(d);
-                for (lcol) |*v| {
-                    cmax = @max(cmax, @abs(v.*));
-                    v.* /= d;
-                }
-                if (@abs(d) < growth_limit * cmax) return error.SingularMatrix;
-            } else {
-                for (lcol) |*v| v.* /= d;
-            }
-        }
-        // The copies out flag a non-finite L or U entry, as the column
-        // loop's stores do.
-        var nonfinite: u64 = 0;
-        for (self.ux.items, tv[0..nu]) |*o, v| {
-            o.* = v;
-            nonfinite |= @as(u64, @bitCast(v - v));
-        }
-        @memcpy(self.udiag, tv[nu..lx0]);
-        self.replay_mult = null;
-        for (self.lx.items, tv[lx0 .. lx0 + self.lx.items.len]) |*o, v| {
-            o.* = v;
-            nonfinite |= @as(u64, @bitCast(v - v));
-        }
-        if (nonfinite != 0) return error.SingularMatrix;
     }
 
     /// x = A^-1 b. `b` and `x` may alias. Requires the last `factor` or
@@ -1303,7 +404,7 @@ pub const SparseLu = struct {
         } else for (0..self.n) |k| {
             const yk = y[k];
             if (yk == 0) continue;
-            scatterAxpy(y, li, lx, lp[k], lp[k + 1], yk);
+            lu_replay.scatterAxpy(y, li, lx, lp[k], lp[k + 1], yk);
         }
 
         // Back through U.
@@ -1313,7 +414,7 @@ pub const SparseLu = struct {
             const zk = y[k] / udiag[k];
             y[k] = zk;
             if (zk == 0) continue;
-            scatterAxpy(y, ui, ux, up[k], up[k + 1], zk);
+            lu_replay.scatterAxpy(y, ui, ux, up[k], up[k + 1], zk);
         }
 
         // x = Q^-1 z
@@ -1359,9 +460,20 @@ pub const SparseLu = struct {
 
         for (0..self.n) |r| x[r] = y[pinv[r]];
     }
+
+    // ---- private ----
+
+    /// Supernode steps [first, last]. Its rows are L[:,first]'s: first
+    /// the block rows of steps first+1..last (slot t-first-1), then the
+    /// rest. Values are column-major, `nrows` per member step.
+    const Panel = struct { first: u32, last: u32, row_off: u32, val_off: u32 };
+
+    comptime {
+        assert(@sizeOf(Panel) == 16);
+    }
 };
 
-const testing = std.testing;
+const NONE: u32 = std.math.maxInt(u32);
 
 /// Test-only random system: an n x n CSC pattern (n <= 64) with a full
 /// structural diagonal, as the pattern merge guarantees, and off-diagonals
@@ -1439,12 +551,47 @@ const TestSystem = struct {
     }
 };
 
+/// U[1,2] = A[1,2] - L[1,0] U[0,2] = -1.5e308 - 1.5e308 overflows, and no
+/// L entry carries it to a pivot: L[:,1] is empty. `overflow_vals` are
+/// finite; `benign_vals` give the same pattern and pivots.
+const overflow_case = struct {
+    pub const col_ptr = [_]u32{ 0, 2, 3, 6 };
+    pub const row_idx = [_]u32{ 0, 1, 1, 0, 1, 2 };
+    pub const q = [_]u32{ 0, 1, 2 };
+    pub const benign_vals = [_]f64{ 1, 1, 1, 1, 1, 1 };
+    pub const overflow_vals = [_]f64{ 1, 1, 1, 1.5e308, -1.5e308, 1 };
+};
+
+// ---- private ----
+
 fn expectAllZero(w: []const f64) !void {
     for (w) |v| try testing.expect(v == 0);
 }
 
 fn expectBitwise(a: []const f64, b: []const f64) !void {
     try testing.expectEqualSlices(u64, @ptrCast(a), @ptrCast(b));
+}
+
+/// One `init`, a full factor, a capped re-pivot that overflows its cap and
+/// restarts on the old pivots, a replay and a solve: every allocating path
+/// of the factor. Any error must hand `w` back all-zero. Asserts n > 3.
+fn factorLifecycle(gpa: Allocator, sys: TestSystem, q: []const u32) !void {
+    const n: u32 = @intCast(q.len);
+    assert(n > 3);
+    var lu = try SparseLu.init(gpa, n, sys.col_ptr, q);
+    defer lu.deinit(gpa);
+    errdefer expectAllZero(lu.w) catch @panic("w not zero after an error");
+    try lu.factor(gpa, sys.col_ptr, sys.row_idx, sys.vals, 1e-3);
+    lu.fill_cap = 0.5;
+    lu.keep_min = 1e-12;
+    try lu.factor(gpa, sys.col_ptr, sys.row_idx, sys.vals, 1e-3);
+    try lu.refactor(sys.col_ptr, sys.vals, 1e-12);
+    // b_3 = 0: the void unknown's equation is 0 = b_3.
+    var b: [64]f64 = @splat(1);
+    b[3] = 0;
+    var x: [64]f64 = undefined;
+    lu.solve(b[0..n], x[0..n]);
+    try testing.expect(sys.residual(sys.vals, x[0..n], b[0..n], false) <= 1e6);
 }
 
 test "factor, refactor and both solves leave a small scaled residual on random systems" {
@@ -1545,17 +692,6 @@ test "a failed replay after a void column with a NaN multiplier leaves w zero" {
     try testing.expectError(error.SingularMatrix, lu.refactor(&col_ptr, &bad, 1e-12));
     try expectAllZero(lu.w);
 }
-
-/// U[1,2] = A[1,2] - L[1,0] U[0,2] = -1.5e308 - 1.5e308 overflows, and no
-/// L entry carries it to a pivot: L[:,1] is empty. `overflow_vals` are
-/// finite; `benign_vals` give the same pattern and pivots.
-const overflow_case = struct {
-    pub const col_ptr = [_]u32{ 0, 2, 3, 6 };
-    pub const row_idx = [_]u32{ 0, 1, 1, 0, 1, 2 };
-    pub const q = [_]u32{ 0, 1, 2 };
-    pub const benign_vals = [_]f64{ 1, 1, 1, 1, 1, 1 };
-    pub const overflow_vals = [_]f64{ 1, 1, 1, 1.5e308, -1.5e308, 1 };
-};
 
 test "a factor whose finite values overflow in U off the pivot fails" {
     const gpa = testing.allocator;
@@ -1737,28 +873,6 @@ test "solutions scale exactly with A and b by powers of two, factor and replay" 
         checked += 1;
     }
     try testing.expect(checked >= 32);
-}
-
-/// One `init`, a full factor, a capped re-pivot that overflows its cap and
-/// restarts on the old pivots, a replay and a solve: every allocating path
-/// of the factor. Any error must hand `w` back all-zero. Asserts n > 3.
-fn factorLifecycle(gpa: Allocator, sys: TestSystem, q: []const u32) !void {
-    const n: u32 = @intCast(q.len);
-    assert(n > 3);
-    var lu = try SparseLu.init(gpa, n, sys.col_ptr, q);
-    defer lu.deinit(gpa);
-    errdefer expectAllZero(lu.w) catch @panic("w not zero after an error");
-    try lu.factor(gpa, sys.col_ptr, sys.row_idx, sys.vals, 1e-3);
-    lu.fill_cap = 0.5;
-    lu.keep_min = 1e-12;
-    try lu.factor(gpa, sys.col_ptr, sys.row_idx, sys.vals, 1e-3);
-    try lu.refactor(sys.col_ptr, sys.vals, 1e-12);
-    // b_3 = 0: the void unknown's equation is 0 = b_3.
-    var b: [64]f64 = @splat(1);
-    b[3] = 0;
-    var x: [64]f64 = undefined;
-    lu.solve(b[0..n], x[0..n]);
-    try testing.expect(sys.residual(sys.vals, x[0..n], b[0..n], false) <= 1e6);
 }
 
 test "factor, a capped re-pivot and a replay release storage and leave w zero on every allocation failure" {
