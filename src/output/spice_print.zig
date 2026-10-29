@@ -1,21 +1,28 @@
-//! SPICE3 `.print`-style text table: a plot line, a header row, a dashed
-//! rule, then one tab-separated row per point.
+//! SPICE3 `.print`-style text table: a validated plot in, a plot line, a
+//! header row, a dashed rule, then one tab-separated row per point out.
+//! Cites: none (SPICE3 listing layout, as ngspice's `print` shows it).
+//!
+//! Contents:
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+//! - `pub fn writeHeader(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+//! - `pub fn writeRows(w: *Io.Writer, stride: usize, first: usize, rows: []const f64) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const Plot = @import("types.zig").Plot;
+const Plot = @import("plot.zig").Plot;
 
-/// Writes `plot`, which must have passed `types.validatePlot(.print, ...)`.
+/// Writes `plot`, which must have passed `plot.validatePlot(.print, ...)`.
 /// Asserts that it has variables and one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
     try writeHeader(w, plot);
     try writeRows(w, plot.stride(), 0, plot.result.data);
 }
 
-/// The plot line, header row and rule: what `encode` writes before the
-/// points.
-pub fn writeHeader(w: *Io.Writer, plot: Plot) !void {
+/// Writes the plot line, header row and rule: what `encode` writes before
+/// the points. Asserts that `plot` has variables.
+pub fn writeHeader(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.varnames.len > 0);
     try w.print("{s}: {s}\n", .{ plot.result.plotname, plot.title });
     try w.writeAll("Index");
@@ -29,9 +36,11 @@ pub fn writeHeader(w: *Io.Writer, plot: Plot) !void {
     try w.writeByte('\n');
 }
 
-/// The rows of the points in `rows` (`stride` f64s each), the first
-/// numbered `first`: what `encode` writes after the header.
-pub fn writeRows(w: *Io.Writer, stride: usize, first: usize, rows: []const f64) !void {
+/// Writes the rows of the points in `rows` (`stride` f64s each), the first
+/// numbered `first`: what `encode` writes after the header. Asserts that
+/// `rows` holds whole points.
+pub fn writeRows(w: *Io.Writer, stride: usize, first: usize, rows: []const f64) Io.Writer.Error!void {
+    assert(stride > 0);
     assert(rows.len % stride == 0);
     for (0..rows.len / stride) |k| {
         try w.print("{d}", .{first + k});

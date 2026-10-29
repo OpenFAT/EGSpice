@@ -1,14 +1,28 @@
 //! The `.meas` passes that read a waveform one sample at a time, in order
 //! (ngspice com_measure2.c): event counting, value at a point, extremum and
 //! average, and the integral. `feed` returns true where the whole-waveform
-//! loop would stop. `measure.zig`'s `Wave` runs them over a recording, its
-//! `Stream` over a transient as it goes, and the GPU lanes on the device
+//! loop would stop. Wave.zig runs them over a recording, Stream.zig
+//! over a transient as it goes, and the GPU lanes on the device
 //! (`solver/lane_device.zig`, performance TODO 06 6.8), so all three give
 //! the same values, to the bit. std only, extern layouts: the device keeps
-//! the states in lane-major arrays the host reads back.
+//! the states in lane-major arrays the host reads back. build.zig compiles
+//! this file alone as `measure_scan` for the lane kernel, so it imports
+//! nothing but std and its layouts are a device contract.
+//! Cites: ngspice 45 com_measure2.c (com_measure_when, measure_at,
+//! measure_minMaxAvg, measure_rms_integral), maths/misc/equality.c.
+//!
+//! Contents:
+//! - `pub const unset: i32`, `pub const last: i32`
+//! - `pub const Bounds`, `pub const Mode`, `pub const Stat`, `pub const Integral`
+//! - `pub fn line(x0: f64, y0: f64, x1: f64, y1: f64, at: f64) f64`
+//! - `pub fn almostEqualUlps(a: f64, b: f64) bool`
+//! - `pub const Cross` (`init`, `feed`, `finish`), `pub const At` (`feed`),
+//!   `pub const Extremum` (`Op`, `feed`, `stat`), `pub const Integ` (`feed`, `panel`, `result`)
+//! - `pub const Find` (`State`, `push`), `pub const Dev` (`Kind`, `feed`)
+//! - `pub const Program` (`max`, `Op`, `Code`, `eval`, `eql`)
+//! - `pub const DevColumns` (`none`, `read`, `eql`)
 
 const std = @import("std");
-const nan = std.math.nan(f64);
 
 /// `core.measure_unset`, `core.measure_last` (measure.zig asserts them).
 pub const unset: i32 = -1;
@@ -36,26 +50,6 @@ pub const Stat = extern struct { value: f64, at: f64 };
 /// An integral or RMS and the window it covers; NaN throughout when no
 /// sample was read.
 pub const Integral = extern struct { value: f64, from: f64, to: f64 };
-
-/// The line through (x0, y0) and (x1, y1) at `at`, in slope-intercept form
-/// (ngspice measure_interpolate, 'y' mode).
-pub fn line(x0: f64, y0: f64, x1: f64, y1: f64, at: f64) f64 {
-    const slope = (y1 - y0) / (x1 - x0);
-    const intercept = y0 - slope * x0;
-    return slope * at + intercept;
-}
-
-/// ngspice AlmostEqualUlps(a, b, 100) (maths/misc/equality.c).
-pub fn almostEqualUlps(a: f64, b: f64) bool {
-    if (a == b) return true;
-    const ordered = struct {
-        fn f(d: f64) i64 {
-            const i: i64 = @bitCast(d);
-            return if (i < 0) std.math.minInt(i64) -% i else i;
-        }
-    }.f;
-    return @abs(ordered(a) -% ordered(b)) <= 100;
-}
 
 /// `Wave.crossings`' event count (ngspice com_measure_when).
 pub const Cross = extern struct {
@@ -493,3 +487,25 @@ pub const DevColumns = extern struct {
         return a.y == b.y and a.y2 == b.y2 and a.prog.eql(&b.prog) and a.prog2.eql(&b.prog2);
     }
 };
+
+const nan = std.math.nan(f64);
+
+/// The line through (x0, y0) and (x1, y1) at `at`, in slope-intercept form
+/// (ngspice measure_interpolate, 'y' mode).
+pub fn line(x0: f64, y0: f64, x1: f64, y1: f64, at: f64) f64 {
+    const slope = (y1 - y0) / (x1 - x0);
+    const intercept = y0 - slope * x0;
+    return slope * at + intercept;
+}
+
+/// ngspice AlmostEqualUlps(a, b, 100) (maths/misc/equality.c).
+pub fn almostEqualUlps(a: f64, b: f64) bool {
+    if (a == b) return true;
+    const ordered = struct {
+        fn f(d: f64) i64 {
+            const i: i64 = @bitCast(d);
+            return if (i < 0) std.math.minInt(i64) -% i else i;
+        }
+    }.f;
+    return @abs(ordered(a) -% ordered(b)) <= 100;
+}

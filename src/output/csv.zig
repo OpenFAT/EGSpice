@@ -1,21 +1,29 @@
-//! CSV (RFC 4180): a header row of variable names, then one row per point.
-//! A complex variable becomes a `_re` and an `_im` column. A name holding a
-//! comma, quote or line break is quoted, its quotes doubled.
+//! CSV: a validated plot in, a header row of variable names then one row per
+//! point out. A complex variable becomes a `_re` and an `_im` column. A name
+//! holding a comma, quote or line break is quoted, its quotes doubled.
+//! Cites: RFC 4180 §2 (fields, quoting).
+//!
+//! Contents:
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+//! - `pub fn writeHeader(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+//! - `pub fn writeRows(w: *Io.Writer, stride: usize, rows: []const f64) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const Plot = @import("types.zig").Plot;
+const Plot = @import("plot.zig").Plot;
 
-/// Writes `plot`, which must have passed `types.validatePlot(.csv, ...)`.
+/// Writes `plot`, which must have passed `plot.validatePlot(.csv, ...)`.
 /// Asserts that it has variables and one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
     try writeHeader(w, plot);
     try writeRows(w, plot.stride(), plot.result.data);
 }
 
-/// The header row: what `encode` writes before the points.
-pub fn writeHeader(w: *Io.Writer, plot: Plot) !void {
+/// Writes the header row: what `encode` writes before the points. Asserts
+/// that `plot` has variables.
+pub fn writeHeader(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.varnames.len > 0);
     for (plot.result.varnames, 0..) |name, i| {
         if (i > 0) try w.writeByte(',');
@@ -28,9 +36,10 @@ pub fn writeHeader(w: *Io.Writer, plot: Plot) !void {
     try w.writeByte('\n');
 }
 
-/// One line per point of `rows` (`stride` f64s each): what `encode`
-/// writes after the header.
-pub fn writeRows(w: *Io.Writer, stride: usize, rows: []const f64) !void {
+/// Writes one line per point of `rows` (`stride` f64s each): what `encode`
+/// writes after the header. Asserts that `rows` holds whole points.
+pub fn writeRows(w: *Io.Writer, stride: usize, rows: []const f64) Io.Writer.Error!void {
+    assert(stride > 0);
     assert(rows.len % stride == 0);
     for (0..rows.len / stride) |k| {
         for (rows[k * stride ..][0..stride], 0..) |x, i| {
@@ -41,8 +50,10 @@ pub fn writeRows(w: *Io.Writer, stride: usize, rows: []const f64) !void {
     }
 }
 
+// ---- private ----
+
 /// `name ++ suffix` as one RFC 4180 field (#61).
-fn field(w: *Io.Writer, name: []const u8, suffix: []const u8) !void {
+fn field(w: *Io.Writer, name: []const u8, suffix: []const u8) Io.Writer.Error!void {
     if (std.mem.indexOfAny(u8, name, ",\"\r\n") == null) return w.print("{s}{s}", .{ name, suffix });
     try w.writeByte('"');
     for (name) |c| {

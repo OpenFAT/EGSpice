@@ -1,24 +1,35 @@
-//! ngspice ASCII raw file: the binary raw header, then one text line per
-//! variable, each point's first line led by the point index.
+//! ngspice ASCII raw file: a validated plot in, the raw header then one text
+//! line per variable out, each point's first line led by the point index.
+//! `Session` writes the rows of a side file through `writeRows`.
+//! Cites: ngspice 44 manual §17.5 (raw file format, `Values:`).
+//!
+//! Contents:
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+//! - `pub fn writeRows(w: *Io.Writer, complex: bool, stride: usize, first: usize, rows: []const f64) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
 const rawfile = @import("rawfile.zig");
-const Plot = @import("types.zig").Plot;
+const Plot = @import("plot.zig").Plot;
 
-/// Writes `plot`, which must have passed `types.validatePlot(.ascii, ...)`.
+/// Writes `plot`, which must have passed `plot.validatePlot(.ascii, ...)`.
 /// Asserts that it has variables and one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.varnames.len > 0);
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
-    try rawfile.writeHeader(w, plot, false);
+    try rawfile.writeHeader(w, plot, .ascii);
     try writeRows(w, plot.result.is_complex, plot.stride(), 0, plot.result.data);
 }
 
-/// The value lines of the points in `rows` (`stride` f64s each), the
-/// first numbered `first`: what `encode` writes after the header.
-pub fn writeRows(w: *Io.Writer, complex: bool, stride: usize, first: usize, rows: []const f64) !void {
+/// Writes the value lines of the points in `rows` (`stride` f64s each, a
+/// (real, imaginary) pair per variable when `complex`), the first numbered
+/// `first`: what `encode` writes after the header. Asserts that `rows` holds
+/// whole points and a complex stride is even.
+pub fn writeRows(w: *Io.Writer, complex: bool, stride: usize, first: usize, rows: []const f64) Io.Writer.Error!void {
+    assert(stride > 0);
     assert(rows.len % stride == 0);
+    if (complex) assert(stride % 2 == 0);
     for (0..rows.len / stride) |k| {
         const row = rows[k * stride ..][0..stride];
         try w.print("{d}", .{first + k});

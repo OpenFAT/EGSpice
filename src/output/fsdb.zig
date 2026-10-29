@@ -1,19 +1,26 @@
-//! A minimal FSDB-style analog container, little-endian: "FSDB", version,
-//! variable and point counts, complex flag, u16-length-prefixed title,
-//! plotname and variable names, then the samples as raw f64.
-//! ponytail: FSDB proper is a closed Synopsys format; vendor tools need
-//! libfsdb. Link it when real FSDB interchange is required.
+//! A minimal FSDB-style analog container: a validated plot in, little-endian
+//! bytes out: "FSDB", version, variable and point counts, complex flag,
+//! u16-length-prefixed title, plotname and variable names, then the samples
+//! as raw f64.
+//! Cites: none (FSDB proper is a closed Synopsys format).
+//! ponytail: vendor tools need libfsdb. Link it when real FSDB interchange
+//! is required.
+//!
+//! Contents:
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const Plot = @import("types.zig").Plot;
+const Plot = @import("plot.zig").Plot;
 
 const magic = "FSDB";
 const version: u32 = 0x0300;
 
-/// Writes `plot`. Asserts the u32 counts and u16 string lengths
-/// `types.validatePlot(.fsdb, ...)` checks, and one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
+/// Writes `plot`, which must have passed `plot.validatePlot(.fsdb, ...)`.
+/// Asserts the u32 counts and u16 string lengths that checks, and one
+/// sample row per point.
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.varnames.len <= std.math.maxInt(u32));
     assert(plot.result.npoints <= std.math.maxInt(u32));
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
@@ -28,7 +35,9 @@ pub fn encode(w: *Io.Writer, plot: Plot) !void {
     try w.writeAll(std.mem.sliceAsBytes(plot.result.data));
 }
 
-fn writeString(w: *Io.Writer, s: []const u8) !void {
+// ---- private ----
+
+fn writeString(w: *Io.Writer, s: []const u8) Io.Writer.Error!void {
     assert(s.len <= std.math.maxInt(u16));
     try w.writeInt(u16, @intCast(s.len), .little);
     try w.writeAll(s);

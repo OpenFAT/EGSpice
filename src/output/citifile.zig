@@ -1,16 +1,22 @@
-//! CITIfile: a header declaring the FREQ variable and every S-parameter
-//! DATA, the frequency list, then one BEGIN/END block of real,imaginary
-//! pairs per DATA in header order. Variables that are not S parameters are
-//! skipped.
+//! CITIfile: a validated S-parameter plot in, a header declaring the FREQ
+//! variable and every S-parameter DATA, the frequency list, then one
+//! BEGIN/END block of real,imaginary pairs per DATA in header order out.
+//! Variables that are not S parameters are skipped.
+//! Cites: CITIfile A.01.01 (Keysight "CITIfile Format", keywords NAME, VAR,
+//! DATA, VAR_LIST_BEGIN, BEGIN/END), in the layout scikit-rf 1.9 reads.
+//!
+//! Contents:
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const types = @import("types.zig");
-const Plot = types.Plot;
+const plots = @import("plot.zig");
+const Plot = plots.Plot;
 
-/// Writes `plot`, which must have passed `types.validatePlot(.citi, ...)`.
+/// Writes `plot`, which must have passed `plot.validatePlot(.citi, ...)`.
 /// Asserts that it is complex with one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.is_complex);
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
     try w.writeAll("CITIFILE A.01.01\n");
@@ -19,14 +25,14 @@ pub fn encode(w: *Io.Writer, plot: Plot) !void {
     for (plot.result.plotname) |c| try w.writeByte(if (c == ' ' or c == '\t') '_' else c);
     try w.print("\nVAR FREQ MAG {d}\n", .{plot.result.npoints});
     for (plot.result.varnames) |name| {
-        const ports = types.sParameter(name) orelse continue;
+        const ports = plots.sParameter(name) orelse continue;
         try w.print("DATA S[{d},{d}] RI\n", .{ ports[0], ports[1] });
     }
     try w.writeAll("VAR_LIST_BEGIN\n");
     for (0..plot.result.npoints) |pt| try w.print("{e}\n", .{plot.point(pt)[0]});
     try w.writeAll("VAR_LIST_END\n");
     for (plot.result.varnames, 0..) |name, vi| {
-        if (types.sParameter(name) == null) continue;
+        if (plots.sParameter(name) == null) continue;
         try w.writeAll("BEGIN\n");
         for (0..plot.result.npoints) |pt| {
             const row = plot.point(pt);

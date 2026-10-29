@@ -124,7 +124,7 @@ pub fn build(b: *Build) void {
     roots.append(b.allocator, .{ .name = "lu", .root = b.path("src/solver/lu_device.zig") }) catch @panic("OOM");
     // The lane root runs `.meas` passes on the device (06 6.8) from the file
     // measure.zig shares with it.
-    const lane_scan = b.allocator.dupe(Import, &.{.{ .name = "measure_scan", .module = b.createModule(.{ .root_source_file = b.path("src/output/scan.zig"), .strip = true }) }}) catch @panic("OOM");
+    const lane_scan = b.allocator.dupe(Import, &.{.{ .name = "measure_scan", .module = b.createModule(.{ .root_source_file = b.path("src/output/measure/scan.zig"), .strip = true }) }}) catch @panic("OOM");
     if (gpu_lanes) roots.append(b.allocator, .{ .name = "lane", .root = b.path("src/solver/lane_device.zig"), .imports = &laneKernelImports, .imports_ctx = @ptrCast(lane_scan.ptr) }) catch @panic("OOM");
     gompute_build.emitKernels(b, gompute, exe, .{
         .kernel_roots = roots.items,
@@ -454,7 +454,7 @@ fn graph(c: Cfg, vera: *Build.Dependency, gompute: *Module, models: []const Mode
     device.module.link_libc = libc;
     const solver = c.make(b.path("src/solver/root.zig"), &.{ core, build_options });
     // `.meas` evaluation: output prints it, a transient watches its cards resolve.
-    const measure: Import = .{ .name = "measure", .module = c.make(b.path("src/output/measure.zig"), &.{core}) };
+    const measure: Import = .{ .name = "measure", .module = c.make(b.path("src/output/measure/root.zig"), &.{core}) };
     const analysis = c.make(b.path("src/analysis/root.zig"), &.{ .{ .name = "solver", .module = solver }, core, device, gomp, build_options, measure });
     analysis.link_libc = libc;
     const netlist: Import = .{ .name = "netlist", .module = c.make(b.path("src/frontend/netlist.zig"), &.{core}) };

@@ -1,9 +1,66 @@
-//! ngspice binary raw file: a text header, then the samples as native-endian
-//! f64. ascii_raw.zig shares the header.
+//! ngspice raw file header and binary body: a validated plot in, the text
+//! header then the samples as native-endian f64 out. ascii_raw.zig writes
+//! the same header before its text values; `Session` writes it in two halves
+//! around a point count it fills in after streaming the rows.
+//! Cites: ngspice 44 manual §17.5 (raw file format), as ngspice writes it.
+//!
+//! Contents:
+//! - `pub const Body = enum { binary, ascii }`
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+//! - `pub fn writeHeader(w: *Io.Writer, plot: Plot, body: Body) Io.Writer.Error!void`
+//! - `pub fn writeHeaderHead(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+//! - `pub fn writeHeaderTail(w: *Io.Writer, plot: Plot, body: Body) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const Plot = @import("types.zig").Plot;
+const Plot = @import("plot.zig").Plot;
+
+/// What follows the header: `Binary:` samples or `Values:` text.
+pub const Body = enum { binary, ascii };
+
+/// Writes `plot`, which must have passed `plot.validatePlot(.binary, ...)`.
+/// Asserts that it has variables and one sample row per point.
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
+    assert(plot.result.varnames.len > 0);
+    assert(plot.result.data.len == plot.result.npoints * plot.stride());
+    try writeHeader(w, plot, .binary);
+    try w.writeAll(std.mem.sliceAsBytes(plot.result.data));
+}
+
+/// Writes the raw header up to and including `Binary:` or `Values:`. The
+/// date is fixed so output is reproducible. Reads no samples, so a streamed
+/// plot's empty data is fine. Asserts that `plot` has variables.
+pub fn writeHeader(w: *Io.Writer, plot: Plot, body: Body) Io.Writer.Error!void {
+    try writeHeaderHead(w, plot);
+    try w.print("{d}", .{plot.result.npoints});
+    try writeHeaderTail(w, plot, body);
+}
+
+/// The header up to the point count: everything through `No. Points: `.
+/// Asserts that `plot` has variables.
+pub fn writeHeaderHead(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
+    assert(plot.result.varnames.len > 0);
+    try w.print("Title: {s}\n", .{plot.title});
+    try w.writeAll("Date: Thu Jan  1 00:00:00 1970\n");
+    try w.print("Plotname: {s}\n", .{plot.result.plotname});
+    try w.writeAll(if (plot.result.is_complex) "Flags: complex\n" else "Flags: real\n");
+    try w.print("No. Variables: {d}\nNo. Points: ", .{plot.result.varnames.len});
+}
+
+/// The header after the point count: the variable table and the body marker.
+/// Asserts that `plot` has variables.
+pub fn writeHeaderTail(w: *Io.Writer, plot: Plot, body: Body) Io.Writer.Error!void {
+    assert(plot.result.varnames.len > 0);
+    try w.writeAll("\nVariables:\n");
+    for (plot.result.varnames, 0..) |name, i| try w.print("\t{d}\t{s}\t{s}\n", .{ i, name, varType(name) });
+    try w.writeAll(switch (body) {
+        .binary => "Binary:\n",
+        .ascii => "Values:\n",
+    });
+}
+
+// ---- private ----
 
 /// ngspice's variable type for a name: time, frequency, current for `i(...)`
 /// and `#branch` names, voltage otherwise.
@@ -13,32 +70,6 @@ fn varType(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "i(")) return "current";
     if (std.mem.indexOf(u8, name, "#branch") != null) return "current";
     return "voltage";
-}
-
-/// Writes `plot`, which must have passed `types.validatePlot(.binary, ...)`.
-/// Asserts that it has variables and one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
-    assert(plot.result.varnames.len > 0);
-    assert(plot.result.data.len == plot.result.npoints * plot.stride());
-    try writeHeader(w, plot, true);
-    try w.writeAll(std.mem.sliceAsBytes(plot.result.data));
-}
-
-/// Writes the raw header up to and including `Binary:` or `Values:`.
-/// The date is fixed so output is reproducible. Reads no samples, so a
-/// streamed plot's empty data is fine. Asserts that `plot` has variables.
-pub fn writeHeader(w: *Io.Writer, plot: Plot, comptime binary: bool) !void {
-    assert(plot.result.varnames.len > 0);
-    try w.print("Title: {s}\n", .{plot.title});
-    try w.writeAll("Date: Thu Jan  1 00:00:00 1970\n");
-    try w.print("Plotname: {s}\n", .{plot.result.plotname});
-    try w.writeAll(if (plot.result.is_complex) "Flags: complex\n" else "Flags: real\n");
-    try w.print("No. Variables: {d}\nNo. Points: {d}\n", .{ plot.result.varnames.len, plot.result.npoints });
-    try w.writeAll("Variables:\n");
-    for (plot.result.varnames, 0..) |name, i| {
-        try w.print("\t{d}\t{s}\t{s}\n", .{ i, name, varType(name) });
-    }
-    try w.writeAll(if (binary) "Binary:\n" else "Values:\n");
 }
 
 fn expectRaw(plot: Plot, header: []const u8) !void {

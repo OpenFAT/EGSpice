@@ -1,23 +1,30 @@
-//! Touchstone (.snp): S parameters in real/imaginary form. One reference
-//! impedance for every port writes Touchstone 1.0 (`# Hz S RI R z0`); ports
-//! with different ones write Touchstone 2.0 with a `[Reference]` line, which
-//! 1.0 cannot express. Needs the complete matrix `types.portCount` checks for.
-//! A two-port result's `.lin` NFMIN, GAMMA_OPT and RN columns follow as the
+//! Touchstone (.snp): a validated S-parameter plot in, the network data in
+//! real/imaginary form out. One reference impedance for every port writes
+//! Touchstone 1.0 (`# Hz S RI R z0`); ports with different ones write
+//! Touchstone 2.0 with a `[Reference]` line, which 1.0 cannot express. A
+//! two-port result's `.lin` NFMIN, GAMMA_OPT and RN columns follow as the
 //! noise block.
+//! Cites: Touchstone File Format Specification 2.0 (IBIS, 2009): option
+//! line, `[Two-Port Data Order]`, `[Reference]`, noise parameters.
+//!
+//! Contents:
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const types = @import("types.zig");
-const Plot = types.Plot;
+const plots = @import("plot.zig");
+const Plot = plots.Plot;
 
-/// Writes `plot`, which must have passed `types.validatePlot(.touchstone,
-/// ...)`. `DataLengthMismatch` when `plot.z0` is neither empty nor one
-/// impedance per port. Asserts that `plot` has one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
+/// Writes `plot`, which must have passed `plot.validatePlot(.touchstone,
+/// ...)`: the complete matrix `portCount` checks for, and `z0` empty or one
+/// impedance per port. Asserts both and one sample row per point.
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
-    const n_ports = try types.portCount(plot.schema());
+    // A validated plot has the layout: this cannot fail.
+    const n_ports = plots.portCount(plot.schema()) catch unreachable;
     assert(n_ports > 0);
-    if (plot.z0.len != 0 and plot.z0.len != n_ports) return error.DataLengthMismatch;
+    assert(plot.z0.len == 0 or plot.z0.len == n_ports);
     const z0 = if (plot.z0.len == 0) 50.0 else plot.z0[0];
     const v2 = for (plot.z0) |z| {
         if (z != z0) break true;
@@ -57,10 +64,13 @@ pub fn encode(w: *Io.Writer, plot: Plot) !void {
     if (v2) try w.writeAll("[End]\n");
 }
 
+// ---- private ----
+
 /// Touchstone's two-port noise data after the S block, when `.lin`
 /// published it: frequency, NFmin in dB, |Γopt|, ∠Γopt in degrees and
 /// RN normalized to port 1's reference `z0`, which Γopt is taken against.
-fn noiseBlock(w: *Io.Writer, plot: Plot, z0: f64, v2: bool) !void {
+fn noiseBlock(w: *Io.Writer, plot: Plot, z0: f64, v2: bool) Io.Writer.Error!void {
+    assert(plot.result.is_complex);
     var cols: [3]usize = undefined;
     for ([_][]const u8{ "NFMIN", "GAMMA_OPT", "RN" }, &cols) |name, *col| {
         col.* = for (plot.result.varnames, 0..) |v, i| {
@@ -116,7 +126,7 @@ test "Touchstone 1-port, 3-port matrix rows and a mismatched z0" {
     try encode(&w, plot);
     try std.testing.expectEqualStrings("! s1p\n# Hz S RI R 50\n1e0 5e-1 -5e-1\n", w.buffered());
     plot.z0 = &.{ 50, 75 };
-    try std.testing.expectError(error.DataLengthMismatch, encode(&w, plot));
+    try std.testing.expectError(error.DataLengthMismatch, plots.validatePlot(.touchstone, plot));
 
     var data: [2 * 10]f64 = undefined;
     for (&data, 0..) |*x, i| x.* = @floatFromInt(i);

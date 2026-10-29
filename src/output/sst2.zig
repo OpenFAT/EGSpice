@@ -1,36 +1,43 @@
-//! HSPICE SST2-style binary in Fortran unformatted records (little-endian i32
-//! length, payload, length again): a text header, the variable count, the
-//! names, a complex flag, then one record of f64 samples per point.
+//! HSPICE SST2-style binary: a validated plot in, Fortran unformatted
+//! records out (little-endian i32 length, payload, length again): a text
+//! header, the variable count, the names, a complex flag, then one record of
+//! f64 samples per point.
+//! Cites: none (the record framing of Fortran unformatted sequential I/O).
 //! ponytail: follows the record structure only; vendor readers may expect
 //! more. Match a real HSPICE file when a reader rejects this one.
+//!
+//! Contents:
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const Plot = @import("types.zig").Plot;
+const plots = @import("plot.zig");
+const Plot = plots.Plot;
+
+const names_max = plots.sst2_names_max;
 
 /// Width of one name slot; names are cut to 15 bytes plus a NUL.
 const name_slot = 16;
-/// Name slots in the names record (`types.validateSchema` enforces it).
-const names_max = 64;
+const header_format = "SST2 {s} {s} nvars={d} npoints={d}";
 
-fn writeRecord(w: *Io.Writer, data: []const u8) !void {
-    assert(data.len <= std.math.maxInt(i32));
-    try w.writeInt(i32, @intCast(data.len), .little);
-    try w.writeAll(data);
-    try w.writeInt(i32, @intCast(data.len), .little);
+comptime {
+    // A full names record and a complex point's record fit an i32 length.
+    assert(name_slot * names_max <= std.math.maxInt(i32));
+    assert(names_max * 2 * @sizeOf(f64) <= std.math.maxInt(i32));
 }
 
-/// Writes `plot`. Asserts at most 64 variables (`types.validateSchema`
-/// enforces it) and one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
+/// Writes `plot`, which must have passed `plot.validatePlot(.sst2, ...)`.
+/// Asserts at most `sst2_names_max` variables, a header record that fits an
+/// i32 length, and one sample row per point.
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     const nvars = plot.result.varnames.len;
     assert(nvars <= names_max);
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
-    const header = "SST2 {s} {s} nvars={d} npoints={d}";
     const args = .{ plot.title, plot.result.plotname, nvars, plot.result.npoints };
-    const header_len: i32 = @intCast(std.fmt.count(header, args));
+    const header_len: i32 = @intCast(std.fmt.count(header_format, args));
     try w.writeInt(i32, header_len, .little);
-    try w.print(header, args);
+    try w.print(header_format, args);
     try w.writeInt(i32, header_len, .little);
 
     try writeRecord(w, &std.mem.toBytes(std.mem.nativeToLittle(i32, @intCast(nvars))));
@@ -42,6 +49,15 @@ pub fn encode(w: *Io.Writer, plot: Plot) !void {
     try writeRecord(w, names[0 .. nvars * name_slot]);
     try writeRecord(w, &std.mem.toBytes(std.mem.nativeToLittle(i32, @intFromBool(plot.result.is_complex))));
     for (0..plot.result.npoints) |pt| try writeRecord(w, std.mem.sliceAsBytes(plot.point(pt)));
+}
+
+// ---- private ----
+
+fn writeRecord(w: *Io.Writer, data: []const u8) Io.Writer.Error!void {
+    assert(data.len <= std.math.maxInt(i32));
+    try w.writeInt(i32, @intCast(data.len), .little);
+    try w.writeAll(data);
+    try w.writeInt(i32, @intCast(data.len), .little);
 }
 
 test "SST2 record framing" {

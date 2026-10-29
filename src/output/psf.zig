@@ -1,14 +1,21 @@
-//! Cadence PSF ASCII. A plot with more than one point writes its first
+//! Cadence PSF ASCII: a validated plot in, the HEADER, TYPE, SWEEP, TRACE
+//! and VALUE sections out. A plot with more than one point writes its first
 //! variable as the SWEEP and the rest as TRACEs; a single point writes every
 //! variable as a TRACE.
+//! Cites: none (Cadence's PSF ASCII is unpublished; this follows the
+//! sections Spectre's `psfascii` output shows).
+//!
+//! Contents:
+//! - `pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void`
+
 const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
-const Plot = @import("types.zig").Plot;
+const Plot = @import("plot.zig").Plot;
 
-/// Writes `plot`, which must have passed `types.validatePlot(.psf, ...)`.
+/// Writes `plot`, which must have passed `plot.validatePlot(.psf, ...)`.
 /// Asserts that it has variables and one sample row per point.
-pub fn encode(w: *Io.Writer, plot: Plot) !void {
+pub fn encode(w: *Io.Writer, plot: Plot) Io.Writer.Error!void {
     assert(plot.result.varnames.len > 0);
     assert(plot.result.data.len == plot.result.npoints * plot.stride());
     const names = plot.result.varnames;
@@ -58,8 +65,10 @@ pub fn encode(w: *Io.Writer, plot: Plot) !void {
     try w.writeAll("END\n");
 }
 
+// ---- private ----
+
 /// `s` as a PSF string: quoted, its quotes and backslashes escaped (#61).
-fn string(w: *Io.Writer, s: []const u8) !void {
+fn string(w: *Io.Writer, s: []const u8) Io.Writer.Error!void {
     try w.writeByte('"');
     for (s) |c| {
         if (c == '"' or c == '\\') try w.writeByte('\\');
