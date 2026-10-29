@@ -2,6 +2,12 @@
 //! harmonic balance by `mhb.solve` over the (2K1+1) x (2K2+1) box, then
 //! published two-sided, one row per mix product k*f1 + l*f2.
 //! No outside source beyond mhb.zig's.
+//!
+//! Contents:
+//! - `pub const Options = @import("core").query.Qpss`
+//! - `pub fn boxLines(spec: mhb.Spectrum, f1: f64, f2: f64, k1: u16, k2: u16, lines: []u32) void`
+//! - `pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result`
+
 const std = @import("std");
 const root = @import("../types.zig");
 const mhb = @import("mhb.zig");
@@ -31,15 +37,6 @@ pub fn boxLines(spec: mhb.Spectrum, f1: f64, f2: f64, k1: u16, k2: u16, lines: [
         std.debug.assert(@abs(spec.freqs[j] - f) <= 1e-12 * @max(f, 1));
         line.* = @intCast(j);
     }
-}
-
-/// (k, l) of box row `flat`.
-fn signedKL(flat: usize, k1: u16, k2: u16) struct { k: i32, l: i32 } {
-    const nf1 = 2 * @as(usize, k1) + 1;
-    return .{
-        .k = @as(i32, @intCast(flat % nf1)) - @as(i32, k1),
-        .l = @as(i32, @intCast(flat / nf1)) - @as(i32, k2),
-    };
 }
 
 /// Contract entry: one row per mix product (frequency k*f1 + l*f2, then each
@@ -95,5 +92,15 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
         .is_complex = false,
         .npoints = n_rows,
         .data = data,
+    };
+}
+// ---- private ----
+
+/// (k, l) of box row `flat`.
+fn signedKL(flat: usize, k1: u16, k2: u16) struct { k: i32, l: i32 } {
+    const nf1 = 2 * @as(usize, k1) + 1;
+    return .{
+        .k = @as(i32, @intCast(flat % nf1)) - @as(i32, k1),
+        .l = @as(i32, @intCast(flat / nf1)) - @as(i32, k2),
     };
 }

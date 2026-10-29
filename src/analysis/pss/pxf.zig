@@ -3,9 +3,14 @@
 //! from every node i at every sideband m to the output (images, LO
 //! feedthrough, conversion gain from every port at once).
 //! No outside source beyond pac.zig's.
+//!
+//! Contents:
+//! - `pub const Options = pac.Options`
+//! - `pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result`
+//! - `pub fn result(ctx: *const root.RunCtx, freqs_buf: []const f64, transfer: []const Complex, n_harmonics: u16, plotname: []const u8) !root.Result`
+
 const root = @import("../types.zig");
 const pac = @import("pac.zig");
-
 const Complex = pac.Complex;
 
 /// PXF takes PAC's query; `out_node` is the output every transfer reaches.

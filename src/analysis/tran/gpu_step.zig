@@ -32,16 +32,19 @@ const run = tran.run;
 /// `runGpuLanes`' lane outcomes: a lane leaves `live` once, with its
 /// result or error in `out`.
 pub const GpuLane = struct {
+    /// Publishes lane l's result (`Run.take(ok)`) and frees its run.
     pub fn done(rs: []Run, on: []bool, o: []LaneOutcome, l: usize, ok: bool) void {
         o[l] = rs[l].take(ok);
         rs[l].deinit();
         on[l] = false;
     }
+    /// Fails lane l with `err` and frees its run.
     pub fn kill(rs: []Run, on: []bool, o: []LaneOutcome, l: usize, err: LaneError) void {
         o[l] = err;
         rs[l].deinit();
         on[l] = false;
     }
+    /// Fails every live lane with `err`.
     pub fn failAll(rs: []Run, on: []bool, o: []LaneOutcome, err: LaneError) void {
         for (0..rs.len) |l| if (on[l]) kill(rs, on, o, l, err);
     }

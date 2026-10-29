@@ -11,6 +11,17 @@
 //!
 //! Cites: Verilog-A LRM §4.6.1 (sources follow their waveform only in the
 //! transient phase), #14 (the projection lane kernel).
+//!
+//! Contents:
+//! - `pub const Options = @import("core").query.Hb`
+//! - `pub const LaneOutcome = root.ErrorOf(run)!root.Result`
+//! - `pub const Spectrum = struct { status: SolveResult, f0: f64 }`
+//! - `pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome) void`
+//! - `pub fn solveSpectrum(ckt: *root.Circuit, x_hat: []f64, ppv: []f64, options: Options, allocator: std.mem.Allocator) !Spectrum`
+//! - `pub fn solveOscillator(ckt: *root.Circuit, x_dc: []const f64, x_hat: []f64, ppv: []f64, options: Options, allocator: std.mem.Allocator) !Spectrum`
+//! - `pub fn orbit(x_hat: []const f64, n: usize, f0: f64, n_samples: usize, converged: bool, allocator: std.mem.Allocator) !pac.Orbit`
+//! - `pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result`
+
 const std = @import("std");
 const root = @import("../types.zig");
 const take = root.take;
@@ -22,8 +33,22 @@ const mhb = @import("mhb.zig");
 
 /// The `.hb` query; `extra_tones` or `phasors` route it to `mhb.zig`.
 pub const Options = @import("core").query.Hb;
+const SolveResult = pss.SolveResult;
+
 /// One lane's `run` outcome.
 pub const LaneOutcome = root.ErrorOf(run)!root.Result;
+
+/// `solveSpectrum`'s outcome: the Newton status and the fundamental the
+/// spectrum is at, `Options.f0` unless the solve was autonomous.
+pub const Spectrum = struct { status: SolveResult, f0: f64 };
+
+/// Time samples per spectral unknown. The 2K+1 collocation points alias
+/// the harmonics a nonlinearity generates past K onto the top of the kept
+/// band; 2(2K+1) > 4K samples project the residual of any cubic in x(t)
+/// onto harmonics 0..K exactly, a Galerkin rather than collocation fit.
+const oversample: usize = 2;
+
+const project_lanes = std.simd.suggestVectorLength(f64) orelse 4;
 
 /// Wide scheduler entry for driven sparse periodic systems. Dense and
 /// autonomous problems retain their ordinary query behavior.
@@ -42,29 +67,6 @@ pub fn runGpuLanes(ctxs: []const root.RunCtx, opts: Options, out: []LaneOutcome)
         grouped_options.subharms = 1;
     }
     mhb.runGpuLanes(ctxs, grouped_options, out);
-}
-
-const SolveResult = pss.SolveResult;
-
-/// `solveSpectrum`'s outcome: the Newton status and the fundamental the
-/// spectrum is at, `Options.f0` unless the solve was autonomous.
-pub const Spectrum = struct { status: SolveResult, f0: f64 };
-
-/// Time samples per spectral unknown. The 2K+1 collocation points alias
-/// the harmonics a nonlinearity generates past K onto the top of the kept
-/// band; 2(2K+1) > 4K samples project the residual of any cubic in x(t)
-/// onto harmonics 0..K exactly, a Galerkin rather than collocation fit.
-const oversample: usize = 2;
-
-/// True when a driven solve of n unknowns and nf = 2K+1 coefficients each
-/// takes `mhb.zig`'s preconditioned GMRES instead of the dense Jacobian.
-/// The dense LU is O((n·nf)^3) a step and GMRES O(iterations·n·nf^2), so
-/// n decides. Callgrind: a 4-node diode
-/// clipper at K = 32 is 1.23x cheaper dense, a 6-node rectifier at K = 32
-/// 1.31x; the diode-RC ladders are cheaper on GMRES by 2.2x at 14 nodes and
-/// K = 8, 3.6x at 9 nodes and K = 32, and 16x at 44 nodes and K = 8.
-fn useGmres(n: usize, nf: usize) bool {
-    return n >= 10 or n * nf >= 512;
 }
 
 /// Harmonic balance from the DC operating point, keeping every unknown's
@@ -415,115 +417,6 @@ pub fn solveOscillator(ckt: *root.Circuit, x_dc: []const f64, x_hat: []f64, ppv:
     return solveSpectrum(ckt, x_hat, ppv, opts, allocator);
 }
 
-/// x_td[node*nt + k] = dc + Σ_h c_h·basis_cos[h-1, k] + s_h·basis_sin[h-1, k]
-/// for every node of `x_hat` (`solveSpectrum`'s layout, harmonics 1..nh),
-/// one contiguous row per node.
-fn idft(x_hat: []const f64, nh: usize, nt: usize, basis_cos: []const f64, basis_sin: []const f64, x_td: []f64) void {
-    const nf = 2 * nh + 1;
-    const n = x_hat.len / nf;
-    for (0..n) |node| {
-        const spec = x_hat[node * nf ..][0..nf];
-        const row = x_td[node * nt ..][0..nt];
-        @memset(row, spec[0]);
-        for (0..nh) |hi| {
-            num.axpy(row, spec[2 * hi + 1], basis_cos[hi * nt ..][0..nt]);
-            num.axpy(row, spec[2 * hi + 2], basis_sin[hi * nt ..][0..nt]);
-        }
-    }
-}
-
-/// The spectrum of the samples `g` to harmonic gc.len - 1, in the
-/// Jacobian's convention: gc[0] = 2*mean(g), gs[0] = 0, and gc[k], gs[k]
-/// the 2/nt cos and sin projections on the harmonic-major bases.
-fn project(g: []const f64, basis_cos: []const f64, basis_sin: []const f64, gc: []f64, gs: []f64) void {
-    projectLanes(project_lanes, g, basis_cos, basis_sin, gc, gs);
-}
-
-const project_lanes = std.simd.suggestVectorLength(f64) orelse 4;
-
-/// `project` on W lanes; W == 1 is the scalar oracle. One pass over g
-/// yields both the cos and the sin sum (#14).
-fn projectLanes(comptime W: comptime_int, g: []const f64, basis_cos: []const f64, basis_sin: []const f64, gc: []f64, gs: []f64) void {
-    const V = @Vector(W, f64);
-    const nt = g.len;
-    std.debug.assert(gc.len == gs.len and gc.len >= 1);
-    std.debug.assert(basis_cos.len >= (gc.len - 1) * nt and basis_sin.len >= (gc.len - 1) * nt);
-    const nt_f: f64 = @floatFromInt(nt);
-    const body = nt - nt % W;
-
-    var dc: V = @splat(0);
-    var k: usize = 0;
-    while (k < body) : (k += W) dc += g[k..][0..W].*;
-    var dc_sum: f64 = @reduce(.Add, dc);
-    for (g[body..]) |v| dc_sum += v;
-    gc[0] = 2.0 * dc_sum / nt_f;
-    gs[0] = 0;
-
-    for (gc[1..], gs[1..], 0..) |*c, *s, hi| {
-        const bc = basis_cos[hi * nt ..][0..nt];
-        const bs = basis_sin[hi * nt ..][0..nt];
-        var cv: V = @splat(0);
-        var sv: V = @splat(0);
-        k = 0;
-        while (k < body) : (k += W) {
-            const gv: V = g[k..][0..W].*;
-            cv += gv * @as(V, bc[k..][0..W].*);
-            sv += gv * @as(V, bs[k..][0..W].*);
-        }
-        var c_sum: f64 = @reduce(.Add, cv);
-        var s_sum: f64 = @reduce(.Add, sv);
-        for (g[body..], bc[body..], bs[body..]) |gv, cb, sb| {
-            c_sum += gv * cb;
-            s_sum += gv * sb;
-        }
-        c.* = 2.0 * c_sum / nt_f;
-        s.* = 2.0 * s_sum / nt_f;
-    }
-}
-
-/// Moves the autonomous fundamental and the period with it.
-fn setOmega(omega0: *f64, period: *f64, omega: f64) void {
-    omega0.* = omega;
-    period.* = 2.0 * std.math.pi / omega;
-}
-
-/// Seeds `x_hat` for an autonomous solve from one period of the
-/// oscillator's shooting orbit: the first K harmonics of every unknown,
-/// time-shifted so the osc node's fundamental is a pure cosine (sin_1 = 0,
-/// the phase condition `solveSpectrum` holds). Exact while the orbit
-/// samples more than 2K points per period; asserts x_hat.len is n * (2K+1)
-/// with K >= 1.
-fn seed(x_hat: []f64, orb: pac.Orbit, n: usize, osc: u32) void {
-    const nf = x_hat.len / n;
-    const nh = (nf - 1) / 2;
-    std.debug.assert(nf * n == x_hat.len and nh > 0);
-    const ns = orb.samples(n);
-    const ns_f: f64 = @floatFromInt(ns);
-    @memset(x_hat, 0);
-    for (0..ns) |k| {
-        const x = orb.state(k, n);
-        for (0..n) |node| {
-            const spec = x_hat[node * nf ..][0..nf];
-            spec[0] += x[node] / ns_f;
-            for (1..nh + 1) |h| {
-                const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt((h * k) % ns)) / ns_f;
-                spec[2 * h - 1] += 2.0 * x[node] * @cos(angle) / ns_f;
-                spec[2 * h] += 2.0 * x[node] * @sin(angle) / ns_f;
-            }
-        }
-    }
-    // Shift t by phi/w0: harmonic h rotates by h*phi.
-    const phi = std.math.atan2(x_hat[osc * nf + 2], x_hat[osc * nf + 1]);
-    for (0..n) |node| for (1..nh + 1) |h| {
-        const c = x_hat[node * nf + 2 * h - 1];
-        const s = x_hat[node * nf + 2 * h];
-        const a = @as(f64, @floatFromInt(h)) * phi;
-        x_hat[node * nf + 2 * h - 1] = c * @cos(a) + s * @sin(a);
-        x_hat[node * nf + 2 * h] = s * @cos(a) - c * @sin(a);
-    };
-    x_hat[osc * nf + 2] = 0;
-}
-
 /// One period of the HB solution `x_hat` (`solveSpectrum`'s layout, n
 /// unknowns, fundamental `f0`) on `n_samples` uniform points, as the
 /// `pac.Orbit` rows [t, x(0..n)] the periodic small-signal analyses
@@ -608,6 +501,125 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
         .npoints = n_rows,
         .data = data,
     };
+}
+// ---- private ----
+
+/// True when a driven solve of n unknowns and nf = 2K+1 coefficients each
+/// takes `mhb.zig`'s preconditioned GMRES instead of the dense Jacobian.
+/// The dense LU is O((n·nf)^3) a step and GMRES O(iterations·n·nf^2), so
+/// n decides. Callgrind: a 4-node diode
+/// clipper at K = 32 is 1.23x cheaper dense, a 6-node rectifier at K = 32
+/// 1.31x; the diode-RC ladders are cheaper on GMRES by 2.2x at 14 nodes and
+/// K = 8, 3.6x at 9 nodes and K = 32, and 16x at 44 nodes and K = 8.
+fn useGmres(n: usize, nf: usize) bool {
+    return n >= 10 or n * nf >= 512;
+}
+
+/// x_td[node*nt + k] = dc + Σ_h c_h·basis_cos[h-1, k] + s_h·basis_sin[h-1, k]
+/// for every node of `x_hat` (`solveSpectrum`'s layout, harmonics 1..nh),
+/// one contiguous row per node.
+fn idft(x_hat: []const f64, nh: usize, nt: usize, basis_cos: []const f64, basis_sin: []const f64, x_td: []f64) void {
+    const nf = 2 * nh + 1;
+    const n = x_hat.len / nf;
+    for (0..n) |node| {
+        const spec = x_hat[node * nf ..][0..nf];
+        const row = x_td[node * nt ..][0..nt];
+        @memset(row, spec[0]);
+        for (0..nh) |hi| {
+            num.axpy(row, spec[2 * hi + 1], basis_cos[hi * nt ..][0..nt]);
+            num.axpy(row, spec[2 * hi + 2], basis_sin[hi * nt ..][0..nt]);
+        }
+    }
+}
+
+/// The spectrum of the samples `g` to harmonic gc.len - 1, in the
+/// Jacobian's convention: gc[0] = 2*mean(g), gs[0] = 0, and gc[k], gs[k]
+/// the 2/nt cos and sin projections on the harmonic-major bases.
+fn project(g: []const f64, basis_cos: []const f64, basis_sin: []const f64, gc: []f64, gs: []f64) void {
+    projectLanes(project_lanes, g, basis_cos, basis_sin, gc, gs);
+}
+
+/// `project` on W lanes; W == 1 is the scalar oracle. One pass over g
+/// yields both the cos and the sin sum (#14).
+fn projectLanes(comptime W: comptime_int, g: []const f64, basis_cos: []const f64, basis_sin: []const f64, gc: []f64, gs: []f64) void {
+    const V = @Vector(W, f64);
+    const nt = g.len;
+    std.debug.assert(gc.len == gs.len and gc.len >= 1);
+    std.debug.assert(basis_cos.len >= (gc.len - 1) * nt and basis_sin.len >= (gc.len - 1) * nt);
+    const nt_f: f64 = @floatFromInt(nt);
+    const body = nt - nt % W;
+
+    var dc: V = @splat(0);
+    var k: usize = 0;
+    while (k < body) : (k += W) dc += g[k..][0..W].*;
+    var dc_sum: f64 = @reduce(.Add, dc);
+    for (g[body..]) |v| dc_sum += v;
+    gc[0] = 2.0 * dc_sum / nt_f;
+    gs[0] = 0;
+
+    for (gc[1..], gs[1..], 0..) |*c, *s, hi| {
+        const bc = basis_cos[hi * nt ..][0..nt];
+        const bs = basis_sin[hi * nt ..][0..nt];
+        var cv: V = @splat(0);
+        var sv: V = @splat(0);
+        k = 0;
+        while (k < body) : (k += W) {
+            const gv: V = g[k..][0..W].*;
+            cv += gv * @as(V, bc[k..][0..W].*);
+            sv += gv * @as(V, bs[k..][0..W].*);
+        }
+        var c_sum: f64 = @reduce(.Add, cv);
+        var s_sum: f64 = @reduce(.Add, sv);
+        for (g[body..], bc[body..], bs[body..]) |gv, cb, sb| {
+            c_sum += gv * cb;
+            s_sum += gv * sb;
+        }
+        c.* = 2.0 * c_sum / nt_f;
+        s.* = 2.0 * s_sum / nt_f;
+    }
+}
+
+/// Moves the autonomous fundamental and the period with it.
+fn setOmega(omega0: *f64, period: *f64, omega: f64) void {
+    omega0.* = omega;
+    period.* = 2.0 * std.math.pi / omega;
+}
+
+/// Seeds `x_hat` for an autonomous solve from one period of the
+/// oscillator's shooting orbit: the first K harmonics of every unknown,
+/// time-shifted so the osc node's fundamental is a pure cosine (sin_1 = 0,
+/// the phase condition `solveSpectrum` holds). Exact while the orbit
+/// samples more than 2K points per period; asserts x_hat.len is n * (2K+1)
+/// with K >= 1.
+fn seed(x_hat: []f64, orb: pac.Orbit, n: usize, osc: u32) void {
+    const nf = x_hat.len / n;
+    const nh = (nf - 1) / 2;
+    std.debug.assert(nf * n == x_hat.len and nh > 0);
+    const ns = orb.samples(n);
+    const ns_f: f64 = @floatFromInt(ns);
+    @memset(x_hat, 0);
+    for (0..ns) |k| {
+        const x = orb.state(k, n);
+        for (0..n) |node| {
+            const spec = x_hat[node * nf ..][0..nf];
+            spec[0] += x[node] / ns_f;
+            for (1..nh + 1) |h| {
+                const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt((h * k) % ns)) / ns_f;
+                spec[2 * h - 1] += 2.0 * x[node] * @cos(angle) / ns_f;
+                spec[2 * h] += 2.0 * x[node] * @sin(angle) / ns_f;
+            }
+        }
+    }
+    // Shift t by phi/w0: harmonic h rotates by h*phi.
+    const phi = std.math.atan2(x_hat[osc * nf + 2], x_hat[osc * nf + 1]);
+    for (0..n) |node| for (1..nh + 1) |h| {
+        const c = x_hat[node * nf + 2 * h - 1];
+        const s = x_hat[node * nf + 2 * h];
+        const a = @as(f64, @floatFromInt(h)) * phi;
+        x_hat[node * nf + 2 * h - 1] = c * @cos(a) + s * @sin(a);
+        x_hat[node * nf + 2 * h] = s * @cos(a) - c * @sin(a);
+    };
+    x_hat[osc * nf + 2] = 0;
 }
 
 test idft {

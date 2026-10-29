@@ -8,17 +8,29 @@
 //!
 //! Cites: VACASK for the signed amplitude
 //! of a negative density; HSPICE `.ptdnoise` for the strobed density.
+//!
+//! Contents:
+//! - `pub const Options = @import("core").query.Pnoise`
+//! - `pub const NoiseSource = root.NoiseSource`
+//! - `pub inline fn sourcePsd(white: f64, flicker: f64, ef: f64, f_sideband: f64) f64`
+//! - `pub fn samplesFor(requested: usize, n_sb: usize) usize`
+//! - `pub fn orbitSweep(ckt: *root.Circuit, orb: pac.Orbit, noise_sources: []const NoiseSource, freqs: []f64, density: []f64, options: Options, allocator: std.mem.Allocator) !void`
+//! - `pub fn sampleAmplitudes(ckt: *const root.Circuit, x: []const f64, srcs: []const NoiseSource, k: usize, n_samples: usize, amp: []f64, exponent: []f64, allocator: std.mem.Allocator) !void`
+//! - `pub inline fn whiteShape(src: NoiseSource, f: f64) f64`
+//! - `pub inline fn signedSqrt(d: f64) f64`
+//! - `pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result`
+//! - `pub fn result(a: std.mem.Allocator, freqs: []const f64, density: []const f64, column: []const u8, plotname: []const u8) !root.Result`
+
 const std = @import("std");
 const root = @import("../types.zig");
 const pac = @import("pac.zig");
-
 const Complex = pac.Complex;
-
-/// One device noise generator between two nodes, as `collectNoiseSources` lists it.
-pub const NoiseSource = root.NoiseSource;
 
 /// The `.pnoise` query; `.hbnoise` and `.phasenoise` fill one in for `orbitSweep`.
 pub const Options = @import("core").query.Pnoise;
+
+/// One device noise generator between two nodes, as `collectNoiseSources` lists it.
+pub const NoiseSource = root.NoiseSource;
 
 /// S(f) = white + flicker/|f|^ef at one sideband, from one time sample's
 /// coefficients.
@@ -28,35 +40,6 @@ pub inline fn sourcePsd(white: f64, flicker: f64, ef: f64, f_sideband: f64) f64 
     // Upgrade to the analytic band integral if it ever matters.
     const f_abs = @max(@abs(f_sideband), 1e-30);
     return white + flicker / std.math.pow(f64, f_abs, ef);
-}
-
-/// Periodic noise density at `options.out_node` (minus `out_neg`), in
-/// V^2/Hz, about the shooting PSS from `x_dc`: `pac.orbit` then
-/// `orbitSweep`. The caller owns freqs and density, both sweep-count long.
-/// Returns false when the shooting stopped short; the density is then about
-/// its last period.
-fn sweep(
-    ckt: *root.Circuit,
-    x_dc: []const f64,
-    noise_sources: []const NoiseSource,
-    freqs: []f64,
-    density: []f64,
-    options: Options,
-    allocator: std.mem.Allocator,
-) !bool {
-    const n_sb = 2 * @as(usize, options.n_sidebands) + 1;
-    const orb = try pac.orbit(ckt, x_dc, .{
-        .tol = options.tol,
-        .period = 1.0 / options.f_fundamental,
-        .n_samples = @intCast(samplesFor(options.pss_n_samples, n_sb)),
-        .max_shooting_iter = options.pss_shoot_max_iter,
-        .shooting_tol = options.pss_shoot_tol,
-        .max_newton_iter = options.pss_newton_max_iter,
-        .newton_tol = options.pss_newton_tol,
-    }, allocator);
-    defer allocator.free(orb.wave);
-    try orbitSweep(ckt, orb, noise_sources, freqs, density, options, allocator);
-    return orb.converged;
 }
 
 /// Orbit samples per period for `n_sb` sidebands: at least `requested`, a
@@ -164,6 +147,110 @@ pub fn orbitSweep(
     }
 }
 
+/// Sample `k` of every source's amplitude at the orbit state `x`: white at
+/// `amp[s * n_samples + k]`, flicker at `amp[(srcs.len + s) * n_samples + k]`,
+/// and at k = 0 each flicker exponent into `exponent[s]`.
+/// error.NoiseTopologyChanged when the sources at `x` are not `srcs`, node
+/// for node.
+pub fn sampleAmplitudes(ckt: *const root.Circuit, x: []const f64, srcs: []const NoiseSource, k: usize, n_samples: usize, amp: []f64, exponent: []f64, allocator: std.mem.Allocator) !void {
+    const at = try ckt.collectNoiseSources(x, allocator);
+    defer allocator.free(at);
+    if (at.len != srcs.len) return error.NoiseTopologyChanged;
+    for (at, srcs, 0..) |src, original, s| {
+        if (src.node_p != original.node_p or src.node_n != original.node_n) return error.NoiseTopologyChanged;
+        amp[s * n_samples + k] = whiteAmp(src);
+        amp[(srcs.len + s) * n_samples + k] = src.coeff * signedSqrt(src.flicker);
+        // ponytail: the flicker exponent is a model constant in every
+        // device, so sample 0 stands for the period.
+        if (k == 0) exponent[s] = src.ef;
+    }
+}
+
+/// The spectrum the white amplitude multiplies at sideband `f`: the table
+/// at |f| for a table row, else 1.
+pub inline fn whiteShape(src: NoiseSource, f: f64) f64 {
+    return if (src.table.points.len != 0) src.tableAt(@abs(f)) else 1;
+}
+
+/// sign(d)*sqrt(|d|): a source amplitude whose square is the density d.
+pub inline fn signedSqrt(d: f64) f64 {
+    return std.math.copysign(@sqrt(@abs(d)), d);
+}
+
+/// Contract entry: device noise sources at ctx.x_op, LPTV sweep. Point-major
+/// rows (frequency, pnoise_density); an unconverged PSS says so in the plot
+/// name rather than failing.
+pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
+    const x_op = ctx.x_op;
+
+    const scratch = ctx.scratch_allocator;
+    const srcs = try ctx.circuit.collectNoiseSources(x_op, scratch);
+    defer scratch.free(srcs);
+
+    const n_points = opts.sweep.count();
+    const freqs_buf = try scratch.alloc(f64, n_points);
+    defer scratch.free(freqs_buf);
+    const density_buf = try scratch.alloc(f64, n_points);
+    defer scratch.free(density_buf);
+
+    const pss_converged = try sweep(ctx.circuit, x_op, srcs, freqs_buf, density_buf, opts, scratch);
+    if (opts.strobe) |t| {
+        var res = try result(ctx.allocator, freqs_buf, density_buf, "ptdnoise_density", "");
+        res.plotname = try ctx.allocator.print("Periodic Time-Dependent Noise Analysis (time={e}){s}", .{ t, if (pss_converged) "" else " (PSS not converged)" });
+        return res;
+    }
+    return result(ctx.allocator, freqs_buf, density_buf, "pnoise_density", if (pss_converged) "Periodic Noise Analysis" else "Periodic Noise Analysis (PSS not converged)");
+}
+
+/// The periodic-noise shape, shared with `.hbnoise`: point-major rows
+/// (frequency, `column`) in the results arena `a`. `column` and `plotname`
+/// are literals.
+pub fn result(a: std.mem.Allocator, freqs: []const f64, density: []const f64, column: []const u8, plotname: []const u8) !root.Result {
+    const names = try a.dupe([]const u8, &.{ "frequency", column });
+    const data = try a.alloc(f64, freqs.len * 2);
+    for (freqs, density, 0..) |f, d, i| {
+        data[i * 2] = f;
+        data[i * 2 + 1] = d;
+    }
+    return .{
+        .plotname = plotname,
+        .varnames = names,
+        .is_complex = false,
+        .npoints = freqs.len,
+        .data = data,
+    };
+}
+// ---- private ----
+
+/// Periodic noise density at `options.out_node` (minus `out_neg`), in
+/// V^2/Hz, about the shooting PSS from `x_dc`: `pac.orbit` then
+/// `orbitSweep`. The caller owns freqs and density, both sweep-count long.
+/// Returns false when the shooting stopped short; the density is then about
+/// its last period.
+fn sweep(
+    ckt: *root.Circuit,
+    x_dc: []const f64,
+    noise_sources: []const NoiseSource,
+    freqs: []f64,
+    density: []f64,
+    options: Options,
+    allocator: std.mem.Allocator,
+) !bool {
+    const n_sb = 2 * @as(usize, options.n_sidebands) + 1;
+    const orb = try pac.orbit(ckt, x_dc, .{
+        .tol = options.tol,
+        .period = 1.0 / options.f_fundamental,
+        .n_samples = @intCast(samplesFor(options.pss_n_samples, n_sb)),
+        .max_shooting_iter = options.pss_shoot_max_iter,
+        .shooting_tol = options.pss_shoot_tol,
+        .max_newton_iter = options.pss_newton_max_iter,
+        .newton_tol = options.pss_newton_tol,
+    }, allocator);
+    defer allocator.free(orb.wave);
+    try orbitSweep(ckt, orb, noise_sources, freqs, density, options, allocator);
+    return orb.converged;
+}
+
 /// Periodic time-dependent noise (HSPICE `.ptdnoise`): the density, over
 /// noise frequency f, whose integral is the output noise variance at time
 /// `t` of the period. A unit source n at f enters at f + i*f0 with the
@@ -244,25 +331,6 @@ fn strobed(
     }
 }
 
-/// Sample `k` of every source's amplitude at the orbit state `x`: white at
-/// `amp[s * n_samples + k]`, flicker at `amp[(srcs.len + s) * n_samples + k]`,
-/// and at k = 0 each flicker exponent into `exponent[s]`.
-/// error.NoiseTopologyChanged when the sources at `x` are not `srcs`, node
-/// for node.
-pub fn sampleAmplitudes(ckt: *const root.Circuit, x: []const f64, srcs: []const NoiseSource, k: usize, n_samples: usize, amp: []f64, exponent: []f64, allocator: std.mem.Allocator) !void {
-    const at = try ckt.collectNoiseSources(x, allocator);
-    defer allocator.free(at);
-    if (at.len != srcs.len) return error.NoiseTopologyChanged;
-    for (at, srcs, 0..) |src, original, s| {
-        if (src.node_p != original.node_p or src.node_n != original.node_n) return error.NoiseTopologyChanged;
-        amp[s * n_samples + k] = whiteAmp(src);
-        amp[(srcs.len + s) * n_samples + k] = src.coeff * signedSqrt(src.flicker);
-        // ponytail: the flicker exponent is a model constant in every
-        // device, so sample 0 stands for the period.
-        if (k == 0) exponent[s] = src.ef;
-    }
-}
-
 /// h[node_p] - h[node_n] over one sideband's node row `h`, ground zero.
 inline fn across(h: []const Complex, src: NoiseSource) Complex {
     const hp = if (src.node_p != root.GROUND) h[src.node_p] else Complex.zero;
@@ -274,61 +342,6 @@ inline fn across(h: []const Complex, src: NoiseSource) Complex {
 /// a table row, whose spectrum `whiteShape` supplies.
 inline fn whiteAmp(src: NoiseSource) f64 {
     return src.coeff * if (src.table.points.len != 0) 1 else signedSqrt(src.white);
-}
-
-/// The spectrum the white amplitude multiplies at sideband `f`: the table
-/// at |f| for a table row, else 1.
-pub inline fn whiteShape(src: NoiseSource, f: f64) f64 {
-    return if (src.table.points.len != 0) src.tableAt(@abs(f)) else 1;
-}
-
-/// sign(d)*sqrt(|d|): a source amplitude whose square is the density d.
-pub inline fn signedSqrt(d: f64) f64 {
-    return std.math.copysign(@sqrt(@abs(d)), d);
-}
-
-/// Contract entry: device noise sources at ctx.x_op, LPTV sweep. Point-major
-/// rows (frequency, pnoise_density); an unconverged PSS says so in the plot
-/// name rather than failing.
-pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
-    const x_op = ctx.x_op;
-
-    const scratch = ctx.scratch_allocator;
-    const srcs = try ctx.circuit.collectNoiseSources(x_op, scratch);
-    defer scratch.free(srcs);
-
-    const n_points = opts.sweep.count();
-    const freqs_buf = try scratch.alloc(f64, n_points);
-    defer scratch.free(freqs_buf);
-    const density_buf = try scratch.alloc(f64, n_points);
-    defer scratch.free(density_buf);
-
-    const pss_converged = try sweep(ctx.circuit, x_op, srcs, freqs_buf, density_buf, opts, scratch);
-    if (opts.strobe) |t| {
-        var res = try result(ctx.allocator, freqs_buf, density_buf, "ptdnoise_density", "");
-        res.plotname = try ctx.allocator.print("Periodic Time-Dependent Noise Analysis (time={e}){s}", .{ t, if (pss_converged) "" else " (PSS not converged)" });
-        return res;
-    }
-    return result(ctx.allocator, freqs_buf, density_buf, "pnoise_density", if (pss_converged) "Periodic Noise Analysis" else "Periodic Noise Analysis (PSS not converged)");
-}
-
-/// The periodic-noise shape, shared with `.hbnoise`: point-major rows
-/// (frequency, `column`) in the results arena `a`. `column` and `plotname`
-/// are literals.
-pub fn result(a: std.mem.Allocator, freqs: []const f64, density: []const f64, column: []const u8, plotname: []const u8) !root.Result {
-    const names = try a.dupe([]const u8, &.{ "frequency", column });
-    const data = try a.alloc(f64, freqs.len * 2);
-    for (freqs, density, 0..) |f, d, i| {
-        data[i * 2] = f;
-        data[i * 2 + 1] = d;
-    }
-    return .{
-        .plotname = plotname,
-        .varnames = names,
-        .is_complex = false,
-        .npoints = freqs.len,
-        .data = data,
-    };
 }
 
 test samplesFor {

@@ -8,6 +8,17 @@
 //! with the port terminations and reads S-parameters between port bands.
 //!
 //! Cites: HSPICE RF [RF Ch.10] for `.hblin`.
+//!
+//! Contents:
+//! - `pub const Ac = struct`
+//! - `Ac`: `Options`, `run`
+//! - `pub const Xf = struct`
+//! - `Xf`: `Options`, `run`
+//! - `pub const Noise = struct`
+//! - `Noise`: `Options`, `run`
+//! - `pub const Lin = struct`
+//! - `Lin`: `Options`, `run`
+
 const std = @import("std");
 const root = @import("../types.zig");
 const hb = @import("hb.zig");
@@ -18,40 +29,8 @@ const mhb_lptv = @import("mhb_lptv.zig");
 const dense_lu = @import("solver").dense_lu;
 const k_boltzmann = @import("../ac/sp.zig").k_boltzmann;
 const t0_kelvin = @import("../ac/sp.zig").t0_kelvin;
-
 const Complex = pac.Complex;
 const HbLptv = @import("core").query.HbLptv;
-
-/// Orbit samples per period before rounding up: the `.pnoise` default. The
-/// grid only has to resolve G(t) and C(t), whose harmonics run past the
-/// HB's K, so it does not shrink with K.
-const min_samples: usize = 64;
-
-/// Solves HB and samples its orbit on a power-of-two grid wide enough for
-/// HB's own 2(2K+1) points and for sideband offsets up to 2M.
-/// error.HbDidNotConverge when Newton stops short. The caller frees `wave`.
-fn orbit(ckt: *root.Circuit, opts: HbLptv, allocator: std.mem.Allocator) !pac.Orbit {
-    const n: usize = ckt.n;
-    const nf = 2 * @as(usize, opts.n_harmonics) + 1;
-    const x_hat = try allocator.alloc(f64, n * nf);
-    defer allocator.free(x_hat);
-    const st = try hb.solveSpectrum(ckt, x_hat, &.{}, opts.hb(), allocator);
-    if (!st.status.converged) return error.HbDidNotConverge;
-    const n_sb = 2 * @as(usize, opts.n_sidebands) + 1;
-    return hb.orbit(x_hat, n, opts.f0, pnoise.samplesFor(@max(min_samples, 2 * nf), n_sb), true, allocator);
-}
-
-/// The HB orbit linearized under `kind`. The caller owns the result.
-fn linearize(ckt: *root.Circuit, opts: HbLptv, kind: root.AnalysisKind, allocator: std.mem.Allocator) !pac.Linearization {
-    const orb = try orbit(ckt, opts, allocator);
-    defer allocator.free(orb.wave);
-    return pac.linearize(ckt, orb, kind, allocator);
-}
-
-/// The `pac.sweep` options for these HB options: sidebands -M..M at f0.
-fn pacOptions(opts: HbLptv) pac.Options {
-    return .{ .tol = opts.tol, .f_lo = opts.f0, .out_node = opts.out_node, .n_harmonics = opts.n_sidebands, .sweep = opts.sweep };
-}
 
 /// `.hbac`: periodic AC about the HB orbit.
 pub const Ac = struct {
@@ -311,6 +290,38 @@ pub const Lin = struct {
         return .{ .re = x[base + row], .im = x[nn + base + row] };
     }
 };
+
+/// Orbit samples per period before rounding up: the `.pnoise` default. The
+/// grid only has to resolve G(t) and C(t), whose harmonics run past the
+/// HB's K, so it does not shrink with K.
+const min_samples: usize = 64;
+// ---- private ----
+
+/// Solves HB and samples its orbit on a power-of-two grid wide enough for
+/// HB's own 2(2K+1) points and for sideband offsets up to 2M.
+/// error.HbDidNotConverge when Newton stops short. The caller frees `wave`.
+fn orbit(ckt: *root.Circuit, opts: HbLptv, allocator: std.mem.Allocator) !pac.Orbit {
+    const n: usize = ckt.n;
+    const nf = 2 * @as(usize, opts.n_harmonics) + 1;
+    const x_hat = try allocator.alloc(f64, n * nf);
+    defer allocator.free(x_hat);
+    const st = try hb.solveSpectrum(ckt, x_hat, &.{}, opts.hb(), allocator);
+    if (!st.status.converged) return error.HbDidNotConverge;
+    const n_sb = 2 * @as(usize, opts.n_sidebands) + 1;
+    return hb.orbit(x_hat, n, opts.f0, pnoise.samplesFor(@max(min_samples, 2 * nf), n_sb), true, allocator);
+}
+
+/// The HB orbit linearized under `kind`. The caller owns the result.
+fn linearize(ckt: *root.Circuit, opts: HbLptv, kind: root.AnalysisKind, allocator: std.mem.Allocator) !pac.Linearization {
+    const orb = try orbit(ckt, opts, allocator);
+    defer allocator.free(orb.wave);
+    return pac.linearize(ckt, orb, kind, allocator);
+}
+
+/// The `pac.sweep` options for these HB options: sidebands -M..M at f0.
+fn pacOptions(opts: HbLptv) pac.Options {
+    return .{ .tol = opts.tol, .f_lo = opts.f0, .out_node = opts.out_node, .n_harmonics = opts.n_sidebands, .sweep = opts.sweep };
+}
 
 test "Lin.sideband offsets the signed band by M" {
     try std.testing.expectEqual(@as(usize, 2), Lin.sideband(.{}, 2));

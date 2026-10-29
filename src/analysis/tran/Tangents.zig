@@ -50,6 +50,9 @@ pub const Step = struct { method: Method, c: integrator.Coeffs, q1: []const f64,
 
 const Tangents = @This();
 
+/// Returns the rows of `opts.tangents`, each with its waveform and a saved
+/// device state, plus the base run's. Caller owns the result; free with
+/// `deinit` and the same `gpa`.
 pub fn init(ctx: *const root.RunCtx, opts: Options, n_probes: u32, gpa: std.mem.Allocator) !Tangents {
     const ckt = ctx.circuit;
     const k = opts.tangents.len;
@@ -81,6 +84,7 @@ pub fn init(ctx: *const root.RunCtx, opts: Options, n_probes: u32, gpa: std.mem.
     return tg;
 }
 
+/// Frees what `init` allocated on `gpa`, streams included.
 pub fn deinit(tg: *Tangents, gpa: std.mem.Allocator) void {
     for (tg.streams) |*s| s.deinit();
     gpa.free(tg.streams);
@@ -183,6 +187,8 @@ pub fn advance(tg: *Tangents, ckt: *root.Circuit, ws: *converger.Workspace, a_va
     }
 }
 
+/// Records every row's accepted point at `t` and feeds its stream.
+/// Invalidates each row's earlier waveform slices if it grows.
 pub fn record(tg: *Tangents, t: f64, probes: []const u32) !void {
     const n = tg.r0.len;
     for (tg.wf, 0..) |*w, k| {

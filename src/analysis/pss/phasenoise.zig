@@ -26,6 +26,11 @@
 //!
 //! Cites: the Demir paper above, HSPICE
 //! `.phasenoise` (METHOD, PHNOISE_LORENTZ, carrierindex).
+//!
+//! Contents:
+//! - `pub const Options = @import("core").query.PhaseNoise`
+//! - `pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result`
+
 const std = @import("std");
 const root = @import("../types.zig");
 const hb = @import("hb.zig");
@@ -62,6 +67,55 @@ const Diffusion = struct {
         gpa.free(d.ef);
     }
 };
+
+/// Contract entry: phase noise of the oscillator `opts.osc_node` names, as
+/// point-major rows (frequency offset, phnoise in dBc/Hz).
+pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
+    const scratch = ctx.scratch_allocator;
+    const n: usize = ctx.circuit.n;
+    const nf = 2 * @as(usize, opts.n_harmonics) + 1;
+    const x_hat = try scratch.alloc(f64, 2 * n * nf);
+    defer scratch.free(x_hat);
+    const y = x_hat[n * nf ..];
+    const st = try hb.solveOscillator(ctx.circuit, ctx.x_op, x_hat[0 .. n * nf], y, opts.hb(), scratch);
+    if (!st.status.converged) return error.HbDidNotConverge;
+
+    const n_points: usize = opts.sweep.count();
+    const buf = try scratch.alloc(f64, 3 * n_points);
+    defer scratch.free(buf);
+    const freqs = buf[0..n_points];
+    const nlp = buf[n_points..][0..n_points];
+    const pac = buf[2 * n_points ..];
+    opts.sweep.fill(freqs, pac);
+    if (opts.method != .nlp) {
+        const srcs = try ctx.circuit.collectNoiseSources(ctx.x_op, scratch);
+        defer scratch.free(srcs);
+        try periodic(ctx.circuit, x_hat[0 .. n * nf], st.f0, srcs, freqs, pac, opts, scratch);
+        for (pac) |*l| l.* = 10 * std.math.log10(l.*);
+    }
+    if (opts.method != .pac) {
+        const d = try diffusion(ctx.circuit, x_hat[0 .. n * nf], y, st.f0, pnoise.samplesFor(min_samples, nf), scratch);
+        defer d.deinit(scratch);
+        // HSPICE's carrierindex normalizes to harmonic k, whose phase is k
+        // times the fundamental's.
+        const f0 = @as(f64, @floatFromInt(opts.carrier)) * st.f0;
+        const f0_sq = f0 * f0;
+        for (freqs, nlp) |fm, *l| {
+            const c = d.at(fm);
+            l.* = 10 * std.math.log10(f0_sq * c / (std.math.pi * std.math.pi * f0_sq * f0_sq * c * c + fm * fm));
+        }
+    }
+    const dbc = switch (opts.method) {
+        .nlp => nlp,
+        .pac => pac,
+        .bpn => blk: {
+            stitch(nlp, pac, 0.5);
+            break :blk nlp;
+        },
+    };
+    return pnoise.result(ctx.allocator, freqs, dbc, "phnoise", "Phase Noise Analysis");
+}
+// ---- private ----
 
 /// The diffusion of the oscillator whose HB solution is `x_hat` at `f0`,
 /// from the normalized left null vector `y` (`hb.solveSpectrum`'s `ppv`,
@@ -157,54 +211,6 @@ fn stitch(nlp: []f64, pac: []const f64, match_db: f64) void {
         @memcpy(nlp[i..], pac[i..]);
         return;
     };
-}
-
-/// Contract entry: phase noise of the oscillator `opts.osc_node` names, as
-/// point-major rows (frequency offset, phnoise in dBc/Hz).
-pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
-    const scratch = ctx.scratch_allocator;
-    const n: usize = ctx.circuit.n;
-    const nf = 2 * @as(usize, opts.n_harmonics) + 1;
-    const x_hat = try scratch.alloc(f64, 2 * n * nf);
-    defer scratch.free(x_hat);
-    const y = x_hat[n * nf ..];
-    const st = try hb.solveOscillator(ctx.circuit, ctx.x_op, x_hat[0 .. n * nf], y, opts.hb(), scratch);
-    if (!st.status.converged) return error.HbDidNotConverge;
-
-    const n_points: usize = opts.sweep.count();
-    const buf = try scratch.alloc(f64, 3 * n_points);
-    defer scratch.free(buf);
-    const freqs = buf[0..n_points];
-    const nlp = buf[n_points..][0..n_points];
-    const pac = buf[2 * n_points ..];
-    opts.sweep.fill(freqs, pac);
-    if (opts.method != .nlp) {
-        const srcs = try ctx.circuit.collectNoiseSources(ctx.x_op, scratch);
-        defer scratch.free(srcs);
-        try periodic(ctx.circuit, x_hat[0 .. n * nf], st.f0, srcs, freqs, pac, opts, scratch);
-        for (pac) |*l| l.* = 10 * std.math.log10(l.*);
-    }
-    if (opts.method != .pac) {
-        const d = try diffusion(ctx.circuit, x_hat[0 .. n * nf], y, st.f0, pnoise.samplesFor(min_samples, nf), scratch);
-        defer d.deinit(scratch);
-        // HSPICE's carrierindex normalizes to harmonic k, whose phase is k
-        // times the fundamental's.
-        const f0 = @as(f64, @floatFromInt(opts.carrier)) * st.f0;
-        const f0_sq = f0 * f0;
-        for (freqs, nlp) |fm, *l| {
-            const c = d.at(fm);
-            l.* = 10 * std.math.log10(f0_sq * c / (std.math.pi * std.math.pi * f0_sq * f0_sq * c * c + fm * fm));
-        }
-    }
-    const dbc = switch (opts.method) {
-        .nlp => nlp,
-        .pac => pac,
-        .bpn => blk: {
-            stitch(nlp, pac, 0.5);
-            break :blk nlp;
-        },
-    };
-    return pnoise.result(ctx.allocator, freqs, dbc, "phnoise", "Phase Noise Analysis");
 }
 
 test stitch {

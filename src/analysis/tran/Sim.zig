@@ -175,9 +175,11 @@ const Stats = struct {
     by_order: [6]u64 = @splat(0),
 };
 
+/// Returns the row-plane charge ring [cur, prev, ...], `n_hist` slots.
 pub fn qHist(s: *Sim) [][]f64 {
     return s.q_ring[0..s.n_hist];
 }
+/// Returns the charge-tape ring, as `qHist` over the LTE states.
 pub fn qtHist(s: *Sim) [][]f64 {
     return s.qt_ring[0..s.n_hist];
 }
@@ -191,9 +193,11 @@ pub fn lteHist(s: *Sim) [][]f64 {
 pub fn promoteMethod(s: *const Sim) Method {
     return methodAt(s.options.method, 2);
 }
+/// Returns the dynamic current of the LTE history's index space.
 pub fn lteIp(s: *const Sim) []const f64 {
     return if (s.n_qt > 0) s.qt_i_prev else s.i_prev;
 }
+/// Returns the gear-3..6 history term of the LTE history's index space.
 pub fn lteG(s: *const Sim) []const f64 {
     return if (s.n_qt > 0) s.qt_g else s.g_row;
 }

@@ -17,6 +17,12 @@
 //! preconditioned by G_0 + j(ω + ω_p)·C_0 lanes.
 //!
 //! No outside source beyond mhb.zig's and pnoise.zig's.
+//!
+//! Contents:
+//! - `pub fn ac(ctx: *const root.RunCtx, opts: Options) !root.Result`
+//! - `pub fn xf(ctx: *const root.RunCtx, opts: Options) !root.Result`
+//! - `pub fn noise(ctx: *const root.RunCtx, opts: Options) !root.Result`
+
 const std = @import("std");
 const root = @import("../types.zig");
 const mhb = @import("mhb.zig");
@@ -25,7 +31,6 @@ const pxf = @import("pxf.zig");
 const pnoise = @import("pnoise.zig");
 const num = @import("core").numerics;
 const dense_lu = @import("solver").dense_lu;
-
 const Complex = pac.Complex;
 const Options = @import("core").query.HbLptv;
 
@@ -176,16 +181,6 @@ const Linear = struct {
     }
 };
 
-/// Sideband `k` (signed line h = k - (nf-1)/2) of the real HB coefficients
-/// `c` = [dc, c_1, s_1, ...]: the phasor of e^(j·2π·f_h·t), (c_h ∓ j·s_h)/2.
-fn linePhasor(c: []const f64, k: usize) Complex {
-    const h = @as(i64, @intCast(k)) - @as(i64, @intCast(c.len / 2));
-    if (h == 0) return .{ .re = c[0], .im = 0 };
-    const j: usize = @intCast(@abs(h));
-    const s = c[2 * j];
-    return .{ .re = 0.5 * c[2 * j - 1], .im = if (h > 0) -0.5 * s else 0.5 * s };
-}
-
 /// `.hbac` about a multi-tone orbit: the deck's AC drive on sideband 0,
 /// `opts.out_node` read on every sideband. Complex point-major rows
 /// (frequency, tf_h[k] for each signed line k by frequency).
@@ -222,15 +217,6 @@ pub fn ac(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const res = try pac.result(ctx.allocator, freqs, transfer, @intCast(nf / 2), "Harmonic Balance AC Analysis");
     try lin.relabel(ctx.allocator, res, "tf_h", 1);
     return res;
-}
-
-/// Solves A(2π·f)^T·w = e for the drive `e` (stacked, real): `x` receives
-/// w, the transfers from every unknown and sideband to e's output.
-fn solveAdjoint(lin: Linear, f: f64, e: []const f64, x: []f64) !void {
-    try lin.factor(f);
-    // sys^T is A^H stacked; for a real e, conj of its solution solves A^T.
-    dense_lu.solveFactoredT(e.len, lin.sys, lin.piv, e, x);
-    for (x[e.len / 2 ..]) |*v| v.* = -v.*;
 }
 
 /// `.hbxf` about a multi-tone orbit: transfers from a current at every
@@ -389,6 +375,26 @@ pub fn noise(ctx: *const root.RunCtx, opts: Options) !root.Result {
         density[fi] = total;
     }
     return pnoise.result(ctx.allocator, freqs, density, "hbnoise_density", "Harmonic Balance Noise Analysis");
+}
+// ---- private ----
+
+/// Sideband `k` (signed line h = k - (nf-1)/2) of the real HB coefficients
+/// `c` = [dc, c_1, s_1, ...]: the phasor of e^(j·2π·f_h·t), (c_h ∓ j·s_h)/2.
+fn linePhasor(c: []const f64, k: usize) Complex {
+    const h = @as(i64, @intCast(k)) - @as(i64, @intCast(c.len / 2));
+    if (h == 0) return .{ .re = c[0], .im = 0 };
+    const j: usize = @intCast(@abs(h));
+    const s = c[2 * j];
+    return .{ .re = 0.5 * c[2 * j - 1], .im = if (h > 0) -0.5 * s else 0.5 * s };
+}
+
+/// Solves A(2π·f)^T·w = e for the drive `e` (stacked, real): `x` receives
+/// w, the transfers from every unknown and sideband to e's output.
+fn solveAdjoint(lin: Linear, f: f64, e: []const f64, x: []f64) !void {
+    try lin.factor(f);
+    // sys^T is A^H stacked; for a real e, conj of its solution solves A^T.
+    dense_lu.solveFactoredT(e.len, lin.sys, lin.piv, e, x);
+    for (x[e.len / 2 ..]) |*v| v.* = -v.*;
 }
 
 test linePhasor {

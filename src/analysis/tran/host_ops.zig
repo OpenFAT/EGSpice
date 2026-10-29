@@ -57,9 +57,11 @@ pub const HostOps = struct {
         _ = ckt.applyLimits(s.trial, s.cur);
         ckt.reject_at = null;
     }
+    /// Reverts every device latch to the last accepted state.
     pub inline fn revert(_: HostOps, s: *Sim) void {
         _ = s.ckt.stateCtl(.revert);
     }
+    /// Returns the time a device asked the step to end on, if any.
     pub inline fn rejectAt(_: HostOps, s: *Sim) ?f64 {
         return s.ckt.reject_at;
     }
@@ -68,6 +70,7 @@ pub const HostOps = struct {
         if (s.has_charge and !s.ckt.q_fresh) s.ckt.evalFollows(s.trial, a.t_dev, true);
         return ask and s.ckt.stateCtl(.query);
     }
+    /// Returns the devices' `$bound_step` for the next step, if any.
     pub inline fn boundStep(_: HostOps, s: *Sim) ?f64 {
         return s.ckt.boundStep();
     }
@@ -85,6 +88,7 @@ pub const HostOps = struct {
         const h = s.lteHist();
         return integrator.stepBound(W, method, a.method, .{ h[0], h[1], h[2], h[3] }, s.lteIp(), a.c, lte);
     }
+    /// `stepBoundGear` of `method` after a step at `a.method`.
     pub inline fn boundGear(_: HostOps, s: *Sim, a: *const Attempt, method: Method, lte: integrator.LteIn) f64 {
         return integrator.stepBoundGear(method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);
     }
@@ -139,6 +143,9 @@ pub fn lteSnap(c: *root.Circuit, dst: []f64, zero: []const [2]u32, rows: []const
     for (rows, dst[n_tape..]) |r, *d| d.* = c.q_vec[r];
 }
 
+/// Prints the operands of the state that bound a rejected step
+/// (`ESPICE_TRAN_LTE_TRACE`), replayed from the captured history. Asserts
+/// that the replay reproduces `bound` bit for bit.
 pub fn traceLte(s: *Sim, a: *const Attempt, nr: converger.Result, lte: integrator.LteIn, bound: f64) void {
     const hit = integrator.diagnoseBound(a.method, a.method, s.lteHist(), s.lteIp(), s.lteG(), a.c, lte, &a.dts);
     const matches = @as(u64, @bitCast(hit.bound)) == @as(u64, @bitCast(bound)) or
