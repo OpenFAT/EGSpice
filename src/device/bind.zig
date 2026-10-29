@@ -1,19 +1,37 @@
-//! The parameter binder: card `name=value` pairs onto a device's Model or
-//! Instance fields. eval.zig compiles it into every device object behind
-//! `DeviceVtable.bind_model`/`bind_instance`, so built-in and runtime-loaded
-//! devices bind a card identically. Cites ngspice's inpgval.c (integer
-//! rounding), the bjt.c, dio.c and res.c IOPR tables (alternate spellings)
-//! and LRM §9.19 `$param_given`.
+//! The parameter binder: card `name=value` pairs in, a device's Model or
+//! Instance fields written out. eval.zig compiles it into every device
+//! object behind `DeviceVtable.bind_model`/`bind_instance`, so built-in and
+//! runtime-loaded devices bind a card identically. Cites ngspice's
+//! inpgval.c (integer rounding), the bjt.c, dio.c and res.c IOPR tables
+//! (alternate spellings) and LRM §9.19 `$param_given`.
+//!
+//! Contents:
+//! - `pub const Param = struct`
+//! - `pub const Error = error{ UnresolvedParameter, NonFiniteParameter, ParameterOutOfRange }`
+//! - `pub const BindStatus = enum(u8)` (`fromLocal`, `unwrap`)
+//! - `pub fn apply(target: anytype, params: []const Param) BindStatus`
+//! - `pub fn markKnown(comptime T: type, params: []const Param, known: []bool) void`
+//! - `pub fn markGiven(target: anytype, comptime field: []const u8) void`
+//! - `pub fn castField(comptime T: type, value: f64) error{ NonFiniteParameter, ParameterOutOfRange }!T`
+
 const std = @import("std");
+const assert = std.debug.assert;
 
 /// One card pair, key lowercased. `value` is null when the netlist value is
 /// not a number (an unresolved name or expression): binding that to a known
 /// field is an error, naming an unknown field is not.
 pub const Param = struct { key: []const u8, value: ?f64 };
 
-/// Why a pair failed to bind: no number (`Param.value` null), NaN or
-/// infinity, or a value the field's type cannot hold (`castField`).
-pub const Error = error{ UnresolvedParameter, NonFiniteParameter, ParameterOutOfRange };
+/// Every way a pair fails to bind. Fields bound before the failing one keep
+/// their new values.
+pub const Error = error{
+    /// The pair names a field but carries no number (`Param.value` null).
+    UnresolvedParameter,
+    /// The value is NaN or infinite.
+    NonFiniteParameter,
+    /// The value does not fit the field's type (`castField`).
+    ParameterOutOfRange,
+};
 
 /// Binding outcome, as a plain enum so it can cross the object boundary.
 pub const BindStatus = enum(u8) {
@@ -44,14 +62,124 @@ pub const BindStatus = enum(u8) {
     }
 };
 
+/// `firstPairs` slot of a key no pair names.
+const absent = std.math.maxInt(u32);
+
+/// The binder before `Keys`: every field scans every pair. Kept as the
+/// oracle the differential test checks `apply` and `markKnown` against.
+const linear = struct {
+    fn apply(target: anytype, params: []const Param) BindStatus {
+        return .fromLocal(bindAll(target, params));
+    }
+
+    fn bindAll(target: anytype, params: []const Param) Error!void {
+        const info = @typeInfo(@TypeOf(target.*)).@"struct";
+        inline for (info.field_names, info.field_types) |field_name, field_type| {
+            if (comptime isScalar(field_type)) {
+                if (try firstNumber(params, comptime lowered(field_name))) |num| {
+                    @field(target.*, field_name) = try castField(field_type, num);
+                    markGiven(target, field_name);
+                } else {
+                    inline for (comptime aliasesOf(field_name)) |alias| {
+                        if (try firstNumber(params, alias)) |num| {
+                            @field(target.*, field_name) = try castField(field_type, num);
+                            markGiven(target, field_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn markKnown(comptime T: type, params: []const Param, known: []bool) void {
+        const info = @typeInfo(T).@"struct";
+        inline for (info.field_names, info.field_types) |field_name, field_type| {
+            if (comptime isScalar(field_type)) {
+                markKey(params, comptime lowered(field_name), known);
+                inline for (comptime aliasesOf(field_name)) |alias| markKey(params, alias, known);
+            }
+        }
+    }
+
+    fn markKey(params: []const Param, key: []const u8, known: []bool) void {
+        for (params, known) |p, *hit| if (std.mem.eql(u8, p.key, key)) {
+            hit.* = true;
+        };
+    }
+
+    fn firstNumber(params: []const Param, key: []const u8) Error!?f64 {
+        for (params) |p| if (std.mem.eql(u8, p.key, key)) {
+            const value = p.value orelse return error.UnresolvedParameter;
+            if (!std.math.isFinite(value)) return error.NonFiniteParameter;
+            return value;
+        };
+        return null;
+    }
+};
+
 /// Binds `params` onto every scalar field of `target.*`. A field takes the
-/// first pair whose key is its lowercased name; only when there is none do its
-/// alternate spellings (`aliasesOf`) apply, in table order, the last match
-/// winning. Keys matching no field are ignored. On error, fields bound before
-/// the failing one keep their new values.
+/// first pair whose key is its lowercased name; only when there is none do
+/// its alternate spellings (`aliasesOf`) apply, in table order, the last
+/// match winning. Keys matching no field are ignored. On error, fields
+/// bound before the failing one keep their new values. Cost: one binary
+/// search per pair, then one probe per field.
 pub fn apply(target: anytype, params: []const Param) BindStatus {
     return .fromLocal(applyKv(target, params));
 }
+
+/// Sets `known[i]` for every `params[i]` whose key `apply` would bind on a
+/// `T`: a scalar field's lowercased name or one of its `aliasesOf`. Entries
+/// already set stay set. Asserts that `known` is parallel to `params`.
+pub fn markKnown(comptime T: type, params: []const Param, known: []bool) void {
+    assert(known.len == params.len);
+    const keys = Keys(T).table;
+    for (params, known) |p, *hit| {
+        if (slotOf(keys, p.key) != null) hit.* = true;
+    }
+}
+
+/// Marks `field` given for LRM §9.19 `$param_given`: VerA's `setGiven` (one
+/// `given__` bitset; a name without a bit is a no-op), or a hand-written
+/// type's `<field>__given` flag. Without it a bound value still takes the
+/// model's defaulted branch (bsim3's derived k1/k2/vth0 defaults, mos1's
+/// NSUB rules).
+pub fn markGiven(target: anytype, comptime field: []const u8) void {
+    const T = @TypeOf(target.*);
+    if (comptime @hasDecl(T, "setGiven")) {
+        target.setGiven(field);
+    } else if (comptime @hasField(T, field ++ "__given")) {
+        @field(target.*, field ++ "__given") = true;
+    }
+}
+
+/// Converts a card value to field type `T`. Integers round half up and must
+/// land in range, floats must stay finite after narrowing, and bools are
+/// `value != 0`. Fails with `NonFiniteParameter` on NaN or infinity and
+/// `ParameterOutOfRange` when the value does not fit `T`.
+pub fn castField(comptime T: type, value: f64) error{ NonFiniteParameter, ParameterOutOfRange }!T {
+    if (!std.math.isFinite(value)) return error.NonFiniteParameter;
+    return switch (@typeInfo(T)) {
+        .float => blk: {
+            const converted: T = @floatCast(value);
+            if (!std.math.isFinite(converted)) return error.ParameterOutOfRange;
+            break :blk converted;
+        },
+        .int => |info| blk: {
+            // A power-of-two bound is exact in f64; maxInt(i64) is not.
+            const upper: f64 = comptime std.math.pow(f64, 2, info.bits - @intFromBool(info.signedness == .signed));
+            const lower: f64 = if (info.signedness == .signed) -upper else 0;
+            // Rounds half up like ngspice inpgval.c:31 (`floor(0.5 + x)`): PDK
+            // cards write integer parameters as reals (IHP's `level = 103.60`).
+            const rounded = @floor(0.5 + value);
+            if (rounded < lower or rounded >= upper) return error.ParameterOutOfRange;
+            break :blk @intFromFloat(rounded);
+        },
+        .bool => value != 0,
+        else => @compileError("unsupported numeric field type"), // else: binding a non-numeric field is a compile error by design
+    };
+}
+
+// ---- private ----
 
 fn applyKv(target: anytype, params: []const Param) Error!void {
     const T = @TypeOf(target.*);
@@ -76,42 +204,6 @@ fn applyKv(target: anytype, params: []const Param) Error!void {
             }
         }
     }
-}
-
-/// Sets `known[i]` for every `params[i]` whose key `apply` would bind on a
-/// `T`: a scalar field's lowercased name or one of its `aliasesOf`.
-/// Entries already set stay set. Asserts that `known` is parallel to
-/// `params`.
-pub fn markKnown(comptime T: type, params: []const Param, known: []bool) void {
-    std.debug.assert(known.len == params.len);
-    const keys = Keys(T).table;
-    for (params, known) |p, *hit| {
-        if (slotOf(keys, p.key) != null) hit.* = true;
-    }
-}
-
-/// `firstPairs` slot of a key no pair names.
-const absent = std.math.maxInt(u32);
-
-/// For each of `keys`, the index of the first pair keyed so, or `absent`.
-/// One binary search per pair, so a card costs O(pairs), not O(fields).
-fn firstPairs(comptime keys: []const []const u8, params: []const Param) [keys.len]u32 {
-    std.debug.assert(params.len < absent);
-    var first: [keys.len]u32 = @splat(absent);
-    if (keys.len == 0) return first;
-    for (params, 0..) |p, i| if (slotOf(keys, p.key)) |k| {
-        if (first[k] == absent) first[k] = @intCast(i);
-    };
-    return first;
-}
-
-/// The value of `params[index]`, or null when `index` is `absent`. Errors
-/// rather than letting a recognized field fall back to its default.
-fn number(params: []const Param, index: u32) Error!?f64 {
-    if (index == absent) return null;
-    const value = params[index].value orelse return error.UnresolvedParameter;
-    if (!std.math.isFinite(value)) return error.NonFiniteParameter;
-    return value;
 }
 
 /// The keys `apply` binds on a `T`, sorted and unique: every scalar field's
@@ -141,7 +233,7 @@ fn Keys(comptime T: type) type {
             var unique: usize = 0;
             for (all) |key| {
                 // Keys are never empty: "" would bind nothing anyway.
-                std.debug.assert(key.len > 0);
+                assert(key.len > 0);
                 if (unique > 0 and std.mem.eql(u8, all[unique - 1], key)) continue;
                 all[unique] = key;
                 unique += 1;
@@ -150,6 +242,28 @@ fn Keys(comptime T: type) type {
             break :blk frozen[0..unique];
         };
     };
+}
+
+/// For each of `keys`, the index of the first pair keyed so, or `absent`.
+/// One binary search per pair, so a card costs O(pairs), not O(fields).
+fn firstPairs(comptime keys: []const []const u8, params: []const Param) [keys.len]u32 {
+    assert(params.len < absent);
+    var first: [keys.len]u32 = @splat(absent);
+    if (keys.len == 0) return first;
+    for (params, 0..) |p, i| if (slotOf(keys, p.key)) |k| {
+        if (first[k] == absent) first[k] = @intCast(i);
+    };
+    return first;
+}
+
+/// The value of `params[index]`, or null when `index` is `absent`. Errors
+/// rather than letting a recognized field fall back to its default.
+fn number(params: []const Param, index: u32) Error!?f64 {
+    if (index == absent) return null;
+    assert(index < params.len);
+    const value = params[index].value orelse return error.UnresolvedParameter;
+    if (!std.math.isFinite(value)) return error.NonFiniteParameter;
+    return value;
 }
 
 fn keyLess(_: void, a: []const u8, b: []const u8) bool {
@@ -181,37 +295,6 @@ fn lowered(comptime s: []const u8) []const u8 {
     }
 }
 
-/// Marks `field` given for LRM §9.19 `$param_given`: VerA's `setGiven`
-/// (one `given__` bitset; a name without a bit is a no-op), or a
-/// hand-written type's `<field>__given` flag. Without it a bound value still
-/// takes the model's defaulted branch (bsim3's derived k1/k2/vth0 defaults,
-/// mos1's NSUB rules).
-pub fn markGiven(target: anytype, comptime field: []const u8) void {
-    const T = @TypeOf(target.*);
-    if (comptime @hasDecl(T, "setGiven")) {
-        target.setGiven(field);
-    } else if (comptime @hasField(T, field ++ "__given")) {
-        @field(target.*, field ++ "__given") = true;
-    }
-}
-
-test "markGiven sets VerA's given__ bit through setGiven" {
-    // VerA's emitted shape (codegen `emitGiven`).
-    const M = struct {
-        cjo: f64 = 0,
-        vt0: f64 = 0,
-        given__: std.StaticBitSet(1) = .empty,
-        pub const given_params = [_][]const u8{"cjo"};
-        pub fn setGiven(model: *@This(), name: []const u8) void {
-            for (given_params, 0..) |n, k| if (std.mem.eql(u8, n, name)) model.given__.set(k);
-        }
-    };
-    var m: M = .{};
-    try apply(&m, &.{ .{ .key = "cjo", .value = 4 }, .{ .key = "vt0", .value = 1 } }).unwrap();
-    try std.testing.expect(m.given__.isSet(0));
-    try std.testing.expectEqual(@as(usize, 1), m.given__.count());
-}
-
 fn isScalar(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .float, .int, .bool => true,
@@ -219,39 +302,12 @@ fn isScalar(comptime T: type) bool {
     };
 }
 
-/// Converts a card value to field type `T`. Integers round half up and must
-/// land in range, floats must stay finite after narrowing, and bools are
-/// `value != 0`. Fails with `NonFiniteParameter` on NaN or infinity and
-/// `ParameterOutOfRange` when the value does not fit `T`.
-pub fn castField(comptime T: type, value: f64) error{ NonFiniteParameter, ParameterOutOfRange }!T {
-    if (!std.math.isFinite(value)) return error.NonFiniteParameter;
-    return switch (@typeInfo(T)) {
-        .float => blk: {
-            const converted: T = @floatCast(value);
-            if (!std.math.isFinite(converted)) return error.ParameterOutOfRange;
-            break :blk converted;
-        },
-        .int => |info| blk: {
-            // A power-of-two bound is exact in f64; maxInt(i64) is not.
-            const upper: f64 = comptime std.math.pow(f64, 2, info.bits - @intFromBool(info.signedness == .signed));
-            const lower: f64 = if (info.signedness == .signed) -upper else 0;
-            // Rounds half up like ngspice inpgval.c:31 (`floor(0.5 + x)`): PDK
-            // cards write integer parameters as reals (IHP's `level = 103.60`).
-            const rounded = @floor(0.5 + value);
-            if (rounded < lower or rounded >= upper) return error.ParameterOutOfRange;
-            break :blk @intFromFloat(rounded);
-        },
-        .bool => value != 0,
-        else => @compileError("unsupported numeric field type"), // else: binding a non-numeric field is a compile error by design
-    };
-}
-
 /// Card keys accepted for a field besides its own name, in probe order:
 /// ngspice IOPR alternate spellings, then the VA name behind a VerA escape.
 ///
-/// The table is shared by every device, so an alias is only safe when no model
-/// declares it as a parameter of its own. That is why dio.c's `js` for `is`
-/// is missing: the MOS models declare both `is` and `js`.
+/// The table is shared by every device, so an alias is only safe when no
+/// model declares it as a parameter of its own. That is why dio.c's `js`
+/// for `is` is missing: the MOS models declare both `is` and `js`.
 fn aliasesOf(comptime field: []const u8) []const []const u8 {
     const pairs = [_][2][]const u8{
         .{ "vt0", "vto" },
@@ -321,6 +377,23 @@ fn escaped(comptime field: []const u8) ?[]const u8 {
     if (n == field.len) return null;
     const frozen = out;
     return frozen[0..n];
+}
+
+test "markGiven sets VerA's given__ bit through setGiven" {
+    // VerA's emitted shape (codegen `emitGiven`).
+    const M = struct {
+        cjo: f64 = 0,
+        vt0: f64 = 0,
+        given__: std.StaticBitSet(1) = .empty,
+        pub const given_params = [_][]const u8{"cjo"};
+        pub fn setGiven(model: *@This(), name: []const u8) void {
+            for (given_params, 0..) |n, k| if (std.mem.eql(u8, n, name)) model.given__.set(k);
+        }
+    };
+    var m: M = .{};
+    try apply(&m, &.{ .{ .key = "cjo", .value = 4 }, .{ .key = "vt0", .value = 1 } }).unwrap();
+    try std.testing.expect(m.given__.isSet(0));
+    try std.testing.expectEqual(@as(usize, 1), m.given__.count());
 }
 
 test "VerA escapes bind under the VA name; ordinary trailing Z does not" {
@@ -411,58 +484,6 @@ test BindStatus {
         }
     }
 }
-
-/// The binder before `Keys`: every field scans every pair. Kept as the
-/// oracle the differential test checks `apply` and `markKnown` against.
-const linear = struct {
-    fn apply(target: anytype, params: []const Param) BindStatus {
-        return .fromLocal(bindAll(target, params));
-    }
-
-    fn bindAll(target: anytype, params: []const Param) Error!void {
-        const info = @typeInfo(@TypeOf(target.*)).@"struct";
-        inline for (info.field_names, info.field_types) |field_name, field_type| {
-            if (comptime isScalar(field_type)) {
-                if (try firstNumber(params, comptime lowered(field_name))) |num| {
-                    @field(target.*, field_name) = try castField(field_type, num);
-                    markGiven(target, field_name);
-                } else {
-                    inline for (comptime aliasesOf(field_name)) |alias| {
-                        if (try firstNumber(params, alias)) |num| {
-                            @field(target.*, field_name) = try castField(field_type, num);
-                            markGiven(target, field_name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn markKnown(comptime T: type, params: []const Param, known: []bool) void {
-        const info = @typeInfo(T).@"struct";
-        inline for (info.field_names, info.field_types) |field_name, field_type| {
-            if (comptime isScalar(field_type)) {
-                markKey(params, comptime lowered(field_name), known);
-                inline for (comptime aliasesOf(field_name)) |alias| markKey(params, alias, known);
-            }
-        }
-    }
-
-    fn markKey(params: []const Param, key: []const u8, known: []bool) void {
-        for (params, known) |p, *hit| if (std.mem.eql(u8, p.key, key)) {
-            hit.* = true;
-        };
-    }
-
-    fn firstNumber(params: []const Param, key: []const u8) Error!?f64 {
-        for (params) |p| if (std.mem.eql(u8, p.key, key)) {
-            const value = p.value orelse return error.UnresolvedParameter;
-            if (!std.math.isFinite(value)) return error.NonFiniteParameter;
-            return value;
-        };
-        return null;
-    }
-};
 
 test "apply and markKnown match the linear-scan oracle on random cards" {
     // Shared keys (`vto` is a field and `vt0`'s alias), two aliases (`cjo`),

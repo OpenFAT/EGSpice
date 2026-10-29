@@ -1,22 +1,30 @@
-//! Device kernels for runtime `.hdl` models (performance TODO 01 1.8). The
-//! loader builds a host library per model; a GPU build's kernel images are
-//! fixed at build time, so a loaded model's batches stayed on the host. Each
-//! library the loader opens is recorded here, and the first time the GPU asks
-//! for one of its kernels `ptx` compiles the same generated device against
-//! `eval.zig` for NVPTX, the way build.zig compiles a built-in model's kernel
-//! root, cached beside the library as `gpu-<sm>.ptx`.
+//! Device kernels for runtime `.hdl` models: a loaded library's path in,
+//! its NVPTX image out. A GPU build's kernel images are fixed at build time,
+//! so a loaded model's batches would stay on the host. The loader records
+//! each library it opens here, and the first time the GPU asks for one of
+//! its kernels `ptx` compiles the same generated device against `eval.zig`
+//! for NVPTX, as build.zig compiles a built-in model's kernel root, cached
+//! beside the library as `gpu-sm_<sm>.ptx`.
 //!
 //! Only outside Debug: a Debug host library keeps VerA's Debug-only `su_ok`
 //! Model field (`eval.vera_validate_contract`), which the `.fast` kernels
 //! drop, so their rows would read at the wrong stride.
+//! Cites nothing beyond performance TODO 01 1.8.
+//!
+//! Contents:
+//! - `pub const enabled: bool`
+//! - `pub fn register(run_io: std.Io, so_path: []const u8, work_dir: []const u8, paths: BuildPaths) void`
+//! - `pub fn ptx(fn_addr: *const anyopaque, sm: u32) ?[:0]const u8`
 
 const std = @import("std");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
 const BuildPaths = @import("loader.zig").BuildPaths;
 
 /// Whether loaded models are recorded at all.
 pub const enabled = builtin.mode != .debug and !builtin.cpu.arch.isWasm() and builtin.os.tag == .linux;
 
+/// One loaded library and what building its kernels needs.
 const Source = struct {
     /// The library as `dlopen` got it, which `dladdr` reports back.
     so_path: []const u8,
@@ -26,24 +34,30 @@ const Source = struct {
     /// The loading Problem's I/O, which runs the compiler.
     // ponytail: the first loader's; a Problem outliving it would need its own.
     run_io: std.Io,
-    /// The PTX once built, or the build failed (null image, `tried`).
+    /// The PTX once built; null before the first try or after a failed build.
     image: ?[:0]const u8 = null,
     tried: bool = false,
 };
 
-// ponytail: process-lifetime registry on the page allocator, never freed; a
-// deck loads a handful of models.
+const DlInfo = extern struct {
+    fname: ?[*:0]const u8,
+    fbase: ?*anyopaque,
+    sname: ?[*:0]const u8,
+    saddr: ?*anyopaque,
+};
+extern "c" fn dladdr(addr: *const anyopaque, info: *DlInfo) c_int;
+
+// ponytail: a process-lifetime registry on the page allocator, never freed,
+// because the libraries it names are never unloaded either; a deck loads a
+// handful of models.
 var sources: std.ArrayList(Source) = .empty;
 var mutex: std.Io.Mutex = .init;
-
-fn io() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
-}
 
 /// Records the library at `so_path`, built in `work_dir` against `paths`.
 /// Best effort: out of memory only leaves the model on the host.
 pub fn register(run_io: std.Io, so_path: []const u8, work_dir: []const u8, paths: BuildPaths) void {
     if (comptime !enabled) return;
+    assert(so_path.len > 0);
     const a = std.heap.page_allocator;
     mutex.lockUncancelable(io());
     defer mutex.unlock(io());
@@ -65,20 +79,14 @@ pub fn register(run_io: std.Io, so_path: []const u8, work_dir: []const u8, paths
     sources.append(a, s) catch return;
 }
 
-const DlInfo = extern struct {
-    fname: ?[*:0]const u8,
-    fbase: ?*anyopaque,
-    sname: ?[*:0]const u8,
-    saddr: ?*anyopaque,
-};
-extern "c" fn dladdr(addr: *const anyopaque, info: *DlInfo) c_int;
-
-/// The PTX for the loaded model whose code holds `fn_addr` (any function
-/// of its library, such as its `Hooks.gpu_payload`), for NVPTX `sm_<sm>`;
+/// Returns the PTX for `sm_<sm>` of the loaded model whose code holds
+/// `fn_addr` (any function of its library, such as its `Hooks.gpu_payload`);
 /// null for a built-in model, in Debug, or when the build fails (reported
-/// once on stderr). Compiles on first use and caches on disk.
+/// once on stderr). Compiles on first use and caches on disk. The image
+/// lives for the process.
 pub fn ptx(fn_addr: *const anyopaque, sm: u32) ?[:0]const u8 {
     if (comptime !enabled) return null;
+    // SAFETY: `dladdr` fills `info` whenever it returns nonzero.
     var info: DlInfo = undefined;
     if (dladdr(fn_addr, &info) == 0) return null;
     const name = std.mem.span(info.fname orelse return null);
@@ -94,16 +102,24 @@ pub fn ptx(fn_addr: *const anyopaque, sm: u32) ?[:0]const u8 {
             break :blk null;
         };
     }
+    assert(s.tried);
     return s.image;
 }
 
-/// `gpu-<sm>.ptx` in the model's build directory, compiled when missing.
+// ---- private ----
+
+fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// `gpu-sm_<sm>.ptx` in the model's build directory, compiled when missing.
 fn build(s: Source, sm: u32) ![:0]const u8 {
     const a = std.heap.page_allocator;
     const cwd = std.Io.Dir.cwd();
-    const gpu_dir = try std.fs.path.join(a, &.{ s.work_dir, "gpu" });
-    const out = try std.fmt.allocPrint(a, "{s}/gpu-sm_{d}.ptx", .{ s.work_dir, sm });
+    const out = try a.print("{s}/gpu-sm_{d}.ptx", .{ s.work_dir, sm });
+    // A cached image short-circuits the build; any read error rebuilds it.
     if (cwd.readFileAllocOptions(io(), out, a, .unlimited, .of(u8), 0)) |text| return text else |_| {}
+    const gpu_dir = try std.fs.path.join(a, &.{ s.work_dir, "gpu" });
     try cwd.createDirPath(io(), gpu_dir);
     // The decl name is the library's module name, `device`, so the kernel
     // symbols match the ones its `gpuPayload` names.
@@ -111,13 +127,9 @@ fn build(s: Source, sm: u32) ![:0]const u8 {
     try cwd.writeFile(io(), .{ .sub_path = models, .data = "pub const device = @import(\"device\");\npub const gpu_kernels = true;\n" });
     const lane_opts = try std.fs.path.join(a, &.{ gpu_dir, "lane_options.zig" });
     try cwd.writeFile(io(), .{ .sub_path = lane_opts, .data = "pub const enabled = true;\n" });
-    const core_dir = std.fs.path.dirname(s.paths.core) orelse ".";
-    const gompute_dir = std.fs.path.dirname(s.paths.gompute) orelse ".";
-    const tmp = try std.fmt.allocPrint(a, "{s}.{d}.tmp", .{ out, std.os.linux.getpid() });
-    // Each module's own mode, strip and deps precede its -M, as the build
-    // runner passes them.
+    const tmp = try a.print("{s}.{d}.tmp", .{ out, std.os.linux.getpid() });
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(a, &.{ s.paths.zig, "build-obj", "-target", "nvptx64-cuda", "-mcpu", try std.fmt.allocPrint(a, "sm_{d}", .{sm}), "-fno-emit-bin", try std.fmt.allocPrint(a, "-femit-asm={s}", .{tmp}) });
+    try argv.appendSlice(a, &.{ s.paths.zig, "build-obj", "-target", "nvptx64-cuda", "-mcpu", try a.print("sm_{d}", .{sm}), "-fno-emit-bin", try a.print("-femit-asm={s}", .{tmp}) });
     const Mod = struct { name: []const u8, root: []const u8, deps: []const []const u8 };
     const mods = [_]Mod{
         .{ .name = "root", .root = s.paths.dyn, .deps = &.{ "models", "contract", "device_abi", "gompute", "lane_options" } },
@@ -125,14 +137,16 @@ fn build(s: Source, sm: u32) ![:0]const u8 {
         .{ .name = "device", .root = try std.fs.path.join(a, &.{ s.work_dir, "device.zig" }), .deps = &.{"contract"} },
         .{ .name = "contract", .root = s.paths.contract, .deps = &.{} },
         .{ .name = "device_abi", .root = s.paths.device_abi, .deps = &.{ "contract", "core" } },
-        .{ .name = "core", .root = try std.fs.path.join(a, &.{ core_dir, "ids.zig" }), .deps = &.{} },
-        .{ .name = "gompute", .root = try std.fs.path.join(a, &.{ gompute_dir, "device.zig" }), .deps = &.{} },
+        .{ .name = "core", .root = try std.fs.path.join(a, &.{ std.fs.path.dirname(s.paths.core) orelse ".", "ids.zig" }), .deps = &.{} },
+        .{ .name = "gompute", .root = try std.fs.path.join(a, &.{ std.fs.path.dirname(s.paths.gompute) orelse ".", "device.zig" }), .deps = &.{} },
         .{ .name = "lane_options", .root = lane_opts, .deps = &.{} },
     };
+    // Each module's own mode, strip and deps precede its -M, as the build
+    // runner passes them.
     for (mods) |m| {
         try argv.appendSlice(a, &.{ "-fstrip", "-Ofast" });
         for (m.deps) |d| try argv.appendSlice(a, &.{ "--dep", d });
-        try argv.append(a, try std.fmt.allocPrint(a, "-M{s}={s}", .{ m.name, m.root }));
+        try argv.append(a, try a.print("-M{s}={s}", .{ m.name, m.root }));
     }
     try argv.appendSlice(a, &.{
         "--cache-dir",        try std.fs.path.join(a, &.{ s.work_dir, ".zig-cache" }),

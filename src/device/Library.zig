@@ -1,17 +1,48 @@
-//! Every device type one Problem can instantiate, built-in or runtime-loaded,
-//! under one dense `DeviceType` id. Built-ins take ids [0, builtin_count) in
-//! catalog order, so their ids are comptime-known (`builtin`); each loaded
-//! HDL module appends one. Cites #13 for the embedder's toolchain paths; the
-//! loading itself is loader.zig.
+//! Every device type one Problem can instantiate, under one dense
+//! `DeviceType` id: the catalog's built-ins and HDL sources in, one
+//! (name, vtable, digital) row per type out. Built-ins hold ids
+//! [0, builtin_count) in catalog order, so their ids are comptime-known
+//! (`builtin`); each loaded HDL module appends one row. The compiling itself
+//! is loader.zig's. Cites LRM 12.31-12.33 for the VPI host, and #13 for the
+//! embedder's toolchain paths.
+//!
+//! Contents:
+//! - `gpa`, `names`, `vtables`, `digital`, `sources`, `toolchain`, `vpi`,
+//!   `vpi_loaded`, `systf_hosts` (fields)
+//! - `pub const Vpi = struct`
+//! - `pub const AnalogPoint = struct`
+//! - `pub const Verdict = enum`
+//! - `pub const VpiError = error{...}`
+//! - `pub const Toolchain = struct`
+//! - `pub const LoadError = error{...}`
+//! - `pub const RegisterError = error{...}`
+//! - `pub const builtin_count: u16`
+//! - `pub const no_vpi_app: abi.SystfHost`
+//! - `pub fn init(gpa: Allocator) Allocator.Error!Library`
+//! - `pub fn deinit(self: *Library) void`
+//! - `pub fn builtin(comptime name: []const u8) DeviceType`
+//! - `pub fn vtable(self: *const Library, t: DeviceType) *const abi.DeviceVtable`
+//! - `pub fn find(self: *const Library, module: []const u8) ?DeviceType`
+//! - `pub fn register(self: *Library, module: []const u8, vt: *const abi.DeviceVtable, is_digital: bool) RegisterError!DeviceType`
+//! - `pub fn loadVpiApp(self: *Library, path: []const u8) (error{VpiUnavailable} || VpiError)!void`
+//! - `pub fn systfHost(self: *const Library, t: DeviceType) ?*const abi.SystfHost`
+//! - `pub fn isSystfTask(call: abi.Systf) bool`
+//! - `pub fn systfRegistered(self: *const Library, name: []const u8) bool`
+//! - `pub fn load(self: *Library, io: std.Io, files: []const []const u8) LoadError!void`
+//! - `pub fn loadWith(self: *Library, io: std.Io, files: []const []const u8, paths: loader.BuildPaths) LoadError!void`
+
 const std = @import("std");
+const builtin_info = @import("builtin");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 const abi = @import("device_abi");
+const build_options = @import("build_options");
 const catalog = @import("catalog.zig");
 const loader = @import("loader.zig");
-const build_options = @import("build_options");
 const DeviceType = abi.DeviceType;
-const Library = @This();
 
-gpa: std.mem.Allocator,
+/// Owns every loaded name, `sources` and the tables.
+gpa: Allocator,
 /// Type names by id. Loaded names are owned and lowercased; built-in names
 /// are static.
 names: std.ArrayList([]const u8) = .empty,
@@ -20,9 +51,8 @@ vtables: std.ArrayList(*const abi.DeviceVtable) = .empty,
 /// Whether each type runs a digital engine (a `.v` design), parallel to
 /// `names`; it becomes `Batch.digital` at the freeze.
 digital: std.ArrayList(bool) = .empty,
-/// Every HDL source `load` has handled, as resolved paths (owned), so one
-/// named again, by another `.lib` section or a later `load`, does not
-/// compile again.
+/// Every HDL source `load` handled, as resolved paths (owned), so one named
+/// again, by another `.lib` section or a later `load`, compiles once.
 sources: std.ArrayList([]const u8) = .empty,
 /// Where `load` finds the Zig compiler and the evaluator sources. Borrowed;
 /// it must outlive every `load`.
@@ -37,12 +67,10 @@ vpi_loaded: bool = false,
 /// one design (VerA#84).
 systf_hosts: std.ArrayList(SystfBinding) = .empty,
 
-const SystfBinding = struct { t: DeviceType, host: *const abi.SystfHost };
-
-/// The VPI application host. The executable implements it over VerA's
-/// `vpi` module, so the `vpi_*` symbols an application calls are exported
-/// from the executable alone, never from a library that embeds ESPice.
-/// Every call is serialized by the implementation.
+/// The VPI application host. The executable implements it over VerA's `vpi`
+/// module, so the `vpi_*` symbols an application calls are exported from
+/// the executable alone, never from a library that embeds ESPice. The
+/// implementation serializes every call.
 pub const Vpi = struct {
     ctx: *anyopaque,
     /// Opens the application at `path` and runs its `vlog_startup_routines`
@@ -81,20 +109,20 @@ pub const AnalogPoint = struct {
     dt: f64 = 0,
 };
 
-/// `reject`: an acbConvergenceTest returned non-zero or vpiRejectTransientStep
-/// ran, so back up; `again`: vpiTransientFailConverge, so solve the same time
-/// again.
+/// `reject`: an acbConvergenceTest returned non-zero or
+/// vpiRejectTransientStep ran, so back up; `again`:
+/// vpiTransientFailConverge, so solve the same time again.
 pub const Verdict = enum { accept, reject, again };
 
-/// Why a VPI step failed, each one logged with what it names:
-/// `VpiApplicationUnloadable` (dlopen failed), `VpiNoStartupRoutines` (the
-/// library exports no `vlog_startup_routines`), `VpiSecondSystfModule` (a
-/// second module calls a `$systf`; VerA's VPI holds one design, VerA#84),
-/// `VpiDesignFailed` (VerA could not build the module's design).
+/// Every way a VPI step fails; each is logged with what it names.
 pub const VpiError = error{
+    /// dlopen refused the application.
     VpiApplicationUnloadable,
+    /// The library exports no `vlog_startup_routines`.
     VpiNoStartupRoutines,
+    /// A second module calls a `$systf`; VerA's VPI holds one design (VerA#84).
     VpiSecondSystfModule,
+    /// VerA could not build the module's design.
     VpiDesignFailed,
     OutOfMemory,
 };
@@ -120,6 +148,29 @@ pub const Toolchain = struct {
     include_dirs: []const []const u8 = &.{},
 };
 
+/// Every way `load` fails. Files before the failing one stay registered;
+/// none after it are.
+pub const LoadError = error{
+    /// The target is wasm, which has no compiler to run and no dlopen.
+    RuntimeHdlUnsupported,
+    /// `toolchain.share` holds no `device/eval.zig`.
+    HdlShareNotFound,
+} || RegisterError || std.Io.Cancelable || loader.Error || VpiError;
+
+/// Every way `register` fails. On any error nothing is added.
+pub const RegisterError = error{
+    /// The id space below `DeviceType.unset` is full.
+    TooManyDeviceTypes,
+} || Allocator.Error;
+
+/// Built-in types, which hold ids [0, builtin_count); loaded ones follow.
+pub const builtin_count: u16 = builtins.len;
+
+/// What an instance whose every unregistered `$systf` call is a task calls
+/// through: nothing reads a task's value, so 0 with zero partials, and its
+/// arguments keep their values (`out` null). Never bound for a used value.
+pub const no_vpi_app: abi.SystfHost = .{ .ctx = undefined, .call = noVpiApp };
+
 /// Catalog entries with an evaluator, in catalog order.
 const builtins = blk: {
     var list: []const []const u8 = &.{};
@@ -128,12 +179,18 @@ const builtins = blk: {
     }
     break :blk list;
 };
-/// Built-in types, which hold ids [0, builtin_count); loaded ones follow.
-pub const builtin_count: u16 = builtins.len;
 
-/// A library holding the built-ins, each resolved through its linked object.
-/// Caller owns it and must `deinit` it.
-pub fn init(gpa: std.mem.Allocator) !Library {
+comptime {
+    // A built-in never takes the sentinel id.
+    assert(builtin_count < @backingInt(DeviceType.unset));
+}
+
+const SystfBinding = struct { t: DeviceType, host: *const abi.SystfHost };
+const Library = @This();
+
+/// Returns a library holding the built-ins, each resolved through its linked
+/// object. Caller owns it and must `deinit` it.
+pub fn init(gpa: Allocator) Allocator.Error!Library {
     var lib: Library = .{ .gpa = gpa };
     errdefer lib.names.deinit(gpa);
     errdefer lib.vtables.deinit(gpa);
@@ -145,16 +202,16 @@ pub fn init(gpa: std.mem.Allocator) !Library {
         lib.names.appendAssumeCapacity(name);
         lib.vtables.appendAssumeCapacity(catalog.vtable(name));
     }
-    std.debug.assert(lib.names.items.len == builtin_count);
-    std.debug.assert(lib.vtables.items.len == builtin_count);
+    assert(lib.names.items.len == builtin_count);
+    assert(lib.vtables.items.len == builtin_count);
     return lib;
 }
 
 /// Frees the loaded names and the tables. Loaded libraries stay mapped, so
-/// vtables handed out stay valid.
+/// vtables handed out stay valid. Asserts that the tables are parallel.
 pub fn deinit(self: *Library) void {
-    std.debug.assert(self.names.items.len >= builtin_count);
-    std.debug.assert(self.vtables.items.len == self.names.items.len);
+    assert(self.names.items.len >= builtin_count);
+    assert(self.vtables.items.len == self.names.items.len);
     for (self.names.items[builtin_count..]) |name| self.gpa.free(name);
     for (self.sources.items) |path| self.gpa.free(path);
     self.sources.deinit(self.gpa);
@@ -165,7 +222,7 @@ pub fn deinit(self: *Library) void {
     self.* = undefined;
 }
 
-/// The id of built-in `name`; a compile error when there is none.
+/// Returns the id of built-in `name`; a compile error when there is none.
 pub fn builtin(comptime name: []const u8) DeviceType {
     inline for (builtins, 0..) |b, i| {
         if (comptime std.mem.eql(u8, b, name)) return @fromBackingInt(@intCast(i));
@@ -173,35 +230,33 @@ pub fn builtin(comptime name: []const u8) DeviceType {
     @compileError("device: no built-in model named '" ++ name ++ "'");
 }
 
-/// The vtable of type `t`, valid for the life of the process.
+/// Returns the vtable of type `t`, valid for the life of the process.
 /// Asserts that `t` is registered (`.unset` never is).
 pub fn vtable(self: *const Library, t: DeviceType) *const abi.DeviceVtable {
-    std.debug.assert(t != .unset);
-    std.debug.assert(@backingInt(t) < self.vtables.items.len);
+    assert(t != .unset);
+    assert(@backingInt(t) < self.vtables.items.len);
     return self.vtables.items[@backingInt(t)];
 }
 
-/// A runtime-loaded type by module name, case-insensitively. Built-ins are not
-/// searched: a netlist reaches them through SPICE letters and LEVELs.
+/// Returns the runtime-loaded type named `module`, case-insensitively, or
+/// null. Built-ins are not searched: a netlist reaches them through SPICE
+/// letters and LEVELs.
 // ponytail: linear scan; a deck loads a handful of HDL modules.
 pub fn find(self: *const Library, module: []const u8) ?DeviceType {
-    std.debug.assert(self.names.items.len >= builtin_count);
+    assert(self.names.items.len >= builtin_count);
+    assert(self.names.items.len <= @backingInt(DeviceType.unset));
     for (self.names.items[builtin_count..], builtin_count..) |n, i| {
-        if (std.ascii.eqlIgnoreCase(n, module)) {
-            std.debug.assert(i < self.vtables.items.len);
-            return @fromBackingInt(@intCast(i));
-        }
+        if (std.ascii.eqlIgnoreCase(n, module)) return @fromBackingInt(@intCast(i));
     }
     return null;
 }
 
 /// Adds a device type under `module` (copied and lowercased) and returns its
 /// id; `is_digital` marks a `.v` design (`digital`). A name already loaded
-/// keeps its first vtable, flag and id. Fails with `TooManyDeviceTypes` when
-/// the id space is full. On failure nothing is added.
-pub fn register(self: *Library, module: []const u8, vt: *const abi.DeviceVtable, is_digital: bool) (error{TooManyDeviceTypes} || std.mem.Allocator.Error)!DeviceType {
-    std.debug.assert(self.vtables.items.len == self.names.items.len);
-    std.debug.assert(self.digital.items.len == self.names.items.len);
+/// keeps its first vtable, flag and id.
+pub fn register(self: *Library, module: []const u8, vt: *const abi.DeviceVtable, is_digital: bool) RegisterError!DeviceType {
+    assert(self.vtables.items.len == self.names.items.len);
+    assert(self.digital.items.len == self.names.items.len);
     if (self.find(module)) |t| return t;
     if (self.names.items.len >= @backingInt(DeviceType.unset)) return error.TooManyDeviceTypes;
     const owned = try std.ascii.allocLowerString(self.gpa, module);
@@ -211,18 +266,10 @@ pub fn register(self: *Library, module: []const u8, vt: *const abi.DeviceVtable,
     try self.names.append(self.gpa, owned);
     self.vtables.appendAssumeCapacity(vt);
     self.digital.appendAssumeCapacity(is_digital);
-    std.debug.assert(self.vtables.items.len == self.names.items.len);
-    std.debug.assert(self.names.items.len > builtin_count);
+    assert(self.vtables.items.len == self.names.items.len);
+    assert(self.names.items.len > builtin_count);
     return @fromBackingInt(@intCast(self.names.items.len - 1));
 }
-
-/// Why `load` failed: `RuntimeHdlUnsupported` on wasm, `HdlShareNotFound`
-/// when `toolchain.share` holds no evaluator sources, `TooManyDeviceTypes`
-/// when the id space is full, out of memory, a canceled task group, the
-/// first file's `loader.Error` in `files` order, or a `VpiError` attaching a
-/// module that calls a `$systf`. Files before the failing one stay
-/// registered; none after it are.
-pub const LoadError = error{ RuntimeHdlUnsupported, HdlShareNotFound, TooManyDeviceTypes } || std.mem.Allocator.Error || std.Io.Cancelable || loader.Error || VpiError;
 
 /// Loads the VPI application at `path` (`--vpi`, `.options vpi=`) and runs
 /// its startup routines. Call before `load`: a registration decides how a
@@ -231,99 +278,85 @@ pub const LoadError = error{ RuntimeHdlUnsupported, HdlShareNotFound, TooManyDev
 /// host's `VpiError`.
 pub fn loadVpiApp(self: *Library, path: []const u8) (error{VpiUnavailable} || VpiError)!void {
     const v = self.vpi orelse {
-        if (!@import("builtin").is_test) std.log.err("vpi: {s}: this build loads no VPI applications; run the espice executable", .{path});
+        if (!builtin_info.is_test) std.log.err("vpi: {s}: this build loads no VPI applications; run the espice executable", .{path});
         return error.VpiUnavailable;
     };
     try v.load_app(v.ctx, path);
     self.vpi_loaded = true;
 }
 
-/// The application type `t` calls its `$systf`s through; null when no
-/// application is loaded, or `t` calls none.
+/// Returns the application type `t` calls its `$systf`s through; null when
+/// no application is loaded, or `t` calls none.
 pub fn systfHost(self: *const Library, t: DeviceType) ?*const abi.SystfHost {
+    assert(t != .unset);
     for (self.systf_hosts.items) |b| if (b.t == t) return b.host;
     return null;
 }
 
-/// Whether `call` is a system task (its value unused), when VerA says;
-/// false (a used value) on a contract that does not mark tasks (VerA#83).
+/// Returns whether `call` is a system task (its value unused), when VerA
+/// says; false (a used value) on a contract that does not mark tasks
+/// (VerA#83).
 pub fn isSystfTask(call: abi.Systf) bool {
     return if (@hasField(abi.Systf, "task")) call.task else false;
 }
 
-/// What an instance whose every unregistered `$systf` call is a task calls
-/// through: nothing reads a task's value, so 0 with zero partials, and its
-/// arguments keep their values (`out` null). Never bound for a used value.
-pub const no_vpi_app: abi.SystfHost = .{ .ctx = undefined, .call = noVpiApp };
-
-fn noVpiApp(_: *anyopaque, _: usize, _: []const f64, partials: []f64) f64 {
-    @memset(partials, 0);
-    return 0;
-}
-
-/// Whether a loaded application registered `name` (LRM 12.32).
+/// Returns whether a loaded application registered `name` (LRM 12.32).
 pub fn systfRegistered(self: *const Library, name: []const u8) bool {
     const v = self.vpi orelse return false;
     return self.vpi_loaded and v.registered(v.ctx, name);
 }
 
-/// Compiles, opens and registers each HDL source not loaded yet (loader.zig).
-/// The generated devices build against `toolchain.share`, else the sources
-/// `zig build` installs in `<exe>/../share/espice`, else the source tree this
-/// espice was built from, with the compiler `toolchain.zig`, else `zig` on
-/// PATH. Builds are cached under `toolchain.cache_dir`. Fails with
-/// `error.HdlShareNotFound` when `toolchain.share` holds no
-/// `device/eval.zig`, and with `error.RuntimeHdlUnsupported` on wasm, which
-/// has no compiler to run and no dlopen; VerA and the loader compile out.
+/// Compiles, opens and registers each HDL source not loaded yet. The
+/// generated devices build against `toolchain.share`, else the sources
+/// `zig build` installs in `<exe>/../share/espice`, else the source tree
+/// this espice was built from, with `toolchain.zig`, else `zig` on PATH.
+/// Builds are cached under `toolchain.cache_dir`. Fails as `LoadError`
+/// says; VerA and the loader compile out on wasm.
 pub fn load(self: *Library, io: std.Io, files: []const []const u8) LoadError!void {
-    if (comptime @import("builtin").cpu.arch.isWasm()) return error.RuntimeHdlUnsupported;
+    if (comptime builtin_info.cpu.arch.isWasm()) return error.RuntimeHdlUnsupported;
     var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const zig = self.toolchain.zig orelse "zig";
-    const work_dir = self.toolchain.cache_dir orelse "/tmp/espice-cache/hdl";
+    const arena = arena_state.allocator();
     const share = self.toolchain.share orelse
-        try std.fs.path.join(a, &.{ std.process.executableDirPathAlloc(io, a) catch "", "..", "share", "espice" });
-    const installed = if (std.Io.Dir.cwd().access(io, try std.fs.path.join(a, &.{ share, "device", "eval.zig" }), .{})) |_| true else |_| false;
-    // An explicit share that does not hold the sources is the caller's
-    // mistake; building against the source tree instead would hide it.
+        try std.fs.path.join(arena, &.{ std.process.executableDirPathAlloc(io, arena) catch "", "..", "share", "espice" });
+    const eval_path = try std.fs.path.join(arena, &.{ share, "device", "eval.zig" });
+    const installed = if (std.Io.Dir.cwd().access(io, eval_path, .{})) |_| true else |_| false;
+    // An explicit share without the sources is the caller's mistake;
+    // building against the source tree instead would hide it.
     if (self.toolchain.share != null and !installed) {
-        if (!@import("builtin").is_test) std.log.warn("hdl: {s} holds no device/eval.zig; point the toolchain share path at the share/espice directory zig build installs", .{share});
+        if (!builtin_info.is_test) std.log.warn("hdl: {s} holds no device/eval.zig; point the toolchain share path at the share/espice directory zig build installs", .{share});
         return error.HdlShareNotFound;
     }
-    const int_systfs: []const []const u8 = if (self.vpi) |v| (if (self.vpi_loaded) v.int_systfs(v.ctx) else &.{}) else &.{};
-    try self.loadWith(io, files, if (installed) .{
-        .work_dir = work_dir,
-        .contract = try std.fs.path.join(a, &.{ share, "vera", "lib", "contract.zig" }),
-        .dyn = try std.fs.path.join(a, &.{ share, "device", "eval.zig" }),
-        .gompute = try std.fs.path.join(a, &.{ share, "gompute", "root.zig" }),
-        .device_abi = try std.fs.path.join(a, &.{ share, "device", "abi.zig" }),
-        .core = try std.fs.path.join(a, &.{ share, "core", "root.zig" }),
-        .zig = zig,
-        .int_systfs = int_systfs,
-        .include_dirs = self.toolchain.include_dirs,
-    } else .{
-        .work_dir = work_dir,
+    var paths: loader.BuildPaths = .{
+        .work_dir = self.toolchain.cache_dir orelse "/tmp/espice-cache/hdl",
         .contract = build_options.contract_path,
         .dyn = build_options.dyn_path,
         .gompute = build_options.gompute_path,
         .device_abi = build_options.device_abi_path,
         .core = build_options.core_path,
-        .zig = zig,
-        .int_systfs = int_systfs,
+        .zig = self.toolchain.zig orelse "zig",
+        .int_systfs = if (self.vpi) |v| (if (self.vpi_loaded) v.int_systfs(v.ctx) else &.{}) else &.{},
         .include_dirs = self.toolchain.include_dirs,
-    });
+    };
+    if (installed) {
+        paths.contract = try std.fs.path.join(arena, &.{ share, "vera", "lib", "contract.zig" });
+        paths.dyn = eval_path;
+        paths.gompute = try std.fs.path.join(arena, &.{ share, "gompute", "root.zig" });
+        paths.device_abi = try std.fs.path.join(arena, &.{ share, "device", "abi.zig" });
+        paths.core = try std.fs.path.join(arena, &.{ share, "core", "root.zig" });
+    }
+    try self.loadWith(io, files, paths);
 }
 
 /// `load` against explicit build paths: compiles and opens every file not
 /// loaded yet in parallel (`loader.prepareAll`), then registers the results
-/// in `files` order. Fails as `load` does, wasm aside.
+/// in `files` order and attaches a loaded VPI application to each module
+/// that calls a `$systf`. Fails as `load` does, wasm aside.
 pub fn loadWith(self: *Library, io: std.Io, files: []const []const u8, paths: loader.BuildPaths) LoadError!void {
     var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena_state.deinit();
-    // A source named twice, here or in an earlier call, compiles once.
     const todo = try loader.pending(self.sources.items, arena_state.allocator(), files);
-    std.debug.assert(todo.files.len == todo.resolved.len);
+    assert(todo.files.len == todo.resolved.len);
     const results = try self.gpa.alloc(loader.Result, todo.files.len);
     defer self.gpa.free(results);
     try loader.prepareAll(self.gpa, io, todo.files, self.names.items[builtin_count..], paths, results);
@@ -331,20 +364,27 @@ pub fn loadWith(self: *Library, io: std.Io, files: []const []const u8, paths: lo
     for (results, todo.resolved) |result, resolved| {
         if (try result) |prepared| {
             const t = try self.register(prepared.name(), prepared.vtable, prepared.digital);
-            for (prepared.vtable.systf_calls) |c| if (isSystfTask(c) and !self.systfRegistered(c.name))
+            const calls = prepared.vtable.systf_calls;
+            for (calls) |c| if (isSystfTask(c) and !self.systfRegistered(c.name))
                 std.log.warn("{s}: no VPI application registered (LRM 12.32); the call does nothing", .{c.name});
-            // LRM 12.32: bind the module's `$systf` calls to the loaded
-            // application. Without one, `NetBuilder` refuses or no-ops each
-            // call by name.
-            if (prepared.vtable.systf_calls.len != 0 and self.vpi_loaded) {
-                const v = self.vpi.?;
+            // LRM 12.32: bind the module's calls to the loaded application.
+            // Without one, `NetBuilder` refuses or no-ops each call by name.
+            if (calls.len != 0 and self.vpi_loaded) {
+                const v = self.vpi.?; // `vpi_loaded` is only ever set through `vpi`.
                 try self.systf_hosts.ensureUnusedCapacity(self.gpa, 1);
-                self.systf_hosts.appendAssumeCapacity(.{ .t = t, .host = try v.attach(v.ctx, resolved, prepared.vtable.systf_calls) });
+                self.systf_hosts.appendAssumeCapacity(.{ .t = t, .host = try v.attach(v.ctx, resolved, calls) });
             }
         }
         self.sources.appendAssumeCapacity(try self.gpa.dupe(u8, resolved));
     }
-    std.debug.assert(self.vtables.items.len == self.names.items.len);
+    assert(self.vtables.items.len == self.names.items.len);
+}
+
+// ---- private ----
+
+fn noVpiApp(_: *anyopaque, _: usize, _: []const f64, partials: []f64) f64 {
+    @memset(partials, 0);
+    return 0;
 }
 
 test register {
@@ -368,7 +408,7 @@ test register {
 }
 
 test "an explicit share path must hold the evaluator sources" {
-    if (comptime @import("builtin").cpu.arch.isWasm()) return error.SkipZigTest;
+    if (comptime builtin_info.cpu.arch.isWasm()) return error.SkipZigTest;
     var lib = try Library.init(std.testing.allocator);
     defer lib.deinit();
     lib.toolchain = .{ .share = "/nonexistent-espice-test-dir/share/espice", .zig = "/nonexistent/zig" };
@@ -384,16 +424,23 @@ test "find searches loaded types only" {
     try std.testing.expectEqual(@as(?DeviceType, null), lib.find(""));
 }
 
-fn registerCase(gpa: std.mem.Allocator) !void {
-    var lib = try Library.init(gpa);
-    defer lib.deinit();
-    var vt: abi.DeviceVtable = undefined;
-    _ = &vt;
-    _ = try lib.register("a", &vt, false);
-    _ = try lib.register("b", &vt, true);
-    try std.testing.expectEqual(lib.names.items.len, lib.digital.items.len);
+test "init and register free everything when an allocation fails" {
+    const case = struct {
+        fn run(gpa: Allocator) !void {
+            var lib = try Library.init(gpa);
+            defer lib.deinit();
+            var vt: abi.DeviceVtable = undefined;
+            _ = &vt;
+            _ = try lib.register("a", &vt, false);
+            _ = try lib.register("b", &vt, true);
+            try std.testing.expectEqual(lib.names.items.len, lib.digital.items.len);
+        }
+    }.run;
+    try std.testing.checkAllAllocationFailures(@import("core").testing.fixed_growth, case, .{});
 }
 
-test "init and register free everything when an allocation fails" {
-    try std.testing.checkAllAllocationFailures(@import("core").testing.fixed_growth, registerCase, .{});
+test no_vpi_app {
+    var partials = [_]f64{ 1, 2 };
+    try std.testing.expectEqual(@as(f64, 0), no_vpi_app.call(no_vpi_app.ctx, 0, &.{3}, &partials));
+    try std.testing.expectEqualSlices(f64, &.{ 0, 0 }, &partials);
 }

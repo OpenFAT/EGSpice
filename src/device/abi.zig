@@ -1,23 +1,52 @@
-//! The neutral device ABI shared by the host, the per-model device objects
-//! and runtime-loaded `.so` devices: construction (`Proto`, `PatternBuilder`),
-//! the frozen per-type `Batch` with its `Hooks`, and the `DeviceVtable`.
-//! Everything that crosses a separately compiled boundary is in `layoutHash`.
-//! Cites VerA's device contract (`contract`: `SimState`, `StateCtlOp`, noise
-//! terms), the LRM sections named on each hook, and ngspice's nevalsrc.c for
-//! the noise row shape; dev/devices/abi.md records why each ABI version moved.
+//! The neutral device ABI: the types every separately compiled side agrees
+//! on, the host, the per-model device objects and runtime-loaded `.so`
+//! devices. Construction (`Proto`, `PatternBuilder`) in, the frozen per-type
+//! `Batch` with its `Hooks` and the `DeviceVtable` out. Everything that
+//! crosses an object boundary is in `layoutHash`; a change no size, offset
+//! or alignment shows bumps `abi_version`.
+//! Cites VerA's device contract (`contract`: `SimState`, `StateCtlOp`,
+//! noise terms), the LRM sections named on each hook, and ngspice's
+//! nevalsrc.c for the noise row shape; `abi_version`'s comment records why
+//! each ABI version moved.
+//!
+//! Contents:
+//! - `pub const bind`, `Param`, `BindStatus` (bind.zig)
+//! - `pub const GROUND: u32`, `pub const DeviceType`
+//! - `pub const gpu_block_size: u32`, `pub const gpu_lane_block_size: u32`
+//! - `pub const StateCtlOp`, `SimState`, `PsdTerm`, `Systf`, `SystfHost` (contract)
+//! - `pub const BypassTol = struct`
+//! - `pub const ParamField = struct`, `pub const ParamLayout = struct` (`ptr`)
+//! - `pub const ParamRef = struct` (`get`, `set`)
+//! - `pub const NoiseSource = struct` (`tableAt`, `groupEnd`)
+//! - `pub const NoiseGenKind = enum`, `pub const NoiseGen = struct`
+//! - `pub const Planes = struct`, `pub const StampMode = enum(u8)`
+//! - `pub const ScatterTapes = struct`, `pub const ChargeIdentity = struct`
+//! - `pub const DerivativeCounts = struct`, `pub const Batch = struct`
+//! - `pub const StatusHit = struct`, `pub const DeviceStatus = enum(u8)`
+//! - `pub const Hooks = struct`, `pub const Proto = struct`
+//! - `pub const PatternView = struct` (`findSlot`)
+//! - `pub const PatternBuilder = struct` (`add`, `reserve`, `deinit`, `toCsc`)
+//! - `pub const lim_pass_limit: u64`, `pub const lim_pass_state: u64`
+//! - `pub const GpuPayload = struct`
+//! - `pub const abi_version: u32`
+//! - `pub const DeviceVtable = struct`
+//! - `pub fn DeviceResult(comptime T: type) type` (`fromLocal`, `unwrap`)
+//! - `pub fn layoutHash() u64`
+
 const std = @import("std");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
 const contract = @import("contract");
 const core = @import("core");
+/// The parameter binder, here so eval.zig compiles it into every device object.
+pub const bind = @import("bind.zig");
 
 /// The ground node id, re-exported because device code imports this module
 /// and not core.
 pub const GROUND = core.GROUND;
 /// A dense device-type id (`Library`), re-exported like `GROUND`.
 pub const DeviceType = core.DeviceType;
-
-/// The parameter binder, here so eval.zig compiles it into every device object.
-pub const bind = @import("bind.zig");
 /// One card `name=value` pair, as `DeviceVtable.bind_model` takes it.
 pub const Param = bind.Param;
 /// The binder's result, an enum because it crosses the object boundary.
@@ -34,6 +63,13 @@ pub const StateCtlOp = contract.StateCtlOp;
 /// VerA's analysis state, passed by value to every device call; in
 /// `layoutHash` because GPU kernels take it too.
 pub const SimState = contract.SimState;
+/// A device's `noisePsd` result, one per `noise_gens` entry.
+pub const PsdTerm = contract.PsdTerm;
+/// VerA's LRM 12.32 call table entry, re-exported for hosts that do not
+/// import the contract.
+pub const Systf = contract.Systf;
+/// The application a device's `$systf` calls go through.
+pub const SystfHost = contract.SystfHost;
 
 /// `Hooks.set_bypass`'s tolerances: the Newton test's.
 pub const BypassTol = struct { reltol: f64, vntol: f64, abstol: f64 };
@@ -66,11 +102,16 @@ pub const ParamLayout = struct {
     model_stride: u32,
     model_of: [*]const u32,
 
-    /// The address of parameter `ord`.
+    /// Returns the address of parameter `ord`. Asserts that `ord` is below
+    /// `count * fields.len`.
     pub fn ptr(l: ParamLayout, ord: u32) *f64 {
+        assert(l.count > 0);
+        assert(ord / l.count < l.fields.len);
         const f = l.fields[ord / l.count];
         const id = ord % l.count;
         const base = if (f.is_instance) l.instances + @as(usize, id) * l.instance_stride else l.models + @as(usize, l.model_of[id]) * l.model_stride;
+        // SAFETY: `offset` is an f64 field's `@offsetOf` in a row the batch
+        // allocated at its type's alignment.
         return @ptrCast(@alignCast(base + f.offset));
     }
 };
@@ -92,6 +133,7 @@ pub const ParamRef = struct {
     pelgrom_ap: f64 = 0,
     area_wl: f64 = 0,
 
+    /// Returns the parameter's value.
     pub fn get(self: ParamRef) f64 {
         return self.ptr.*;
     }
@@ -148,46 +190,32 @@ pub const NoiseSource = struct {
 
     /// Returns the end of the group starting at `srcs[lead]`: rows
     /// `[lead, end)` are one correlated generator. Asserts that `lead` is in
-    /// range and starts a group.
+    /// range and starts a group. O(group length).
     pub fn groupEnd(srcs: []const NoiseSource, lead: usize) usize {
-        std.debug.assert(lead < srcs.len);
-        std.debug.assert(srcs[lead].group == lead or srcs[lead].group == std.math.maxInt(u32));
+        assert(lead < srcs.len);
+        assert(srcs[lead].group == lead or srcs[lead].group == std.math.maxInt(u32));
         var end = lead + 1;
         while (end < srcs.len and srcs[end].group == lead) end += 1;
-        std.debug.assert(end > lead);
-        std.debug.assert(end <= srcs.len);
+        assert(end > lead);
+        assert(end <= srcs.len);
         return end;
     }
 };
-
-comptime {
-    // Read whole per row and frequency; the 4 pad bytes are
-    // `contract.NoiseTable`'s.
-    if (@sizeOf(usize) == 8) std.debug.assert(@sizeOf(NoiseSource) == 72);
-}
 
 /// The physical origin a device declares for a noise generator.
 pub const NoiseGenKind = enum { thermal, shot, flicker };
 /// A device's generator declaration: local rows `row`/`col` and its kind.
 pub const NoiseGen = struct { row: usize, col: usize, kind: NoiseGenKind };
-/// A device's `noisePsd` result, one per `noise_gens` entry.
-pub const PsdTerm = contract.PsdTerm;
 
-/// The value planes one eval pass stamps into. The serial path points them at
-/// the circuit's own slices; ParEval points them at each batch's window of its
-/// staging arrays and calls `Hooks.stage`.
+/// The value planes one eval pass stamps into. The serial path points them
+/// at the circuit's own slices; ParEval points them at each batch's window
+/// of its staging arrays and calls `Hooks.stage`.
 pub const Planes = struct {
     g_vals: []f64,
     c_vals: []f64,
     rhs: []f64,
     q_vec: []f64,
 };
-
-comptime {
-    // Every eval call receives a `*const Planes`; nothing beyond the four
-    // plane slices may ride along on that path.
-    std.debug.assert(@sizeOf(Planes) == 4 * @sizeOf([]f64));
-}
 
 /// Which planes a stamp writes. `.charge` is the transient's post-accept
 /// re-read: `q_vec` and the per-batch `q_tape` only.
@@ -243,13 +271,6 @@ pub const Batch = struct {
     digital: bool = false,
 };
 
-comptime {
-    // Every Newton iteration walks the circuit's `[]Batch` and calls
-    // `eval` through each; one cache line per batch (59 bytes of fields on
-    // a 64-bit target, 64 with padding) keeps that walk one line per type.
-    std.debug.assert(@sizeOf(Batch) <= 64);
-}
-
 /// Where `Hooks.status` found a latched status: the instance index within
 /// the batch and the length of the message it wrote.
 pub const StatusHit = struct { index: u32, len: u32 };
@@ -258,43 +279,14 @@ pub const StatusHit = struct { index: u32, len: u32 };
 /// Zig error values, whose numbering is per compilation.
 pub const DeviceStatus = enum(u8) { ok = 0, out_of_memory = 1, too_many_instances = 2 };
 
-/// A callback result carried by value across the object boundary. A
-/// successful payload keeps its existing owner.
-pub fn DeviceResult(comptime T: type) type {
-    return union(DeviceStatus) {
-        ok: T,
-        out_of_memory: void,
-        too_many_instances: void,
-
-        /// Encodes this compilation's error union for the trip across the
-        /// object boundary.
-        pub fn fromLocal(value: error{ OutOfMemory, TooManyInstances }!T) @This() {
-            return .{ .ok = value catch |err| return switch (err) {
-                error.OutOfMemory => .out_of_memory,
-                error.TooManyInstances => .too_many_instances,
-            } };
-        }
-
-        /// Decodes into the caller's own error values, whatever numbering the
-        /// compilation that produced it used.
-        pub fn unwrap(self: @This()) error{ OutOfMemory, TooManyInstances }!T {
-            return switch (self) {
-                .ok => |value| value,
-                .out_of_memory => error.OutOfMemory,
-                .too_many_instances => error.TooManyInstances,
-            };
-        }
-    };
-}
-
 /// Per-type hooks, one static table per device type. A null entry means the
 /// device lacks the feature.
 pub const Hooks = struct {
     /// A fresh mutable batch from an unevaluated template. The template and
     /// its tapes must outlive every instance made from it.
-    instantiate: *const fn (*const anyopaque, std.mem.Allocator) DeviceResult(Batch),
+    instantiate: *const fn (*const anyopaque, Allocator) DeviceResult(Batch),
     /// A copy of an accepted batch, mutable history included.
-    snapshot: *const fn (*const anyopaque, std.mem.Allocator) DeviceResult(Batch),
+    snapshot: *const fn (*const anyopaque, Allocator) DeviceResult(Batch),
     /// Overwrites the first batch's mutable state (models, instances,
     /// history, limiting state) with the second's. Both must be this type
     /// and one a `snapshot` of the other, or of a common batch. Allocates
@@ -433,7 +425,7 @@ pub const Hooks = struct {
     /// Appends a `ParamRef` for every sweepable field of every instance and
     /// Model row. First gives every instance its own Model row, so a
     /// `GpuPayload.models` slice taken before the call is stale.
-    collect_params: *const fn (*anyopaque, std.mem.Allocator, *std.ArrayList(ParamRef)) DeviceResult(void),
+    collect_params: *const fn (*anyopaque, Allocator, *std.ArrayList(ParamRef)) DeviceResult(void),
     /// `collect_params`' order without a `ParamRef` per parameter: one run
     /// of `count` parameters per field, instance fields first. Leaves the
     /// Model rows shared, so it is for reading. A sweep planner over a
@@ -457,7 +449,7 @@ pub const Hooks = struct {
     isolate_rows: ?*const fn (*anyopaque, ids: []const u32) DeviceResult(void) = null,
     /// Appends every declared noise generator with its PSD at x. Temperature
     /// is the instance's own, already applied by the device.
-    collect_noise: ?*const fn (*anyopaque, []const f64, std.mem.Allocator, *std.ArrayList(NoiseSource)) DeviceResult(void) = null,
+    collect_noise: ?*const fn (*anyopaque, []const f64, Allocator, *std.ArrayList(NoiseSource)) DeviceResult(void) = null,
     /// The model's name for each generator `collect_noise` appends per
     /// instance, in that order (LRM §4.6.4 `name` argument; "" when absent).
     /// Its length is the per-instance generator count.
@@ -467,7 +459,7 @@ pub const Hooks = struct {
     /// zi), instance-major. A ground entry reads as the trash slot. Under
     /// kind `.ac`/`.noise` the G and C planes leave these partials out, and
     /// `ac_dyn` supplies them. Null when the device has none.
-    collect_ac_dyn: ?*const fn (*anyopaque, std.mem.Allocator, *std.ArrayList(u32)) DeviceResult(void) = null,
+    collect_ac_dyn: ?*const fn (*anyopaque, Allocator, *std.ArrayList(u32)) DeviceResult(void) = null,
     /// Writes the small-signal term of each `collect_ac_dyn` entry e at x and
     /// at every ω in `omegas`: `re[e * omegas.len + k]` and `im[...]`, so
     /// A(ω_k) = G + jω_kC + (re + j·im) per entry. Reads the stored sim state
@@ -481,7 +473,7 @@ pub const Hooks = struct {
     /// GPU-eligible, in which case the launcher keeps the whole circuit on
     /// the CPU.
     gpu_payload: ?*const fn (*anyopaque) GpuPayload = null,
-    deinit: *const fn (*anyopaque, std.mem.Allocator) void,
+    deinit: *const fn (*anyopaque, Allocator) void,
 };
 
 /// A device type's construction-time store. `pattern` adds its matrix
@@ -491,41 +483,41 @@ pub const Proto = struct {
     type_name: []const u8,
     /// Adds every staged instance's matrix entries; the allocator is the
     /// builder's.
-    pattern: *const fn (*anyopaque, std.mem.Allocator, *PatternBuilder) DeviceResult(void),
+    pattern: *const fn (*anyopaque, Allocator, *PatternBuilder) DeviceResult(void),
     /// Builds the frozen batch, allocated with the given allocator, against
     /// the final pattern. The proto still needs `destroy` afterwards.
-    finalize: *const fn (*anyopaque, std.mem.Allocator, PatternView) DeviceResult(Batch),
-    destroy: *const fn (*anyopaque, std.mem.Allocator) void,
+    finalize: *const fn (*anyopaque, Allocator, PatternView) DeviceResult(Batch),
+    destroy: *const fn (*anyopaque, Allocator) void,
     /// Renumbers staged nodes through `perm` (old id to new); ids at or past
     /// `perm.len`, ground among them, stay as they are.
     apply_perm: *const fn (*anyopaque, []const u32) void,
 };
 
-/// A read-only CSC sparsity pattern. `trash_slot` (= nnz) is the slot ground
-/// entries scatter into.
+/// A read-only CSC sparsity pattern. `trash_slot` (= nnz) is the slot
+/// ground entries scatter into.
 pub const PatternView = struct {
     col_ptr: []const u32,
     row_idx: []const u32,
     n: u32,
     trash_slot: u32,
 
-    /// The slot of (`row`, `col`), or null when the pattern lacks it. Binary
-    /// search, O(log) in the column's length.
-    /// Asserts that `col < n`, that `col_ptr` has n + 1 entries, and that
-    /// column `col` is a well-formed range.
+    /// Returns the slot of (`row`, `col`), or null when the pattern lacks
+    /// it. Binary search, O(log) in the column's length. Asserts that
+    /// `col < n`, that `col_ptr` has n + 1 entries, and that column `col`
+    /// is a well-formed range.
     pub fn findSlot(self: PatternView, row: u32, col: u32) ?u32 {
-        std.debug.assert(col < self.n);
-        std.debug.assert(self.col_ptr.len == @as(usize, self.n) + 1);
+        assert(col < self.n);
+        assert(self.col_ptr.len == @as(usize, self.n) + 1);
         var lo = self.col_ptr[col];
         var hi = self.col_ptr[col + 1];
-        std.debug.assert(lo <= hi);
+        assert(lo <= hi);
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             if (self.row_idx[mid] < row) lo = mid + 1 else hi = mid;
         }
         if (lo < self.col_ptr[col + 1] and self.row_idx[lo] == row) {
             // A real slot is never the trash slot ground entries scatter into.
-            std.debug.assert(lo < self.trash_slot);
+            assert(lo < self.trash_slot);
             return lo;
         }
         return null;
@@ -534,24 +526,25 @@ pub const PatternView = struct {
 
 /// Accumulates `(col << 32 | row)` keys, duplicates included, and turns them
 /// into CSC with `toCsc`. Pass a scratch allocator, not the circuit's arena:
-/// the keys and sort buffers die in `Circuit.freeze`, and an arena would keep
-/// them (measured 14.6 MB on a 25,000-MOSFET deck).
+/// the keys and sort buffers die in `Circuit.freeze`, and an arena would
+/// keep them (measured 14.6 MB on a 25,000-MOSFET deck).
 pub const PatternBuilder = struct {
     keys: std.ArrayList(u64) = .empty,
 
     /// Records entry (`row`, `col`); duplicates merge in `toCsc`.
-    pub fn add(self: *PatternBuilder, gpa: std.mem.Allocator, row: u32, col: u32) !void {
+    /// Invalidates nothing the caller holds; the keys are private.
+    pub fn add(self: *PatternBuilder, gpa: Allocator, row: u32, col: u32) Allocator.Error!void {
         try self.keys.append(gpa, (@as(u64, col) << 32) | row); // col-major sort order
     }
 
     /// Makes room for `extra` more `add`s.
-    pub fn reserve(self: *PatternBuilder, gpa: std.mem.Allocator, extra: usize) !void {
+    pub fn reserve(self: *PatternBuilder, gpa: Allocator, extra: usize) Allocator.Error!void {
         try self.keys.ensureUnusedCapacity(gpa, extra);
-        std.debug.assert(self.keys.capacity - self.keys.items.len >= extra);
+        assert(self.keys.capacity - self.keys.items.len >= extra);
     }
 
     /// Frees the keys; `gpa` must be the allocator every `add` used.
-    pub fn deinit(self: *PatternBuilder, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *PatternBuilder, gpa: Allocator) void {
         self.keys.deinit(gpa);
     }
 
@@ -561,8 +554,9 @@ pub const PatternBuilder = struct {
     /// passes over the keys where a 16-bit radix sort makes four.
     /// Caller owns `col_ptr_out` (n + 1 entries) and `row_idx_out` (nnz) and
     /// must free them with `gpa`; `scratch` is only used during the call.
-    /// Asserts that every row and column is below `n`.
-    pub fn toCsc(self: *PatternBuilder, gpa: std.mem.Allocator, scratch: std.mem.Allocator, n: u32, col_ptr_out: *[]u32, row_idx_out: *[]u32) !u32 {
+    /// On error neither output is written. Asserts that every row and column
+    /// is below `n`.
+    pub fn toCsc(self: *PatternBuilder, gpa: Allocator, scratch: Allocator, n: u32, col_ptr_out: *[]u32, row_idx_out: *[]u32) Allocator.Error!u32 {
         const all = self.keys.items;
         const col_ptr = try gpa.alloc(u32, n + 1);
         errdefer gpa.free(col_ptr);
@@ -570,9 +564,10 @@ pub const PatternBuilder = struct {
         defer scratch.free(rows);
         const next = try scratch.alloc(u32, n);
         defer scratch.free(next);
+        // Counting sort by column.
         @memset(col_ptr, 0);
         for (all) |k| {
-            std.debug.assert(k >> 32 < n);
+            assert(k >> 32 < n);
             col_ptr[@intCast((k >> 32) + 1)] += 1;
         }
         for (0..n) |j| col_ptr[j + 1] += col_ptr[j];
@@ -592,7 +587,7 @@ pub const PatternBuilder = struct {
             std.mem.sortUnstable(u32, col, {}, std.sort.asc(u32));
             const first = m;
             for (col) |r| {
-                std.debug.assert(r < n);
+                assert(r < n);
                 if (m != first and rows[m - 1] == r) continue;
                 rows[m] = r;
                 m += 1;
@@ -602,10 +597,10 @@ pub const PatternBuilder = struct {
         }
         col_ptr[n] = m;
         const row_idx = try gpa.dupe(u32, rows[0..m]);
-        const nnz = m;
+        assert(m <= all.len);
         col_ptr_out.* = col_ptr;
         row_idx_out.* = row_idx;
-        return nnz;
+        return m;
     }
 };
 
@@ -725,9 +720,9 @@ pub const GpuPayload = struct {
 pub const abi_version: u32 = 36;
 
 /// A device type's construction entry points, exported by each device object
-/// and by runtime-loaded `.so` devices.
-/// Every blob pointer it takes must be 16-byte aligned: the host aligns every
-/// Model and Instance blob to 16, and no device field needs more.
+/// and by runtime-loaded `.so` devices. Every blob pointer it takes must be
+/// 16-byte aligned: the host aligns every Model and Instance blob to 16, and
+/// no device field needs more.
 pub const DeviceVtable = struct {
     name: []const u8,
     /// Unknowns per instance: the ports, then the internal nodes.
@@ -751,10 +746,10 @@ pub const DeviceVtable = struct {
     /// Writes, for each internal unknown in `[num_ports, n_u)`, the unknown
     /// it aliases, or -1.
     collapse: ?*const fn (model: [*]const u8, instance: [*]const u8, out: [*]i32) void,
-    proto_create: *const fn (std.mem.Allocator) DeviceResult(Proto),
+    proto_create: *const fn (Allocator) DeviceResult(Proto),
     /// Stages one instance into a `proto_create` store, copying both blobs;
     /// `nodes` holds `n_u` global unknowns.
-    proto_add: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, model: [*]const u8, instance: [*]const u8, nodes: [*]const u32) DeviceResult(void),
+    proto_add: *const fn (ctx: *anyopaque, gpa: Allocator, model: [*]const u8, instance: [*]const u8, nodes: [*]const u32) DeviceResult(void),
     /// The Model row the last `proto_add` staged into a store that shares
     /// rows between equal Models. Null when the store keeps a row per
     /// instance.
@@ -778,14 +773,54 @@ pub const DeviceVtable = struct {
     bind_systf: ?*const fn (instance: [*]u8, host: *const contract.SystfHost) void = null,
 };
 
-/// VerA's LRM 12.32 call table entry and the application a device calls
-/// through, re-exported for hosts that do not import the contract.
-pub const Systf = contract.Systf;
-pub const SystfHost = contract.SystfHost;
+comptime {
+    // Read whole per row and frequency; the 4 pad bytes are
+    // `contract.NoiseTable`'s.
+    if (@sizeOf(usize) == 8) assert(@sizeOf(NoiseSource) == 72);
+    // Every eval call receives a `*const Planes`; nothing beyond the four
+    // plane slices may ride along on that path.
+    assert(@sizeOf(Planes) == 4 * @sizeOf([]f64));
+    // Every Newton iteration walks the circuit's `[]Batch` and calls `eval`
+    // through each; one cache line per batch (59 bytes of fields on a
+    // 64-bit target, 64 with padding) keeps that walk one line per type.
+    assert(@sizeOf(Batch) <= 64);
+    // The two `halves` bits are distinct.
+    assert(lim_pass_limit & lim_pass_state == 0);
+    assert(gpu_block_size % gpu_lane_block_size == 0);
+}
 
-/// Hash of every type that crosses the object boundary, the compiler
-/// version, backend and mode, and `abi_version`. Both sides compile this same
-/// source, so equal hashes mean compatible layouts.
+/// Returns a callback result type carried by value across the object
+/// boundary. A successful payload keeps its existing owner.
+pub fn DeviceResult(comptime T: type) type {
+    return union(DeviceStatus) {
+        ok: T,
+        out_of_memory: void,
+        too_many_instances: void,
+
+        /// Encodes this compilation's error union for the trip across the
+        /// object boundary.
+        pub fn fromLocal(value: error{ OutOfMemory, TooManyInstances }!T) @This() {
+            return .{ .ok = value catch |err| return switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                error.TooManyInstances => .too_many_instances,
+            } };
+        }
+
+        /// Decodes into the caller's own error values, whatever numbering the
+        /// compilation that produced it used.
+        pub fn unwrap(self: @This()) error{ OutOfMemory, TooManyInstances }!T {
+            return switch (self) {
+                .ok => |value| value,
+                .out_of_memory => error.OutOfMemory,
+                .too_many_instances => error.TooManyInstances,
+            };
+        }
+    };
+}
+
+/// Returns the hash of every type that crosses the object boundary, the
+/// compiler version, backend and mode, and `abi_version`. Both sides compile
+/// this same source, so equal hashes mean compatible layouts. Comptime.
 pub fn layoutHash() u64 {
     return comptime blk: {
         @setEvalBranchQuota(100_000);
@@ -810,18 +845,22 @@ pub fn layoutHash() u64 {
     };
 }
 
+// ---- private ----
+
+/// One FNV-1a step.
 fn mix(h: u64, v: u64) u64 {
     return (h ^ v) *% 0x100000001b3;
 }
 
+/// Folds `T`'s size, alignment and every field offset into `h0`, recursing
+/// into by-value struct fields; a pointer's target is hashed only if listed.
 fn hashType(h0: u64, comptime T: type) u64 {
     var h = mix(mix(h0, @sizeOf(T)), @alignOf(T));
     switch (@typeInfo(T)) {
         .@"struct" => |si| inline for (si.field_names, si.field_types, si.field_attrs) |name, FT, attrs| {
             if (attrs.@"comptime" or @sizeOf(FT) == 0) continue;
             h = mix(h, @offsetOf(T, name));
-            // A by-value struct (`NoiseSource.table`) crosses with its
-            // parent; a pointer's target is hashed only if listed.
+            // A by-value struct (`NoiseSource.table`) crosses with its parent.
             if (@typeInfo(FT) == .@"struct") h = hashType(h, FT);
         },
         else => {}, // else: a non-struct type hashes by size and alignment only
@@ -841,7 +880,7 @@ test "hashType sees a field move inside a by-value nested struct" {
     }.of;
     const A = extern struct { a: u16, b: u8, c: u8 };
     const B = extern struct { a: u8, b: u8, c: u16 };
-    comptime std.debug.assert(@sizeOf(A) == @sizeOf(B) and @alignOf(A) == @alignOf(B));
+    comptime assert(@sizeOf(A) == @sizeOf(B) and @alignOf(A) == @alignOf(B));
     try std.testing.expect(hashType(0, Outer(A)) != hashType(0, Outer(B)));
 }
 
@@ -857,6 +896,43 @@ test ParamRef {
     const b: ParamRef = .{ .ptr = &wide, .param_name = "l", .index = 0, .is_instance = true, .primary = true };
     b.set(0.1);
     try std.testing.expectEqual(@as(f64, 0.1), b.get());
+}
+
+test "ParamLayout.ptr reaches instance and shared Model fields" {
+    const Inst = extern struct { pad: f64 = 0, m: f64 };
+    const Model = extern struct { r: f64 };
+    var insts = [_]Inst{ .{ .m = 1 }, .{ .m = 2 } };
+    var models = [_]Model{.{ .r = 10 }};
+    const model_of = [_]u32{ 0, 0 };
+    const fields = [_]ParamField{
+        .{ .name = "m", .offset = @offsetOf(Inst, "m"), .is_instance = true, .primary = false },
+        .{ .name = "r", .offset = @offsetOf(Model, "r"), .is_instance = false, .primary = true },
+    };
+    const l: ParamLayout = .{
+        .count = 2,
+        .fields = &fields,
+        .instances = @ptrCast(&insts),
+        .instance_stride = @sizeOf(Inst),
+        .models = @ptrCast(&models),
+        .model_stride = @sizeOf(Model),
+        .model_of = &model_of,
+    };
+    try std.testing.expectEqual(@as(f64, 2), l.ptr(1).*);
+    // Both instances read the one Model row.
+    try std.testing.expectEqual(&models[0].r, l.ptr(2));
+    try std.testing.expectEqual(&models[0].r, l.ptr(3));
+}
+
+test "NoiseSource.groupEnd spans a correlated group and stops at the next" {
+    const srcs = [_]NoiseSource{
+        .{ .node_p = 1, .node_n = 0, .group = 0 },
+        .{ .node_p = 2, .node_n = 0, .group = 0 },
+        .{ .node_p = 3, .node_n = 0 },
+        .{ .node_p = 4, .node_n = 0, .group = 3 },
+    };
+    try std.testing.expectEqual(@as(usize, 2), NoiseSource.groupEnd(&srcs, 0));
+    try std.testing.expectEqual(@as(usize, 3), NoiseSource.groupEnd(&srcs, 2));
+    try std.testing.expectEqual(@as(usize, 4), NoiseSource.groupEnd(&srcs, 3));
 }
 
 test "PatternView.findSlot: hits, misses and an empty column" {
@@ -907,24 +983,25 @@ test "PatternBuilder.toCsc matches a comparison sort of the keys" {
     };
 }
 
-fn toCscCase(gpa: std.mem.Allocator) !void {
-    var pb: PatternBuilder = .{};
-    defer pb.deinit(gpa);
-    // Column 1 stays empty; (2, 0) arrives twice and out of order.
-    for ([_][2]u32{ .{ 2, 0 }, .{ 0, 0 }, .{ 2, 2 }, .{ 2, 0 }, .{ 1, 2 } }) |rc| try pb.add(gpa, rc[0], rc[1]);
-    var col_ptr: []u32 = undefined;
-    var row_idx: []u32 = undefined;
-    const nnz = try pb.toCsc(gpa, gpa, 3, &col_ptr, &row_idx);
-    defer gpa.free(col_ptr);
-    defer gpa.free(row_idx);
-    try std.testing.expectEqual(@as(u32, 4), nnz);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 2, 4 }, col_ptr);
-    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 1, 2 }, row_idx);
-}
-
 test "PatternBuilder.toCsc dedups, sorts rows and keeps empty columns" {
-    try toCscCase(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(@import("core").testing.fixed_growth, toCscCase, .{});
+    const case = struct {
+        fn run(gpa: Allocator) !void {
+            var pb: PatternBuilder = .{};
+            defer pb.deinit(gpa);
+            // Column 1 stays empty; (2, 0) arrives twice and out of order.
+            for ([_][2]u32{ .{ 2, 0 }, .{ 0, 0 }, .{ 2, 2 }, .{ 2, 0 }, .{ 1, 2 } }) |rc| try pb.add(gpa, rc[0], rc[1]);
+            var col_ptr: []u32 = undefined;
+            var row_idx: []u32 = undefined;
+            const nnz = try pb.toCsc(gpa, gpa, 3, &col_ptr, &row_idx);
+            defer gpa.free(col_ptr);
+            defer gpa.free(row_idx);
+            try std.testing.expectEqual(@as(u32, 4), nnz);
+            try std.testing.expectEqualSlices(u32, &.{ 0, 2, 2, 4 }, col_ptr);
+            try std.testing.expectEqualSlices(u32, &.{ 0, 2, 1, 2 }, row_idx);
+        }
+    }.run;
+    try case(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(core.testing.fixed_growth, case, .{});
 }
 
 test "PatternBuilder.toCsc of no keys is all-empty columns" {
