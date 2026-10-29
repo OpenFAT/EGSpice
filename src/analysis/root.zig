@@ -1,5 +1,13 @@
 //! The analysis module's public seam: the query session, execution config and
 //! result schemas. The numerical implementations stay private to the module.
+//! In: nothing (re-exports). Out: what `espice.zig` calls.
+//! Cites no outside source.
+//!
+//! Contents:
+//! - `pub const session`, `ExecutionConfig`, `Knobs`, `validateBackend`, `batchWidth`
+//! - `pub const ThreadPool`, `Threads`, `WsPool`, `GpuDriver`, `gpu_available`
+//! - `pub const gpu_lanes`, `schemaOf`, `mosra`
+
 /// The query graph and its scheduler (`Session`).
 pub const session = @import("session.zig");
 /// Per-Problem execution settings every query shares.
@@ -25,10 +33,10 @@ pub const gpu_available = @import("gpu/context.zig").available;
 /// The GPU transient lane backend (phase 4): `policy` decides
 /// `ExecutionConfig.gpu_lanes` once per Problem.
 pub const gpu_lanes = @import("gpu/lanes.zig");
-/// The result shape of a query, without running it.
-pub const schemaOf = session.schemaOf;
 /// HSPICE MOSRA level 1 aging over a stress transient.
 pub const mosra = @import("post/mosra.zig");
+/// The result shape of a query, without running it.
+pub const schemaOf = session.schemaOf;
 
 test {
     _ = @import("tests/ac.zig");
@@ -51,6 +59,20 @@ test {
     _ = @import("tests/certify.zig");
     _ = @import("post/mosra.zig");
     _ = @import("Circuit.zig");
+    _ = @import("certify.zig");
+    _ = @import("circuit_params.zig");
+    _ = @import("dc/dc.zig");
+    _ = @import("ac/lstb.zig");
+    _ = @import("ac/sp.zig");
+    _ = @import("ac/acmatch.zig");
+    _ = @import("eigen/pz.zig");
+    _ = @import("post/disto.zig");
+    _ = @import("post/fft.zig");
+    _ = @import("sweep/mc.zig");
+    _ = @import("sweep/sens.zig");
+    _ = @import("dc/xf.zig");
+    _ = @import("eigen/qz.zig");
+    _ = @import("eigen/arnoldi.zig");
     _ = @import("par_eval.zig");
     _ = @import("session.zig");
 

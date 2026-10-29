@@ -7,8 +7,15 @@
 //! textbook step cost fewer flops, but a pole-zero pencil is solved once per
 //! query and one primitive keeps the step short.
 //!
-//! Cites Moler and Stewart (1973) and dev/analysis/pole-zero.md.
+//! In: a dense n x n pencil (A, B). Out: its finite roots.
+//! Cites Moler and Stewart (1973); LAPACK dggbal, dgghrd, dhgeqz;
+//! dev/analysis/pole-zero.md.
+//!
+//! Contents:
+//! - `pub fn roots(n: usize, a: []f64, b: []f64, out: []Complex, tol: f64, max_iter: u32) Eigs`
+
 const std = @import("std");
+const assert = std.debug.assert;
 const num = @import("core").numerics;
 const Complex = num.Complex;
 const Eigs = @import("core").eigen.Eigs;
@@ -26,7 +33,11 @@ const eps = std.math.floatEps(f64);
 /// below `tol` relative to its diagonal pair, or below eps·‖A‖_F.
 /// `converged` is false when one block exhausted `max_iter` QZ steps; its
 /// roots are then missing.
+/// Asserts that `a` and `b` hold n x n values and `out` n slots.
 pub fn roots(n: usize, a: []f64, b: []f64, out: []Complex, tol: f64, max_iter: u32) Eigs {
+    assert(a.len >= n * n);
+    assert(b.len >= n * n);
+    assert(out.len >= n);
     var count: usize = 0;
     const m = isolate(n, a, b, out, &count);
     if (m == 0) return .{ .count = count, .converged = true };
@@ -37,7 +48,11 @@ pub fn roots(n: usize, a: []f64, b: []f64, out: []Complex, tol: f64, max_iter: u
 
     var hi = m;
     var iter: u32 = 0;
-    while (hi > 0) {
+    // Every pass deflates a root (hi falls) or takes a QZ step on the active
+    // block (iter rises, reset on deflation), so at most m (max_iter + 1) run.
+    var passes: usize = 0;
+    while (hi > 0) : (passes += 1) {
+        assert(passes <= m * (@as(usize, max_iter) + 1));
         const l = hi - 1;
         // Top of the active block: the largest f whose subdiagonal entry is
         // negligible, as in core/eigen.zig's Francis loop.
@@ -77,8 +92,11 @@ pub fn roots(n: usize, a: []f64, b: []f64, out: []Complex, tol: f64, max_iter: u
         qzStep(m, a, b, f, l, iter, tr, det);
         iter += 1;
     }
+    assert(count <= n);
     return .{ .count = count, .converged = true };
 }
+
+// ---- private ----
 
 /// dggbal's permutation step for a pencil: a row of the active block with at
 /// most one nonzero column across A and B (or a column with at most one
@@ -94,6 +112,7 @@ pub fn roots(n: usize, a: []f64, b: []f64, out: []Complex, tol: f64, max_iter: u
 fn isolate(n: usize, a: []f64, b: []f64, out: []Complex, count: *usize) usize {
     var lo: usize = 0;
     var hi: usize = n;
+    // Every pass that continues narrows [lo, hi) by one.
     search: while (lo < hi) {
         for (lo..hi) |i| {
             if (single(a, b, lo, hi, i, n, 1)) |j| {

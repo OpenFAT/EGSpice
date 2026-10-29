@@ -23,12 +23,25 @@
 //! O(n^3) dense solves per frequency; device-side analytic F''/F''' stamps and
 //! a sparse frequency solve are the upgrade for large n.
 //!
-//! Cites ngspice distoan.c, cktdisto.c, dkerproc.c, dloadfns.c and
-//! diodset.c.
+//! The kernels themselves are `disto_kernels.zig`; this file is the sweep
+//! and the plots.
+//! In: a run context and the `.disto` card. Out: one of five plots.
+//! Cites ngspice distoan.c (:143), cktdisto.c (:115-158), dkerproc.c,
+//! dloadfns.c (:545) and diodset.c (:78).
+//!
+//! Contents:
+//! - `pub const Options = core.query.Disto`
+//! - `pub fn run(ctx: *const RunCtx, opts: Options) !Result`
+
 const std = @import("std");
-const root = @import("../types.zig");
+const assert = std.debug.assert;
 const dense_lu = @import("solver").dense_lu;
 const num = @import("core").numerics;
+const root = @import("../types.zig");
+const kernels_mod = @import("disto_kernels.zig");
+const bilinear = kernels_mod.bilinear;
+const scatter = kernels_mod.scatter;
+const cubic_step = kernels_mod.cubic_step;
 
 /// Query options, defined in core/query.zig.
 pub const Options = @import("core").query.Disto;
@@ -54,6 +67,101 @@ const Out = struct {
     twof1mf2: []f64 = &.{},
 };
 
+/// Contract entry: drive the `DISTOF1` card's branch (opts.drive_branch,
+/// resolved from the deck) and measure at opts.output_node.
+///
+/// One `.disto` card publishes three plots, one query each (`opts.plot`):
+/// ngspice's `DISTORTION - 2nd harmonic` and `- 3rd harmonic`, complex and
+/// point-major (frequency, probes...), and espice's `Distortion Analysis`
+/// summary, real and point-major (frequency, hd2, v1_mag, v2_mag).
+pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
+    const a = ctx.allocator;
+    const x_op = ctx.x_op;
+
+    var o = opts;
+    // ponytail: with no DISTOF1 in the deck ngspice solves an unexcited system
+    // and prints zeros; this falls back to the deck's drive source so a
+    // card-less `.disto` still reports something. Drop the fallback when a
+    // fixture wants ngspice's zeros.
+    if (o.drive_branch == root.GROUND and o.ac_source_node == root.GROUND)
+        o.drive_branch = ctx.source_branch;
+
+    const n_points: usize = o.sweep.count();
+    const scratch = ctx.scratch_allocator;
+    const cols = try scratch.alloc(f64, n_points * 4);
+    defer scratch.free(cols);
+    const freqs = cols[0..n_points];
+    const hd2_buf = cols[n_points .. 2 * n_points];
+    const v1_buf = cols[2 * n_points .. 3 * n_points];
+    const v2_buf = cols[3 * n_points ..];
+
+    var out: Out = .{ .freqs = freqs, .hd2 = hd2_buf, .v1_mag = v1_buf, .v2_mag = v2_buf };
+    const harmonic = o.plot != .summary;
+
+    const harm_buf = try scratch.alloc(f64, n_points * ctx.probes.len * 2);
+    defer scratch.free(harm_buf);
+    if (harmonic) {
+        out.probes = ctx.probes;
+        switch (o.plot) {
+            .second => out.h2 = harm_buf,
+            .third => out.h3 = harm_buf,
+            .f1pf2 => out.f1pf2 = harm_buf,
+            .f1mf2 => out.f1mf2 = harm_buf,
+            .twof1mf2 => out.twof1mf2 = harm_buf,
+            .summary => unreachable,
+        }
+    }
+
+    try sweep(ctx.circuit, x_op, out, o, scratch);
+
+    if (harmonic) {
+        const names = try root.probeNames(ctx, "frequency");
+        const ncols = names.len;
+        const data = try a.alloc(f64, n_points * ncols * 2);
+        for (0..n_points) |i| {
+            const row = data[i * ncols * 2 ..][0 .. ncols * 2];
+            row[0] = freqs[i];
+            row[1] = 0;
+            @memcpy(row[2..], harm_buf[i * ctx.probes.len * 2 ..][0 .. ctx.probes.len * 2]);
+        }
+        return .{
+            .plotname = switch (o.plot) {
+                .second => "DISTORTION - 2nd harmonic",
+                .third => "DISTORTION - 3rd harmonic",
+                .f1pf2 => "DISTORTION - IM: f1+f2",
+                .f1mf2 => "DISTORTION - IM: f1-f2",
+                .twof1mf2 => "DISTORTION - IM: 2f1-f2",
+                .summary => unreachable,
+            },
+            .varnames = names,
+            .is_complex = true,
+            .npoints = n_points,
+            .data = data,
+        };
+    }
+
+    const names = try a.dupe([]const u8, &.{ "frequency", "hd2", "v1_mag", "v2_mag" });
+    const ncols = names.len;
+    const data = try a.alloc(f64, n_points * ncols);
+    for (0..n_points) |i| {
+        const row = data[i * ncols ..][0..ncols];
+        row[0] = freqs[i];
+        row[1] = hd2_buf[i];
+        row[2] = v1_buf[i];
+        row[3] = v2_buf[i];
+    }
+
+    return .{
+        .plotname = "Distortion Analysis",
+        .varnames = names,
+        .is_complex = false,
+        .npoints = n_points,
+        .data = data,
+    };
+}
+
+// ---- private ----
+
 /// Harmonic responses across the frequency sweep, into `out`:
 ///   1. Linearize at the operating point: one eval(), dense G and C.
 ///   2. Second-order kernels d2F/dxa dxb = dG[.,a]/dx_b and d2Q = dC/dx, a
@@ -73,7 +181,7 @@ const Out = struct {
 /// phasor, so the 2f1 source term is ½·F''·V1². ngspice spells the ½ into the
 /// device coefficient (`g2 = 0.5 * gd / vte`, diodset.c:78) and contributes
 /// `g2 * V1²` (dloadfns.c:545 D1n2F1). The harmonic vectors are reported as
-/// sinusoid amplitudes, ×2 (DkerProc, dkerproc.c:43-52, `HARMONIC_SCALE`);
+/// sinusoid amplitudes, ×2 (DkerProc, dkerproc.c:43-52, `harmonic_scale`);
 /// the summary magnitudes are not rescaled. The planes are left at the
 /// operating point. Asserts that `hd2`, `v1_mag` and `v2_mag` match
 /// `freqs` in length, that each non-empty `h2`/`h3` holds
@@ -91,14 +199,16 @@ fn sweep(
     const hd2 = out.hd2;
     const v1_mag = out.v1_mag;
     const v2_mag = out.v2_mag;
-    std.debug.assert(hd2.len == freqs.len and v1_mag.len == freqs.len and v2_mag.len == freqs.len);
+    assert(hd2.len == freqs.len);
+    assert(v1_mag.len == freqs.len);
+    assert(v2_mag.len == freqs.len);
     const want_h2 = out.h2.len != 0;
     const want_h3 = out.h3.len != 0;
-    std.debug.assert(!want_h2 or out.h2.len == freqs.len * out.probes.len * 2);
-    std.debug.assert(!want_h3 or out.h3.len == freqs.len * out.probes.len * 2);
+    assert(!want_h2 or out.h2.len == freqs.len * out.probes.len * 2);
+    assert(!want_h3 or out.h3.len == freqs.len * out.probes.len * 2);
     const want_im3 = out.twof1mf2.len != 0;
     const two_tone = out.f1pf2.len != 0 or out.f1mf2.len != 0 or want_im3;
-    std.debug.assert(!two_tone or options.f2_ratio > 0);
+    assert(!two_tone or options.f2_ratio > 0);
 
     ckt.eval(x_op, 0);
 
@@ -112,69 +222,18 @@ fn sweep(
     ckt.denseG(g_dense);
     ckt.denseC(c_mat);
 
-    // d2[row][a][b] ≈ (G(x_op + eps*e_b) − G(x_op − eps*e_b))[row][a] / 2eps,
-    // and its charge twin from C, kept as the nonzero terms only. G and C
-    // share one pattern and both planes are 0 outside it, so only pattern
-    // slots can contribute. Central, not forward: the forward difference's
-    // O(eps·d3) error was the whole 2nd-harmonic residual of
-    // disto/bench_disto_diode_clipper.
-    const eps = options.fd_eps;
-    const inv_2eps = 0.5 / eps;
-    const nnz: usize = ckt.nnz;
-    const gc_plus = try allocator.alloc(f64, 2 * nnz);
-    defer allocator.free(gc_plus);
-    const g_plus = gc_plus[0..nnz];
-    const c_plus = gc_plus[nnz..];
-
+    // The second-order kernels, then the planes back at the operating point.
     const g_pert = try allocator.alloc(f64, 2 * n2);
     defer allocator.free(g_pert);
+
     const x_pert = try allocator.alloc(f64, n);
     defer allocator.free(x_pert);
 
-    var term_list: std.ArrayList(Term) = .empty;
-    defer term_list.deinit(allocator);
-    for (0..n) |b| {
-        if (b != 0) try ckt.checkpoint(.{ .phase = .prepare, .completed = b, .total = n });
-        @memcpy(x_pert, x_op[0..n]);
-        x_pert[b] += eps;
-        ckt.eval(x_pert, 0);
-        @memcpy(g_plus, ckt.g_vals[0..nnz]);
-        @memcpy(c_plus, ckt.c_vals[0..nnz]);
-        x_pert[b] = x_op[b] - eps;
-        ckt.eval(x_pert, 0);
-        for (0..n) |a| for (ckt.col_ptr[a]..ckt.col_ptr[a + 1]) |slot| {
-            // (-0 compares equal to 0 and is skipped; NaN is kept.)
-            const coeff = (g_plus[slot] - ckt.g_vals[slot]) * inv_2eps;
-            const qcoeff = (c_plus[slot] - ckt.c_vals[slot]) * inv_2eps;
-            if (coeff == 0 and qcoeff == 0) continue;
-            try term_list.append(allocator, .{ .row = ckt.row_idx[slot], .a = @intCast(a), .b = @intCast(b), .coeff = coeff, .qcoeff = qcoeff });
-        };
-    }
+    var kernels = try kernels_mod.Kernels.build(ckt, x_op, options.fd_eps, allocator);
+    defer kernels.deinit(allocator);
 
-    // Put the planes back at the operating point.
-    ckt.eval(x_op, 0);
-
-    // Row by row in (a, b) order: the per-frequency contractions add
-    // exactly the terms a dense d2 sweep with a zero skip would, in the same
-    // order, so the sums are bitwise the same. The sort is stable and b was
-    // appended in ascending order.
-    const terms = term_list.items;
-    std.sort.block(Term, terms, {}, struct {
-        fn lt(_: void, x: Term, y: Term) bool {
-            return x.row < y.row or (x.row == y.row and x.a < y.a);
-        }
-    }.lt);
-    const row_start = try allocator.alloc(u32, n + 1);
-    defer allocator.free(row_start);
-    {
-        var t: u32 = 0;
-        for (0..n) |row| {
-            row_start[row] = t;
-            while (t < terms.len and terms[t].row == row) t += 1;
-        }
-        row_start[n] = t;
-    }
-
+    const terms = kernels.terms;
+    const row_start = kernels.row_start;
     const nn = 2 * n;
     const a_work = try allocator.alloc(f64, nn * nn);
     defer allocator.free(a_work);
@@ -273,7 +332,7 @@ fn sweep(
         // K''(V1,V2) + ⅙·K'''(V1,V1,V1) at 3w: the 2f1·f1 beat through the
         // quadratic kernel plus the direct cube.
         if (want_h3) {
-            const d3v = cubicForms(ckt, x_op, v1_re, v1_im, cubic_step, 3.0 * omega, gc0, g_pert, g_minus, x_pert, cubic);
+            const d3v = kernels_mod.cubicForms(ckt, x_op, v1_re, v1_im, cubic_step, 3.0 * omega, gc0, g_pert, g_minus, x_pert, cubic);
             bilinear(terms, row_start, v1_re, v1_im, v2_re, v2_im, -1, 3.0 * omega, rhs_work);
             for (rhs_work[0..n], rhs_work[n..], d3v[0], d3v[1]) |*re, *im, d_re, d_im| {
                 re.* -= d_re / 6.0;
@@ -306,7 +365,7 @@ fn sweep(
                 bilinear(terms, row_start, v1_re, v1_im, v2m[0..n], v2m[n..], -1, w_im3, rhs_work);
                 bilinear(terms, row_start, v1b_re, v1b_cim, v2_re, v2_im, -1, w_im3, t3);
                 num.axpy(rhs_work, 1, t3);
-                mixedCubic(ckt, x_op, v1_re, v1_im, v1b_re, v1b_cim, cubic_step, w_im3, gc0, g_pert, g_minus, m_planes, x_pert, t3);
+                kernels_mod.mixedCubic(ckt, x_op, v1_re, v1_im, v1b_re, v1b_cim, cubic_step, w_im3, gc0, g_pert, g_minus, m_planes, x_pert, t3);
                 num.axpy(rhs_work, -0.5, t3);
                 try solveAt(ckt, x_op, g_dense, c_mat, w_im3, a_work, dyn_work, rhs_work, x_im);
                 scatter(out.twof1mf2, k, out.probes, x_im);
@@ -352,368 +411,6 @@ fn solveAt(ckt: *root.Circuit, x_op: []const f64, g_dense: []const f64, c_mat: [
     try dense_lu.factorizeSolve(2 * n, a_work, rhs, x);
 }
 
-/// One nonzero of the second-order kernels: d²F[row]/dx_a dx_b (`coeff`)
-/// and d²Q[row]/dx_a dx_b (`qcoeff`).
-/// `bilinear` reads 24 of its 32 bytes (`row` only orders the terms).
-const Term = struct { row: u32, a: u32, b: u32, coeff: f64, qcoeff: f64 };
-comptime {
-    std.debug.assert(@sizeOf(Term) == 32);
-}
-
-/// dst (stacked 2n) := scale·(F''(a, b) + jω·Q''(a, b)), the complex
-/// bilinear form of the second-order kernels `terms` (rows `row_start`) on
-/// phasors a and b given as real and imaginary parts, for a product at ω.
-fn bilinear(terms: []const Term, row_start: []const u32, a_re: []const f64, a_im: []const f64, b_re: []const f64, b_im: []const f64, scale: f64, omega: f64, dst: []f64) void {
-    const n = a_re.len;
-    for (0..n) |row| {
-        var re: f64 = 0;
-        var im: f64 = 0;
-        var q_re: f64 = 0;
-        var q_im: f64 = 0;
-        for (terms[row_start[row]..row_start[row + 1]]) |t| {
-            const p_re = a_re[t.a] * b_re[t.b] - a_im[t.a] * b_im[t.b];
-            const p_im = a_re[t.a] * b_im[t.b] + a_im[t.a] * b_re[t.b];
-            re += t.coeff * p_re;
-            im += t.coeff * p_im;
-            q_re += t.qcoeff * p_re;
-            q_im += t.qcoeff * p_im;
-        }
-        dst[row] = scale * (re - omega * q_im);
-        dst[n + row] = scale * (im + omega * q_re);
-    }
-}
-
-/// Point k's row of a harmonic plot (`Out.h2` layout): the stacked 2n
-/// solution `x` at every probe, as a sinusoid amplitude.
-fn scatter(dst: []f64, k: usize, probes: []const u32, x: []const f64) void {
-    const n = x.len / 2;
-    for (probes, 0..) |row, i| {
-        dst[(k * probes.len + i) * 2] = HARMONIC_SCALE * x[row];
-        dst[(k * probes.len + i) * 2 + 1] = HARMONIC_SCALE * x[n + row];
-    }
-}
-
-/// `dst` (stacked 2n) := K'''(a, a, c) = F'''(a, a, c) + jω·Q'''(a, a, c)
-/// for complex a = p + jq and c, without forming d3. With S(u) the second
-/// difference of the Jacobians along u (`secondDirDeriv`, scaled back from a
-/// unit direction), for each of F and Q
-///   d3(a, a, c) = (S(p) - S(q))·c + j·(S(p+q) - S(p) - S(q))·c,
-/// the second term being 2·d3(p, q, ·) by polarization. Twelve evals.
-/// `gc0` is the G/C pair at x_op (2n·n), `planes` 4n·n scratch,
-/// `g_work`/`g_tap` 2n·n, `x_work` n.
-fn mixedCubic(
-    ckt: *root.Circuit,
-    x_op: []const f64,
-    p: []const f64,
-    q: []const f64,
-    c_re: []const f64,
-    c_im: []const f64,
-    h: f64,
-    omega: f64,
-    gc0: []const f64,
-    g_work: []f64,
-    g_tap: []f64,
-    planes: []f64,
-    x_work: []f64,
-    dst: []f64,
-) void {
-    const n = p.len;
-    const n2 = n * n;
-    const m1 = planes[0 .. 2 * n2];
-    const m2 = planes[2 * n2 ..][0 .. 2 * n2];
-    @memset(planes, 0);
-    // (direction, weight into m1, weight into m2); p + q goes through x_work's tail.
-    const sum = dst[0..n];
-    for (sum, p, q) |*s, a, b| s.* = a + b;
-    const dirs = [_]struct { []const f64, f64, f64 }{ .{ p, 1, -1 }, .{ q, -1, -1 }, .{ sum, 0, 1 } };
-    for (dirs) |d| {
-        const nrm = norm(d[0]);
-        if (nrm == 0) continue;
-        secondDirDeriv(ckt, x_op, d[0], 1.0 / nrm, h, gc0, g_work, g_tap, x_work);
-        // a + (w·s2)·g, the rounding the per-element loop had.
-        const s2 = nrm * nrm;
-        num.axpy(m1, d[1] * s2, g_work);
-        num.axpy(m2, d[2] * s2, g_work);
-    }
-    // Per plane Re = m1·c_re - m2·c_im, Im = m1·c_im + m2·c_re; then F + jω·Q.
-    for (0..n) |row| {
-        var acc: [2][2]f64 = .{ .{ 0, 0 }, .{ 0, 0 } };
-        for (&acc, 0..) |*plane, k| {
-            const off = k * n2 + row * n;
-            for (m1[off..][0..n], m2[off..][0..n], c_re, c_im) |a, b, cr, ci| {
-                plane[0] += a * cr - b * ci;
-                plane[1] += a * ci + b * cr;
-            }
-        }
-        dst[row] = acc[0][0] - omega * acc[1][1];
-        dst[n + row] = acc[0][1] + omega * acc[1][0];
-    }
-}
-
-/// Step of the third-order kernel's second difference, along a unit
-/// direction (volts, for the node rows that dominate V1). It is not
-/// `fd_eps`: a second difference loses ε·|G|/h² to roundoff, and V1 is often
-/// dominated by a nearly linear output node, so the controlling voltage of
-/// the nonlinearity moves only a fraction of h. At h = 1e-6 that left the
-/// BJT common-emitter HD3 as roundoff, moving 1.5% for a 1e-5 K temperature
-/// change (disto/bench_disto_bjt_ce). The fourth-order stencil keeps the
-/// truncation at (h/Vt)^4/90, 2.4e-8 relative for an exponential at 1e-3 V;
-/// that deck's HD3 is flat to four digits for h from 1e-4 to 1e-2.
-const cubic_step: f64 = 1e-3;
-
-/// The harmonic plots report the sinusoid amplitude, twice the one-sided
-/// phasor the Volterra recursion solves for (DkerProc, dkerproc.c:43-52).
-/// The summary plot does not apply it.
-const HARMONIC_SCALE: f64 = 2.0;
-
-/// `K'''(V1, V1, V1)` at ω, F''' + jω·Q''', without forming d3, returned as
-/// `.{ re, im }`, each an n-vector aliasing `cubic`.
-///
-/// It is a directional second difference of the analytic Jacobians: for a
-/// unit direction u, with G(k) = G(x + k·h·u),
-///   S(u)[row,a] = (16(G(1) + G(−1)) − (G(2) + G(−2)) − 30G(0))[row,a] / 12h²
-///               = d3[row,a,·,·](u,u) + O(h⁴)
-/// and the cubic form T(w,u,u)[row] = Σ_a w[a]·S(u)[row,a] by symmetry of d3,
-/// likewise for C. With V1 = p + jq that is eight evals, S(p̂) and S(q̂), and
-/// per plane
-///   A = T(p,p,p) − 3T(p,q,q),  B = 3T(p,p,q) − T(q,q,q),
-/// so F'''(V1,V1,V1) = A_F + jB_F and the charge part adds jω(A_Q + jB_Q).
-/// `gc0` is the G/C pair at x_op (2n·n), `g_work`/`g_minus` 2n·n scratch,
-/// `x_work` n scratch, `cubic` 8n.
-fn cubicForms(
-    ckt: *root.Circuit,
-    x_op: []const f64,
-    p: []const f64,
-    q: []const f64,
-    h: f64,
-    omega: f64,
-    gc0: []const f64,
-    g_work: []f64,
-    g_minus: []f64,
-    x_work: []f64,
-    cubic: []f64,
-) [2][]const f64 {
-    const n = p.len;
-    const n2 = n * n;
-    @memset(cubic, 0);
-
-    // cubic[k·4n ..] holds plane k's T(p,p,p), T(p,q,q), T(p,p,q), T(q,q,q).
-    const norm_p = norm(p);
-    const norm_q = norm(q);
-    if (norm_p > 0) {
-        secondDirDeriv(ckt, x_op, p, 1.0 / norm_p, h, gc0, g_work, g_minus, x_work);
-        for (0..2) |k| {
-            const t = cubic[k * 4 * n ..];
-            contract(g_work[k * n2 ..][0..n2], p, 1.0 / norm_p, t[0..n]);
-            if (norm_q > 0) contract(g_work[k * n2 ..][0..n2], q, 1.0 / norm_q, t[2 * n ..][0..n]);
-        }
-    }
-    if (norm_q > 0) {
-        secondDirDeriv(ckt, x_op, q, 1.0 / norm_q, h, gc0, g_work, g_minus, x_work);
-        for (0..2) |k| {
-            const t = cubic[k * 4 * n ..];
-            contract(g_work[k * n2 ..][0..n2], q, 1.0 / norm_q, t[3 * n ..][0..n]);
-            if (norm_p > 0) contract(g_work[k * n2 ..][0..n2], p, 1.0 / norm_p, t[n..][0..n]);
-        }
-    }
-
-    // Undo the unit-direction normalization: every form is cubic in its inputs.
-    const ppp = norm_p * norm_p * norm_p;
-    const pqq = norm_p * norm_q * norm_q;
-    const ppq = norm_p * norm_p * norm_q;
-    const qqq = norm_q * norm_q * norm_q;
-    for (0..n) |row| {
-        var ab: [2][2]f64 = undefined;
-        for (&ab, 0..) |*plane, k| {
-            const t = cubic[k * 4 * n ..];
-            plane.* = .{
-                ppp * t[row] - 3.0 * pqq * t[n + row],
-                3.0 * ppq * t[2 * n + row] - qqq * t[3 * n + row],
-            };
-        }
-        cubic[row] = ab[0][0] - omega * ab[1][1];
-        cubic[n + row] = ab[0][1] + omega * ab[1][0];
-    }
-    return .{ cubic[0..n], cubic[n .. 2 * n] };
-}
-
-fn norm(v: []const f64) f64 {
-    return @sqrt(num.dot(v, v));
-}
-
-/// g_out := the second derivative of the G/C pair (2n·n, G first) along
-/// `scale·u` at x_op, by the five-point stencil in `cubicForms`. `g0` is the
-/// pair at x_op.
-fn secondDirDeriv(
-    ckt: *root.Circuit,
-    x_op: []const f64,
-    u: []const f64,
-    scale: f64,
-    h: f64,
-    g0: []const f64,
-    g_out: []f64,
-    g_tap: []f64,
-    x_work: []f64,
-) void {
-    const n = u.len;
-    const n2 = n * n;
-    // (k, weight) of the stencil's off-centre points.
-    const taps = [_]struct { f64, f64 }{ .{ 1, 16 }, .{ -1, 16 }, .{ 2, -1 }, .{ -2, -1 } };
-    num.scale(g_out[0..n2], -30.0, g0[0..n2]);
-    @memset(g_out[n2..], 0);
-    for (taps) |tap| {
-        const step = tap[0] * h * scale;
-        @memcpy(x_work, x_op[0..n]);
-        num.axpy(x_work[0..n], step, u);
-        ckt.eval(x_work, 0);
-        ckt.denseG(g_tap[0..n2]);
-        ckt.denseC(g_tap[n2..]);
-        num.axpy(g_out[0..n2], tap[1], g_tap[0..n2]);
-        // C as differences from C(0): exactly zero for a linear capacitor.
-        for (g_out[n2..], g_tap[n2..], g0[n2..]) |*out, c, c0| out.* += tap[1] * (c - c0);
-    }
-    const inv = 1.0 / (12.0 * h * h);
-    num.scale(g_out, inv, g_out);
-}
-
-/// dst[row] := (Σ_a s[row·n + a] · w[a]) · scale.
-fn contract(s: []const f64, w: []const f64, scale: f64, dst: []f64) void {
-    for (dst, 0..) |*d, row| d.* = num.dot(s[row * w.len ..][0..w.len], w) * scale;
-}
-
-/// Contract entry: drive the `DISTOF1` card's branch (opts.drive_branch,
-/// resolved from the deck) and measure at opts.output_node.
-///
-/// One `.disto` card publishes three plots, one query each (`opts.plot`):
-/// ngspice's `DISTORTION - 2nd harmonic` and `- 3rd harmonic`, complex and
-/// point-major (frequency, probes...), and espice's `Distortion Analysis`
-/// summary, real and point-major (frequency, hd2, v1_mag, v2_mag).
-pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
-    const a = ctx.allocator;
-    const x_op = ctx.x_op;
-
-    var o = opts;
-    // ponytail: with no DISTOF1 in the deck ngspice solves an unexcited system
-    // and prints zeros; this falls back to the deck's drive source so a
-    // card-less `.disto` still reports something. Drop the fallback when a
-    // fixture wants ngspice's zeros.
-    if (o.drive_branch == root.GROUND and o.ac_source_node == root.GROUND)
-        o.drive_branch = ctx.source_branch;
-
-    const n_points: usize = o.sweep.count();
-    const scratch = ctx.scratch_allocator;
-    const cols = try scratch.alloc(f64, n_points * 4);
-    defer scratch.free(cols);
-    const freqs = cols[0..n_points];
-    const hd2_buf = cols[n_points .. 2 * n_points];
-    const v1_buf = cols[2 * n_points .. 3 * n_points];
-    const v2_buf = cols[3 * n_points ..];
-
-    var out: Out = .{ .freqs = freqs, .hd2 = hd2_buf, .v1_mag = v1_buf, .v2_mag = v2_buf };
-    const harmonic = o.plot != .summary;
-
-    const harm_buf = try scratch.alloc(f64, n_points * ctx.probes.len * 2);
-    defer scratch.free(harm_buf);
-    if (harmonic) {
-        out.probes = ctx.probes;
-        switch (o.plot) {
-            .second => out.h2 = harm_buf,
-            .third => out.h3 = harm_buf,
-            .f1pf2 => out.f1pf2 = harm_buf,
-            .f1mf2 => out.f1mf2 = harm_buf,
-            .twof1mf2 => out.twof1mf2 = harm_buf,
-            .summary => unreachable,
-        }
-    }
-
-    try sweep(ctx.circuit, x_op, out, o, scratch);
-
-    if (harmonic) {
-        const names = try root.probeNames(ctx, "frequency");
-        const ncols = names.len;
-        const data = try a.alloc(f64, n_points * ncols * 2);
-        for (0..n_points) |i| {
-            const row = data[i * ncols * 2 ..][0 .. ncols * 2];
-            row[0] = freqs[i];
-            row[1] = 0;
-            @memcpy(row[2..], harm_buf[i * ctx.probes.len * 2 ..][0 .. ctx.probes.len * 2]);
-        }
-        return .{
-            .plotname = switch (o.plot) {
-                .second => "DISTORTION - 2nd harmonic",
-                .third => "DISTORTION - 3rd harmonic",
-                .f1pf2 => "DISTORTION - IM: f1+f2",
-                .f1mf2 => "DISTORTION - IM: f1-f2",
-                .twof1mf2 => "DISTORTION - IM: 2f1-f2",
-                .summary => unreachable,
-            },
-            .varnames = names,
-            .is_complex = true,
-            .npoints = n_points,
-            .data = data,
-        };
-    }
-
-    const names = try a.dupe([]const u8, &.{ "frequency", "hd2", "v1_mag", "v2_mag" });
-    const ncols = names.len;
-    const data = try a.alloc(f64, n_points * ncols);
-    for (0..n_points) |i| {
-        const row = data[i * ncols ..][0..ncols];
-        row[0] = freqs[i];
-        row[1] = hd2_buf[i];
-        row[2] = v1_buf[i];
-        row[3] = v2_buf[i];
-    }
-
-    return .{
-        .plotname = "Distortion Analysis",
-        .varnames = names,
-        .is_complex = false,
-        .npoints = n_points,
-        .data = data,
-    };
-}
-
-test "bilinear: complex form matches a dense per-term oracle" {
-    // Two rows over n = 2; row 1 has no terms and must come out zero.
-    const terms = [_]Term{
-        .{ .row = 0, .a = 0, .b = 1, .coeff = 2, .qcoeff = 0.5 },
-        .{ .row = 0, .a = 1, .b = 1, .coeff = -3, .qcoeff = 0 },
-    };
-    const row_start = [_]u32{ 0, 2, 2 };
-    const a_re = [_]f64{ 1, 2 };
-    const a_im = [_]f64{ 0.5, -1 };
-    const b_re = [_]f64{ 3, -2 };
-    const b_im = [_]f64{ 1, 0.25 };
-    var dst: [4]f64 = undefined;
-    bilinear(&terms, &row_start, &a_re, &a_im, &b_re, &b_im, -0.5, 10, &dst);
-
-    const C = std.math.Complex(f64);
-    var f = C.init(0, 0);
-    var q = C.init(0, 0);
-    for (terms) |t| {
-        const p = C.init(a_re[t.a], a_im[t.a]).mul(C.init(b_re[t.b], b_im[t.b]));
-        f = f.add(p.mul(C.init(t.coeff, 0)));
-        q = q.add(p.mul(C.init(t.qcoeff, 0)));
-    }
-    const want = f.add(C.init(0, 10).mul(q)).mul(C.init(-0.5, 0));
-    try std.testing.expectApproxEqRel(want.re, dst[0], 1e-15);
-    try std.testing.expectApproxEqRel(want.im, dst[2], 1e-15);
-    try std.testing.expectEqual(@as(f64, 0), dst[1]);
-    try std.testing.expectEqual(@as(f64, 0), dst[3]);
-}
-
-test "contract: row-major matrix-vector product, then scaled" {
-    const s = [_]f64{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-    const w = [_]f64{ 1, 0, -1 };
-    var dst: [3]f64 = undefined;
-    contract(&s, &w, 2, &dst);
-    try std.testing.expectEqualSlices(f64, &.{ -4, -4, -4 }, &dst);
-}
-
-test "scatter: probes land point-major with (re, im) adjacent, doubled" {
-    var dst: [8]f64 = @splat(0);
-    const x = [_]f64{ 1, 2, 3, 10, 20, 30 }; // re | im, n = 3
-    scatter(&dst, 1, &.{ 2, 0 }, &x);
-    try std.testing.expectEqualSlices(f64, &.{ 0, 0, 0, 0, 6, 60, 2, 20 }, &dst);
+test {
+    _ = kernels_mod;
 }

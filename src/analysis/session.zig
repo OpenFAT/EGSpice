@@ -3,7 +3,26 @@
 //! one query, an implicit OP prerequisite included; numerical state lives in
 //! the row's Executor. Cites #13 (the C API's calling contract) and #154
 //! (the `.sens` schema).
+//!
+//! Contents (every `pub` name, the Session methods included): `Failure`,
+//! `PointError`, `QueryId`, `Status`, `terminal`, `Scope`, `Limits`,
+//! `Preview`, `PrintOptions`, `QueryInfo`, `Advance`, `Session`, `append`,
+//! `appendAt`, `JobRef`, `intern`, `jobAt`, `kindAt`, `opKey`, `addRow`,
+//! `markFinal`, `final`, `refuse`, `addTemplate`, `makeExecutor`, `gather`,
+//! `peerOf`, `lead`, `gpuLaned`, `staticWide`, `gatherWide`, `shareWithHost`,
+//! `settlePeers`, `launch`, `settle`, `laneDone`, `assemble`, `readerDone`,
+//! `releaseIfRead`, `advanceReady`, `event`, `requeue`, `nextReady`,
+//! `follow`, `followOne`, `runAll`, `advance`, `advanceDone`, `print`,
+//! `containsComponent`, `printQuery`, `init`, `markLastTemplateReader`,
+//! `StreamOpener`, `streamTo`, `deinit`, `count`, `index`, `effectiveStatus`,
+//! `info`, `validateScope`, `contains`, `ready`, `readyCount`,
+//! `readyQueries`, `validateReady`, `templateOf`, `finished`, `released`,
+//! `outputIndex`, `release`, `failure`, `failureFrom`, `query`, `result`,
+//! `operatingPoint`, `Pool`, `init`, `deinit`, `add`, `fill`, `wait`,
+//! `schemaOf`
+
 const std = @import("std");
+const assert = std.debug.assert;
 const core = @import("core");
 const requests = core.query;
 const Deck = core.Deck;
@@ -12,9 +31,18 @@ const ParamRef = @import("device").abi.ParamRef;
 const execution = @import("executor.zig");
 const progress = @import("worker.zig");
 const types = @import("types.zig");
-const temp_sweep = @import("sweep/temp_sweep.zig");
 const Result = types.Result;
-const validateDeck = @import("core").validate.validateDeck;
+const jobs_mod = @import("session_jobs.zig");
+const session_build = @import("session_build.zig");
+const session_sched = @import("session_sched.zig");
+const session_print = @import("session_print.zig");
+const schema = @import("schema.zig");
+const none = jobs_mod.none;
+const no_output = jobs_mod.no_output;
+const no_variant = jobs_mod.no_variant;
+const OpIndex = jobs_mod.OpIndex;
+const JobIndex = jobs_mod.JobIndex;
+const Quantum = progress.Quantum;
 
 /// Why a query ended without a result: its run failed (`QueryError`,
 /// `error.QueryCancelled` included), its executor could not be built
@@ -32,7 +60,6 @@ pub const PointError = error{ TopologyChanged, ModelBinNotFound, NonFiniteParame
 
 /// A row index into the session, stable for its lifetime.
 pub const QueryId = requests.QueryId;
-const none = requests.invalid_query;
 
 /// Lifecycle of one query row.
 pub const Status = enum(u8) {
@@ -57,7 +84,6 @@ pub const Scope = union(enum) { all, query: QueryId, component: u32 };
 /// How many ready queries one scheduling round may run at once, and how far
 /// each runs.
 pub const Limits = struct { max_parallel: u16 = 1, quantum: Quantum = .checkpoint };
-const Quantum = @import("worker.zig").Quantum;
 /// Which advancement `print` previews.
 pub const Preview = union(enum) { run_all, advance: QueryId, advance_ready: []const QueryId };
 /// What `Session.print` shows; `limits` previews a concurrency cap.
@@ -91,47 +117,6 @@ pub const Advance = struct {
     progress: ?progress.Event = null,
     failure: ?Failure = null,
 };
-const Row = struct {
-    /// Index into `Session.jobs`; a lane row names its split query's.
-    job: u32,
-    /// The `tol.variant` the row runs, which `jobs` leaves out so a
-    /// sweep's points share one entry; `no_variant` for none.
-    variant: u32 = no_variant,
-    dependency: QueryId = none,
-    component: u32,
-    requested: bool,
-    status: Status = .pending,
-    progress: ?progress.Event = null,
-    failure: ?Failure = null,
-    executor: ?*execution.Executor = null,
-    /// The circuit the query instantiates: 0 for `topology`, k for
-    /// `templates[k - 1]`.
-    template: u32 = 0,
-    /// Rows that read this one's device state (its dependents) and have
-    /// not yet stopped a first quantum, which is when their copy is done.
-    readers: u32 = 0,
-    /// The newest dependent and the next older one sharing `dependency`.
-    child: QueryId = none,
-    sibling: QueryId = none,
-    /// A quantum is in flight; `settle` collects it.
-    running: bool = false,
-    /// A query split into its lanes (`splitLanes`): its lane rows are the
-    /// `lanes` rows just before it. It never runs; `assemble` gathers its
-    /// result once every lane has ended.
-    lanes: u32 = 0,
-    /// On a lane row, the split query it belongs to.
-    owner: QueryId = none,
-    /// `release` dropped its executor and result.
-    released: bool = false,
-    /// No query appended later reads its state (`markFinal`), so it is
-    /// treated as under `Config.final_plan`.
-    final: bool = false,
-    /// Its position in `outputs`, or `no_output` when not requested.
-    output: u32 = no_output,
-};
-
-const no_output = std.math.maxInt(u32);
-const no_variant = std.math.maxInt(u32);
 
 /// The query graph over one prepared circuit and deck, both borrowed for the
 /// session's lifetime. `QueryId` is the row index; every call that takes one
@@ -190,6 +175,49 @@ pub const Session = struct {
     /// Runs on the thread that calls `Pool.fill`.
     stream_opener: ?StreamOpener = null,
 
+    /// `session_build.zig`.
+    pub const append = session_build.append;
+    pub const appendAt = session_build.appendAt;
+    pub const JobRef = session_build.JobRef;
+    pub const intern = session_build.intern;
+    pub const jobAt = session_build.jobAt;
+    pub const kindAt = session_build.kindAt;
+    pub const opKey = session_build.opKey;
+    pub const addRow = session_build.addRow;
+    pub const markFinal = session_build.markFinal;
+    pub const final = session_build.final;
+    pub const refuse = session_build.refuse;
+    pub const addTemplate = session_build.addTemplate;
+    /// `session_sched.zig`.
+    pub const makeExecutor = session_sched.makeExecutor;
+    pub const gather = session_sched.gather;
+    pub const peerOf = session_sched.peerOf;
+    pub const lead = session_sched.lead;
+    pub const gpuLaned = session_sched.gpuLaned;
+    pub const staticWide = session_sched.staticWide;
+    pub const gatherWide = session_sched.gatherWide;
+    pub const shareWithHost = session_sched.shareWithHost;
+    pub const settlePeers = session_sched.settlePeers;
+    pub const launch = session_sched.launch;
+    pub const settle = session_sched.settle;
+    pub const laneDone = session_sched.laneDone;
+    pub const assemble = session_sched.assemble;
+    pub const readerDone = session_sched.readerDone;
+    pub const releaseIfRead = session_sched.releaseIfRead;
+    pub const advanceReady = session_sched.advanceReady;
+    pub const event = session_sched.event;
+    pub const requeue = session_sched.requeue;
+    pub const nextReady = session_sched.nextReady;
+    pub const follow = session_sched.follow;
+    pub const followOne = session_sched.followOne;
+    pub const runAll = session_sched.runAll;
+    pub const advance = session_sched.advance;
+    pub const advanceDone = session_sched.advanceDone;
+    /// `session_print.zig`.
+    pub const print = session_print.print;
+    pub const containsComponent = session_print.containsComponent;
+    pub const printQuery = session_print.printQuery;
+
     /// An empty session. Allocates nothing; `topology` and `deck` must
     /// outlive it.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, topology: *const Circuit, deck: *const Deck, config: execution.Config) Session {
@@ -200,7 +228,7 @@ pub const Session = struct {
     /// (`last_template_reader`). Asserts that nothing has been appended, so
     /// every row sees the same answer (#13).
     pub fn markLastTemplateReader(self: *Session) void {
-        std.debug.assert(self.rows.len == 0);
+        assert(self.rows.len == 0);
         self.last_template_reader = true;
     }
 
@@ -218,9 +246,9 @@ pub const Session = struct {
     /// Asserts that no other query streams and that `id` is a tran or AC row.
     pub fn streamTo(self: *Session, id: QueryId, writer: *std.Io.Writer) !bool {
         const i = try self.index(id);
-        std.debug.assert(self.stream == null);
+        assert(self.stream == null);
         const job = self.kindAt(i);
-        std.debug.assert(job == .tran or job == .ac);
+        assert(job == .tran or job == .ac);
         if (self.rows.items(.executor)[i] != null) return false;
         self.stream = .{ .id = id, .writer = writer };
         return true;
@@ -247,233 +275,18 @@ pub const Session = struct {
         self.* = undefined;
     }
 
-    /// Adds `jobs`, writing their ids to `ids`, and returns `jobs.len`. Each
-    /// non-OP job shares an existing matching OP prerequisite or gets a new
-    /// one. All-or-nothing: every job is validated and deep-copied before any
-    /// row or id is published. Fails with `error.BufferTooSmall` when `ids`
-    /// is shorter than `jobs`, a validation error for the first bad job, or
-    /// `error.TooManyQueries` past u32 rows.
-    pub fn append(self: *Session, jobs: []const requests.Query, ids: []QueryId) !usize {
-        return self.appendAt(jobs, null, ids);
-    }
-
-    /// `append` with job k instantiating `templates[k]` (as `template`
-    /// numbers them) instead of `template`, so one call can hold points on
-    /// several templates. Asserts `templates` matches `jobs` in length.
-    pub fn appendAt(self: *Session, jobs: []const requests.Query, templates: ?[]const u32, ids: []QueryId) !usize {
-        if (templates) |t| std.debug.assert(t.len == jobs.len);
-        if (ids.len < jobs.len) return error.BufferTooSmall;
-        if (jobs.len == 0) return 0;
-        // Each job adds at least its own row, at most also an OP and its
-        // lane rows; the first bound needs only the length (#55).
-        if (jobs.len >= std.math.maxInt(u32) - self.rows.len) return error.TooManyQueries;
-        var added: usize = 0;
-        for (jobs) |job| added = std.math.add(usize, added, 2 + @as(usize, splitLanes(job))) catch return error.TooManyQueries;
-        const max_rows = std.math.add(usize, self.rows.len, added) catch return error.TooManyQueries;
-        if (max_rows >= std.math.maxInt(u32)) return error.TooManyQueries;
-        const old_len = self.rows.len;
-        for (jobs) |job| try validateDeck(job, self.topology.n, self.deck);
-        // Everything that can fail first: interning, then room for every
-        // row, OP index entry and output, so the rows below change
-        // infallibly. A failed append leaves at most unread `jobs` entries.
-        const refs = try self.allocator.alloc(JobRef, jobs.len);
-        defer self.allocator.free(refs);
-        for (jobs, refs) |job, *r| {
-            const stripped, const variant = withoutVariant(job);
-            r.* = .{
-                .job = try self.intern(stripped),
-                .variant = variant,
-                .op = if (prerequisite(stripped)) |op| try self.intern(.{ .op = op }) else no_variant,
-            };
-        }
-        try self.rows.ensureTotalCapacity(self.allocator, max_rows);
-        try self.ops.ensureUnusedCapacity(self.allocator, @intCast(max_rows - old_len));
-        try self.outputs.ensureUnusedCapacity(self.allocator, jobs.len);
-        try self.urgent.ensureTotalCapacity(self.allocator, max_rows);
-        var roots: u32 = 0;
-        for (refs, ids[0..jobs.len], 0..) |r, *id, k| {
-            const template = if (templates) |t| t[k] else self.template;
-            std.debug.assert(template <= self.templates.items.len);
-            const job = self.jobs.items[r.job];
-            // An explicit OP can expose an already shared prerequisite product.
-            if (job == .op) {
-                if (self.ops.get(.{ .template = template, .job = r.job, .variant = r.variant })) |existing| {
-                    const e = @backingInt(existing);
-                    id.* = existing;
-                    if (!self.rows.items(.requested)[e]) {
-                        self.rows.items(.requested)[e] = true;
-                        self.rows.items(.output)[e] = @intCast(self.outputs.items.len);
-                        self.outputs.appendAssumeCapacity(existing);
-                    }
-                    continue;
-                }
-            }
-            const n_lanes = splitLanes(job);
-            for (0..n_lanes) |_| _ = self.addRow(r, true, template, false, &roots);
-            id.* = self.addRow(r, false, template, true, &roots);
-            if (n_lanes != 0) {
-                const g = @backingInt(id.*);
-                self.rows.items(.lanes)[g] = n_lanes;
-                for (g - n_lanes..g) |l| {
-                    std.debug.assert(self.rows.items(.dependency)[l] == self.rows.items(.dependency)[g]);
-                    self.rows.items(.owner)[l] = id.*;
-                }
-            }
-        }
-        self.root_readers += roots;
-        return jobs.len;
-    }
-
-    /// One appended job: its `jobs` entry, its variant, and its
-    /// prerequisite OP's entry (`no_variant` without one).
-    const JobRef = struct { job: u32, variant: u32, op: u32 };
-
-    /// `job`'s index in `jobs`, appending a deep copy when no equal entry
-    /// exists (slices by content, floats by bits).
-    fn intern(self: *Session, job: requests.Query) !u32 {
-        const jobs = self.jobs.items;
-        const got = try self.job_index.getOrPutContextAdapted(self.allocator, job, JobKey{ .jobs = jobs }, .{ .jobs = jobs });
-        if (got.found_existing) return got.key_ptr.*;
-        errdefer self.job_index.removeByPtr(got.key_ptr);
-        try self.jobs.ensureUnusedCapacity(self.allocator, 1);
-        const k: u32 = @intCast(self.jobs.items.len);
-        self.jobs.appendAssumeCapacity(try copyValue(self.job_arena.allocator(), job));
-        got.key_ptr.* = k;
-        return k;
-    }
-
-    /// Row `i`'s query as it was appended: its variant set and, on a lane
-    /// row, its lane.
-    fn jobAt(self: *const Session, i: usize) requests.Query {
-        var job = self.jobs.items[self.rows.items(.job)[i]];
-        const v = self.rows.items(.variant)[i];
-        switch (job) {
-            inline else => |*o| o.tol.variant = if (v == no_variant) null else v,
-        }
-        const owner = self.rows.items(.owner)[i];
-        if (owner != none) {
-            const g = @backingInt(owner);
-            const lane: u32 = @intCast(i - (g - self.rows.items(.lanes)[g]));
-            switch (job) {
-                inline .mc, .temp => |*o| o.lane = lane,
-                else => unreachable, // else: only `.mc` and `.temp` split (`splitLanes`)
-            }
-        }
-        return job;
-    }
-
-    fn kindAt(self: *const Session, i: usize) requests.Kind {
-        return self.jobs.items[self.rows.items(.job)[i]];
-    }
-
-    fn opKey(self: *const Session, i: usize) OpKey {
-        return .{ .template = self.rows.items(.template)[i], .job = self.rows.items(.job)[i], .variant = self.rows.items(.variant)[i] };
-    }
-
-    /// Appends job `r` after the OP it needs, shared when one matches, and
-    /// returns its id; a `requested` row joins `outputs`. A split query
-    /// (`splitLanes`) reads its OP only through its `lane` rows, so it is
-    /// not one of the OP's readers. Infallible: `appendAt` reserved every
-    /// row, OP index entry and output first.
-    fn addRow(self: *Session, r: JobRef, lane: bool, template: u32, requested: bool, roots: *u32) QueryId {
-        const job = self.jobs.items[r.job];
-        const split = if (lane) 0 else splitLanes(job);
-        var dependency = none;
-        if (r.op != no_variant) {
-            const key: OpKey = .{ .template = template, .job = r.op, .variant = r.variant };
-            dependency = self.ops.get(key) orelse blk: {
-                const dep: QueryId = @fromBackingInt(@intCast(self.rows.len));
-                self.rows.appendAssumeCapacity(.{
-                    .job = r.op,
-                    .variant = r.variant,
-                    .component = @backingInt(dep),
-                    .requested = false,
-                    .template = template,
-                });
-                self.ops.putAssumeCapacity(key, dep);
-                roots.* += 1;
-                break :blk dep;
-            };
-        }
-        const id: QueryId = @fromBackingInt(@intCast(self.rows.len));
-        var sibling = none;
-        if (dependency == none) {
-            std.debug.assert(split == 0);
-            roots.* += 1;
-        } else if (split == 0) {
-            const d = @backingInt(dependency);
-            self.rows.items(.readers)[d] += 1;
-            sibling = self.rows.items(.child)[d];
-            self.rows.items(.child)[d] = id;
-        }
-        self.rows.appendAssumeCapacity(.{
-            .job = r.job,
-            .variant = r.variant,
-            .dependency = dependency,
-            .component = if (dependency == none) @backingInt(id) else self.rows.items(.component)[@backingInt(dependency)],
-            .requested = requested,
-            .template = template,
-            .sibling = sibling,
-            .output = if (requested) @intCast(self.outputs.items.len) else no_output,
-        });
-        if (requested) self.outputs.appendAssumeCapacity(id);
-        if (job == .op) self.ops.putAssumeCapacity(.{ .template = template, .job = r.job, .variant = r.variant }, id);
-        return id;
-    }
-
-    /// Marks query `id` and its prerequisite final: the caller appends
-    /// nothing that reads their state (a point of `Problem.append_points`
-    /// owns its OP), so a dependent may take the OP's state instead of
-    /// copying it and each circuit is freed once nothing reads it, as under
-    /// `Config.final_plan`. Results stay.
-    pub fn markFinal(self: *Session, id: QueryId) !void {
-        const i = try self.index(id);
-        self.rows.items(.final)[i] = true;
-        const dep = self.rows.items(.dependency)[i];
-        if (dep != none) self.rows.items(.final)[@backingInt(dep)] = true;
-    }
-
-    fn final(self: *const Session, i: usize) bool {
-        return self.config.final_plan or self.rows.items(.final)[i];
-    }
-
-    /// Ends pending query `id`, and its pending prerequisite, with `err`
-    /// before anything runs: a point `Problem.append_points` could not set.
-    /// The prerequisite must be the query's own (no other row reads it).
-    pub fn refuse(self: *Session, id: QueryId, err: PointError) !void {
-        const i = try self.index(id);
-        const dep = self.rows.items(.dependency)[i];
-        for ([_]QueryId{ id, dep }) |row| if (row != none) {
-            const r = @backingInt(row);
-            std.debug.assert(self.rows.items(.executor)[r] == null);
-            self.rows.items(.status)[r] = .failed;
-            self.rows.items(.failure)[r] = err;
-        };
-    }
-
-    /// Makes `circuit` the template of every row appended from now on
-    /// (`template`, which a caller may point back at an earlier one).
-    /// Asserts that it has `topology`'s node count and pattern size; the
-    /// caller keeps it alive for the session's lifetime.
-    pub fn addTemplate(self: *Session, circuit: *const Circuit) !void {
-        std.debug.assert(circuit.n == self.topology.n);
-        std.debug.assert(circuit.nnz == self.topology.nnz);
-        try self.templates.append(self.allocator, circuit);
-        self.template = @intCast(self.templates.items.len);
-    }
-
     /// Returns the row count, implicit prerequisites included.
     pub fn count(self: *const Session) u32 {
         return @intCast(self.rows.len);
     }
 
-    fn index(self: *const Session, id: QueryId) !usize {
+    pub fn index(self: *const Session, id: QueryId) !usize {
         const i = @backingInt(id);
         if (i >= self.rows.len) return error.InvalidQuery;
         return i;
     }
 
-    fn effectiveStatus(self: *const Session, i: usize) Status {
+    pub fn effectiveStatus(self: *const Session, i: usize) Status {
         const status = self.rows.items(.status)[i];
         if (status.terminal()) return status;
         const dep = self.rows.items(.dependency)[i];
@@ -502,7 +315,7 @@ pub const Session = struct {
         };
     }
 
-    fn validateScope(self: *const Session, scope: Scope) !void {
+    pub fn validateScope(self: *const Session, scope: Scope) !void {
         switch (scope) {
             .all => {},
             .query => |id| _ = try self.index(id),
@@ -513,7 +326,7 @@ pub const Session = struct {
         }
     }
 
-    fn contains(self: *const Session, scope: Scope, i: usize) bool {
+    pub fn contains(self: *const Session, scope: Scope, i: usize) bool {
         return switch (scope) {
             .all => true,
             .component => |component| self.rows.items(.component)[i] == component,
@@ -522,7 +335,7 @@ pub const Session = struct {
         };
     }
 
-    fn ready(self: *const Session, i: usize) bool {
+    pub fn ready(self: *const Session, i: usize) bool {
         if (self.rows.items(.lanes)[i] != 0 or self.effectiveStatus(i).terminal()) return false;
         const dep = self.rows.items(.dependency)[i];
         return dep == none or self.rows.items(.status)[@backingInt(dep)] == .complete;
@@ -556,7 +369,7 @@ pub const Session = struct {
         return n;
     }
 
-    fn validateReady(self: *const Session, ids: []const QueryId, limits: Limits) !void {
+    pub fn validateReady(self: *const Session, ids: []const QueryId, limits: Limits) !void {
         if (limits.max_parallel == 0) return error.InvalidConcurrency;
         for (ids, 0..) |id, pos| {
             const i = try self.index(id);
@@ -566,485 +379,15 @@ pub const Session = struct {
     }
 
     /// The circuit row `i` instantiates (`Row.template`).
-    fn templateOf(self: *const Session, i: usize) *const Circuit {
+    pub fn templateOf(self: *const Session, i: usize) *const Circuit {
         const t = self.rows.items(.template)[i];
         return if (t == 0) self.topology else self.templates.items[t - 1];
-    }
-
-    fn makeExecutor(self: *Session, i: usize) !void {
-        if (self.rows.items(.executor)[i] != null) return;
-        const dep = self.rows.items(.dependency)[i];
-        const initial = if (dep == none) null else self.rows.items(.executor)[@backingInt(dep)];
-        // Query `i` may take its source's state only as its last reader,
-        // once every other reader has stopped a quantum: their copies are done.
-        const last = if (dep == none) self.last_template_reader and self.root_readers == 1 else self.rows.items(.readers)[@backingInt(dep)] == 1;
-        self.rows.items(.executor)[i] = try execution.Executor.create(
-            self.allocator,
-            self.io,
-            self.templateOf(i),
-            self.deck,
-            self.jobAt(i),
-            initial,
-            (if (dep == none) self.config.final_plan else self.final(@backingInt(dep))) and last,
-            self.config,
-        );
-        if (self.stream) |s| if (@backingInt(s.id) == i) {
-            self.rows.items(.executor)[i].?.stream = s.writer;
-        };
-        self.rows.items(.executor)[i].?.row = @intCast(i);
-        if (self.config.timing_in_depth)
-            self.rows.items(.executor)[i].?.controller.options.timing_query = @fromBackingInt(@intCast(i));
-    }
-
-    /// The grouping pass (lane-batched-simulation.md §2): makes ready `.op`,
-    /// `batchable` row `i` (`.op`, `.dc`, `.tran`, `.pss`, an AC-family kind or
-    /// a `.mc`/`.temp` lane row) the leader of a lane batch with up to
-    /// `lane_width - 1` other ready, never-started rows of its kind on its
-    /// template, with a prerequisite exactly when it has one, whose options
-    /// differ at most in `tol.variant`, `tol.temp_c` and a lane row's lane,
-    /// taken from the queue ahead.
-    /// Each lane is bitwise its query run alone, so grouping is free to
-    /// follow scheduling order. A row whose executor cannot be built is
-    /// left to run alone.
-    /// ponytail: looks `lane_window` rows into `urgent` and the queue, not
-    /// all of them; a sweep's rows are adjacent in row order.
-    fn gather(self: *Session, i: usize) void {
-        const lane_width = execution.lane_width;
-        const config = self.config;
-        if (config.gpu_lanes and self.gpuLaned(i)) return self.gatherWide(i);
-        if (!execution.lanesOn(config) or config.backend != .cpu or config.device_threads != 1 or config.timing_in_depth) return;
-        const ji = self.jobAt(i);
-        if (!batchable(ji) or self.rows.items(.executor)[i] != null) return;
-        var peers: [lane_width - 1]usize = undefined;
-        var n: usize = 0;
-        // A finished batch's dependents wait in `urgent`, newest last.
-        const urgent = self.urgent.items;
-        const from_urgent = @min(urgent.len, lane_window);
-        const queued = self.queue.items[@min(self.queue_head, self.queue.items.len)..];
-        for (0..from_urgent + @min(queued.len, lane_window)) |at| {
-            if (n == peers.len) break;
-            const j = if (at < from_urgent) urgent[urgent.len - 1 - at] else queued[at - from_urgent];
-            if (!self.peerOf(i, ji, j)) continue;
-            peers[n] = j;
-            n += 1;
-        }
-        _ = self.lead(i, peers[0..n]);
-    }
-
-    /// Row `j` may join leader `i` (whose query is `ji`) in a lane batch: a
-    /// ready, never-started row other than `i` on its template, with a
-    /// prerequisite exactly when `i` has one, and `sameLaneJob` options.
-    fn peerOf(self: *const Session, i: usize, ji: requests.Query, j: usize) bool {
-        const rows = self.rows.slice();
-        return j != i and self.ready(j) and !rows.items(.running)[j] and rows.items(.executor)[j] == null and
-            rows.items(.template)[j] == rows.items(.template)[i] and
-            (rows.items(.dependency)[j] == none) == (rows.items(.dependency)[i] == none) and
-            sameLaneJob(ji, self.jobAt(j));
-    }
-
-    /// Makes row `i` the leader of `peers` (rows): builds every executor
-    /// and marks each peer running. A peer whose executor cannot be built
-    /// is left out to run alone. Null, with no peer taken, when `peers` is
-    /// empty or the leader or its list cannot be built.
-    fn lead(self: *Session, i: usize, peers: []const usize) ?*execution.Executor {
-        if (peers.len == 0) return null;
-        self.makeExecutor(i) catch return null;
-        const leader = self.rows.items(.executor)[i].?;
-        const list = leader.work.allocator().alloc(*execution.Executor, peers.len) catch return null;
-        var taken: usize = 0;
-        for (peers) |j| {
-            self.makeExecutor(j) catch continue;
-            list[taken] = self.rows.items(.executor)[j].?;
-            taken += 1;
-            self.rows.items(.running)[j] = true;
-        }
-        leader.peers = list[0..taken];
-        return leader;
-    }
-
-    /// Row i is a never-built transient, shooting, HB, AC-family or
-    /// `staticWide` row: under `Config.gpu_lanes` it gathers as GPU lanes.
-    /// A row `shareWithHost` gave the CPU already has its executor.
-    fn gpuLaned(self: *const Session, i: usize) bool {
-        const kind = self.kindAt(i);
-        return (kind == .tran or kind == .pss or kind == .hb or execution.gpuFreqLaneKind(kind) or self.staticWide(i)) and
-            self.rows.items(.executor)[i] == null;
-    }
-
-    /// Row i is an operating point or `.dc` sweep that batches as GPU
-    /// lanes (`Config.gpu_static`).
-    fn staticWide(self: *const Session, i: usize) bool {
-        const job = self.kindAt(i);
-        return self.config.gpu_static and (job == .op or job == .dc);
-    }
-
-    /// The GPU lane form of `gather`: up to `gpu_lane_cap - 1` ready,
-    /// never-started transient, shooting, HB or AC-family rows of row i's
-    /// template and options, from all of `urgent` and the queue (the rows are ready together
-    /// under breadth-first order). A row whose executor cannot be built is
-    /// left to run alone.
-    /// ponytail: an ineligible sweep (`tran.gpuLaneRefusal`) still gathers
-    /// and then runs its lanes one after another on one worker; check the
-    /// template before gathering if that ever costs a `--jobs` run.
-    fn gatherWide(self: *Session, i: usize) void {
-        const ji = self.jobAt(i);
-        var peers: std.ArrayList(usize) = .empty;
-        defer peers.deinit(self.allocator);
-        // Bound the actual GPU lanes: frequencies for AC, collocation
-        // samples for HB. The full tone box is an upper bound after
-        // frequency merging/truncation; one tone uses 2x oversampling.
-        const width: u32 = if (execution.gpuFreqLaneKind(ji))
-            @import("solver").freq_solve.FreqSolver.W
-        else if (ji == .hb) blk: {
-            var samples: u32 = 2 * (2 * @as(u32, ji.hb.n_harmonics) + 1);
-            for (ji.hb.extra_harmonics) |h|
-                samples = std.math.mul(u32, samples, 2 * @as(u32, h) + 1) catch std.math.maxInt(u32);
-            break :blk samples;
-        } else 1;
-        const cap = @max(self.config.gpu_lane_cap / width, 1) - 1;
-        const queued = self.queue.items[@min(self.queue_head, self.queue.items.len)..];
-        for ([_][]const u32{ self.urgent.items, queued }) |list| for (list) |j32| {
-            if (peers.items.len == cap) break;
-            const j: usize = j32;
-            if (!self.peerOf(i, ji, j) or std.mem.indexOfScalar(usize, peers.items, j) != null) continue;
-            peers.append(self.allocator, j) catch break;
-        };
-        // Lanes in row order, whatever order the OPs finished in, so lane 0
-        // (the LU plan's source) and the host share are the same each run.
-        std.mem.sortUnstable(usize, peers.items, {}, std.sort.asc(usize));
-        self.shareWithHost(&peers);
-        const leader = self.lead(i, peers.items) orelse return;
-        // Under a final plan a member nothing reads drops its circuit with
-        // its wave (`Executor.executeGpuBatch`), as `releaseIfRead` would
-        // once the batch ends.
-        leader.no_readers = self.final(i) and self.rows.items(.readers)[i] == 0;
-        for (leader.peers) |p| p.no_readers = self.final(p.row) and self.rows.items(.readers)[p.row] == 0;
-    }
-
-    /// `Config.gpu_share` f: of a GPU batch leader and its gathered
-    /// `peers`, the first ceil(f * all) stay on the device and the rest
-    /// leave `peers` with a CPU executor, which the pool runs alongside the
-    /// batch. The split is by row order, so a run is reproducible.
-    fn shareWithHost(self: *Session, peers: *std.ArrayList(usize)) void {
-        const f = self.config.gpu_share;
-        if (!(f > 0 and f < 1)) return;
-        const all: f64 = @floatFromInt(1 + peers.items.len);
-        const keep: usize = @intFromFloat(@max(1, @ceil(f * all)) - 1);
-        if (keep >= peers.items.len) return;
-        for (peers.items[keep..]) |j| {
-            self.makeExecutor(j) catch continue;
-            const e = self.rows.items(.executor)[j].?;
-            e.config.backend = .cpu;
-            e.config.gpu_lanes = false;
-        }
-        peers.shrinkRetainingCapacity(keep);
-    }
-
-    /// Settles the peers of batch leader `i`, which has stopped: each takes
-    /// the outcome its lane left, or the leader's cancel.
-    fn settlePeers(self: *Session, i: usize) void {
-        const leader = self.rows.items(.executor)[i].?;
-        const cancelled = self.rows.items(.status)[i] == .cancelled;
-        for (leader.peers) |p| {
-            const j = p.row;
-            std.debug.assert(self.rows.items(.running)[j]);
-            self.rows.items(.running)[j] = false;
-            const first = self.rows.items(.status)[j] == .pending;
-            if (p.published != null) {
-                self.rows.items(.status)[j] = .complete;
-            } else if (cancelled or p.peer_failure == null) {
-                self.rows.items(.status)[j] = .cancelled;
-            } else {
-                self.rows.items(.status)[j] = .failed;
-                self.rows.items(.failure)[j] = p.peer_failure;
-            }
-            if (first) self.readerDone(j);
-            self.releaseIfRead(j);
-            self.laneDone(j);
-        }
-    }
-
-    /// Starts query `i`'s next quantum, building its executor first, with
-    /// `signal` posted when it stops. False, the row failed and settled,
-    /// when it could not start.
-    fn launch(self: *Session, i: usize, quantum: Quantum, signal: *std.Io.Semaphore) bool {
-        const started = blk: {
-            self.makeExecutor(i) catch |err| break :blk err;
-            const exec = self.rows.items(.executor)[i].?;
-            if (self.stream_opener) |o| if (exec.stream == null and exec.peers.len == 0 and
-                self.rows.items(.status)[i] == .pending and self.rows.items(.output)[i] != no_output and
-                self.rows.items(.owner)[i] == none)
-            {
-                exec.stream = o.open(o.ctx, @fromBackingInt(@intCast(i)), self.jobAt(i));
-            };
-            exec.start(quantum, signal) catch |err| break :blk err;
-            self.rows.items(.running)[i] = true;
-            return true;
-        };
-        const first = self.rows.items(.status)[i] == .pending;
-        self.rows.items(.status)[i] = .failed;
-        self.rows.items(.failure)[i] = started;
-        if (first) self.readerDone(i);
-        self.laneDone(i);
-        return false;
-    }
-
-    /// Records the quantum of running query `i`, which has stopped. Under
-    /// `Config.final_plan`, a completed query's circuit, or its source's, is
-    /// released once no dependent still has to copy it.
-    fn settle(self: *Session, i: usize) void {
-        std.debug.assert(self.rows.items(.running)[i]);
-        self.rows.items(.running)[i] = false;
-        const first = self.rows.items(.status)[i] == .pending;
-        // A started worker always has an outcome; `NotStarted` cannot happen.
-        const outcome = self.rows.items(.executor)[i].?.wait() catch unreachable;
-        switch (outcome) {
-            .progress => |p| {
-                self.rows.items(.status)[i] = .paused;
-                self.rows.items(.progress)[i] = p;
-            },
-            .complete => self.rows.items(.status)[i] = .complete,
-            .failed => |err| {
-                self.rows.items(.status)[i] = .failed;
-                self.rows.items(.failure)[i] = err;
-            },
-            .cancelled => self.rows.items(.status)[i] = .cancelled,
-        }
-        if (first) self.readerDone(i);
-        self.releaseIfRead(i);
-        self.laneDone(i);
-        self.settlePeers(i);
-    }
-
-    /// Assembles the split query lane row `i` belongs to once `i`, the last
-    /// of its lanes to end, has.
-    fn laneDone(self: *Session, i: usize) void {
-        const owner = self.rows.items(.owner)[i];
-        if (owner == none or !self.rows.items(.status)[i].terminal()) return;
-        const g = @backingInt(owner);
-        for (g - self.rows.items(.lanes)[g]..g) |l| if (!self.rows.items(.status)[l].terminal()) return;
-        self.assemble(g) catch |err| {
-            self.rows.items(.status)[g] = .failed;
-            self.rows.items(.failure)[g] = err;
-        };
-    }
-
-    /// Ends split query `g`, whose lanes all ended: as its first lane (in
-    /// lane order) that did not complete, else complete with the lanes'
-    /// rows in lane order, as the query run whole publishes them.
-    fn assemble(self: *Session, g: usize) !void {
-        const first = g - self.rows.items(.lanes)[g];
-        var npoints: usize = 0;
-        for (first..g) |l| {
-            const status = self.rows.items(.status)[l];
-            if (status != .complete) {
-                self.rows.items(.status)[g] = status;
-                self.rows.items(.failure)[g] = self.rows.items(.failure)[l];
-                return;
-            }
-            npoints += self.rows.items(.executor)[l].?.result().?.npoints;
-        }
-        const job = self.jobAt(g);
-        const e = try execution.Executor.create(self.allocator, self.io, self.templateOf(g), self.deck, job, null, false, self.config);
-        self.rows.items(.executor)[g] = e;
-        var res = self.rows.items(.executor)[first].?.result().?;
-        const ncols = res.varnames.len;
-        const data = try e.results.allocator().alloc(f64, npoints * ncols);
-        var at: usize = 0;
-        for (first..g) |l| {
-            const part = self.rows.items(.executor)[l].?.result().?.data;
-            @memcpy(data[at..][0..part.len], part);
-            at += part.len;
-        }
-        // A plain `.mc` numbers its converged trials.
-        if (job == .mc and job.mc.variants.count == 0) {
-            for (0..npoints) |r| data[r * ncols] = @floatFromInt(r);
-        }
-        res.data = data;
-        res.npoints = npoints;
-        e.published = res;
-        self.rows.items(.status)[g] = .complete;
-    }
-
-    /// Query `i` no longer reads its source's state.
-    fn readerDone(self: *Session, i: usize) void {
-        const dep = self.rows.items(.dependency)[i];
-        if (dep == none) {
-            self.root_readers -= 1;
-        } else {
-            self.rows.items(.readers)[@backingInt(dep)] -= 1;
-            self.releaseIfRead(@backingInt(dep));
-        }
-    }
-
-    /// Under a final plan nothing reads a finished query's circuit once
-    /// its dependents have copied it; its result lives elsewhere.
-    fn releaseIfRead(self: *Session, i: usize) void {
-        if (self.final(i) and self.rows.items(.status)[i] == .complete and self.rows.items(.readers)[i] == 0)
-            self.rows.items(.executor)[i].?.circuit.release();
-    }
-
-    /// Advances each of `ids` by one quantum, at most `limits.max_parallel` at
-    /// a time, starting the next as soon as one stops, and writes one event
-    /// per id. Every id must be ready and unique;
-    /// that is checked for all of them before any runs: fails with
-    /// `error.InvalidConcurrency` for a zero `max_parallel`,
-    /// `error.QueryNotReady`, `error.DuplicateQuery`, or
-    /// `error.BufferTooSmall` when `events` is shorter than `ids`. A query
-    /// whose executor cannot be built or started is marked failed, not
-    /// returned as an error. Under `Config.final_plan`, a completed query's
-    /// circuit is released once no dependent still has to snapshot it.
-    pub fn advanceReady(self: *Session, ids: []const QueryId, limits: Limits, events: []Advance) !usize {
-        try self.validateReady(ids, limits);
-        if (events.len < ids.len) return error.BufferTooSmall;
-        if (ids.len == 0) return 0;
-        // Positions into `ids` of the running queries.
-        const running = try self.allocator.alloc(usize, @min(ids.len, limits.max_parallel));
-        defer self.allocator.free(running);
-        var signal: std.Io.Semaphore = .{};
-        var n_running: usize = 0;
-        var next: usize = 0;
-        while (true) {
-            while (n_running < running.len and next < ids.len) : (next += 1) {
-                if (self.launch(@backingInt(ids[next]), limits.quantum, &signal)) {
-                    running[n_running] = next;
-                    n_running += 1;
-                } else try self.event(ids[next], &events[next]);
-            }
-            if (n_running == 0) break;
-            signal.waitUncancelable(self.io);
-            var k: usize = 0;
-            while (k < n_running) {
-                const at = running[k];
-                const i = @backingInt(ids[at]);
-                if (!self.rows.items(.executor)[i].?.stopped()) {
-                    k += 1;
-                    continue;
-                }
-                self.settle(i);
-                try self.event(ids[at], &events[at]);
-                n_running -= 1;
-                running[k] = running[n_running];
-            }
-        }
-        self.cursor = @intCast((@backingInt(ids[ids.len - 1]) + 1) % self.rows.len);
-        return ids.len;
-    }
-
-    fn event(self: *const Session, id: QueryId, out: *Advance) !void {
-        const q = try self.info(id);
-        out.* = .{ .requested = id, .advanced = id, .status = q.status, .target_status = q.status, .progress = q.progress, .failure = q.failure };
-    }
-
-    /// Queues every query that is ready now for `Pool.fill`, in row order;
-    /// queries that turn ready later join as they do.
-    fn requeue(self: *Session) !void {
-        self.queue.clearRetainingCapacity();
-        self.urgent.clearRetainingCapacity();
-        self.queue_head = 0;
-        // A row is queued in `urgent` at most once at a time.
-        try self.urgent.ensureTotalCapacity(self.allocator, self.rows.len);
-        self.advanceDone();
-        for (self.done_rows..self.rows.len) |i| if (self.ready(i) and !self.rows.items(.running)[i]) {
-            try self.queue.append(self.allocator, @intCast(i));
-        };
-    }
-
-    /// The next query `Pool.fill` starts: a parked query or a finished
-    /// OP's dependent first, so each point's OP and analysis run back to
-    /// back, then the queue in row order.
-    fn nextReady(self: *Session) ?usize {
-        // Breadth-first under GPU lanes: OPs drain before their dependents,
-        // so the analyses become ready together and gather N wide.
-        if (!self.config.gpu_lanes) while (self.urgent.pop()) |i| if (self.ready(i) and !self.rows.items(.running)[i]) return i;
-        while (self.queue_head < self.queue.items.len) {
-            const i = self.queue.items[self.queue_head];
-            self.queue_head += 1;
-            if (self.ready(i) and !self.rows.items(.running)[i]) return i;
-        }
-        if (self.config.gpu_lanes) {
-            // A laned analysis waits while anything still runs, so the rest of
-            // its sweep's OPs finish and it gathers with all of them.
-            // ponytail: one scan of `running` per call; count it if a sweep
-            // of 100k points makes the scan show.
-            const top = self.urgent.getLastOrNull() orelse return null;
-            const laned = self.gpuLaned(top);
-            if (laned and std.mem.indexOfScalar(bool, self.rows.items(.running), true) != null) return null;
-            // The batch leader is the lowest ready row, not the last OP to finish.
-            if (laned) std.mem.sortUnstable(u32, self.urgent.items, {}, std.sort.desc(u32));
-            while (self.urgent.pop()) |i| if (self.ready(i) and !self.rows.items(.running)[i]) return i;
-        }
-        return null;
-    }
-
-    /// Queues for `nextReady` what settled query `i` (and its batch's
-    /// peers) made ready: itself when parked, its dependents when complete.
-    fn follow(self: *Session, i: usize) void {
-        for (self.rows.items(.executor)[i].?.peers) |p| self.followOne(p.row);
-        self.followOne(i);
-    }
-
-    fn followOne(self: *Session, i: usize) void {
-        switch (self.rows.items(.status)[i]) {
-            .paused => self.urgent.appendAssumeCapacity(@intCast(i)),
-            .complete => {
-                var c = self.rows.items(.child)[i];
-                while (c != none) : (c = self.rows.items(.sibling)[@backingInt(c)]) {
-                    const j = @backingInt(c);
-                    if (self.ready(j) and !self.rows.items(.running)[j]) self.urgent.appendAssumeCapacity(j);
-                }
-            },
-            else => {},
-        }
-    }
-
-    /// Runs every query to its end through a pool of `limits.max_parallel`.
-    /// Fails with `error.SchedulingFailure` when queries remain that can
-    /// never become ready.
-    pub fn runAll(self: *Session, limits: Limits) !void {
-        var pool: Pool = try .init(self.allocator, self.io, limits);
-        defer pool.deinit();
-        try pool.add(self);
-        while (true) {
-            pool.fill(self);
-            if (!pool.wait()) break;
-        }
-        if (!self.finished()) return error.SchedulingFailure;
-    }
-
-    /// Advances `target`, or its prerequisite first, by one quantum. A
-    /// terminal target returns its status without running anything. Fails
-    /// as `advanceReady` does.
-    pub fn advance(self: *Session, target: QueryId) !Advance {
-        var events: [1]Advance = undefined;
-        if ((try self.info(target)).status.terminal()) {
-            try self.event(target, &events[0]);
-            return events[0];
-        }
-        // The first ready query in scheduler order: the prerequisite, the
-        // target, or one of a split target's lanes.
-        const next: QueryId = for (0..self.rows.len) |offset| {
-            const i = (offset + self.cursor) % self.rows.len;
-            if (self.contains(.{ .query = target }, i) and self.ready(i)) break @fromBackingInt(@intCast(i));
-        } else return error.SchedulingFailure;
-        _ = try self.advanceReady(&.{next}, .{}, &events);
-        events[0].requested = target;
-        events[0].target_status = (try self.info(target)).status;
-        return events[0];
     }
 
     /// True when every requested query is terminal.
     pub fn finished(self: *const Session) bool {
         for (self.outputs.items[self.done_outputs..]) |id| if (!self.effectiveStatus(@backingInt(id)).terminal()) return false;
         return true;
-    }
-
-    /// Moves `done_rows` and `done_outputs` past the rows and outputs that
-    /// have ended; a terminal row stays terminal. O(rows ended since).
-    fn advanceDone(self: *Session) void {
-        while (self.done_rows < self.rows.len and self.effectiveStatus(self.done_rows).terminal()) self.done_rows += 1;
-        const outputs = self.outputs.items;
-        while (self.done_outputs < outputs.len and self.effectiveStatus(@backingInt(outputs[self.done_outputs])).terminal()) self.done_outputs += 1;
     }
 
     /// Whether `release` freed query `id`.
@@ -1137,107 +480,6 @@ pub const Session = struct {
         const worker = self.rows.items(.executor)[if (dep == none) i else @backingInt(dep)] orelse return null;
         return worker.operatingPoint();
     }
-
-    /// Writes the query tree for `options.scope`, marking what the chosen
-    /// preview would run next. Runs nothing; uses the same readiness order and
-    /// validation as advancement.
-    pub fn print(self: *const Session, writer: *std.Io.Writer, options: PrintOptions) !void {
-        try self.validateScope(options.scope);
-        const limits = options.limits orelse Limits{};
-        if (limits.max_parallel == 0) return error.InvalidConcurrency;
-        const a = self.allocator;
-        const next = try a.alloc(QueryId, self.rows.len);
-        defer a.free(next);
-        var n_next: usize = 0;
-        switch (options.preview) {
-            .run_all => n_next = @min(try self.readyQueries(options.scope, next), limits.max_parallel),
-            .advance => |id| n_next = @min(try self.readyQueries(.{ .query = id }, next), 1),
-            .advance_ready => |ids| {
-                try self.validateReady(ids, limits);
-                @memcpy(next[0..ids.len], ids);
-                n_next = ids.len;
-            },
-        }
-        const seen = try a.alloc(bool, self.rows.len);
-        defer a.free(seen);
-        @memset(seen, false);
-        const continuations = try a.alloc(bool, self.rows.len + 1);
-        defer a.free(continuations);
-        var components: usize = 0;
-        for (self.rows.items(.component), 0..) |component, i|
-            if (component == i and self.containsComponent(options.scope, component)) {
-                components += 1;
-            };
-        try writer.print("Problem: {d} requested queries, {d} total queries, {d} components\n", .{ self.outputs.items.len, self.rows.len, components });
-        // Each component's rows in row order, CSR by component (a
-        // component is numbered by its first row), so the tree is one pass.
-        const starts = try a.alloc(u32, self.rows.len + 1);
-        defer a.free(starts);
-        @memset(starts, 0);
-        for (self.rows.items(.component)) |c| starts[c + 1] += 1;
-        for (1..starts.len) |c| starts[c] += starts[c - 1];
-        const members = try a.alloc(u32, self.rows.len);
-        defer a.free(members);
-        const fill = try a.dupe(u32, starts[0..self.rows.len]);
-        defer a.free(fill);
-        for (self.rows.items(.component), 0..) |c, j| {
-            members[fill[c]] = @intCast(j);
-            fill[c] += 1;
-        }
-        for (self.rows.items(.component), 0..) |component, i| {
-            if (component != i or !self.containsComponent(options.scope, component)) continue;
-            components -= 1;
-            continuations[0] = components != 0;
-            try writer.print("{s} Component {d}\n", .{ connector(options.ascii, components == 0), component });
-            const rows = members[starts[component]..starts[component + 1]];
-            var last_query: usize = i;
-            for (rows) |j| {
-                if (self.contains(options.scope, j) and self.rows.items(.requested)[j]) last_query = j;
-            }
-            for (rows) |j| {
-                if (!self.contains(options.scope, j) or !self.rows.items(.requested)[j]) continue;
-                try self.printQuery(writer, j, 1, j == last_query, continuations, next[0..n_next], seen, options.ascii);
-            }
-            // A scope naming an implicit prerequisite still shows that query.
-            if (options.scope == .query) {
-                const j = @backingInt(options.scope.query);
-                if (!seen[j]) try self.printQuery(writer, j, 1, j == last_query, continuations, next[0..n_next], seen, options.ascii);
-            }
-        }
-    }
-
-    fn containsComponent(self: *const Session, scope: Scope, component: u32) bool {
-        return switch (scope) {
-            .all => true,
-            .component => |c| component == c,
-            .query => |q| component == self.rows.items(.component)[@backingInt(q)],
-        };
-    }
-
-    fn printQuery(self: *const Session, writer: *std.Io.Writer, i: usize, depth: usize, last: bool, continuations: []bool, next: []const QueryId, seen: []bool, ascii: bool) !void {
-        const q = try self.info(@fromBackingInt(@intCast(i)));
-        for (continuations[0..depth]) |continues|
-            try writer.writeAll(if (!continues) "    " else if (ascii) "|   " else "│   ");
-        try writer.print("{s} {s}q{d} {s} [{s}", .{
-            connector(ascii, last),
-            if (seen[i]) (if (ascii) "-> " else "↪ ") else "",
-            i,
-            @tagName(q.kind),
-            if (q.status == .pending and self.ready(i)) "ready" else @tagName(q.status),
-        });
-        if (seen[i]) try writer.writeAll("; shared");
-        const selected = std.mem.indexOfScalar(QueryId, next, @fromBackingInt(@intCast(i))) != null;
-        if (selected) try writer.writeAll("; NEXT") else if (self.ready(i)) try writer.writeAll("; deferred by selection");
-        if (q.dependency) |dep| if (!self.ready(i) and !q.status.terminal())
-            try writer.print("; waiting for q{d}", .{@backingInt(dep)});
-        if (q.progress) |p| try writer.print("; {s} {d}/{d}", .{ @tagName(p.phase), p.completed, p.total });
-        if (q.failure) |err| try writer.print("; {s}", .{@errorName(err)});
-        try writer.writeAll("]\n");
-        if (seen[i]) return;
-        seen[i] = true;
-        continuations[depth] = !last;
-        if (q.dependency) |dep| try self.printQuery(writer, @backingInt(dep), depth + 1, true, continuations, next, seen, ascii);
-    }
 };
 
 /// A refilling scheduler over the queries of one or more sessions: up to
@@ -1317,315 +559,48 @@ pub const Pool = struct {
     }
 };
 
-/// How far ahead of the queue head `gather` looks for a batch's peers.
-const lane_window = 8 * execution.lane_width;
+/// The result shape of a query, without running it (`schema.zig`).
+pub const schemaOf = schema.schemaOf;
 
-/// Whether two rows may share a lane batch: the same kind with equal
-/// options but for the variant row and temperature, which only the circuit
-/// each lane builds reads. Slices compare by content, floats by bits.
-fn sameLaneJob(a: requests.Query, b: requests.Query) bool {
-    return switch (a) {
-        // HB's GPU provider owns its Newton rounds; it is deliberately not
-        // CPU-batchable, so ordinary CPU query workers remain independent.
-        .hb => |o| b == .hb and sameDeep(stripTol(o), stripTol(b.hb)),
-        // The AC family's list is `execution.freqLaneKind`'s; keep the two adjacent in review.
-        inline .op, .dc, .mc, .temp, .tran, .pss, .ac, .noise, .sp, .stb, .lstb, .acxf, .tf, .dcxf, .dcinc, .sens, .dcmatch, .dcsens, .acmatch => |o, tag| b == tag and batchable(b) and sameDeep(stripTol(o), stripTol(@field(b, @tagName(tag)))),
-        else => false,
-    };
-}
-
-/// Kinds a lane batch runs: `.op`, `.dc`, `.tran`, `.pss`, the AC family
-/// (`execution.freqLaneKind`), and the lane rows a split `.mc` or `.temp`
-/// became (`splitLanes`).
-fn batchable(job: requests.Query) bool {
-    return switch (job) {
-        .op, .dc, .tran, .pss => true,
-        inline .mc, .temp => |o| o.lane != null,
-        else => execution.freqLaneKind(job),
-    };
-}
-
-/// `o` without what only the circuit each lane builds reads: the variant
-/// row, the temperature and a split row's lane.
-fn stripTol(o: anytype) @TypeOf(o) {
-    var c = o;
-    c.tol.variant = null;
-    c.tol.temp_c = null;
-    if (@hasField(@TypeOf(o), "lane")) c.lane = null;
-    return c;
-}
-
-fn sameDeep(a: anytype, b: @TypeOf(a)) bool {
-    const T = @TypeOf(a);
-    switch (@typeInfo(T)) {
-        .@"struct" => |s| {
-            inline for (s.field_names) |name| if (!sameDeep(@field(a, name), @field(b, name))) return false;
-            return true;
-        },
-        .@"union" => {
-            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-            return switch (a) {
-                inline else => |payload, tag| sameDeep(payload, @field(b, @tagName(tag))),
-            };
-        },
-        .optional => {
-            if (a == null or b == null) return a == null and b == null;
-            return sameDeep(a.?, b.?);
-        },
-        .pointer => |p| {
-            if (p.size != .slice) return a == b;
-            if (a.len != b.len) return false;
-            for (a, b) |x, y| if (!sameDeep(x, y)) return false;
-            return true;
-        },
-        .float => return std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b)),
-        .array => {
-            for (a, b) |x, y| if (!sameDeep(x, y)) return false;
-            return true;
-        },
-        else => return a == b,
-    }
-}
-
-/// An OP row's template, `jobs` entry and variant: equal keys are equal
-/// OPs.
-const OpKey = struct { template: u32, job: u32, variant: u32 };
-const OpIndex = std.AutoHashMapUnmanaged(OpKey, QueryId);
-
-/// `Session.jobs` indices, hashed and compared by the entry they name.
-const JobIndex = std.HashMapUnmanaged(u32, void, struct {
-    jobs: []const requests.Query,
-    pub fn hash(c: @This(), k: u32) u64 {
-        return JobKey.hash(.{ .jobs = c.jobs }, c.jobs[k]);
-    }
-    pub fn eql(_: @This(), a: u32, b: u32) bool {
-        return a == b;
-    }
-}, std.hash_map.default_max_load_percentage);
-
-/// `JobIndex` looked up by a query.
-const JobKey = struct {
-    jobs: []const requests.Query,
-    pub fn hash(_: JobKey, job: requests.Query) u64 {
-        var h: std.hash.Wyhash = .init(0);
-        hashFields(&h, job);
-        return h.final();
-    }
-    pub fn eql(c: JobKey, job: requests.Query, k: u32) bool {
-        return sameDeep(job, c.jobs[k]);
-    }
+/// One query row's columns (`Session.rows`).
+const Row = struct {
+    /// Index into `Session.jobs`; a lane row names its split query's.
+    job: u32,
+    /// The `tol.variant` the row runs, which `jobs` leaves out so a
+    /// sweep's points share one entry; `no_variant` for none.
+    variant: u32 = no_variant,
+    dependency: QueryId = none,
+    component: u32,
+    requested: bool,
+    status: Status = .pending,
+    progress: ?progress.Event = null,
+    failure: ?Failure = null,
+    executor: ?*execution.Executor = null,
+    /// The circuit the query instantiates: 0 for `topology`, k for
+    /// `templates[k - 1]`.
+    template: u32 = 0,
+    /// Rows that read this one's device state (its dependents) and have
+    /// not yet stopped a first quantum, which is when their copy is done.
+    readers: u32 = 0,
+    /// The newest dependent and the next older one sharing `dependency`.
+    child: QueryId = none,
+    sibling: QueryId = none,
+    /// A quantum is in flight; `settle` collects it.
+    running: bool = false,
+    /// A query split into its lanes (`splitLanes`): its lane rows are the
+    /// `lanes` rows just before it. It never runs; `assemble` gathers its
+    /// result once every lane has ended.
+    lanes: u32 = 0,
+    /// On a lane row, the split query it belongs to.
+    owner: QueryId = none,
+    /// `release` dropped its executor and result.
+    released: bool = false,
+    /// No query appended later reads its state (`markFinal`), so it is
+    /// treated as under `Config.final_plan`.
+    final: bool = false,
+    /// Its position in `outputs`, or `no_output` when not requested.
+    output: u32 = no_output,
 };
-
-/// `job` with `tol.variant` cleared, and the variant (`no_variant` for none).
-fn withoutVariant(job: requests.Query) struct { requests.Query, u32 } {
-    var j = job;
-    switch (j) {
-        inline else => |*o| {
-            const v = o.tol.variant orelse no_variant;
-            o.tol.variant = null;
-            return .{ j, v };
-        },
-    }
-}
-
-/// Feeds `value` to `h` as `sameDeep` compares it: slices by content,
-/// floats by their bits (which `std.hash.autoHash` refuses).
-fn hashFields(h: *std.hash.Wyhash, value: anytype) void {
-    switch (@typeInfo(@TypeOf(value))) {
-        .@"struct" => |s| inline for (s.field_names) |name| hashFields(h, @field(value, name)),
-        .@"union" => switch (value) {
-            inline else => |payload, tag| {
-                std.hash.autoHash(h, tag);
-                hashFields(h, payload);
-            },
-        },
-        .optional => if (value) |v| {
-            h.update(&.{1});
-            hashFields(h, v);
-        } else h.update(&.{0}),
-        .pointer => |p| if (p.size != .slice) std.hash.autoHash(h, value) else {
-            std.hash.autoHash(h, value.len);
-            if (p.child == u8) h.update(value) else for (value) |x| hashFields(h, x);
-        },
-        .array => for (value) |x| hashFields(h, x),
-        .float => h.update(std.mem.asBytes(&value)),
-        else => std.hash.autoHash(h, value),
-    }
-}
-
-/// Largest query `append` splits into lane rows; a longer one runs whole,
-/// which publishes the same rows.
-/// ponytail: one row per lane; batch lanes into rows of several if huge
-/// sweeps make the row table the memory bottleneck.
-const max_split = 1 << 16;
-
-/// How many lane rows `append` splits `job` into (#213): one per `.mc`
-/// trial or variant and per `.temp` temperature, each solved alone; 0 for
-/// a job it keeps whole.
-fn splitLanes(job: requests.Query) u32 {
-    const n: usize = switch (job) {
-        .mc => |o| if (o.lane != null) 0 else if (o.variants.count != 0) o.variants.count else o.n_trials,
-        // Unvalidated: NaN and huge spans fail the comparison.
-        .temp => |o| if (o.lane == null and o.t_step > 0 and (o.t_stop - o.t_start) / o.t_step < max_split) temp_sweep.numPoints(o) else 0,
-        else => 0,
-    };
-    return if (n >= 2 and n <= max_split) @intCast(n) else 0;
-}
-
-/// The OP a query needs first: its tolerances, transient-flavoured for
-/// time-domain kinds, warm when a transient point asks. Null for `.op`
-/// itself and a `uic` start.
-fn prerequisite(job: requests.Query) ?requests.Op {
-    if (job == .op or job.uic()) return null;
-    const tol = switch (job) {
-        inline else => |o| o.tol,
-    };
-    return .{ .tol = tol, .tran_op = @as(requests.Kind, job).transient(), .warm_start = tol.warm_op or (job == .tran and job.tran.point.warm_start) };
-}
-
-fn connector(ascii: bool, last: bool) []const u8 {
-    return if (ascii) (if (last) "`--" else "|--") else (if (last) "└──" else "├──");
-}
-
-/// Deep-copies every slice reachable from `value` into `allocator`.
-fn copyValue(allocator: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!@TypeOf(value) {
-    const T = @TypeOf(value);
-    switch (@typeInfo(T)) {
-        .@"struct" => |s| {
-            var result = value;
-            inline for (s.field_names) |name| @field(result, name) = try copyValue(allocator, @field(value, name));
-            return result;
-        },
-        .@"union" => switch (value) {
-            inline else => |payload, tag| return @unionInit(T, @tagName(tag), try copyValue(allocator, payload)),
-        },
-        .optional => return if (value) |payload| try copyValue(allocator, payload) else null,
-        .pointer => |p| {
-            if (p.size != .slice) return value;
-            const result = try allocator.alloc(p.child, value.len);
-            for (value, result) |src, *dst| dst.* = try copyValue(allocator, src);
-            return result;
-        },
-        else => return value,
-    }
-}
-
-/// Sidebands an HB small-signal analysis reads: 2M + 1 about one tone,
-/// every signed line of a multi-tone spectrum.
-fn hbSidebands(allocator: std.mem.Allocator, o: requests.HbLptv) !usize {
-    if (o.extra_tones.len == 0) return 2 * @as(usize, o.n_sidebands) + 1;
-    return 2 * try @import("pss/mhb.zig").lineCount(allocator, o.hb()) - 1;
-}
-
-/// How many of `topology`'s device parameters `keep(type_name, param_name)`
-/// admits, all of them for null. A batch with a `param_layout` is counted
-/// from it, which leaves the template's Model rows shared.
-fn countParams(allocator: std.mem.Allocator, topology: *const Circuit, comptime keep: ?fn ([]const u8, []const u8) bool) !usize {
-    var refs: std.ArrayList(ParamRef) = .empty;
-    defer refs.deinit(allocator);
-    var n: usize = 0;
-    for (topology.batches) |b| {
-        if (b.hooks.param_layout) |layout| {
-            const l = try layout(b.ctx).unwrap();
-            for (l.fields) |f| n += l.count * @intFromBool(if (keep) |k| k(b.type_name, f.name) else true);
-            continue;
-        }
-        refs.clearRetainingCapacity();
-        try b.hooks.collect_params(b.ctx, allocator, &refs).unwrap();
-        for (refs.items) |r| n += @intFromBool(if (keep) |k| k(b.type_name, r.param_name) else true);
-    }
-    return n;
-}
-
-/// Returns the shape `query` publishes over this circuit and deck, without
-/// running it.
-pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *const Deck, query: requests.Query) !core.QuerySchema {
-    const columns: usize = switch (query) {
-        .op, .dcinc => deck.probes.len,
-        // HSPICE `.op <time>` publishes the `.op` layout, with no time column.
-        .tran => |o| deck.probes.len + @intFromBool(!o.snapshot),
-        .tran_noise => |o| deck.probes.len + 1 + @intFromBool(o.sde),
-        .tf => 3,
-        .lstb => |o| if (o.margins) 5 else 8,
-        .dcxf => |o| (if (o.tf_only) @as(usize, 1) else 3) * o.sources.len,
-        .acxf => |o| 1 + (if (o.tf_only) @as(usize, 1) else 3) * o.sources.len,
-        .noise => |o| try @import("ac/noise.zig").columnCount(allocator, topology.batches, topology.batch_types, o),
-        // Time, then peak and rms per probe.
-        .envelope => 1 + 2 * deck.probes.len,
-        .four => 4,
-        .disto => |o| if (o.plot == .summary) 4 else deck.probes.len + 1,
-        .pz, .stb, .pnoise, .hbnoise, .phasenoise, .fft => 2,
-        .pac => |o| 2 + 2 * @as(usize, o.n_harmonics),
-        .hbac => |o| 1 + try hbSidebands(allocator, o),
-        .pxf => |o| 1 + (1 + 2 * @as(usize, o.n_harmonics)) * topology.n,
-        .hbxf => |o| 1 + try hbSidebands(allocator, o) * topology.n,
-        .hblin => |o| 1 + o.ports.len * o.ports.len + @intFromBool(o.noise and o.ports.len >= 2),
-        .sp => |o| @import("ac/sp.zig").columns(@import("ac/sp.zig").modeCount(o.ports), o.lin),
-        // The parameters `.sens` lists, which isSensParam narrows (#154).
-        .sens => try countParams(allocator, topology, @import("sweep/sens.zig").isSensParam),
-        .dcmatch, .dcsens, .acmatch => blk: {
-            const groups = switch (query) {
-                inline .dcmatch, .dcsens, .acmatch => |o| o.variations.starts.len -| 1,
-                else => 0,
-            };
-            const extra: usize = switch (query) {
-                .dcmatch => 1,
-                .acmatch => 5,
-                else => 0,
-            };
-            if (groups != 0) break :blk groups + extra;
-            break :blk try countParams(allocator, topology, null) + extra;
-        },
-        else => deck.probes.len + 1,
-    };
-    const tran = @import("tran/tran.zig");
-    const ac = @import("ac/ac.zig");
-    const streamable = switch (query) {
-        .tran => |o| !o.snapshot,
-        .ac => true,
-        else => false, // else: only a transient or AC sweep streams its rows
-    };
-    return .{
-        .kind = query,
-        .columns = columns,
-        .portless = query == .sp and query.sp.ports.len == 0 and deck.source_branch == 0,
-        .plotname = if (!streamable) "" else if (query == .tran) tran.plotname else ac.plotname,
-        .scale = if (!streamable) "" else if (query == .tran) tran.scale else ac.scale,
-    };
-}
-
-test copyValue {
-    // The copy shares no slice with the request, so a caller may free or
-    // reuse its option buffers once `append` returns.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var tones = [_]f64{ 2e3, 3e3 };
-    var harms = [_]u16{ 2, 3 };
-    const job: requests.Query = .{ .hb = .{ .f0 = 1e3, .extra_tones = &tones, .extra_harmonics = &harms } };
-    const copy = try copyValue(arena.allocator(), job);
-    tones[0] = 0;
-    harms[1] = 0;
-    try std.testing.expectEqual(@as(f64, 1e3), copy.hb.f0);
-    try std.testing.expectEqualSlices(f64, &.{ 2e3, 3e3 }, copy.hb.extra_tones);
-    try std.testing.expectEqualSlices(u16, &.{ 2, 3 }, copy.hb.extra_harmonics);
-    // An empty slice copies to an empty slice.
-    const plain = try copyValue(arena.allocator(), requests.Query{ .hb = .{ .f0 = 1e3 } });
-    try std.testing.expectEqual(@as(usize, 0), plain.hb.extra_tones.len);
-}
-
-test prerequisite {
-    try std.testing.expectEqual(null, prerequisite(.{ .op = .{} }));
-    try std.testing.expectEqual(null, prerequisite(.{ .tran = .{ .t_stop = 1e-6, .uic = true } }));
-    // A transient-family query gets a MODETRANOP point with its own tolerances.
-    const tran = prerequisite(.{ .tran = .{ .t_stop = 1e-6, .tol = .{ .reltol = 1e-4 } } }).?;
-    try std.testing.expect(tran.tran_op);
-    try std.testing.expectEqual(@as(f64, 1e-4), tran.tol.reltol);
-    try std.testing.expect(!tran.warm_start);
-    try std.testing.expect(prerequisite(.{ .tran = .{ .t_stop = 1e-6, .point = .{ .warm_start = true } } }).?.warm_start);
-    const ac = prerequisite(.{ .ac = .{ .sweep = .{ .f_start = 1, .f_stop = 1e3 } } }).?;
-    try std.testing.expect(!ac.tran_op);
-    try std.testing.expect(!ac.warm_start);
-}
 
 test "Status.terminal" {
     for ([_]Status{ .pending, .paused }) |s| try std.testing.expect(!s.terminal());

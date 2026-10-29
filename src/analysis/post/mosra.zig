@@ -2,7 +2,16 @@
 //! integrated over a fresh transient, extrapolated to each reliability time
 //! as a power law, and turned into the `delvto`/`mulu0` writes of the aged
 //! runs plus the degradation table HSPICE writes as `.radeg`.
+//! In: the stress transient's terminal voltages and the MOSRA cards. Out:
+//! the degradation table and the aged parameter values.
+//! Cites the HSPICE MOSRA level 1 manual; no dev/ note.
+//!
+//! Contents:
+//! - `pub const Aged = struct { table, values }`
+//! - `pub fn age(arena: Allocator, m: core.Mosra, res: core.Result) !Aged`
+
 const std = @import("std");
+const assert = std.debug.assert;
 const core = @import("core");
 
 /// What `age` returns, allocated in its arena.
@@ -26,7 +35,7 @@ pub const Aged = struct {
 pub fn age(arena: std.mem.Allocator, m: core.Mosra, res: core.Result) !Aged {
     const n = m.names.len;
     const width = res.varnames.len;
-    std.debug.assert(width == 1 + 3 * n);
+    assert(width == 1 + 3 * n);
     // Integrals of A^(1/n): HCI in [0, n), BTI in [n, 2n), then the
     // integrands at the previous and current sample.
     const buf = try arena.alloc(f64, 6 * n);
@@ -81,6 +90,7 @@ pub fn age(arena: std.mem.Allocator, m: core.Mosra, res: core.Result) !Aged {
             if (m.mulu0[i] != core.Mosra.no_param) values.appendAssumeCapacity(m.mulu0_fresh[i] * mulu0);
         }
     }
+    assert(values.items.len == m.rel_times.len * per_time);
     return .{ .values = values.items, .table = .{
         .plotname = "MOSRA Degradation",
         .varnames = names,
@@ -89,6 +99,8 @@ pub fn age(arena: std.mem.Allocator, m: core.Mosra, res: core.Result) !Aged {
         .data = data,
     } };
 }
+
+// ---- private ----
 
 /// Each device's A^(1/n) at one sample, HCI into `out[0..n]` and BTI into
 /// `out[n..]`. `v` holds three terminal voltages per device.
@@ -132,6 +144,30 @@ fn lifetime(rate: [2]f64, exponent: [2]f64, deg_f: f64) f64 {
         if (deg(rate, exponent, std.math.pow(f64, 10, mid)) < deg_f) lo = mid else hi = mid;
     }
     return std.math.pow(f64, 10, hi);
+}
+
+/// Test fixture: one device of one model.
+fn testMosra(pmos: bool) core.Mosra {
+    const S = struct {
+        const md = [_]core.MosraModel{.{ .tit0 = 1e-3, .titfd = 0.5, .tn = 0.25, .hci0 = 2e-4, .hcin = 0.5, .hcimu = 0.1 }};
+        const p_true = [_]bool{true};
+        const p_false = [_]bool{false};
+    };
+    return .{
+        .tran = .{ .t_stop = 1e-6 },
+        .rel_times = &.{1e6},
+        .aged_runs = true,
+        .models = &S.md,
+        .names = &.{"m1"},
+        .terminals = &.{.{ 1, 2, 3 }},
+        .pmos = if (pmos) &S.p_true else &S.p_false,
+        .temp_k = &.{300},
+        .model = &.{0},
+        .delvto = &.{7},
+        .mulu0 = &.{8},
+        .delvto_fresh = &.{0},
+        .mulu0_fresh = &.{1},
+    };
 }
 
 test "age: constant stress is A t^n, and DegF inverts it" {
@@ -189,29 +225,6 @@ test "age: a PMOS mirrored in every terminal ages by the negated NMOS shift" {
 
 test "lifetime: inf when the degradation never reaches DegF" {
     try std.testing.expectEqual(std.math.inf(f64), lifetime(.{ 0, 0 }, .{ 0.5, 0.25 }, 0.05));
-}
-
-fn testMosra(pmos: bool) core.Mosra {
-    const S = struct {
-        const md = [_]core.MosraModel{.{ .tit0 = 1e-3, .titfd = 0.5, .tn = 0.25, .hci0 = 2e-4, .hcin = 0.5, .hcimu = 0.1 }};
-        const p_true = [_]bool{true};
-        const p_false = [_]bool{false};
-    };
-    return .{
-        .tran = .{ .t_stop = 1e-6 },
-        .rel_times = &.{1e6},
-        .aged_runs = true,
-        .models = &S.md,
-        .names = &.{"m1"},
-        .terminals = &.{.{ 1, 2, 3 }},
-        .pmos = if (pmos) &S.p_true else &S.p_false,
-        .temp_k = &.{300},
-        .model = &.{0},
-        .delvto = &.{7},
-        .mulu0 = &.{8},
-        .delvto_fresh = &.{0},
-        .mulu0_fresh = &.{1},
-    };
 }
 
 test "age: every allocation failure is reported" {

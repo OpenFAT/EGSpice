@@ -13,18 +13,24 @@
 //! nearly defective wanted pair loses accuracy in the restart; switch to a
 //! reordered real Schur form if one ever stalls.
 //!
+//! In: an operator `op.apply(x, y)` over R^n and a count k. Out: its k
+//! largest-magnitude eigenvalues.
 //! Cites Stewart, "A Krylov-Schur algorithm for large eigenproblems" (SIAM
 //! J. Matrix Anal. Appl. 23, 2001) and ARPACK's convergence test (dnaup2).
+//!
+//! Contents:
+//! - `pub fn dominant(gpa: Allocator, n: usize, k: usize, op: anytype, out: []Complex, stable_only: bool) !qr.Eigs`
+
 const std = @import("std");
+const assert = std.debug.assert;
 const num = @import("core").numerics;
 const qr = @import("core").eigen;
 const dense_lu = @import("solver").dense_lu;
-
 const Complex = num.Complex;
 
 /// A Ritz pair is converged when ‖Ay − θy‖ ≤ tol·|θ|.
 const tol = 1e-10;
-const max_restarts = 300;
+const restarts_max = 300;
 /// Deflation tolerance and step limit of the QR on H.
 const qr_tol = 1e-12;
 const qr_max_iter = 1000;
@@ -44,7 +50,8 @@ const qr_max_iter = 1000;
 /// eigenvalue too, which without it comes back as the same ring a dense QR
 /// gives. error.PzDidNotConverge when the QR on H runs out of steps.
 pub fn dominant(gpa: std.mem.Allocator, n: usize, k: usize, op: anytype, out: []Complex, stable_only: bool) !qr.Eigs {
-    std.debug.assert(k >= 1 and out.len >= k + 1);
+    assert(k >= 1);
+    assert(out.len >= k + 1);
     const m = @min(n, 2 * k + 20);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -79,6 +86,7 @@ pub fn dominant(gpa: std.mem.Allocator, n: usize, k: usize, op: anytype, out: []
     var j0: usize = 0;
     var restart: usize = 0;
     while (true) : (restart += 1) {
+        assert(restart < restarts_max); // The last restart returns below.
         // Expand to m columns, or until the space is invariant.
         var mm = m;
         var beta: f64 = 0;
@@ -175,12 +183,13 @@ pub fn dominant(gpa: std.mem.Allocator, n: usize, k: usize, op: anytype, out: []
             if (theta[i].im > 0) conv[i + 1] = conv[i];
             all = all and conv[i];
         }
-        if (all or restart + 1 == max_restarts) {
+        if (all or restart + 1 == restarts_max) {
             var count: usize = 0;
             for (theta[0..want], conv[0..want]) |t, c| if (all or c) {
                 out[count] = t;
                 count += 1;
             };
+            assert(count <= k + 1);
             return .{ .count = count, .converged = all };
         }
 
@@ -227,6 +236,8 @@ pub fn dominant(gpa: std.mem.Allocator, n: usize, k: usize, op: anytype, out: []
         j0 = p;
     }
 }
+
+// ---- private ----
 
 /// The unit eigenvector y = yr + i·yi of the leading mm×mm block of H (row
 /// stride `stride`) for its eigenvalue θ = a + ib, by two steps of inverse

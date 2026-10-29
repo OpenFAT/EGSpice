@@ -2,7 +2,23 @@
 //! progress checkpoint until the coordinator resumes or cancels it, and the
 //! checkpoint protocol itself (`Event`, `Callback`). Independent of circuit
 //! and solver state.
+//! In: a run function and its context. Out: checkpoints and the run's
+//! outcome, quantum by quantum.
+//! Cites no outside source.
+//!
+//! Contents:
+//! - `pub const Phase = enum(u8)`
+//! - `pub const Event = struct`
+//! - `pub const Callback = struct` (`checkpoint`)
+//! - `pub const Quantum = enum(u8)`
+//! - `pub const min_quantum_ns: i96`, `pub const stack_size: usize`
+//! - `pub const Threads = struct` (`Slot`, `Task`, `init`, `spawn`, `join`, `deinit`)
+//! - `pub const Options = struct`
+//! - `pub fn Worker(comptime Error: type, comptime Product: type) type`
+//!   (`Outcome`, `init`, `callback`, `start`, `stopped`, `wait`, `advance`, `cancel`, `deinit`)
+
 const std = @import("std");
+const assert = std.debug.assert;
 const builtin = @import("builtin");
 const requests = @import("core").query;
 
@@ -141,6 +157,7 @@ pub const Threads = struct {
 
     /// Waits until `slot`'s task returned, then makes its thread idle.
     pub fn join(self: *Threads, slot: *Slot) void {
+        assert(slot.pool == self);
         slot.mutex.lockUncancelable(self.io);
         while (!slot.done) slot.changed.waitUncancelable(self.io, &slot.mutex);
         slot.mutex.unlock(self.io);
@@ -148,12 +165,13 @@ pub const Threads = struct {
         defer self.mutex.unlock(self.io);
         // `spawn` reserved room for every slot.
         self.idle.appendAssumeCapacity(slot);
+        assert(self.idle.items.len <= self.all.items.len);
     }
 
     /// Stops and joins every thread, then frees the pool. Asserts that
     /// every spawned task was joined.
     pub fn deinit(self: *Threads) void {
-        std.debug.assert(self.idle.items.len == self.all.items.len);
+        assert(self.idle.items.len == self.all.items.len);
         for (self.all.items) |s| {
             s.mutex.lockUncancelable(self.io);
             s.quit = true;
@@ -186,7 +204,7 @@ pub const Options = struct {
 /// ponytail: one retained thread stack per started query; move to explicit
 /// phase storage if stacks become the limiting resource.
 pub fn Worker(comptime Error: type, comptime Product: type) type {
-    comptime std.debug.assert(@typeInfo(Error) == .error_set);
+    comptime assert(@typeInfo(Error) == .error_set);
     return struct {
         io: std.Io,
         ctx: *anyopaque,
@@ -356,6 +374,8 @@ pub fn Worker(comptime Error: type, comptime Product: type) type {
         }
 
         fn checkpoint(ctx: *anyopaque, event: Event) error{QueryCancelled}!void {
+            // SAFETY: `callback` hands out `self` as `ctx`, and the worker
+            // outlives every checkpoint its run makes.
             const self: *Self = @ptrCast(@alignCast(ctx));
             // Suppressed checkpoints only poll cancellation, lock-free.
             if (self.quantum == .completion or (event.phase == .nonlinear and !self.options.report_nonlinear) or (self.quantum == .interval and !self.quantumSpent())) {
@@ -408,6 +428,7 @@ pub fn Worker(comptime Error: type, comptime Product: type) type {
         }
 
         fn mainOpaque(ctx: *anyopaque) void {
+            // SAFETY: `spawnThread` passes `self` as the task's `ctx`.
             main(@ptrCast(@alignCast(ctx)));
         }
 
@@ -438,6 +459,8 @@ pub fn Worker(comptime Error: type, comptime Product: type) type {
         }
     };
 }
+
+// ---- private ----
 
 fn milliseconds(ns: i96) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;

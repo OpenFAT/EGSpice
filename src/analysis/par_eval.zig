@@ -17,80 +17,37 @@
 //! lane count (up to 24554 ulp), the slabs cost a plane copy per lane, and
 //! the reduce walked every lane's slot window, which a shared rail stretches
 //! to the whole plane (#138; dev/analysis/refactoring.md, "ParEval").
+//! The serial walks are `host_walks.zig`, re-exported here.
+//! In: batches, planes and an iterate. Out: the stamped planes, bitwise the
+//! serial stamp.
+//! Cites #137, #138, #172; dev/devices/gpu-evaluation.md.
+//!
+//! Contents:
+//! - `pub const Mode`, `stampRange`, `limitBatches`, `seedBatches`,
+//!   `clearLimitBatches`, `updateBatches`, `stateCtlBatches`, `minReject`
+//!   (re-exports of `host_walks.zig`)
+//! - `pub const ParEval = struct` (`Base`, `init`, `deinit`, `run`, `limit`, `update`)
+//! - `pub fn instanceWeight(b: Batch) u64`
 
 const std = @import("std");
+const assert = std.debug.assert;
 const builtin = @import("builtin");
-const device_ir = @import("device").abi;
+const abi = @import("device").abi;
+const host_walks = @import("host_walks.zig");
+const Batch = abi.Batch;
+const Planes = abi.Planes;
 
-const Batch = device_ir.Batch;
-const Planes = device_ir.Planes;
-const StateCtlOp = device_ir.StateCtlOp;
-
-/// Which planes a stamp writes; see `device_ir.StampMode`. `.charge` uses
-/// the same staging and reduce as `.full`, so its q plane is bit-for-bit
-/// what `.full` leaves.
-pub const Mode = device_ir.StampMode;
-
-/// Instances [first, last) of batch `batch`.
-const EvalTask = struct {
-    batch: u32,
-    first: u32,
-    last: u32,
-};
-
-comptime {
-    // Claimed one per `fetchAdd`; all three fields are read together.
-    std.debug.assert(@sizeOf(EvalTask) == 12);
-}
-
-/// Stamps instances [first, last) of one batch in `mode`. The serial path's
-/// per-mode dispatch.
-pub fn stampRange(b: Batch, pl: *const Planes, first: u32, last: u32, x: []const f64, t: f64, comptime mode: Mode) void {
-    switch (mode) {
-        .full => b.eval(b.ctx, pl, first, last, x, t),
-        .newton => b.eval_newton(b.ctx, pl, first, last, x, t),
-        .charge => if (b.hooks.eval_q) |f| f(b.ctx, pl, first, last, x, t),
-    }
-}
-
-/// Cell -> its staging positions in tape order, for one index space (slots
-/// or rows). Cell i's positions are `src[seg[i]..seg[i + 1]]`; ground
-/// entries are in no cell.
-const Gather = struct {
-    seg: []u32,
-    src: []u32,
-
-    /// Counting sort of `tapes` (each batch's tape, its positions starting
-    /// at `base[b]`) by destination cell, stable, so each run keeps tape
-    /// order. `trash` (ground) entries are dropped.
-    fn build(gpa: std.mem.Allocator, tapes: []const []const u32, n_cells: usize, trash: u32) !Gather {
-        const seg = try gpa.alloc(u32, n_cells + 1);
-        errdefer gpa.free(seg);
-        @memset(seg, 0);
-        for (tapes) |tape| for (tape) |dest| {
-            if (dest != trash) seg[dest + 1] += 1;
-        };
-        for (1..seg.len) |i| seg[i] += seg[i - 1];
-        const src = try gpa.alloc(u32, seg[n_cells]);
-        errdefer gpa.free(src);
-        const cursor = try gpa.dupe(u32, seg[0..n_cells]);
-        defer gpa.free(cursor);
-        var pos: u32 = 0;
-        for (tapes) |tape| for (tape) |dest| {
-            if (dest != trash) {
-                src[cursor[dest]] = pos;
-                cursor[dest] += 1;
-            }
-            pos += 1;
-        };
-        return .{ .seg = seg, .src = src };
-    }
-
-    fn deinit(self: Gather, gpa: std.mem.Allocator) void {
-        gpa.free(self.seg);
-        gpa.free(self.src);
-    }
-};
+/// Which planes a stamp writes (`host_walks.Mode`).
+pub const Mode = host_walks.Mode;
+/// The serial stamp of one batch's instance range.
+pub const stampRange = host_walks.stampRange;
+/// The serial hook walks (`host_walks.zig`).
+pub const limitBatches = host_walks.limitBatches;
+pub const seedBatches = host_walks.seedBatches;
+pub const clearLimitBatches = host_walks.clearLimitBatches;
+pub const updateBatches = host_walks.updateBatches;
+pub const stateCtlBatches = host_walks.stateCtlBatches;
+pub const minReject = host_walks.minReject;
 
 /// Persistent-worker threaded stamp. Owned by the executor for one query;
 /// the batch table it was built for must not change shape while it lives.
@@ -175,8 +132,8 @@ pub const ParEval = struct {
     };
 
     comptime {
-        std.debug.assert(@sizeOf(Counter) == std.atomic.cache_line);
-        std.debug.assert(@sizeOf(Wake) == std.atomic.cache_line);
+        assert(@sizeOf(Counter) == std.atomic.cache_line);
+        assert(@sizeOf(Wake) == std.atomic.cache_line);
     }
 
     /// Initial g and c of every cell: the constant baseline, or empty for
@@ -218,7 +175,7 @@ pub const ParEval = struct {
         var n_row: u64 = 0;
         for (batches, slot_base, row_base, slot_tapes, row_tapes) |b, *sb, *rb, *st, *rt| {
             const tapes = b.hooks.scatter_tapes(b.ctx);
-            std.debug.assert(tapes.rows.len == @as(usize, b.count) * b.n_u);
+            assert(tapes.rows.len == @as(usize, b.count) * b.n_u);
             st.* = tapes.slots;
             rt.* = tapes.rows;
             sb.* = std.math.cast(u32, n_slot) orelse return error.OutOfMemory;
@@ -320,8 +277,8 @@ pub const ParEval = struct {
     /// outside `.newton`.
     pub fn run(self: *ParEval, batches: []const Batch, planes: Planes, base: Base, x: []const f64, t: f64, mode: Mode) void {
         if (mode == .charge and !self.has_charge) return;
-        std.debug.assert(batches.len == self.slot_base.len);
-        std.debug.assert(mode == .newton or (base.g.len == 0 and base.c.len == 0));
+        assert(batches.len == self.slot_base.len);
+        assert(mode == .newton or (base.g.len == 0 and base.c.len == 0));
         self.job_batches = batches;
         self.job_planes = planes;
         self.job_base = base;
@@ -523,6 +480,85 @@ pub const ParEval = struct {
     }
 };
 
+/// Instances [first, last) of batch `batch`.
+const EvalTask = struct {
+    batch: u32,
+    first: u32,
+    last: u32,
+};
+
+comptime {
+    // Claimed one per `fetchAdd`; all three fields are read together.
+    assert(@sizeOf(EvalTask) == 12);
+}
+
+/// Cell -> its staging positions in tape order, for one index space (slots
+/// or rows). Cell i's positions are `src[seg[i]..seg[i + 1]]`; ground
+/// entries are in no cell.
+const Gather = struct {
+    seg: []u32,
+    src: []u32,
+
+    /// Counting sort of `tapes` (each batch's tape, its positions starting
+    /// at `base[b]`) by destination cell, stable, so each run keeps tape
+    /// order. `trash` (ground) entries are dropped.
+    fn build(gpa: std.mem.Allocator, tapes: []const []const u32, n_cells: usize, trash: u32) !Gather {
+        const seg = try gpa.alloc(u32, n_cells + 1);
+        errdefer gpa.free(seg);
+        @memset(seg, 0);
+        for (tapes) |tape| for (tape) |dest| {
+            if (dest != trash) seg[dest + 1] += 1;
+        };
+        for (1..seg.len) |i| seg[i] += seg[i - 1];
+        const src = try gpa.alloc(u32, seg[n_cells]);
+        errdefer gpa.free(src);
+        const cursor = try gpa.dupe(u32, seg[0..n_cells]);
+        defer gpa.free(cursor);
+        var pos: u32 = 0;
+        for (tapes) |tape| for (tape) |dest| {
+            if (dest != trash) {
+                src[cursor[dest]] = pos;
+                cursor[dest] += 1;
+            }
+            pos += 1;
+        };
+        return .{ .seg = seg, .src = src };
+    }
+
+    fn deinit(self: Gather, gpa: std.mem.Allocator) void {
+        gpa.free(self.seg);
+        gpa.free(self.src);
+    }
+};
+
+/// Stamp chunks and reduce blocks per lane: enough that a lane on a core
+/// half as fast takes about half as many, few enough that claiming costs
+/// nothing next to an instance's eval.
+const chunks_per_lane = 8;
+/// Cells per reduce-block cut: 128 bytes of f64, `std.atomic.cache_line` on
+/// x86_64 (adjacent-line prefetch pairs 64-byte lines).
+const block_align = 16;
+
+/// Pause-loop iterations a worker spins on `epoch` before it parks: long
+/// enough to catch the next pass across a short solve, short enough that a
+/// long LU solve does not burn the cores.
+const park_spins: u32 = 4096;
+const park_yields: u32 = 64;
+
+/// An instance's eval cost estimate: its stamp count `n_u^2`, times 16 for
+/// a nonlinear model. With `n_u^2` alone, chain_psp103_10k's lane 0 got all
+/// 64,244 capacitors and 241 ms of an eval pass that took the PSP103 lanes
+/// 5-7 s: a PSP103 instance costs about 1,000 capacitors, not 36. Only the
+/// chunk sizes depend on it, never the results.
+pub fn instanceWeight(b: Batch) u64 {
+    // At least 1: the chunking divides by it, and an instance with no
+    // unknowns still costs a call.
+    const stamps = @max(@as(u64, b.n_u) * b.n_u, 1);
+    return if (b.has_const_jacobian) stamps else 16 * stamps;
+}
+
+// ---- private ----
+
 /// `plane[i] = base[i] + stage[p0] + stage[p1] + ...` over cell i's
 /// positions in tape order, left to right, for cells `[lo, hi)`; an empty
 /// `base` is zero. Resets each position read to -0.0 for the next pass.
@@ -582,20 +618,8 @@ fn cutBlocks(gpa: std.mem.Allocator, slot_seg: []const u32, row_seg: []const u32
             lo = hi;
         }
     }
-    std.debug.assert(cuts.last() == nnz + n);
+    assert(cuts.last() == nnz + n);
     return cuts.toOwnedSlice(gpa);
-}
-
-/// An instance's eval cost estimate: its stamp count `n_u^2`, times 16 for
-/// a nonlinear model. With `n_u^2` alone, chain_psp103_10k's lane 0 got all
-/// 64,244 capacitors and 241 ms of an eval pass that took the PSP103 lanes
-/// 5-7 s: a PSP103 instance costs about 1,000 capacitors, not 36. Only the
-/// chunk sizes depend on it, never the results.
-pub fn instanceWeight(b: Batch) u64 {
-    // At least 1: the chunking divides by it, and an instance with no
-    // unknowns still costs a call.
-    const stamps = @max(@as(u64, b.n_u) * b.n_u, 1);
-    return if (b.has_const_jacobian) stamps else 16 * stamps;
 }
 
 /// Moves the calling thread onto the performance cores of a hybrid CPU
@@ -641,20 +665,6 @@ fn waitCount(counter: *std.atomic.Value(u32), target: u32) void {
         if (!builtin.single_threaded and spins > 4096) std.Thread.yield() catch {};
     }
 }
-
-/// Stamp chunks and reduce blocks per lane: enough that a lane on a core
-/// half as fast takes about half as many, few enough that claiming costs
-/// nothing next to an instance's eval.
-const chunks_per_lane = 8;
-/// Cells per reduce-block cut: 128 bytes of f64, `std.atomic.cache_line` on
-/// x86_64 (adjacent-line prefetch pairs 64-byte lines).
-const block_align = 16;
-
-/// Pause-loop iterations a worker spins on `epoch` before it parks: long
-/// enough to catch the next pass across a short solve, short enough that a
-/// long LU solve does not burn the cores.
-const park_spins: u32 = 4096;
-const park_yields: u32 = 64;
 
 test "Gather lists each cell's positions in tape order, ground dropped" {
     const gpa = std.testing.allocator;
@@ -729,53 +739,4 @@ test instanceWeight {
     try std.testing.expectEqual(@as(u64, 9), instanceWeight(b));
     b.has_const_jacobian = false;
     try std.testing.expectEqual(@as(u64, 144), instanceWeight(b));
-}
-
-// Host walks over a batch slice: each runs one device hook over every batch
-// in order. `Circuit` walks all of its batches; the GPU context walks the
-// ones it keeps on the host, or all of them after a fault.
-
-/// `applyLimits` over `batches` on the host.
-pub fn limitBatches(batches: []const Batch, x: []f64, x_old: []const f64) bool {
-    var any_limited = false;
-    for (batches) |b| if (b.hooks.apply_limits) |f| {
-        if (f(b.ctx, x, x_old)) any_limited = true;
-    };
-    return any_limited;
-}
-
-/// `seedJunctions` over `batches` on the host.
-pub fn seedBatches(batches: []const Batch, x: []f64) void {
-    for (batches) |b| if (b.hooks.seed) |f| f(b.ctx, x);
-}
-
-/// `clearLimits` over `batches` on the host.
-pub fn clearLimitBatches(batches: []const Batch) void {
-    for (batches) |b| if (b.hooks.clear_limits) |f| f(b.ctx);
-}
-
-/// `updateStates`' device walk over `batches`: the earliest reject time,
-/// or null. Stages state for the next `stateCtl`.
-pub fn updateBatches(batches: []const Batch, x: []const f64) ?f64 {
-    return minReject(batches, "update_state", x);
-}
-
-/// `stateCtl` over `batches` on the host.
-pub fn stateCtlBatches(batches: []const Batch, sop: StateCtlOp) bool {
-    var dirty = false;
-    for (batches) |b| if (b.hooks.state_ctl) |f| {
-        if (f(b.ctx, sop)) dirty = true;
-    };
-    return dirty;
-}
-
-/// Earliest step-reject time any batch's `hook` returns, or null.
-pub fn minReject(batches: []const Batch, comptime hook: []const u8, x: []const f64) ?f64 {
-    var min_reject: ?f64 = null;
-    for (batches) |b| {
-        if (@field(b.hooks, hook)) |f| if (f(b.ctx, x)) |tr| {
-            min_reject = if (min_reject) |cur| @min(cur, tr) else tr;
-        };
-    }
-    return min_reject;
 }

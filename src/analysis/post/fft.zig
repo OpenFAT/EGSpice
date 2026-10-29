@@ -2,8 +2,17 @@
 //! NP uniform points over [START, STOP), windowed and transformed. The plot
 //! is the `.ft#` data: every bin from DC to NP/2, as one complex column
 //! whose magnitude is the component's amplitude and whose angle is its sine
-//! phase. Also cites Harris 1978 (Kaiser window side lobes, #82).
+//! phase.
+//! In: a run context and the `.fft` options. Out: NP/2 + 1 complex rows.
+//! Cites HSPICE [CR .FFT; SA Ch.15 Table 56]; Harris 1978 (Kaiser window
+//! side lobes, #82).
+//!
+//! Contents:
+//! - `pub const Options = core.query.Fft`
+//! - `pub fn run(ctx: *const RunCtx, opts: Options) !Result`
+
 const std = @import("std");
+const assert = std.debug.assert;
 const root = @import("../types.zig");
 const fft_mod = @import("solver").fft;
 const tran = @import("../tran/tran.zig");
@@ -12,47 +21,8 @@ const four = @import("four.zig");
 /// Query options, defined in core/query.zig.
 pub const Options = @import("core").query.Fft;
 
-/// HSPICE's window `n` of `np` [SA Ch.15 Table 56], `alfa` shaping GAUSS and
-/// KAISER.
-fn window(kind: Options.Window, n: usize, np: usize, alfa: f64) f64 {
-    const x: f64 = @floatFromInt(n);
-    const m: f64 = @floatFromInt(np);
-    const c = 2 * std.math.pi * x / (m - 1);
-    const half = m / 2;
-    // Distance from the centre of the symmetric NP - 1 forms the cosine
-    // windows use, so GAUSS and KAISER reach their edge value at n = 0 and
-    // n = NP - 1 (#82): Kaiser's u = 2d/(NP - 1) spans [0, 1], as in Harris
-    // 1978 and numpy's kaiser(NP, pi ALFA).
-    const d = @abs(x - (m - 1) / 2);
-    return switch (kind) {
-        .rect => 1,
-        .bart => if (x <= half - 1) 2 * x / (m - 1) else 2 - 2 * x / (m - 1),
-        .hann => 0.5 - 0.5 * @cos(c),
-        .hamm => 0.54 - 0.46 * @cos(c),
-        .black => 0.42323 - 0.49755 * @cos(c) + 0.07922 * @cos(2 * c),
-        .harris => 0.35875 - 0.48829 * @cos(c) + 0.14128 * @cos(2 * c) - 0.01168 * @cos(3 * c),
-        .gauss => @exp(-0.5 * alfa * alfa * d * d / (m * m)),
-        .kaiser => blk: {
-            const x1 = std.math.pi * alfa;
-            const r = 2 * d / (m - 1);
-            break :blk besselI0(x1 * @sqrt(@max(1 - r * r, 0))) / besselI0(x1);
-        },
-    };
-}
-
-/// Zero-order modified Bessel function of the first kind, by its power
-/// series, which converges for every finite argument.
-fn besselI0(x: f64) f64 {
-    var sum: f64 = 1;
-    var term: f64 = 1;
-    var k: f64 = 1;
-    while (term > 1e-17 * sum) : (k += 1) {
-        const h = x / (2 * k);
-        term *= h * h;
-        sum += term;
-    }
-    return sum;
-}
+/// More series terms than any argument a window passes (pi ALFA) needs.
+const besselI0_terms_max = 1000;
 
 /// Contract entry: the transient, then the spectrum. Complex, NP/2 + 1 rows
 /// (frequency, output). Bin k >= 1 holds 2·X[k]/Σw rotated to a sine
@@ -64,6 +34,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const a = ctx.allocator;
     const scratch = ctx.scratch_allocator;
     const np: usize = opts.np;
+    assert(np >= 2);
 
     const x = try scratch.dupe(f64, ctx.x_op);
     defer scratch.free(x);
@@ -114,6 +85,7 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
         data[k * 4 + 3] /= peak;
     };
 
+    assert(rows == np / 2 + 1);
     const names = try a.dupe([]const u8, &.{ "frequency", opts.label });
     return .{
         .plotname = try a.print("FFT Analysis {s}", .{opts.label}),
@@ -122,6 +94,51 @@ pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
         .npoints = rows,
         .data = data,
     };
+}
+
+// ---- private ----
+
+/// HSPICE's window `n` of `np` [SA Ch.15 Table 56], `alfa` shaping GAUSS and
+/// KAISER.
+fn window(kind: Options.Window, n: usize, np: usize, alfa: f64) f64 {
+    const x: f64 = @floatFromInt(n);
+    const m: f64 = @floatFromInt(np);
+    const c = 2 * std.math.pi * x / (m - 1);
+    const half = m / 2;
+    // Distance from the centre of the symmetric NP - 1 forms the cosine
+    // windows use, so GAUSS and KAISER reach their edge value at n = 0 and
+    // n = NP - 1 (#82): Kaiser's u = 2d/(NP - 1) spans [0, 1], as in Harris
+    // 1978 and numpy's kaiser(NP, pi ALFA).
+    const d = @abs(x - (m - 1) / 2);
+    return switch (kind) {
+        .rect => 1,
+        .bart => if (x <= half - 1) 2 * x / (m - 1) else 2 - 2 * x / (m - 1),
+        .hann => 0.5 - 0.5 * @cos(c),
+        .hamm => 0.54 - 0.46 * @cos(c),
+        .black => 0.42323 - 0.49755 * @cos(c) + 0.07922 * @cos(2 * c),
+        .harris => 0.35875 - 0.48829 * @cos(c) + 0.14128 * @cos(2 * c) - 0.01168 * @cos(3 * c),
+        .gauss => @exp(-0.5 * alfa * alfa * d * d / (m * m)),
+        .kaiser => blk: {
+            const x1 = std.math.pi * alfa;
+            const r = 2 * d / (m - 1);
+            break :blk besselI0(x1 * @sqrt(@max(1 - r * r, 0))) / besselI0(x1);
+        },
+    };
+}
+
+/// Zero-order modified Bessel function of the first kind, by its power
+/// series, which converges for every finite argument.
+fn besselI0(x: f64) f64 {
+    var sum: f64 = 1;
+    var term: f64 = 1;
+    var k: f64 = 1;
+    while (term > 1e-17 * sum) : (k += 1) {
+        assert(k < besselI0_terms_max); // The terms fall factorially past k = x/2.
+        const h = x / (2 * k);
+        term *= h * h;
+        sum += term;
+    }
+    return sum;
 }
 
 test "window: every kind is symmetric and peaks at 1 or less" {
