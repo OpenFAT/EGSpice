@@ -5,14 +5,19 @@
 //! `Lib`), and the §12.31.3 analog callbacks driven by `.op` and `.tran`.
 //! Lives in the executable, so the `vpi_*` symbols an application resolves
 //! are exported from it alone (`rdynamic`), never from libespice.
-//! The sequence is VerA's tests/vpi_host.zig `analogHost`; #197, #198.
+//! Cites: IEEE 1800-2017 (LRM) §12.9, §12.18, §12.31.3, §12.32, §12.33.2,
+//! §12.36; the sequence is VerA's tests/vpi_host.zig `analogHost`; #197,
+//! #198.
+//!
+//! Contents:
+//! - `pub fn init(gpa: std.mem.Allocator, io: std.Io) *const espice.Vpi`
 
 const std = @import("std");
+const assert = std.debug.assert;
 const contract = @import("contract");
 const vera = @import("fastvaf");
 const vpi = @import("vera_vpi");
 const espice = @import("espice");
-
 const VpiError = espice.VpiError;
 
 /// VerA's VPI is process-global (one design, one call table, C callbacks
@@ -26,7 +31,7 @@ const Host = struct {
     /// Paths of the loaded applications. Each library stays open for the
     /// life of the process: its calltf pointers live in VerA's registry.
     apps: std.ArrayList([]const u8) = .empty,
-    /// `vpi.systf.intAnalogNames` after the latest load.
+    /// `vpi.systf.intAnalogNames` after the latest load, in `names_arena`.
     int_names: []const []const u8 = &.{},
     names_arena: std.heap.ArenaAllocator,
     /// The one module whose design is open, by source path.
@@ -37,16 +42,18 @@ const Host = struct {
     binding: vpi.analog_run.Binding = .{},
 };
 
-var host: Host = undefined;
+/// The largest module source `attach` reads for its design.
+const source_bytes_max = 64 * 1024 * 1024;
 
-/// Sets up the process's VPI host and returns its interface for
-/// `espice.Options.vpi`. Call once, before any Problem.
-pub fn init(gpa: std.mem.Allocator, io: std.Io) *const espice.Vpi {
-    host = .{ .gpa = gpa, .io = io, .names_arena = .init(gpa) };
-    return &interface;
-}
+/// What VerA reads for an unknown outside a call's arguments. NaN, so a
+/// calltf that reads one shows it rather than a plausible number.
+// ponytail: NaN until VerA refuses that read by name without a solution
+// (VerA#83, V5); bounded by the unknowns a module can have.
+const no_solution: [4096]f64 = @splat(std.math.nan(f64));
 
 const interface: espice.Vpi = .{
+    // SAFETY: never read; every function below reaches `host` directly,
+    // since VerA's callbacks carry no context either.
     .ctx = undefined,
     .load_app = loadApp,
     .int_systfs = intSystfs,
@@ -57,6 +64,54 @@ const interface: espice.Vpi = .{
     .accept = accept,
     .next_forced = nextForced,
 };
+
+/// What every instance of the attached module calls through: VerA's
+/// `Binding.call`/`output` under `mutex`. Every instance shares one call
+/// object (VerA#84), so state an application keeps per call handle is
+/// shared by every instance.
+const systf_host: contract.SystfHost = .{
+    // SAFETY: never read, as `interface.ctx`.
+    .ctx = undefined,
+    .call = call,
+    .out = out,
+};
+
+/// The device side of VerA's analog walk, reduced to the call table: ESPice
+/// solves and walks the circuit itself, so `analog_run` never solves through
+/// it.
+const stub_lib: vpi.analog_run.Lib = .{
+    .open = stubOpen,
+    .solve = stubSolve,
+    .accept = stubAccept,
+    .x = stubX,
+    .n_u = zero,
+    .n_rows = zero,
+    .row = stubRow,
+    .rows = stubValues,
+    .n_shares = zero,
+    .shares = stubValues,
+    .systf = bindCalls,
+    .n_systf = nSystf,
+    .systf_name = systfName,
+    .systf_tok = systfTok,
+    .systf_outs = systfOuts,
+    .ac = stubAc,
+};
+
+// SAFETY: written by `init` before any `Vpi` function can be called.
+var host: Host = undefined;
+
+/// Sets up the process's VPI host and returns its interface for
+/// `espice.Options.vpi`. Call once, before any Problem; the interface lives
+/// for the rest of the process.
+pub fn init(gpa: std.mem.Allocator, io: std.Io) *const espice.Vpi {
+    host = .{ .gpa = gpa, .io = io, .names_arena = .init(gpa) };
+    assert(host.attached == null);
+    assert(host.apps.items.len == 0);
+    return &interface;
+}
+
+// ---- private ----
 
 fn loadApp(_: *anyopaque, path: []const u8) VpiError!void {
     host.mutex.lockUncancelable(host.io);
@@ -77,8 +132,8 @@ fn loadApp(_: *anyopaque, path: []const u8) VpiError!void {
         try host.apps.ensureUnusedCapacity(host.gpa, 1);
         host.apps.appendAssumeCapacity(try host.gpa.dupe(u8, path));
     }
-    // From here the library stays open and listed: its calltfs enter
-    // VerA's registry, even if the name list below fails.
+    // From here the library stays open and listed: its calltfs enter VerA's
+    // registry, even if the name list below fails.
     vpi.runStartupTable(table);
     host.int_names = try vpi.systf.intAnalogNames(host.names_arena.allocator());
 }
@@ -98,7 +153,8 @@ fn registered(_: *anyopaque, name: []const u8) bool {
 /// Opens VerA's design of the module at `source_path` (compiled again here:
 /// a cached `.hdl` build carries no design), binds `calls` to it and runs
 /// the build-time callbacks (compiletf, derivtf, cbEndOfCompile,
-/// cbStartOfSimulation).
+/// cbStartOfSimulation). A second module is refused: VerA's VPI holds one
+/// design.
 fn attach(_: *anyopaque, source_path: []const u8, calls: []const contract.Systf) VpiError!*const contract.SystfHost {
     host.mutex.lockUncancelable(host.io);
     defer host.mutex.unlock(host.io);
@@ -107,7 +163,7 @@ fn attach(_: *anyopaque, source_path: []const u8, calls: []const contract.Systf)
         std.log.err("vpi: {s} calls a $systf, and so does {s}: VerA's VPI holds one design (VerA#84), so one module per run may call one", .{ source_path, p });
         return error.VpiSecondSystfModule;
     }
-    const source = std.Io.Dir.cwd().readFileAlloc(host.io, source_path, host.gpa, .limited(64 * 1024 * 1024)) catch |err| {
+    const source = std.Io.Dir.cwd().readFileAlloc(host.io, source_path, host.gpa, .limited(source_bytes_max)) catch |err| {
         std.log.err("vpi: {s}: cannot read the module for its design ({s})", .{ source_path, @errorName(err) });
         return error.VpiDesignFailed;
     };
@@ -127,24 +183,21 @@ fn attach(_: *anyopaque, source_path: []const u8, calls: []const contract.Systf)
     vpi.callback.endOfCompile();
     vpi.callback.startOfSimulation();
     host.attached = try host.gpa.dupe(u8, source_path);
+    assert(host.calls.len == calls.len);
     return &systf_host;
 }
-
-/// What every instance of the attached module calls through: VerA's
-/// `Binding.call`/`output` under `mutex`. Every instance shares one call
-/// object (VerA#84), so state an application keeps per call handle is
-/// shared by every instance.
-const systf_host: contract.SystfHost = .{ .ctx = undefined, .call = call, .out = out };
 
 fn call(_: *anyopaque, k: usize, args: []const f64, partials: []f64) f64 {
     host.mutex.lockUncancelable(host.io);
     defer host.mutex.unlock(host.io);
+    assert(k < host.calls.len);
     return host.binding.call(0, k, args, partials);
 }
 
 fn out(_: *anyopaque, k: usize, j: usize, args: []const f64, partials: []f64) f64 {
     host.mutex.lockUncancelable(host.io);
     defer host.mutex.unlock(host.io);
+    assert(k < host.calls.len);
     return host.binding.output(0, k, j, args, partials);
 }
 
@@ -154,6 +207,7 @@ fn out(_: *anyopaque, k: usize, j: usize, args: []const f64, partials: []f64) f6
 fn point(_: *anyopaque, p: espice.VpiAnalogPoint) void {
     host.mutex.lockUncancelable(host.io);
     defer host.mutex.unlock(host.io);
+    assert(p.dt >= 0);
     const kind: vpi.analog_run.Kind = switch (p.kind) {
         .op => .op,
         .tran => .tran,
@@ -202,61 +256,48 @@ fn nextForced(_: *anyopaque, after: f64) ?f64 {
     return vpi.callback.nextForced(after, std.math.inf(f64));
 }
 
-/// The device side of VerA's analog walk, reduced to the call table: ESPice
-/// solves and walks the circuit itself, so `analog_run` never solves through
-/// it.
-const stub_lib: vpi.analog_run.Lib = .{
-    .open = stubOpen,
-    .solve = stubSolve,
-    .accept = stubAccept,
-    .x = stubX,
-    .n_u = zero,
-    .n_rows = zero,
-    .row = stubRow,
-    .rows = stubValues,
-    .n_shares = zero,
-    .shares = stubValues,
-    .systf = bindCalls,
-    .n_systf = nSystf,
-    .systf_name = systfName,
-    .systf_tok = systfTok,
-    .systf_outs = systfOuts,
-    .ac = stubAc,
-};
-
-/// What VerA reads for an unknown outside a call's arguments. NaN, so a
-/// calltf that reads one shows it rather than a plausible number.
-// ponytail: NaN until VerA refuses that read by name without a solution
-// (VerA#83, V5); bounded by the unknowns a module can have.
-const no_solution: [4096]f64 = @splat(std.math.nan(f64));
-
 fn stubOpen(_: u8) callconv(.c) void {}
+
 fn stubSolve(_: f64, _: f64, _: bool, _: bool) callconv(.c) bool {
     return false;
 }
+
 fn stubAccept() callconv(.c) void {}
+
 fn stubX() callconv(.c) [*]const f64 {
     return &no_solution;
 }
+
 fn zero() callconv(.c) usize {
     return 0;
 }
+
 fn stubRow(_: usize, _: *[4]i32) callconv(.c) void {}
+
 fn stubValues(_: [*]f64) callconv(.c) void {}
+
 fn stubAc(_: f64, _: [*]f64, _: [*]f64) callconv(.c) bool {
     return false;
 }
+
 fn bindCalls(_: ?*anyopaque, _: ?vpi.analog_run.HostCall, _: ?vpi.analog_run.HostOut) callconv(.c) void {}
+
 fn nSystf() callconv(.c) usize {
     return host.calls.len;
 }
+
 fn systfName(k: usize, len: *usize) callconv(.c) [*]const u8 {
+    assert(k < host.calls.len);
     len.* = host.calls[k].name.len;
     return host.calls[k].name.ptr;
 }
+
 fn systfTok(k: usize) callconv(.c) u32 {
+    assert(k < host.calls.len);
     return host.calls[k].tok;
 }
+
 fn systfOuts(k: usize) callconv(.c) u64 {
+    assert(k < host.calls.len);
     return host.calls[k].outs;
 }
