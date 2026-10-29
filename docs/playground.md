@@ -86,5 +86,5 @@ M2 out in vdd vdd pch w=2.5u l=0.18u
   lower. Decks with tens of thousands of devices belong on the native
   `espice`.
 
-For anything past these limits, [build ESPice](https://github.com/OmarSiwy/ESPice)
+For anything past these limits, [build ESPice](https://github.com/OpenFAT/EGSpice)
 and run the same deck from the command line.

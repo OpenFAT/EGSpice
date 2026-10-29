@@ -1,7 +1,7 @@
 # ESPice
 
 A SPICE circuit simulator written in Zig. Every device model is Verilog-A, compiled at build time by
-[VerA](https://github.com/OmarSiwy/VerA), and one device kernel builds for the CPU, CUDA and HIP
+[VerA](https://github.com/OpenFAT/VerA), and one device kernel builds for the CPU, CUDA and HIP
 through [Gompute](https://github.com/OmarSiwy/Gompute).
 
 ```sh
@@ -11,7 +11,7 @@ espice --format=touchstone -r out.s2p deck.sp
 espice --backend cuda sweep.sp                   # sweep points as GPU lanes
 ```
 
-Docs: <https://omarsiwy.github.io/ESPice/> · Changes: [CHANGELOGS.md](CHANGELOGS.md)
+Docs: <https://openfat.github.io/EGSpice/> · Changes: [CHANGELOGS.md](CHANGELOGS.md)
 
 ## Install
 
@@ -23,16 +23,16 @@ Docs: <https://omarsiwy.github.io/ESPice/> · Changes: [CHANGELOGS.md](CHANGELOG
 | Arch | `sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst`, or the release's `PKGBUILD` (`espice-bin`) with `makepkg`; on the AUR once published |
 | NVIDIA / AMD GPUs (Linux) | `espice-cuda-0.3.0-linux-{amd64,arm64}.{deb,rpm,pkg.tar.zst}` (any NVIDIA GPU from Turing on; needs the driver) or `espice-hip-0.3.0-linux-amd64.*` (every AMD target the release builds, picked at start; needs ROCm's HIP runtime). One of `espice`, `espice-cuda`, `espice-hip` at a time |
 | Homebrew (macOS, Linux) | `brew install OmarSiwy/espice/espice`, once the tap is published (the release's `espice.rb`) |
-| Nix (release binary) | `nix run github:OmarSiwy/ESPice#latest -- deck.sp`, or `'#"0.3.0"'` for a given release |
-| Nix (from source) | `nix run github:OmarSiwy/ESPice -- deck.sp`; `nix profile install github:OmarSiwy/ESPice` (`.#espice-cuda` adds CUDA) |
-| Release tarball | [GitHub releases](https://github.com/OmarSiwy/ESPice/releases): every platform and CPU level, with `SHA256SUMS`; GPU builds as self-extracting `.run` bundles |
+| Nix (release binary) | `nix run github:OpenFAT/EGSpice#latest -- deck.sp`, or `'#"0.3.0"'` for a given release |
+| Nix (from source) | `nix run github:OpenFAT/EGSpice -- deck.sp`; `nix profile install github:OpenFAT/EGSpice` (`.#espice-cuda` adds CUDA) |
+| Release tarball | [GitHub releases](https://github.com/OpenFAT/EGSpice/releases): every platform and CPU level, with `SHA256SUMS`; GPU builds as self-extracting `.run` bundles |
 
 The packages, the install script, Homebrew and Nix install the CPU build at the baseline instruction
 set. Every route but the two from source needs a published release, and none exists yet; until
 one does, use Nix from source or build from source. Runtime `.hdl`
 models build with Zig 0.18.0-dev.349: the Linux packages and Nix carry it; with the install script,
 Homebrew or a tarball, put it on `PATH` or in `$ZIG`. More in the
-[install guide](https://omarsiwy.github.io/ESPice/using/install/).
+[install guide](https://openfat.github.io/EGSpice/using/install/).
 
 From source (Zig 0.18.0-dev.349, provided by the devshell; VerA and Gompute are pinned in
 `build.zig.zon`):
@@ -99,7 +99,7 @@ Median of 3 runs after a warm-up, process startup included, CPU backend, 32 x In
 `zig build test` runs the unit suites and then the fixture corpus: about 920 decks in
 `tests/conformance/tests/netlist/`, each scored against its `.expected.json` (oracles from ngspice and
 VACASK). The decks live in the
-[VAMS Conformance Suite](https://github.com/OmarSiwy/VAMS-Conformance-Suite), a submodule
+[VAMS Conformance Suite](https://github.com/OpenFAT/VAMS-Conformance-Suite), a submodule
 (`git submodule update --init tests/conformance`; the flake reads the same commit as its `conformance`
 input). Add or fix a deck there, then move the submodule and `nix flake update conformance` together. Narrow a run with `-Dtest-filter=NAME` (unit tests) and
 `-- --filter op/` (decks). Benchmarks:

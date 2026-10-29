@@ -1,7 +1,7 @@
 site_name: ESPice
 site_description: A SPICE circuit simulator with Verilog-A device models, GPU device evaluation and a C API.
-site_url: https://omarsiwy.github.io/ESPice/
-repo_url: https://github.com/OmarSiwy/ESPice
+site_url: https://openfat.github.io/EGSpice/
+repo_url: https://github.com/OpenFAT/EGSpice
 repo_name: OmarSiwy/ESPice
 edit_uri: edit/main/docs/
 docs_dir: docs

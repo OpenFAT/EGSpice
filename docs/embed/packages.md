@@ -6,7 +6,7 @@ ESPice builds with Zig 0.17.0 and can be a dependency of your own
 `build.zig`. Add it to `build.zig.zon`:
 
 ```sh
-zig fetch --save git+https://github.com/OmarSiwy/ESPice#main
+zig fetch --save git+https://github.com/OpenFAT/EGSpice#main
 ```
 
 Pin a revision after 0.1.0: the `libespice` lazy path used below was added
@@ -63,7 +63,7 @@ a `*std.Io.Writer`, from Zig); see [Conventions](c-api.md#conventions).
 ```nix
 {
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-  inputs.espice.url = "github:OmarSiwy/ESPice";
+  inputs.espice.url = "github:OpenFAT/EGSpice";
 
   outputs = { nixpkgs, espice, ... }:
     let

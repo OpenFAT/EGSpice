@@ -18,7 +18,7 @@
     nix-bundle.inputs.utils.follows = "flake-utils";
     # The SPICE decks (tests/netlist/), also checked out at tests/conformance:
     # a git flake leaves submodules out of its source.
-    conformance.url = "github:OmarSiwy/VAMS-Conformance-Suite";
+    conformance.url = "github:OpenFAT/VAMS-Conformance-Suite";
     conformance.inputs.nixpkgs.follows = "nixpkgs";
     conformance.inputs.flake-utils.follows = "flake-utils";
   };

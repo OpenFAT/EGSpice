@@ -38,7 +38,7 @@ Newest first.
 - **Robustness:** bad decks fail with an error naming the card instead of running wrong; out-of-memory and Newton runaway are reported instead of publishing zeros.
 - **Models:** third-party compact models (PSP, BSIM-CMG/BULK/IMG/SOI, HiSIM, HICUM, Mextram, ASM-HEMT, MVSG and more) from their upstream releases, unmodified.
 - `ESPICE_THREADS` gives the same output at any thread count (#137).
-- Nix flake (`nix run github:OmarSiwy/ESPice`, CUDA package), the playground (`zig build wasm`) and the user documentation site.
+- Nix flake (`nix run github:OpenFAT/EGSpice`, CUDA package), the playground (`zig build wasm`) and the user documentation site.
 
 ## 0.1.0 (2026-10-05)
 

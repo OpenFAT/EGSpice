@@ -5,14 +5,14 @@ pkgver=@VERSION@
 pkgrel=1
 pkgdesc='SPICE circuit simulator with a built-in Verilog-A compiler (CPU build)'
 arch=(x86_64 aarch64)
-url='https://github.com/OmarSiwy/ESPice'
+url='https://github.com/OpenFAT/EGSpice'
 license=(Apache-2.0)
 depends=(glibc)
 provides=(espice)
 conflicts=(espice)
 # The bundled Zig and its lib/ must stay byte-for-byte as released.
 options=(!strip !debug)
-_release="https://github.com/OmarSiwy/ESPice/releases/download/v$pkgver"
+_release="https://github.com/OpenFAT/EGSpice/releases/download/v$pkgver"
 source_x86_64=("espice-$pkgver-linux-amd64.deb::$_release/espice-$pkgver-linux-amd64.deb")
 source_aarch64=("espice-$pkgver-linux-arm64.deb::$_release/espice-$pkgver-linux-arm64.deb")
 sha256sums_x86_64=('@SHA256_AMD64@')
