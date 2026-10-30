@@ -60,4 +60,4 @@ RC low-pass filter: 3 devices
 ESPice is Apache-2.0. Its source, issues and releases are on
 [GitHub](https://github.com/OpenFAT/EGSpice). The developer reference, on
 how ESPice is built inside, is on
-[DeepWiki](https://deepwiki.com/OmarSiwy/ESPice).
+[DeepWiki](https://deepwiki.com/OpenFAT/EGSpice).

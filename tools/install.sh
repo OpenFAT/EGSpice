@@ -2,7 +2,7 @@
 # Installs an ESPice release from sources.json, the same catalogue the flake's
 # versioned packages install from, without nix (after VerA's tools/install.sh):
 #
-#   curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/OpenFAT/EGSpice/main/tools/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- 0.3.0       # a pinned version
 #
 # Each version lives in $ESPICE_INSTALL_HOME/<version> (the release tree: bin,
@@ -21,7 +21,7 @@
 # the Zig in sources.json's "zig", printed at the end (zig on PATH, or ZIG).
 set -eu
 
-sources=${ESPICE_INSTALL_SOURCES:-https://raw.githubusercontent.com/OmarSiwy/ESPice/main/sources.json}
+sources=${ESPICE_INSTALL_SOURCES:-https://raw.githubusercontent.com/OpenFAT/EGSpice/main/sources.json}
 home=${ESPICE_INSTALL_HOME:-$HOME/.local/share/espice}
 bindir=${ESPICE_INSTALL_BIN:-$HOME/.local/bin}
 cache=${ESPICE_INSTALL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/espice/releases}

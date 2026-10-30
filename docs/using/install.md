@@ -10,8 +10,8 @@ source (`nix run github:OpenFAT/EGSpice`) or build from source.
 On Linux or macOS, without root:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh
-curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh -s -- 0.3.0
+curl -fsSL https://raw.githubusercontent.com/OpenFAT/EGSpice/main/tools/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/OpenFAT/EGSpice/main/tools/install.sh | sh -s -- 0.3.0
 ```
 
 It reads `sources.json` (each release's tarballs and checksums), downloads

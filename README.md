@@ -17,7 +17,7 @@ Docs: <https://openfat.github.io/EGSpice/> · Changes: [CHANGELOGS.md](CHANGELOG
 
 | Route | Command |
 |---|---|
-| Install script (Linux, macOS) | `curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh \| sh` (`sh -s -- 0.3.0` pins a version): reads `sources.json`, checks the download's sha256, caches it, and keeps versions side by side under `~/.local/share/espice` |
+| Install script (Linux, macOS) | `curl -fsSL https://raw.githubusercontent.com/OpenFAT/EGSpice/main/tools/install.sh \| sh` (`sh -s -- 0.3.0` pins a version): reads `sources.json`, checks the download's sha256, caches it, and keeps versions side by side under `~/.local/share/espice` |
 | Debian, Ubuntu, Mint | `sudo apt install ./espice-0.3.0-linux-amd64.deb` (`arm64` too) |
 | Fedora, openSUSE | `sudo dnf install ./espice-0.3.0-linux-amd64.rpm` (`zypper install` on openSUSE) |
 | Arch | `sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst`, or the release's `PKGBUILD` (`espice-bin`) with `makepkg`; on the AUR once published |
