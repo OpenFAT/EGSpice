@@ -1,7 +1,7 @@
 # The release binary as a Homebrew formula (macOS and Linux), after VerA's.
 # `tools/release.py verify` fills the @...@ fields from a release's tarballs;
 # release.yml attaches the result and, given a token, pushes it to the
-# OmarSiwy/homebrew-espice tap.
+# OpenFAT/homebrew-espice tap.
 class Espice < Formula
   desc "SPICE circuit simulator with a built-in Verilog-A compiler (CPU build)"
   homepage "https://github.com/OpenFAT/EGSpice"

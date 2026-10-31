@@ -2,7 +2,7 @@
 
 A SPICE circuit simulator written in Zig. Every device model is Verilog-A, compiled at build time by
 [VerA](https://github.com/OpenFAT/VerA), and one device kernel builds for the CPU, CUDA and HIP
-through [Gompute](https://github.com/OmarSiwy/Gompute).
+through [Gompute](https://github.com/OpenFAT/Gompute).
 
 ```sh
 espice deck.sp                                   # ngspice, HSPICE or Spectre deck, detected
@@ -22,7 +22,7 @@ Docs: <https://openfat.github.io/EGSpice/> · Changes: [CHANGELOGS.md](CHANGELOG
 | Fedora, openSUSE | `sudo dnf install ./espice-0.3.0-linux-amd64.rpm` (`zypper install` on openSUSE) |
 | Arch | `sudo pacman -U ./espice-0.3.0-linux-amd64.pkg.tar.zst`, or the release's `PKGBUILD` (`espice-bin`) with `makepkg`; on the AUR once published |
 | NVIDIA / AMD GPUs (Linux) | `espice-cuda-0.3.0-linux-{amd64,arm64}.{deb,rpm,pkg.tar.zst}` (any NVIDIA GPU from Turing on; needs the driver) or `espice-hip-0.3.0-linux-amd64.*` (every AMD target the release builds, picked at start; needs ROCm's HIP runtime). One of `espice`, `espice-cuda`, `espice-hip` at a time |
-| Homebrew (macOS, Linux) | `brew install OmarSiwy/espice/espice`, once the tap is published (the release's `espice.rb`) |
+| Homebrew (macOS, Linux) | `brew install OpenFAT/espice/espice`, once the tap is published (the release's `espice.rb`) |
 | Nix (release binary) | `nix run github:OpenFAT/EGSpice#latest -- deck.sp`, or `'#"0.3.0"'` for a given release |
 | Nix (from source) | `nix run github:OpenFAT/EGSpice -- deck.sp`; `nix profile install github:OpenFAT/EGSpice` (`.#espice-cuda` adds CUDA) |
 | Release tarball | [GitHub releases](https://github.com/OpenFAT/EGSpice/releases): every platform and CPU level, with `SHA256SUMS`; GPU builds as self-extracting `.run` bundles |

@@ -9,7 +9,7 @@
             .hash = "vera-0.20.0-fzAu7FQXLgFAvPn0QWF5P0zfUrFZY-Jz-_8DhcZfPAIf",
         },
         .gompute = .{
-            .url = "git+https://github.com/OmarSiwy/Gompute#15ab58137b094db1a82a74f67b0b0cba1c57d7af",
+            .url = "git+https://github.com/OpenFAT/Gompute#15ab58137b094db1a82a74f67b0b0cba1c57d7af",
             .hash = "gompute-1.5.0-YJVc1qjKCAC0sRRUEgn07hJbNHviJzrSf2fHE7XnWN7g",
         },
     },
