@@ -557,10 +557,11 @@ fn hspicePower(x: f64, y: f64) f64 {
 }
 
 /// numparam's `nint` (§2.2): to the nearest integer, a half to the even one.
+/// A zero keeps `a`'s sign, so nint(-0.5) is -0, as in ngspice.
 fn roundHalfEven(a: f64) f64 {
     const r = @round(a);
     if (@abs(a - @trunc(a)) != 0.5) return r;
-    return if (@mod(r, 2) == 0) r else r - std.math.sign(a);
+    return std.math.copysign(if (@mod(r, 2) == 0) r else r - std.math.sign(a), a);
 }
 
 /// Operands an op pops.
@@ -653,6 +654,9 @@ test "compile and fold: precedence, associativity and calls" {
         try std.testing.expect(v.known);
         try std.testing.expectEqual(case[1], v.num);
     }
+    // nint(-0.5) is -0: ngspice-45 reads {1/nint(-0.5)} as -inf. Found by the
+    // reference fuzz as ln(+(ln(0)&&3)/nint(-0.5))^1e-300.
+    try std.testing.expectEqual(-std.math.inf(f64), (try testFold(a, "1/nint(-0.5)")).num);
     // Names, probes, unknown functions and wrong arities stay symbolic.
     for ([_][]const u8{ "x+1", "v(a)", "i(v1)*2", "foo(1)", "sqrt()", "min(1)", "agauss(1)" }) |text|
         try std.testing.expect(!(try testFold(a, text)).known);
