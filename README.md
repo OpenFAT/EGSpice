@@ -2,7 +2,7 @@
 
 A SPICE circuit simulator written in Zig. Every device model is Verilog-A, compiled at build time by
 [VerA](https://github.com/OpenFAT/VerA), and one device kernel builds for the CPU, CUDA and HIP
-through [Gompute](https://github.com/OpenFAT/Gompute).
+through [Gompute](https://github.com/OmarSiwy/Gompute).
 
 ```sh
 espice deck.sp                                   # ngspice, HSPICE or Spectre deck, detected
