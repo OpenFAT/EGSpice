@@ -22,7 +22,7 @@ provides:
 conflicts:
   - espice-simulator
 vendor: ESPice
-homepage: https://github.com/OmarSiwy/ESPice
+homepage: https://github.com/OpenFAT/EGSpice
 license: Apache-2.0
 disable_globbing: true
 contents:

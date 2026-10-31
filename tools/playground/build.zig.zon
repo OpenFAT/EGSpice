@@ -8,7 +8,7 @@
     .dependencies = .{
         .espice = .{ .path = "../.." },
         .cktimg = .{
-            .url = "git+https://github.com/OmarSiwy/cktImg#b6631d8ad1806084707da3ec15e16e72818e718d",
+            .url = "git+https://github.com/OpenFAT/cktImg#f79ec5a4529496bff861dbf92306b837802d8f63",
             .hash = "NetlistParser-0.0.0-g79GuK4rCwCqws4vfH93K09_yc8ivZuCwF4I0j7H3udR",
         },
     },

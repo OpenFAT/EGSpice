@@ -4,27 +4,27 @@
 # OmarSiwy/homebrew-espice tap.
 class Espice < Formula
   desc "SPICE circuit simulator with a built-in Verilog-A compiler (CPU build)"
-  homepage "https://github.com/OmarSiwy/ESPice"
+  homepage "https://github.com/OpenFAT/EGSpice"
   version "@VERSION@"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
-      url "https://github.com/OmarSiwy/ESPice/releases/download/v@VERSION@/espice-@VERSION@-macos-arm64-cpu.tar.gz"
+      url "https://github.com/OpenFAT/EGSpice/releases/download/v@VERSION@/espice-@VERSION@-macos-arm64-cpu.tar.gz"
       sha256 "@SHA256_MACOS_ARM64@"
     end
     on_intel do
-      url "https://github.com/OmarSiwy/ESPice/releases/download/v@VERSION@/espice-@VERSION@-macos-x86_64-cpu.tar.gz"
+      url "https://github.com/OpenFAT/EGSpice/releases/download/v@VERSION@/espice-@VERSION@-macos-x86_64-cpu.tar.gz"
       sha256 "@SHA256_MACOS_X86_64@"
     end
   end
   on_linux do
     on_arm do
-      url "https://github.com/OmarSiwy/ESPice/releases/download/v@VERSION@/espice-@VERSION@-linux-aarch64-cpu.tar.gz"
+      url "https://github.com/OpenFAT/EGSpice/releases/download/v@VERSION@/espice-@VERSION@-linux-aarch64-cpu.tar.gz"
       sha256 "@SHA256_LINUX_AARCH64@"
     end
     on_intel do
-      url "https://github.com/OmarSiwy/ESPice/releases/download/v@VERSION@/espice-@VERSION@-linux-x86_64-v1-cpu.tar.gz"
+      url "https://github.com/OpenFAT/EGSpice/releases/download/v@VERSION@/espice-@VERSION@-linux-x86_64-v1-cpu.tar.gz"
       sha256 "@SHA256_LINUX_X86_64@"
     end
   end

@@ -19,7 +19,7 @@ benchmarks in the README have the details.
 Install it ([other ways](using/install.md)):
 
 ```sh
-nix profile install github:OmarSiwy/ESPice
+nix profile install github:OpenFAT/EGSpice
 ```
 
 Save this as `rc.sp`:
@@ -58,6 +58,6 @@ RC low-pass filter: 3 devices
 | call ESPice from C or Zig | [Embedding ESPice](embed/c-api.md) |
 
 ESPice is Apache-2.0. Its source, issues and releases are on
-[GitHub](https://github.com/OmarSiwy/ESPice). The developer reference, on
+[GitHub](https://github.com/OpenFAT/EGSpice). The developer reference, on
 how ESPice is built inside, is on
-[DeepWiki](https://deepwiki.com/OmarSiwy/ESPice).
+[DeepWiki](https://deepwiki.com/OpenFAT/EGSpice).

@@ -12,13 +12,13 @@
       "locked": {
         "lastModified": 1792789931,
         "narHash": "sha256-Z0sV0m/lB2VwchU/PPL0zwJjyzEe93GTBXR9amLEZCE=",
-        "owner": "OmarSiwy",
+        "owner": "OpenFAT",
         "repo": "VAMS-Conformance-Suite",
-        "rev": "2fddbea5917fa6f8e50739feedf74ca0b5e1fbcf",
+        "rev": "4eba2333f1f534f8545e3b5e810d168ac90862c4",
         "type": "github"
       },
       "original": {
-        "owner": "OmarSiwy",
+        "owner": "OpenFAT",
         "repo": "VAMS-Conformance-Suite",
         "type": "github"
       }

@@ -39,7 +39,7 @@ anything that reads ngspice raw files can open (ngspice's own `load`
 command, for one). [Output](../using/output.md) lists every format.
 
 All the examples are also in the repository under
-[`docs/examples/`](https://github.com/OmarSiwy/ESPice/tree/main/docs/examples).
+[`docs/examples/`](https://github.com/OpenFAT/EGSpice/tree/main/docs/examples).
 
 Each chapter ends with exercises. Try them before opening the answers;
 editing a working deck and predicting the result is how SPICE sticks.

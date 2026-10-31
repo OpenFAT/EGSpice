@@ -3,15 +3,15 @@
 ESPice is one binary, `espice`, plus a static library and C header for
 embedding. Every route below except building from source installs a
 published release, and no release exists yet: until one does, use Nix from
-source (`nix run github:OmarSiwy/ESPice`) or build from source.
+source (`nix run github:OpenFAT/EGSpice`) or build from source.
 
 ## Install script
 
 On Linux or macOS, without root:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh
-curl -fsSL https://raw.githubusercontent.com/OmarSiwy/ESPice/main/tools/install.sh | sh -s -- 0.3.0
+curl -fsSL https://raw.githubusercontent.com/OpenFAT/EGSpice/main/tools/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/OpenFAT/EGSpice/main/tools/install.sh | sh -s -- 0.3.0
 ```
 
 It reads `sources.json` (each release's tarballs and checksums), downloads
@@ -81,13 +81,13 @@ built-in model and a runtime Verilog-A deck.
 The repository is a flake. Run it without installing:
 
 ```sh
-nix run github:OmarSiwy/ESPice -- my_circuit.sp
+nix run github:OpenFAT/EGSpice -- my_circuit.sp
 ```
 
 Install it into your profile:
 
 ```sh
-nix profile install github:OmarSiwy/ESPice
+nix profile install github:OpenFAT/EGSpice
 espice --version
 ```
 
@@ -95,7 +95,7 @@ Or use it as an input of your own flake:
 
 ```nix
 {
-  inputs.espice.url = "github:OmarSiwy/ESPice";
+  inputs.espice.url = "github:OpenFAT/EGSpice";
 
   outputs = { self, nixpkgs, espice, ... }: {
     # espice.packages.<system>.default is the espice package
@@ -110,8 +110,8 @@ A released version installs from its release binary instead of building
 from source (CPU build, baseline instruction set):
 
 ```sh
-nix run github:OmarSiwy/ESPice#latest -- my_circuit.sp
-nix run 'github:OmarSiwy/ESPice#"0.3.0"' -- my_circuit.sp
+nix run github:OpenFAT/EGSpice#latest -- my_circuit.sp
+nix run 'github:OpenFAT/EGSpice#"0.3.0"' -- my_circuit.sp
 ```
 
 `sources.json` lists each release's tarballs and checksums; the release
@@ -127,13 +127,13 @@ a checkout. Build from source inside `nix develop` for other targets.
 
 The release workflow builds a tarball per platform, plus a `SHA256SUMS`
 file, for each tagged release on the
-[GitHub releases page](https://github.com/OmarSiwy/ESPice/releases).
+[GitHub releases page](https://github.com/OpenFAT/EGSpice/releases).
 
 !!! note
     The 0.1.0 release has no tarballs: its release build failed. Until a
     release carries them, install with Nix or build from source.
 
-The release catalogue is [tools/release-targets.json](https://github.com/OmarSiwy/ESPice/blob/main/tools/release-targets.json).
+The release catalogue is [tools/release-targets.json](https://github.com/OpenFAT/EGSpice/blob/main/tools/release-targets.json).
 It currently configures **128 variants**, with separate CPU and GPU choices:
 
 | Host | CPU targets | Backends |
@@ -229,7 +229,7 @@ else; the Zig dependencies (VerA, Gompute) are pinned in `build.zig.zon` and
 fetched by the build.
 
 ```sh
-git clone https://github.com/OmarSiwy/ESPice
+git clone https://github.com/OpenFAT/EGSpice
 cd ESPice
 nix develop     # pinned Zig plus the CUDA and ROCm toolchains
 zig build       # zig-out/bin/espice

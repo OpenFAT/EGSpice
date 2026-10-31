@@ -1,7 +1,7 @@
 name: nix
 
 # Builds the flake's espice and pushes it to the omarsiwy cache, so
-# `nix run github:OmarSiwy/ESPice` is a download, not a Zig compile.
+# `nix run github:OpenFAT/EGSpice` is a download, not a Zig compile.
 # This job builds and smokes x86_64-linux. The release matrix builds on
 # Linux ARM64 and both macOS architectures as well.
 on:

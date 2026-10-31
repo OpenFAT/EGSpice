@@ -1,6 +1,6 @@
 # Agents
 
-ESPice is a simulator whose consumers pin it by commit and hash, or follow `main` (`nix run github:OmarSiwy/ESPice`). Two rules decide everything below: **every test names its oracle**, and **main is green by machine**. Read [TESTING.md](TESTING.md) before adding a test layer, touching a gate, or claiming something is tested; it maps every bug class to its oracle, layer, file and tier. [CONTRIBUTING.md](CONTRIBUTING.md) holds the branch, pin and release policy for people, and [SECURITY.md](SECURITY.md) the reporting route and trust boundary.
+ESPice is a simulator whose consumers pin it by commit and hash, or follow `main` (`nix run github:OpenFAT/EGSpice`). Two rules decide everything below: **every test names its oracle**, and **main is green by machine**. Read [TESTING.md](TESTING.md) before adding a test layer, touching a gate, or claiming something is tested; it maps every bug class to its oracle, layer, file and tier. [CONTRIBUTING.md](CONTRIBUTING.md) holds the branch, pin and release policy for people, and [SECURITY.md](SECURITY.md) the reporting route and trust boundary.
 
 ## Testing
 
