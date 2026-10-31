@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
     env:
       FLAGS: -Doptimize=ReleaseSafe -Dgpu=false -Dcuda-arch=none -Dhip-arch=none -j2 --summary failures
     steps:
