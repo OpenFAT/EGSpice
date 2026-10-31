@@ -7,6 +7,8 @@ A run produces three kinds of output:
 | stderr | one summary line per deck and per result (`AC Analysis: 41 points, 4 variables`), warnings and errors |
 | stdout | `.meas` results, Monte Carlo statistics, and `--plan` / `--print-dag` graphs |
 | `--rawfile FILE` | the results themselves, in the `--format` you choose |
+| `--measures FILE` | the `.meas` results as JSON, labelled with analysis and variant |
+| `--emir FILE` | each device terminal's average, RMS and peak current as JSON, per variant |
 
 Without `--rawfile`, results stay in memory and nothing is written.
 
@@ -126,7 +128,51 @@ dropped from the results.
 ```
 
 Without `.save`, every node voltage and branch current is written.
-`.print`, `.plot`, `.probe` and `.graph` are accepted and ignored for the
+
+A device's operating-point variables are vectors too, at the operating
+point, along a `.dc` sweep and in a `.tran`. Save or measure them by name:
+
+```text
+.save @m1[gm] @m.x1.mn1[vdsat] all
+.meas op gm1 find @m1[gm]
+```
+
+HSPICE names them `.probe op` (every variable of every device, written as
+`@m1[gm]`) and `.probe lx7(m1)`, Spectre `save m1:gm x1.mn1:vdsat`, and
+each dialect's `.meas` takes the same names (`.meas dc gm1 find lx7(m1)
+at=0.9`). A vector is written under the name it was saved as. HSPICE's
+element template numbers, after its MOSFET output templates: `lx1` vbs,
+`lx2` vgs, `lx3` vds, `lx4` id, `lx7` gm, `lx8` gds, `lx9` gmbs, `lx18`
+cgg, `lv9` vth, `lv10` vdsat; another number refuses the deck. A Spectre
+`inst:t` with a one-character or numeric `t` is a terminal current and is
+not written.
+
+A device has its model's own variables: each module-scope variable with a
+`desc` or `units` attribute (the LRM's output variables, §3.2.1), such as `vth`,
+`vdsat` or `region`. They are the instance's own, per unit of `m=`: VerA
+leaves `$mfactor` to the host, and does not say which variables scale with
+it (the CMC models mark that with `multiplicity`, which it does not read).
+BSIM4 (`bsim4va`, sky130's model) has `vth` and `vdsat`, ngspice's `von`
+and `vdsat` from b4ld.c, in the n-type frame, and `cgg`, ngspice's
+intrinsic `cggb`: ∂Q_g/∂V_g of the channel's gate charge, without the
+overlap. A MOSFET also has `id` (`ids`), `ig`,
+`is`, `ib`, `gm`, `gds`, `gmbs`, `cgg`, `cgd`, `cgs`, `cgb`, `ft`, `vgs`,
+`vds` and `vbs`, where the model has none of that name, with `m=` applied.
+These come from
+its terminals (d, g, s, b) with its internal nodes eliminated. Currents
+and voltages are in ngspice's frame: type × the current into the
+terminal and type × the voltage, type +1 for `nmos` and -1 for `pmos`,
+so a saturated pfet's `id` and `vgs` are positive, as ngspice reports
+them (`--emir` keeps the plain current into each terminal). `gm`, `gds`
+and `gmbs` are positive at either polarity. `cgg` is ∂Q_g/∂V_g, `cgd`
+is -∂Q_g/∂V_d (and so on), with the overlap charges. So `cgg` follows the
+model: intrinsic for BSIM4, as ngspice's, and the total gate capacitance
+for a model without its own. `ft` is gm / (2π·Cgg) of the total, overlap
+included, either way. An unknown name refuses the deck and lists the
+device's variables. A `.dc` that sweeps the temperature or a device of the
+same type is not supported yet (#236).
+
+`.print`, `.plot`, `.probe` and `.graph` are otherwise accepted and ignored for the
 same reason. In the HSPICE dialect `.save` has HSPICE's meaning: it writes
 the operating point as a loadable `.nodeset` or `.ic` file, beside the
 output file.
@@ -145,6 +191,123 @@ They are printed whether or not `--rawfile` is given. Over Monte Carlo
 trials ESPice also prints the mean, sigma, min and max of each
 measurement. [Chapter 7](../learn/measure.md) and the
 [reference](reference.md#meas) cover the syntax.
+
+### Measurements as JSON
+
+`espice deck.sp --measures=meas.json` writes every `.meas` result of the
+run to `meas.json` as well as to stdout, which is unchanged. The file is
+written atomically when the run ends, as `-r` is. `--measures=-` writes the
+JSON to stdout in place of the text blocks. The shape (values abridged):
+
+```json
+{
+  "format": "espice-measures/1",
+  "deck": "ota.sp",
+  "results": [
+    {"name": "gain", "analysis": "ac", "variant": {"kind": "nominal"}, "value": 144.242},
+    {"name": "ugf", "analysis": "ac", "variant": {"kind": "step", "params": {"ib": 9e-6}}, "value": 30304900},
+    {"name": "irms", "analysis": "tran", "variant": {"kind": "alter", "index": 2}, "value": 6.27185e-4, "from": 0, "to": 3e-6},
+    {"name": "ph", "analysis": "ac", "variant": {"kind": "monte", "trial": 17}, "value": -1.667081},
+    {"name": "off", "analysis": "dc", "variant": {"kind": "nominal"}, "value": null, "error": "out of interval"}
+  ],
+  "statistics": [
+    {"name": "ph", "analysis": "ac", "kind": "monte", "n": 30, "failed": 0, "mean": -1.66, "sigma": 0.02, "min": -1.71, "max": -1.61}
+  ],
+  "soa": [
+    {"instance": "x1.mn3", "quantity": "vds", "key": "vds_max", "limit": 1.95, "peak": 2.03, "from": 1.2e-6, "to": 1.31e-6, "analysis": "tran", "variant": {"kind": "nominal"}}
+  ]
+}
+```
+
+- `variant` names what produced the point: `nominal`, `step` (a `.step`
+  or card `SWEEP` point, its parameter values in `params`), `data` (a
+  `SWEEP DATA` row, its columns in `params`), `alter` (the run's `index`),
+  `monte` (the `trial`), `temp` (an HSPICE `.temp` list entry, in `temp`).
+  A point inside an `.alter` run also carries `alter`, and any point run at
+  a `.temp` entry carries `temp`.
+- `from`, `to` and `at` carry the window and position the stdout line
+  prints.
+- Numbers are the shortest text that reads back as the same f64, parameter
+  values included.
+- A failed measure has `"value": null` and an `error` string (`out of
+  interval`, `no such vector`, or `analysis failed` for a sweep point whose
+  analysis failed), never a sentinel number.
+- Results keep the stdout order, so the JSON and the text agree line for
+  line; a `_CONT` card's events are `name[1]`, `name[2]`, ... as printed.
+- `statistics` holds, per card and Monte Carlo analysis, the trial count
+  `n`, the trials the card `failed` in, and its mean, sigma (Bessel's
+  correction), min and max. An analysis run with `SIGMA_SCALE=` has one
+  object instead, `"kind": "sss"`: its `fail` text, the `trials` per
+  scale, the `scales` and `failures` lists, then `p`, `lo`, `hi` (the 95 %
+  interval) and `sigma`; these four are null with an `error` when the fit
+  is refused ([analyses](analyses.md#scaled-sigma)). A `.wcd` card adds
+  one `"kind": "wcd"` object per spec and `.step` point: `spec`, `bound`,
+  `corner` (the `.step` label, `""` without), `beta` and `yield` (null
+  when no parameter moves the measure), `converged`, `status`,
+  `iterations`, `sims`, and `point`, a list of `{"name", "z"}` per
+  statistical parameter ([analyses](analyses.md#wcd)).
+- `soa` holds, under `.option soa`, every excursion past a model-card
+  limit ([analyses](analyses.md#soa)), `maxwarns` aside: the instance, the
+  quantity and the card key of its limit, the limit, the peak, and the
+  window `from` and `to` (both null at an operating point; `to` null when
+  the excursion lasts to the last point).
+
+### Terminal currents as JSON
+
+`espice hot.sp --emir=hot.emir.json` writes, for the deck's first `.tran`
+(or, without one, its first `.op` or `.dc`), the current statistics of every device terminal and every independent
+source, for electromigration and IR-drop sign-off (values abridged):
+
+```json
+{
+  "format": "espice-emir/1",
+  "deck": "hot.sp",
+  "analysis": "tran",
+  "variant": {"kind": "nominal"},
+  "temp": 125,
+  "window": [1e-06, 3e-06],
+  "em_recovery": 1,
+  "terminals": [
+    {"instance": "x1.mn1", "model": "sky130_fd_pr__nfet_01v8", "terminal": "d", "net": "x1.out",
+     "avg": 1.21e-04, "em_avg": 1.21e-04, "rms": 1.53e-04, "peak": 4.10e-04},
+    {"instance": "x1.mn1", "model": "sky130_fd_pr__nfet_01v8", "terminal": "s", "net": "x1.tail",
+     "avg": -1.21e-04, "em_avg": 1.21e-04, "rms": 1.53e-04, "peak": 4.10e-04}
+  ],
+  "sources": [
+    {"instance": "vdd", "terminal": "p", "net": "vdd", "avg": -5.49e-04, "em_avg": 5.49e-04, "rms": 6.27e-04, "peak": 1.14e-03},
+    {"instance": "vdd", "terminal": "n", "net": "0", "avg": 5.49e-04, "em_avg": 5.49e-04, "rms": 6.27e-04, "peak": 1.14e-03}
+  ]
+}
+```
+
+- Current is positive into the terminal. It is the current the solver's
+  own Kirchhoff rows see, charge currents included, so at every internal
+  net the terminals' `avg` sum to zero.
+- `avg` is the signed mean over the window and `em_avg` the
+  electromigration average with `.option em_recovery` applied, both as
+  `.meas AVG` and `.meas EM_AVG` compute them over the same samples; `rms`
+  is over the window, and `peak` the largest |i| at an accepted point.
+- `window` holds the first and last accepted points read. `--emir-window=T1:T2`
+  reads `[T1, T2]` as `.meas ... FROM=T1 TO=T2` does; the default is the
+  whole run.
+- At an operating point or a `.dc` sweep's first point, `analysis` is `op`
+  or `dc`, `window` is null and `avg = em_avg = rms = peak = |i|` with the
+  sign kept in `avg`.
+- `instance` is the card's flattened name, `model` the `.model` card it
+  names (a binned card's bin; null for a card without one), `terminal` the
+  device's port and `net` the node it connects to. Internal nodes of a
+  device are not terminals. A source lists both of its terminals, so every
+  net's entries sum to zero.
+- In the Spectre dialect an analysis's `emirformat` or `emirfile`
+  parameter sets the flag: the file is `emirfile`, else
+  `<deck stem>.emir.json`, and JSON whatever the format names. In any
+  dialect `.options emirfile="FILE"` does the same; `--emir=FILE` names
+  the file over both.
+- Under `.step`, `.alter` or a sweep, each variant writes its own file
+  (`FILE`, `FILE.2`, ...), the variant's label (the `--measures` object)
+  under `variant`.
+- The file is the same at any `--jobs`. The transient runs on the CPU, to
+  its end (no early stop).
 
 HSPICE's `.stim` writes transient signals as PWL sources or a `.data`
 table, and `.save` (HSPICE dialect) writes the operating point; both go

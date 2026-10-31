@@ -9,6 +9,7 @@ const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
 const op = @import("op.zig");
+const emir = @import("../tran/emir.zig");
 const gpu_lanes = @import("../gpu/lanes.zig");
 
 /// Query options, defined in core/query.zig.
@@ -329,6 +330,9 @@ const Sweep = struct {
     v: f64 = 0,
     v2: f64 = 0,
     taken: bool = false,
+    /// `opts.emir`: the first point's terminal currents, in the result's
+    /// allocator.
+    currents: @import("core").Emir = .{},
 
     /// `run`'s setup through the outer target. On an error everything set
     /// up so far is undone and freed.
@@ -408,6 +412,7 @@ const Sweep = struct {
             .is_complex = false,
             .npoints = s.n_inner * s.n_outer * (1 + s.opts.tangents.len),
             .data = s.data,
+            .emir = s.currents,
         };
     }
 
@@ -518,6 +523,7 @@ const Sweep = struct {
             // Each sweep point is an accepted point for device state.
             _ = ckt.stateCtl(.commit);
             for (ctx.probes, row[1..]) |node, *o| o.* = x[node];
+            if (opts.emir and at == 0) s.currents = try emir.atPoint(ctx, x);
             if (opts.tangents.len != 0) try tangentRows(ctx, ckt, s.ws, x, opts.tangents, s.hist[2 * ckt.n ..], data[(block + at) * ncols ..], block * ncols, ncols);
             s.cold = false;
             // ngspice copies state0 into state1 after the first point

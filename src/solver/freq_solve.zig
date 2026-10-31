@@ -67,13 +67,13 @@ pub const FreqSolver = struct {
     held_count: usize = 0,
     /// `solveBatch` runs its sparse lanes in complex arithmetic on an n x n
     /// tape (`Complex`); false keeps the stacked-real LaneLu, whose lanes
-    /// are bitwise the scalar path's. The device sweep replays the same
-    /// complex tapes (`beginComplexChunk`); the live round driver clears it
-    /// so its host fallback stays bitwise its stacked replay.
+    /// are bitwise the scalar path's. The device sweep and live rounds
+    /// replay the same complex tapes (`beginComplexChunk`).
     complex_lanes: bool = true,
     /// `factorEach` holds complex factors on one n x n tape (`Complex`)
     /// when every ω replays it, else its stacked-real policy. Off by
-    /// default: a device provider reads stacked held tapes (`heldTape`).
+    /// default. A device provider uploads either held tape (`heldTape`,
+    /// `complexHeldTape`); only stacked ones factor on the device.
     complex_held: bool = false,
 
     const Strategy = union(enum) {
@@ -793,6 +793,18 @@ pub const FreqSolver = struct {
         return laneChunk(sp, sp.held[0].base);
     }
 
+    /// `heldTape` for complex held factors (`complex_held`): the n x n
+    /// proxy tape every group replayed. Null for dense blocks and for
+    /// stacked held factors.
+    pub fn complexHeldTape(self: *const Self) ?ComplexChunk {
+        const sp = switch (self.strategy) {
+            .sp => |*s| s,
+            .dense => return null,
+        };
+        if (sp.cx_held.len == 0) return null;
+        return .{ .lu = sp.cx_held[0].base, .src_col_ptr = sp.src_col_ptr, .g = sp.g_vals, .c = sp.c_vals, .growth = sp.slv.params.refactor_growth_limit, .fresh = false };
+    }
+
     /// Host pivot-selection boundary for a resident factorEach provider.
     /// It lays the same fresh candidate tape as replayTape, but leaves
     /// numeric harmonic replay to the provider. Null means every harmonic
@@ -925,6 +937,37 @@ pub const FreqSolver = struct {
                 const values: [W]f64 = v;
                 diag[i * count + k] = values[lane];
             }
+        }
+    }
+
+    /// `packHeld` for complex held factors, in `kernels/frequency.zig`'s
+    /// complex layout: each buffer's real plane, then its imaginary one;
+    /// `diag` holds the pivot reciprocals. Complex factors hold no
+    /// identity harmonic. The caller sized the slices from
+    /// `complexHeldTape` and `count`.
+    pub fn packComplexHeld(self: *const Self, count: usize, lower: []f64, upper: []f64, diag: []f64) void {
+        const sp = &self.strategy.sp;
+        const lu = self.complexHeldTape().?.lu;
+        assert(count > 0 and sp.cx_held.len == (count + W - 1) / W);
+        assert(self.held_id.items.len == 0);
+        assert(lower.len == 2 * lu.lx.items.len * count);
+        assert(upper.len == 2 * lu.ux.items.len * count);
+        assert(diag.len == self.nn * count);
+        const put = struct {
+            fn f(re: []const ComplexLaneLu(W).V, im: []const ComplexLaneLu(W).V, out: []f64, m: usize, k: usize, lane: usize) void {
+                for (re, im, 0..) |vr, vi, p| {
+                    const r: [W]f64 = vr;
+                    const i: [W]f64 = vi;
+                    out[p * m + k] = r[lane];
+                    out[(re.len + p) * m + k] = i[lane];
+                }
+            }
+        }.f;
+        for (0..count) |k| {
+            const group = sp.cx_held[k / W];
+            put(group.lr, group.li, lower, count, k, k % W);
+            put(group.ur, group.ui, upper, count, k, k % W);
+            put(group.dr, group.di, diag, count, k, k % W);
         }
     }
 
@@ -1966,6 +2009,54 @@ test "packed held factors preserve ragged harmonics, transpose solves and singul
                 B.solve(built.tab, built.idx.ptr, lower.ptr, upper.ptr, &diag, &rhs_plane, &work, &got, N, k, adjoint);
             }
         }
+        for (0..N) |k| for (0..nn) |i|
+            try testing.expectEqual(@as(u64, @bitCast(want[k * nn + i])), @as(u64, @bitCast(got[i * N + k])));
+    }
+}
+
+test "packed complex held factors solve bitwise as solveEach on ragged harmonics, both ways" {
+    // The device's complex held solve is `complexSolve` on these packed
+    // planes; a swapped re/im plane in the pack fails here.
+    const gpa = testing.allocator;
+    const lk = @import("kernels/lane.zig");
+    const B = @import("kernels/frequency.zig").Bodies(lk.HostP);
+    const n: u32 = 20;
+    const nn = 2 * n;
+    var ring: Ring = .init(n, 1e-3);
+    for (0..n) |j| for (ring.col_ptr[j]..ring.col_ptr[j + 1]) |p| {
+        if (ring.row_idx[p] == j) ring.g[p] = 3;
+    };
+    const nz = ring.col_ptr[n];
+    var fs = try FreqSolver.fromPlanes(gpa, n, ring.col_ptr[0 .. n + 1], ring.row_idx[0..nz], ring.g[0..nz], ring.c[0..nz]);
+    defer fs.deinit();
+    fs.complex_held = true;
+    const omegas = [_]f64{ 1, 3, 9, 27, -2 };
+    const N = omegas.len;
+    try fs.factorEach(&omegas);
+    try testing.expect(fs.heldTape() == null);
+    const tape = fs.complexHeldTape().?;
+    const built = try lk.buildTab(gpa, tape.lu, tape.src_col_ptr, tape.growth, direct.pivot_tol);
+    defer gpa.free(built.idx);
+    try testing.expectEqual(tape.lu.lx.items.len, built.tab.nnz_l);
+    const lower = try gpa.alloc(f64, 2 * tape.lu.lx.items.len * N);
+    defer gpa.free(lower);
+    const upper = try gpa.alloc(f64, 2 * tape.lu.ux.items.len * N);
+    defer gpa.free(upper);
+    var diag: [nn * N]f64 = undefined;
+    fs.packComplexHeld(N, lower, upper, &diag);
+    var rhs: [nn * N]f64 = undefined;
+    var rhs_plane: [nn * N]f64 = undefined;
+    for (0..N) |k| for (0..nn) |i| {
+        const value = @as(f64, @floatFromInt((k + 1) * (i + 1))) / 11;
+        rhs[k * nn + i] = value;
+        rhs_plane[i * N + k] = value;
+    };
+    var want: [nn * N]f64 = undefined;
+    var got: [nn * N]f64 = undefined;
+    var work: [nn * N]f64 = undefined;
+    for ([_]bool{ false, true }) |adjoint| {
+        fs.solveEach(&rhs, &want, adjoint);
+        for (0..N) |k| B.complexSolve(built.tab, built.idx.ptr, lower.ptr, upper.ptr, &diag, &rhs_plane, &work, &got, N, k, adjoint);
         for (0..N) |k| for (0..nn) |i|
             try testing.expectEqual(@as(u64, @bitCast(want[k * nn + i])), @as(u64, @bitCast(got[i * N + k])));
     }

@@ -578,6 +578,65 @@ each tone (default 5). Plot `Quasi-Periodic Steady State`.
 .qpss 1000 1414.2 2 2
 ```
 
+## Safe operating area { #soa }
+
+`.option soa=1` (ngspice's `.option warn=1` works too) holds every accepted
+point of each operating point, DC sweep and transient to the limits the
+model cards state: `vgs_max`, `vgd_max`, `vgb_max`, `vds_max`, `vbs_max`,
+`vbd_max` (MOS), `vbe_max`, `vbc_max`, `vce_max` (BJT) and `bv_max`
+(diode, resistor, capacitor). Each limit bounds the
+magnitude of its terminal voltage; a diode's `bv_max` bounds its reverse voltage.
+
+```spice
+SOA check
+V1 d 0 1
+V2 g 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)
+M1 d g 0 0 nm
+.model nm nmos level=1 vgs_max=1.8 vds_max=1.95
+.option soa=1 maxwarns=20
+.tran 10n 4u
+.end
+```
+
+Here the gate passes 1.8 V twice. Each excursion prints one line on
+stderr, with its peak and window (no window at an operating point, the
+sweep value in a DC sweep), then the count:
+
+```text
+soa: <instance> <quantity> = <peak> V > <key> <limit> V from <t1> to <t2> s (tran)
+soa: <n> excursions on <m> instances
+```
+
+A value exactly at the limit passes. An excursion runs from the first
+point past the limit to the first point back at or under it. `maxwarns`
+(default 5) caps the printed lines; the count includes every excursion. A
+limit whose terminal `.save` leaves out is not checked, and the count of
+such checks is printed. `.biaschk` stays for expressions a rating table
+cannot state.
+
+A kit whose model cards state no limits can name them in a file:
+
+```text
+.option soa=1 soalimits="sky130_soa.json"
+```
+
+```json
+{"sky130_fd_pr__nfet_01v8": {"vds_max": 1.95, "vgs_max": 1.95}}
+```
+
+Each name rates the models it equals or starts with (so a binned model's
+`name.1`, `name.2`, ...); the longest such name wins. The file reaches
+only a model card that states none of its device's limits, so a card
+value is never shadowed. The path is relative to the deck. A file that is
+not one such object of finite numbers under the keys above refuses the
+deck, naming the file.
+
+The counts are measurable: `.meas tran soa_n param='soa_count()'` is the
+number of excursions in the result the card reads (each `.step` point its
+own); it has no value where a limit was not checked. Under
+`--measures` ([output](output.md#measurements-as-json)) each excursion is
+also an object under `soa`.
+
 ## Runs over variants
 
 These wrap other analyses rather than being analyses themselves; see the
@@ -593,3 +652,96 @@ These wrap other analyses rather than being analyses themselves; see the
 - An HSPICE `.temp` list: `<plot> (temp=t)`.
 - `.mosra` adds `MOSRA Degradation` (aging per device) and reruns the
   aged circuit.
+- `SWEEP MONTE=n SIGMA_SCALE=... FAIL=...` estimates a failure rate too
+  rare to count (below).
+- `.wcd` finds each spec's worst-case distance in sigmas (below).
+
+### Scaled-sigma sampling { #scaled-sigma }
+
+Brute-force Monte Carlo resolves a failure tail to about 4σ in 10⁵ trials.
+A replicated cell needs more: 32 comparators at a 3σ chip target need 4σ
+each, and a bit cell needs 6σ. Scaled-sigma sampling (Sun, Li, Liu, Luo,
+Gu, "Fast statistical analysis of rare circuit failure events via
+scaled-sigma sampling", IEEE TCAD 34(7), 2015) draws with every sigma
+made larger, where failures are common, and extrapolates back:
+
+```spice
+--8<-- "examples/monte_sss.sp"
+```
+
+- `SIGMA_SCALE=s1,...` runs `MONTE` trials at each scale: every
+  statistical parameter (`agauss`/`gauss` draws, `.variation` local and
+  global, `DEV`/`LOT`, a kit's in-model mismatch) is drawn with its sigma
+  multiplied by s. A uniform (`unif`, `aunif`) is scaled in its
+  standard-normal image, Φ(s·Φ⁻¹(u)), so its mass moves to its edges; a
+  `limit` is unchanged. Each scale's trials are numbered after the last
+  scale's (`(monte=n)` plots), so the scales draw independently.
+- `FAIL=` is a quoted boolean expression over the analysis's own `.meas`
+  names. A trial whose measure has no value, or that did not converge,
+  counts as a failure.
+- ESPice fits ln P_f(s) = α + β·ln s − γ/s² by weighted least squares
+  over the scales where some, but not all, trials failed (weights from the
+  binomial counts), extrapolates to s = 1, and prints, in place of the
+  Monte Carlo statistics of that analysis, the table `scale trials
+  failures`, then `P_f(1)`, its 95 % interval and the equivalent sigma
+  Φ⁻¹(1 − P_f).
+- The interval is statistical only: the model's own error at s = 1 is not
+  in it. The extrapolation is long, so the interval is wide. On
+  `docs/examples/monte_sss.sp` (1000 trials at each of five scales, true
+  P_f = Q(5) = 2.9e-7) it prints P_f(1) = 4.7e-6 in [1.7e-11, 1.0].
+- Fewer than three such scales is refused, naming the scales where none or
+  all trials failed: the run's exit status is an error. `--measures`
+  writes the same numbers as `{"kind": "sss", ...}`.
+- Seeds follow `.option seed`, so a run is reproducible. Refused:
+  `sampling_method=lhs` (its counts are not binomial), `.alter`, an
+  HSPICE `.temp` list, a second `MONTE` card of the same analysis,
+  `MONTE=list(...)`, and a bare `.dc MONTE=n`.
+
+### Worst-case distance { #wcd }
+
+Design centering measures each spec's margin as its worst-case distance
+β_w: the distance in sigmas from the nominal point to the nearest failing
+point in the space of the statistical parameters, with partial yield
+Φ(β_w) (Antreich, Graeb, Wieser, IEEE TCAD 13(1), 1994). It reaches 6σ
+statements without 10⁹ samples:
+
+```spice
+--8<-- "examples/wcd_ota.sp"
+```
+
+- `.wcd m1 'op L1' m2 'op L2' ... [MAXITER=20] [TOL=0.01] [TOP=5]`: each
+  named `.meas` card with its bound is a spec. `op` is `>=`, `>`, `<=` or
+  `<` (the same for a continuous measure); `L` is a number or a `.param`
+  expression.
+- The statistical parameters are the ones `SWEEP MONTE` draws: each
+  `.variation` local row per device, each global row and `LOT` per model
+  and parameter, each `DEV` per device, and each `agauss`/`gauss`/`unif`/
+  `aunif` call that moves a device parameter, a kit's mismatch included.
+  Each is one standard-normal coordinate, 0 at its nominal; a uniform
+  enters through Φ.
+- The search is FORM by iHL-RF (Zhang and Der Kiureghian, 1995): at the
+  current point, the gradient of the margin from forward differences of
+  0.1σ, a step to the nearest point of the linearized boundary, then a
+  line search on the merit ½‖z‖² + c|g| with real simulations. It stops
+  when β would change by less than `TOL` and the boundary is nearer than
+  `TOL`, both in sigmas.
+- A `.dc` or `.tran` spec takes its gradient from tangent rows of one run
+  (as `SWEEP OPTIMIZE` does); other analyses, and a `.tran` the tangents
+  cannot follow (`uic`, Gear above order 2, a GPU backend), run one
+  simulation per coordinate, `--jobs` at a time. `sims` counts the real
+  simulations. Every operating point starts cold, so the report is the
+  same at any `--jobs`.
+- The report, after the `.meas` results, has one line per spec: its
+  bound, β_w (positive when the nominal point passes), Φ(β_w), the
+  gradient rounds, the simulations and the `TOP` coordinates of the
+  worst-case point by size, `name +2.90s`. Under `.step`, one table per
+  point. A search that does not converge in `MAXITER` rounds says so and
+  prints the β of its last simulated point, never a predicted one; a
+  measure no parameter moves has no β. `--measures` writes each as
+  `{"kind": "wcd", ...}`.
+- β_w is local: a spec that fails on both sides (an offset's magnitude)
+  has a design point on each; write one spec per side.
+- Refused: `.alter`, `SWEEP OPTIMIZE`, an HSPICE `.temp` list, a `limit`
+  or a multiplier draw that moves a parameter, a deck with no statistical
+  parameter, a point that changes the topology (a parameter a B source
+  reads), and a spec whose analysis runs only under a `SWEEP DATA` card.

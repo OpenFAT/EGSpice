@@ -1805,6 +1805,14 @@ module bsim4va(d, g, s, b);
     real V0, CoxWLcen, LINK, VgDP;
     real DeltaPhi, Cox, Tox, Tcen, Ccen, Coxeff;
     real Denomi, ueff, Esat, Vdsat, EsatL;
+    // ESPice (#236): b4ld.c's von and vdsat as operating-point variables
+    // (@m[vth], @m[vdsat]), kept before the C-V model reuses Vth and Vdsat.
+    // In the n-type frame (BSIM4type folded in), as b4ld.c stores them.
+    (* desc = "Threshold voltage", units = "V" *) real vth;
+    (* desc = "Saturation voltage", units = "V" *) real vdsat;
+    // b4ld.c's cggb (@m[cgg], as ngspice reports it): dQg/dVg of the
+    // intrinsic gate charge, before the overlap charges join it.
+    (* desc = "Intrinsic gate capacitance", units = "F" *) real cgg;
     real Vasat, Va, Vbseff;
     real Arg1, One_Third_CoxWL, Two_Third_CoxWL, Alphaz, CoxWL;
     real T10, T11, T12, T13, T14;
@@ -6824,6 +6832,7 @@ module bsim4va(d, g, s, b);
         end
         if (verbose == 1)
             $strobe("Vth=%g\n", Vth);
+        vth = Vth;
 
         /* Poly Gate Si Depletion Effect */
         T0 = here_BSIM4vfb + BSIM4phi;
@@ -7412,6 +7421,7 @@ module bsim4va(d, g, s, b);
 
         if (verbose == 1)
             $strobe("Vdsat=%g\n", Vdsat);
+        vdsat = Vdsat;
 
         /* Calculate Vdseff */
         T1 = Vdsat - Vds - BSIM4delta;
@@ -9308,6 +9318,10 @@ module bsim4va(d, g, s, b);
 
             end   /* End of CTM */
         end
+        // qgate is the intrinsic, n-frame charge here; BSIM4type turns its
+        // V(gi) partial (vgs = type V(gi,si)) back into dQg/dVg, positive
+        // for both polarities, as b4ld.c's cggb.
+        (* vera_nodiff *) cgg = BSIM4type * ddx(qgate, V(gi));
 
 
         /* NQS begins */

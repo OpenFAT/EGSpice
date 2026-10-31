@@ -11,6 +11,7 @@ const std = @import("std");
 const root = @import("../types.zig");
 const converger = @import("solver").converger;
 const tran = @import("../tran/tran.zig");
+const emir = @import("../tran/emir.zig");
 const gpu_lanes = @import("../gpu/lanes.zig");
 
 /// Query options, defined in core/query.zig.
@@ -643,8 +644,9 @@ fn solveOnDevice(ckts: []const *root.Circuit, xs: []const []f64, options: Option
     }
 }
 
-/// Contract entry: the executor's solved ctx.x_op, one point per probe.
-pub fn run(ctx: *const root.RunCtx, _: Options) !root.Result {
+/// Contract entry: the executor's solved ctx.x_op, one point per probe,
+/// and with `opts.emir` its terminal currents.
+pub fn run(ctx: *const root.RunCtx, opts: Options) !root.Result {
     const x = ctx.x_op;
     // LRM 12.31.3: the one solution is the first and the last. It has no
     // earlier time to back up to, so acbConvergenceTest is not asked.
@@ -661,6 +663,7 @@ pub fn run(ctx: *const root.RunCtx, _: Options) !root.Result {
         .is_complex = false,
         .npoints = 1,
         .data = data,
+        .emir = if (opts.emir) try emir.atPoint(ctx, x) else .{},
     };
 }
 

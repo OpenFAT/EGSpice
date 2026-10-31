@@ -3,8 +3,9 @@
 //! only equal pivot tapes share a launch. Failed lanes peel in point-local
 //! frequency order before the next round. Analysis readout stays unchanged.
 //! The sweep precompute (`solveAll`) replays the host's complex tapes while
-//! a point's complex lanes are on, its stacked tapes after; live rounds and
-//! held preconditioner factors use stacked tapes.
+//! a point's complex lanes are on, its stacked tapes after, as do live
+//! rounds. Held preconditioner factors upload whichever tape the host's
+//! `factorEach` held.
 const std = @import("std");
 const gompute = @import("gompute");
 const artifacts = @import("gompute_kernels");
@@ -305,7 +306,7 @@ pub const Held = struct {
 /// rest of the query; a dense or all-identity factor stays on the host.
 pub fn prepareHeld(held: *?Held, disabled: *bool, ckt: *const root.Circuit, fs: *const FS, count: usize, gpa: std.mem.Allocator) void {
     if (disabled.* or ckt.gpu == null) return;
-    if (fs.heldTape() == null) {
+    if (fs.heldTape() == null and fs.complexHeldTape() == null) {
         if (held.*) |*h| h.deinit();
         held.* = null;
         return;
@@ -337,6 +338,8 @@ pub fn DeviceHeld(comptime backend: gompute.Backend) type {
         nn: usize = 0,
         work: []f64 = &.{},
         identity: []u8 = &.{},
+        /// The factors are `packComplexHeld`'s, solved by `csolve`.
+        complex: bool = false,
         poisoned: bool = false,
         stats: bool,
         solves: usize = 0,
@@ -378,6 +381,9 @@ pub fn DeviceHeld(comptime backend: gompute.Backend) type {
         pub fn factorEach(self: *Self, fs: *FS, omegas: []const f64) !bool {
             if (self.poisoned) return error.GpuBackendUnavailable;
             std.debug.assert(omegas.len > 0);
+            // The device factors stacked tapes only (the grouped HB driver).
+            std.debug.assert(!fs.complex_held);
+            self.complex = false;
             if (self.identity.len != omegas.len) {
                 const next = try self.gpa.alloc(u8, omegas.len);
                 self.gpa.free(self.identity);
@@ -495,22 +501,29 @@ pub fn DeviceHeld(comptime backend: gompute.Backend) type {
             try self.update(fs, count);
         }
 
-        /// Uploads the host-factored held tape of `fs` for `count`
-        /// harmonics, its identity harmonics marked. Fails with
-        /// `error.GpuBackendUnavailable` once poisoned or
+        /// Uploads the host-factored held tape of `fs` (complex or
+        /// stacked) for `count` harmonics, its identity harmonics marked.
+        /// Fails with `error.GpuBackendUnavailable` once poisoned or
         /// `error.NoLaneTape` without a held tape.
         pub fn update(self: *Self, fs: *const FS, count: usize) !void {
             if (self.poisoned) return error.GpuBackendUnavailable;
-            const tape = fs.heldTape() orelse return error.NoLaneTape;
+            const complex = fs.complexHeldTape();
+            const stacked: ?Chunk = if (complex == null) (fs.heldTape() orelse return error.NoLaneTape) else null;
+            // The complex tape lies on the n x n source pattern, each
+            // factor buffer a real plane then an imaginary one.
+            const lu = if (complex) |t| t.lu else stacked.?.lu;
+            const col_ptr = if (complex) |t| t.src_col_ptr else stacked.?.col_ptr;
+            const growth = if (complex) |t| t.growth else stacked.?.growth;
+            const planes: usize = if (complex != null) 2 else 1;
             var arena = std.heap.ArenaAllocator.init(self.gpa);
             defer arena.deinit();
             defer self.engine.stream.synchronize() catch {};
             const a = arena.allocator();
-            const built = try lk.buildTab(a, tape.lu, tape.col_ptr, tape.growth, solver.direct.pivot_tol);
-            const lower = try a.alloc(f64, tape.lu.lx.items.len * count);
-            const upper = try a.alloc(f64, tape.lu.ux.items.len * count);
+            const built = try lk.buildTab(a, lu, col_ptr, growth, solver.direct.pivot_tol);
+            const lower = try a.alloc(f64, planes * lu.lx.items.len * count);
+            const upper = try a.alloc(f64, planes * lu.ux.items.len * count);
             const diag = try a.alloc(f64, fs.nn * count);
-            fs.packHeld(count, lower, upper, diag);
+            if (complex != null) fs.packComplexHeld(count, lower, upper, diag) else fs.packHeld(count, lower, upper, diag);
             const values = @as(usize, fs.nn) * count;
             if (self.work.len != 2 * values) {
                 const next = try self.gpa.alloc(f64, 2 * values);
@@ -533,6 +546,7 @@ pub fn DeviceHeld(comptime backend: gompute.Backend) type {
             try self.engine.ensure(.y, values * @sizeOf(f64));
             try self.engine.ensure(.out, values * @sizeOf(f64));
             self.tab = built.tab;
+            self.complex = complex != null;
             self.count = count;
             self.nn = fs.nn;
             self.factors += 1;
@@ -574,6 +588,14 @@ pub fn DeviceHeld(comptime backend: gompute.Backend) type {
             const nl: u64 = self.count;
             const trans: u64 = @intFromBool(adjoint);
             const scalar = gompute.interface.arg;
+            if (self.complex) {
+                const nr: u64 = 1;
+                return self.engine.csolve.launchOn(stream, gompute.Dim3.linear(@intCast(self.count), block), .{ .x = block }, 0, &.{
+                    scalar(&nl),            scalar(&nr),          scalar(&self.tab),    self.engine.arg(.idx),
+                    self.engine.arg(.fail), self.engine.arg(.lx), self.engine.arg(.ux), self.engine.arg(.diag),
+                    rhs.argPtr(),           self.engine.arg(.y),  out.argPtr(),         scalar(&trans),
+                });
+            }
             try self.engine.solve.launchOn(stream, gompute.Dim3.linear(@intCast(self.count), block), .{ .x = block }, 0, &.{
                 scalar(&nl),          scalar(&self.tab),    self.engine.arg(.idx),  self.engine.arg(.fail),
                 self.engine.arg(.lx), self.engine.arg(.ux), self.engine.arg(.diag), rhs.argPtr(),

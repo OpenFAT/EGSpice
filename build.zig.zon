@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.18.0-dev.349+d924f83bf",
     .dependencies = .{
         .vera = .{
-            .url = "git+https://github.com/OpenFAT/VerA#14541a6f966b2e96eca145546b36e4550078dc0f",
-            .hash = "vera-0.20.0-fzAu7Jl5MAHMmactWCpIh2BGb_2do27ch6fg_gaabk8R",
+            .url = "git+https://github.com/OpenFAT/VerA#3fabee3cd24baefc72c32ea052d032e4757b10be",
+            .hash = "vera-0.20.0-fzAu7FQXLgFAvPn0QWF5P0zfUrFZY-Jz-_8DhcZfPAIf",
         },
         .gompute = .{
             .url = "git+https://github.com/OmarSiwy/Gompute#15ab58137b094db1a82a74f67b0b0cba1c57d7af",

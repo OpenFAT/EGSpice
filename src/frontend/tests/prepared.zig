@@ -19,7 +19,7 @@ fn build(sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: netli
 }
 
 fn prepare(io: std.Io, session: std.mem.Allocator, source: input.Source, dialect: input.Dialect) !netlist.Netlist {
-    return input.prepare(io, session, source, dialect, &.{});
+    return input.prepare(io, session, source, dialect, &.{}, .{});
 }
 const resolveQueries = input.resolveQueries;
 
@@ -673,7 +673,7 @@ fn prepareAndBuild(gpa: std.mem.Allocator, lib: *const device.Library, src: []co
     defer session.deinit();
     var parse_arena = std.heap.ArenaAllocator.init(gpa);
     defer parse_arena.deinit();
-    const nl = try input.prepare(std.testing.io, parse_arena.allocator(), .{ .bytes = .{ .data = src, .origin = "sweep.cir" } }, .ngspice, &.{});
+    const nl = try input.prepare(std.testing.io, parse_arena.allocator(), .{ .bytes = .{ .data = src, .origin = "sweep.cir" } }, .ngspice, &.{}, .{});
     var prepared = try input.build(lib, session.allocator(), parse_arena.allocator(), nl);
     prepared.deinit();
 }

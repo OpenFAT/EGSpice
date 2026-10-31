@@ -92,7 +92,7 @@ pub const Options = struct {
     vpi: ?*const Vpi = null,
     /// What every `.tran` of the deck does, as `append_points` asks of a
     /// point (the CLI's `--measures-only`, `--early-stop`, `--abort-after`).
-    /// `measures_only` is dropped for a deck with `.save` or `.stim`, which
+    /// `measures_only` is dropped for a deck with `.save`, `.stim` or `.option soa`, which
     /// read every column.
     point: requests.PointOptions = .{},
     /// The CLI's default: also turn on `point`'s `measures_only`,
@@ -105,6 +105,9 @@ pub const Options = struct {
     /// come first. The same bytes in the same order as `print_measures`
     /// alone, at any `max_parallel`. Both writers must outlive the Problem.
     measures: ?MeasureWriters = null,
+    /// Also keep every `.meas` result printed, as JSON, for
+    /// `write_measures_json` (the CLI's `--measures=FILE`, #235).
+    measures_json: bool = false,
 };
 
 /// `Options.measures`: the `.meas` values and the cards' error lines.
@@ -201,6 +204,9 @@ pub const Problem = struct {
     /// `.model OPT` says.
     optimization: []core.lm.Lm = &.{},
     bisection: []core.bisect.Bisect = &.{},
+    /// The finished `.wcd` searches (#240), once `worstCase` has run: one
+    /// per `WorstCase.bases` entry and spec, base-major.
+    worst_case: []WcdRun = &.{},
     /// The MOSRA degradation table, once `age` has run.
     degradation: ?Result = null,
     /// Whether a query of this Problem brought the GPU driver up, which every
@@ -215,18 +221,36 @@ pub const Problem = struct {
     /// Each transient appended with `PointOptions.tangent_step`: the step
     /// of each live parameter its tangent rows took (`point_tangents`).
     tangent_steps: std.AutoHashMapUnmanaged(QueryId, []const f64) = .empty,
+    /// Bit v of `point_rows`: `append_points` made variant row v for a
+    /// point (its own row or a tangent row), so nothing else reads it. Of
+    /// `freed_rows`: nothing reads row v again (its point was released, or
+    /// its call failed). `release_points` drops the table's freed prefix.
+    point_rows: std.DynamicBitSetUnmanaged = .{},
+    freed_rows: std.DynamicBitSetUnmanaged = .{},
     /// `Options.measures`, how far `run_all` has printed to it, and the
     /// first error printing there, which `print_measures` returns.
     measures_to: ?MeasureWriters = null,
     measure_cursor: MeasureCursor = .{},
     measure_error: ?anyerror = null,
+    /// `Options.measures_json`: each result printed so far as a JSON
+    /// object, each led by `,\n`.
+    measure_json: ?std.Io.Writer.Allocating = null,
     /// The outputs `run_all` has checked for failures, and the first it
     /// found, which every later call returns too.
     checked_outputs: usize = 0,
     first_failure: ?anyerror = null,
+    /// `Options.point.emir`: `write_emir_json` reads every transient after
+    /// the run, so none is released.
+    emir: bool = false,
+    /// `emir_file`'s answer, in `arena`.
+    emir_path: ?[]const u8 = null,
 
     /// A variant run's queries and its next result to publish.
     const Run = struct { session: analysis.session.Session, next_output: usize = 0 };
+
+    /// One `.wcd` search and the real simulations it ran (a tangent row is
+    /// none).
+    const WcdRun = struct { form: core.form.Form, sims: u32 };
 
     /// The next `.meas` block to print: whether the optimization summaries
     /// are out, the session (0 the main one, k the k-th run's) and its output.
@@ -288,7 +312,7 @@ pub const Problem = struct {
         errdefer self.library.deinit();
         self.library.toolchain = try toolchainFromEnv(a, options.hdl_toolchain);
         self.library.vpi = options.vpi;
-        const ast = try frontend.prepare(io, scratch, options.source, options.dialect, options.live_params);
+        const ast = try frontend.prepare(io, scratch, options.source, options.dialect, options.live_params, parseFromEnv());
         try frontend.loadModels(io, &self.library, scratch, ast, self.origin, options.vpi_apps);
         timingLap(io, &lap, "frontend (source, parsing, HDL)");
         self.prepared = try frontend.build(&self.library, a, scratch, ast);
@@ -313,6 +337,11 @@ pub const Problem = struct {
         self.delivery = try output.Session.init(allocator, options.output);
         errdefer self.delivery.deinit();
         var execution = options.backend;
+        // `--emir` reads the host device batches, as the CLI's does (#237).
+        if (self.prepared.deck.emir_file != null) {
+            if (execution.gpu_explicit) return error.EmirNeedsCpu;
+            execution.backend = .cpu;
+        }
         execution.timing_in_depth = options.timing_in_depth;
         execution.knobs = knobsFromEnv();
         // A test whose oracle is the plain scalar run turns the bypass off.
@@ -338,6 +367,8 @@ pub const Problem = struct {
         }
         execution.display = options.display;
         self.measures_to = options.measures;
+        // Allocates on its first write only, so no errdefer.
+        if (options.measures_json) self.measure_json = .init(allocator);
         self.session = analysis.session.Session.init(self.workerAllocator(), io, &self.prepared.circuit, &self.prepared.deck, execution);
         errdefer self.session.deinit();
         // An optimization's sessions run before this one; nothing after it
@@ -356,7 +387,15 @@ pub const Problem = struct {
         // point within Newton's tolerances, in a few iterations instead of
         // the cold ladder (145 → 2 per point on a 20-stage CMOS chain).
         if (options.auto_point and isSweep(&self.prepared.deck)) point.warm_start = true;
-        if (self.save_path != null or self.prepared.deck.stims.len != 0) point.measures_only = false;
+        if (self.save_path != null or self.prepared.deck.stims.len != 0 or self.prepared.deck.soa.limits.len != 0) point.measures_only = false;
+        // A Spectre analysis's `emirformat`/`emirfile` is `--emir` (#237).
+        if (self.prepared.deck.emir_file) |f| {
+            point.emir = true;
+            self.emir_path = if (f.len != 0) f else try std.mem.concat(a, u8, &.{ std.fs.path.stem(self.origin), ".emir.json" });
+        }
+        // `--emir` reads every accepted point to t_stop (#237).
+        if (point.emir) point.early_stop = false;
+        self.emir = point.emir;
         // No analysis card runs an OP, unless it would have no columns (a
         // title-only deck): ngspice runs nothing there either.
         const jobs: []Query = if (self.prepared.deck.queries.len == 0 and self.prepared.deck.probes.len == 0)
@@ -386,7 +425,7 @@ pub const Problem = struct {
             _ = try run.session.append(try withPoint(scratch, prep.deck.queries, point), try scratch.alloc(QueryId, prep.deck.queries.len));
         }
         timingLap(io, &lap, "query graph and output setup");
-        keep_parse = self.prepared.tuner != null or self.prepared.tuning != null;
+        keep_parse = self.prepared.tuner != null or self.prepared.tuning != null or self.prepared.wcd != null;
         return self;
     }
 
@@ -408,13 +447,13 @@ pub const Problem = struct {
     }
 
     /// Whether anything besides the `.meas` cards reads the deck's
-    /// transient waveforms: an output file, `.save`, `.stim`, an
+    /// transient waveforms: an output file, `.save`, `.stim`, `.option soa`, an
     /// optimization, tangents, or a device's display tasks, which print at
     /// every accepted step. `.print`, `.probe` and `.plot` are ignored
     /// cards, and `.four`, `.fft` and MOSRA run transients of their own.
     fn waveformsConsumed(self: *const Problem, options: Options) bool {
         const deck = &self.prepared.deck;
-        if (options.output.path != null or self.save_path != null or deck.stims.len != 0) return true;
+        if (options.output.path != null or self.save_path != null or deck.stims.len != 0 or deck.soa.limits.len != 0) return true;
         if (self.prepared.tuner != null or options.point.tangent_step > 0) return true;
         for (self.prepared.circuit.batches) |b| if (b.hooks.say != null) return true;
         for (self.prepared.runs) |run| for (run.circuit.batches) |b| if (b.hooks.say != null) return true;
@@ -440,11 +479,19 @@ pub const Problem = struct {
         return false;
     }
 
-    /// A copy of `queries` whose transients carry `point`.
+    /// A copy of `queries` whose transients carry `point`. Without one,
+    /// `point.emir` falls to the `.op` and `.dc` queries (#237).
     fn withPoint(a: std.mem.Allocator, queries: []const Query, point: requests.PointOptions) ![]Query {
         const copy = try a.dupe(Query, queries);
+        const static_emir = point.emir and (for (queries) |q| {
+            if (q == .tran) break false;
+        } else true);
         for (copy) |*q| {
             if (q.* == .tran) q.tran.point = point;
+            switch (q.*) {
+                inline .op, .dc => |*o| o.emir = static_emir,
+                else => {},
+            }
             if (point.warm_start) switch (q.*) {
                 inline else => |*o| o.tol.warm_op = true,
             };
@@ -460,6 +507,8 @@ pub const Problem = struct {
         const a = self.allocator;
         for (self.runs) |*run| run.session.deinit();
         self.released.deinit(a);
+        self.point_rows.deinit(a);
+        self.freed_rows.deinit(a);
         self.session.deinit();
         self.gpu_driver.deinit();
         self.sides.deinit(a);
@@ -468,6 +517,7 @@ pub const Problem = struct {
         self.delivery.deinit();
         self.prepared.deinit();
         self.library.deinit();
+        if (self.measure_json) |*j| j.deinit();
         if (self.parse_arena) |*arena| arena.deinit();
         self.arena.deinit();
         a.destroy(self);
@@ -555,9 +605,9 @@ pub const Problem = struct {
     /// takes its new bin, and the circuit is rebuilt only when parameter
     /// writes cannot express the point (dev/analysis/variants.md §5).
     ///
-    /// The first call also runs the deck's pending `.model OPT` optimization
-    /// and MOSRA stress run, so it can take as long as they do and fail with
-    /// their errors.
+    /// The first call also runs the deck's pending `.model OPT`
+    /// optimization, MOSRA stress run and `.wcd` searches, so it can take
+    /// as long as they do and fail with their errors.
     ///
     /// All-or-nothing. Fails with `error.UnknownParameter` for a name not
     /// in `Options.live_params` (nor a `.step` name), `error.InvalidArgument`
@@ -573,6 +623,7 @@ pub const Problem = struct {
         // run before rows are appended to it.
         try self.optimize();
         try self.age();
+        try self.worstCase();
         try self.session.templates.ensureUnusedCapacity(self.session.allocator, 1);
         const change = try tuning.set(&self.prepared.circuit, self.prepared.deck.variants, names, values);
         if (change.built) |c| self.session.addTemplate(c) catch unreachable;
@@ -591,7 +642,7 @@ pub const Problem = struct {
     /// failed with `TopologyChanged` (a topology change or a flipped
     /// top-level `.if`), `ModelBinNotFound`, `NonFiniteParameter` or, for
     /// any other error building its circuit, `PointRefused`. The
-    /// first call also runs the deck's `.model OPT` and MOSRA runs.
+    /// first call also runs the deck's `.model OPT`, MOSRA and `.wcd` runs.
     ///
     /// All-or-nothing. `error.NoLiveParameters` without
     /// `Options.live_params`, `error.SweptTemplate` for a deck whose
@@ -617,6 +668,7 @@ pub const Problem = struct {
         };
         try self.optimize();
         try self.age();
+        try self.worstCase();
         const template_jobs = if (deck.queries.len == 0) &[_]Query{.{ .op = .{ .tol = deck.deck_tol } }} else deck.queries;
         try self.checkOutput(&self.prepared, template_jobs);
         const tangent = options.tangent_step > 0;
@@ -635,6 +687,14 @@ pub const Problem = struct {
         // rows appended later keep theirs.
         const current = self.session.template;
         defer self.session.template = current;
+        // Room to mark every row this call makes, a point's own and its
+        // tangent rows, before it makes any; a failed call's rows are freed.
+        const rows_before = deck.variants.count();
+        const rows_most = rows_before + count * (1 + if (tangent) p else 0);
+        if (self.point_rows.bit_length < rows_most) try self.point_rows.resize(self.allocator, rows_most, false);
+        if (self.freed_rows.bit_length < rows_most) try self.freed_rows.resize(self.allocator, rows_most, false);
+        var appended = false;
+        errdefer if (!appended) self.freed_rows.setRangeValue(.{ .start = rows_before, .end = deck.variants.count() }, true);
         for (0..count) |i| {
             try self.session.templates.ensureUnusedCapacity(self.session.allocator, 1);
             refused[i] = null;
@@ -675,6 +735,8 @@ pub const Problem = struct {
         }
         const ids = try a.alloc(QueryId, jobs.len);
         _ = try self.session.appendAt(jobs, templates, ids);
+        appended = true;
+        self.point_rows.setRangeValue(.{ .start = rows_before, .end = deck.variants.count() }, true);
         for (refused, 0..) |r, i| if (r) |err| for (ids[i * j ..][0..j]) |id| self.session.refuse(id, err) catch unreachable;
         // A point owns its OP: nothing appended later reads either.
         for (ids) |id| self.session.markFinal(id) catch unreachable;
@@ -877,10 +939,14 @@ pub const Problem = struct {
     /// stays the same size. Each query keeps its id and status;
     /// `result`, `point_measures` and `point_tangents` then fail with
     /// `error.ResultUnavailable`, and nothing publishes it. A point already
-    /// released is left alone. Errors as `point_measures`.
-    // ponytail: each query's row (a few hundred bytes) and the point's
-    // variant row (its label and parameter writes) stay until `deinit`;
-    // drop a released prefix of both if sessions reach billions of points.
+    /// released is left alone. The variant rows of `append_points` points
+    /// go too, at a call made while no query runs; a query appended with
+    /// one of them (`tol.variant`) must not outlive its point, and is
+    /// refused once it is gone. Errors as `point_measures`.
+    // ponytail: each query's row (a few hundred bytes) stays until `deinit`;
+    // drop a released prefix of them if sessions reach billions of points.
+    // Rows drop as a prefix: a `set_params` row is never freed, so no row
+    // after it is dropped.
     pub fn release_points(self: *Problem, first: QueryId, count: usize) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -893,6 +959,30 @@ pub const Problem = struct {
             try self.session.release(outputs[k]);
             _ = self.tangent_steps.remove(outputs[k]);
         }
+        for (outputs[ends[0]..ends[count]]) |id| {
+            const job = try self.session.query(id);
+            if (variantOf(job)) |v| self.freeRow(v);
+            if (job == .tran) for (job.tran.tangents) |v| self.freeRow(v);
+        }
+        self.dropFreedRows();
+    }
+
+    /// Marks variant row `v` freed when `append_points` made it.
+    fn freeRow(self: *Problem, v: u32) void {
+        if (v < self.point_rows.bit_length and self.point_rows.isSet(v)) self.freed_rows.set(v);
+    }
+
+    /// Drops the variant table's prefix of freed rows when no query runs
+    /// (a running one reads its own copy of the table) and the prefix is at
+    /// least as long as the rows kept, so each row moves O(1) times. A
+    /// table that cannot move keeps its rows.
+    fn dropFreedRows(self: *Problem) void {
+        const tuning = self.prepared.tuning orelse return;
+        const rows = &self.prepared.deck.variants;
+        var below = rows.base;
+        while (below < self.freed_rows.bit_length and self.freed_rows.isSet(below)) below += 1;
+        if (below == rows.base or below - rows.base < rows.count() - below or !self.session.idle()) return;
+        rows.* = tuning.drop(self.allocator, below) catch return;
     }
 
     /// Most points the executor runs together as one lane batch on this
@@ -979,10 +1069,11 @@ pub const Problem = struct {
     /// `delivery_error`. `error.InvalidQuery` for an ID outside
     /// `0..query_count()`. The first of `advance`, `advance_ready`,
     /// `run_all` and `set_params` also runs the deck's `.model OPT`
-    /// optimization and MOSRA stress run.
+    /// optimization, MOSRA stress run and `.wcd` searches (#240).
     pub fn advance(self: *Problem, id: QueryId) !Advance {
         try self.optimize();
         try self.age();
+        try self.worstCase();
         var event = try self.session.advance(id);
         self.deliverFrom(&self.session, &self.next_output);
         self.finishWhenDone();
@@ -1009,6 +1100,7 @@ pub const Problem = struct {
     fn stepReady(self: *Problem, ids: []const QueryId, limits: Limits, events: []Advance) !usize {
         try self.optimize();
         try self.age();
+        try self.worstCase();
         const n = try self.session.advanceReady(ids, limits, events);
         self.deliverFrom(&self.session, &self.next_output);
         return n;
@@ -1037,6 +1129,7 @@ pub const Problem = struct {
         defer timingLap(self.io, &lap, "run total (analysis, scheduling, output)");
         try self.optimize();
         try self.age();
+        try self.worstCase();
         try self.openStream();
         if (self.sidesAllowed()) self.session.stream_opener = .{ .ctx = self, .open = openSide };
         // Whole-query quanta: nothing here reads intermediate progress,
@@ -1158,7 +1251,8 @@ pub const Problem = struct {
         if (!self.sidesAllowed() or self.next_output != 0 or self.streaming != null) return;
         if (self.session.outputs.items.len == 0) return;
         const id = self.session.outputs.items[0];
-        if ((try self.session.info(id)).status != .pending) return;
+        // A `.four`/`.fft` reads a `.tran`'s rows after it ends (#231).
+        if ((try self.session.info(id)).status != .pending or self.session.resultRead(id)) return;
         const job = try self.session.query(id);
         for (deck.measures) |m| if (m.analysis == job) return;
         const schema = try analysis.schemaOf(self.allocator, &self.prepared.circuit, deck, job);
@@ -1183,11 +1277,12 @@ pub const Problem = struct {
 
     /// What `openStream` asks of the whole run before any plot streams: a
     /// final plan, nothing that reads results after the run, and a probe
-    /// label per column.
+    /// label per column, with no device operating-point variable computed
+    /// from the finished rows.
     fn sidesAllowed(self: *const Problem) bool {
         const deck = &self.prepared.deck;
         return self.session.config.final_plan and self.save_path == null and deck.stims.len == 0 and
-            self.prepared.tuner == null and deck.probe_labels.len == deck.probes.len;
+            self.prepared.tuner == null and deck.soa.limits.len == 0 and deck.probe_labels.len == deck.probes.len and deck.opvars.len == 0;
     }
 
     /// `Session.stream_opener`: a transient or AC plot that no `.meas` card
@@ -1203,7 +1298,7 @@ pub const Problem = struct {
             .ac => {},
             else => return null, // else: only a transient or AC sweep streams its rows
         }
-        if (self.streaming == id or self.tangent_steps.contains(id)) return null;
+        if (self.streaming == id or self.tangent_steps.contains(id) or self.session.resultRead(id)) return null;
         for (self.prepared.deck.measures) |m| if (m.analysis == job) return null;
         self.sides.ensureUnusedCapacity(self.allocator, 1) catch return null;
         const s = (self.delivery.beginSide(self.io) catch return null) orelse return null;
@@ -1268,29 +1363,119 @@ pub const Problem = struct {
     /// `.meas` results for every completed result a card can read (tran,
     /// transient noise, AC, DC, FFT, S-parameter, mismatch, loop stability,
     /// phase and periodic noise), in request order, as ngspice prints them,
-    /// then the Monte Carlo statistics of each tran, AC and DC card. Cards
-    /// that cannot be measured are reported on `err`.
+    /// then the Monte Carlo statistics of each tran, AC and DC card, or its
+    /// SIGMA_SCALE report (#239), then the `.wcd` worst-case distances
+    /// (#240). Cards that cannot be measured are
+    /// reported on `err`; a refused SIGMA_SCALE fit fails with
+    /// `error.TooFewScales` or `error.Singular` once everything is printed.
     /// With `Options.measures`, it writes only what `run_all` has not
     /// printed there, and returns the first error printing there.
     pub fn print_measures(self: *Problem, out: *std.Io.Writer, err: *std.Io.Writer) !void {
-        const measures = self.prepared.deck.measures;
         if (self.measures_to != null) {
             if (self.measure_error) |e| return e;
             try self.printMeasuresFrom(&self.measure_cursor, out, err, false);
         } else {
+            // Each call prints every block again, so the JSON starts over.
+            if (self.measure_json) |*j| j.clearRetainingCapacity();
             var cursor: MeasureCursor = .{};
             try self.printMeasuresFrom(&cursor, out, err, false);
         }
+        try self.writeStatistics(out, false);
+    }
+
+    /// Writes every `.meas` result `print_measures` (or `run_all`, with
+    /// `Options.measures`) has printed as one JSON document,
+    /// `espice-measures/1` (#235): `deck`, the `results` in the printed
+    /// order, each with its analysis, its `variant` (`output.writeVariantJson`)
+    /// and the `from`/`to`/`at` its line prints, a failed one with a null
+    /// `value` and an `error`; then the Monte Carlo `statistics`; then
+    /// under `.option soa` every excursion `print_soa` counts (#238), as
+    /// `instance`, `quantity`, `key`, `limit`, `peak`, its window `from` and
+    /// `to` (null at an operating point, `to` null past the last point), and
+    /// its result's `analysis` and `variant`.
+    /// `error.MeasuresJsonOff` without `Options.measures_json`.
+    pub fn write_measures_json(self: *Problem, out: *std.Io.Writer, deck: []const u8) !void {
+        const results = if (self.measure_json) |*j| j.written() else return error.MeasuresJsonOff;
+        try out.writeAll("{\n  \"format\": \"espice-measures/1\",\n  \"deck\": ");
+        try std.json.Stringify.encodeJsonString(deck, .{}, out);
+        // Each object is led by `,\n`; the first one's comma goes.
+        try out.print(",\n  \"results\": [{s}\n  ],\n  \"statistics\": [", .{if (results.len == 0) "" else results[1..]});
+        var stats: std.Io.Writer.Allocating = .init(self.allocator);
+        defer stats.deinit();
+        try self.writeStatistics(&stats.writer, true);
+        const s = stats.written();
+        try out.print("{s}\n  ],\n  \"soa\": [", .{if (s.len == 0) "" else s[1..]});
+        var soa: std.Io.Writer.Allocating = .init(self.allocator);
+        defer soa.deinit();
+        var tally: SoaTally = .{ .gpa = self.allocator, .json = &soa.writer };
+        defer tally.instances.deinit(self.allocator);
+        try tally.session(&self.session);
+        for (self.runs) |*run| try tally.session(&run.session);
+        const e = soa.written();
+        try out.print("{s}\n  ]\n}}\n", .{if (e.len == 0) "" else e[1..]});
+    }
+
+    /// The file the deck asks `--emir` to write (a Spectre analysis's
+    /// `emirfile`, `<deck stem>.emir.json` for `emirformat` alone), relative
+    /// to the working directory; null when it asks none (#237).
+    pub fn emir_file(self: *const Problem) ?[]const u8 {
+        return self.emir_path;
+    }
+
+    /// Writes `--emir`'s document `k` (#237), `espice-emir/1`, and returns
+    /// true; false, writing nothing, past the last one. One document per
+    /// variant (a variant row and temperature of the main session or of a
+    /// variant run, in output order): its first completed transient's
+    /// terminal currents (`Result.emir`), or without a transient its first
+    /// `.op` or `.dc`'s, under its `variant` label
+    /// (`output.writeVariantJson`). An instance is named by its card and its
+    /// `.model` card, a terminal by its device's port and a net by its node;
+    /// an independent source lists both terminals, under `sources`. `em_avg`
+    /// is what `.meas EM_AVG` makes of the same halves with `.option
+    /// em_recovery`; at a static point it is |i|.
+    pub fn write_emir_json(self: *const Problem, out: *std.Io.Writer, deck: []const u8, k: usize) !bool {
+        var n: usize = 0;
+        for (0..1 + self.runs.len) |s| {
+            const session = if (s == 0) &self.session else &self.runs[s - 1].session;
+            const outputs = session.outputs.items;
+            for (outputs, 0..) |id, j| {
+                if (!try emirFirst(session, outputs[0..j], id)) continue;
+                if (n == k) {
+                    try writeEmir(out, deck, &self.library, if (s == 0) &self.prepared else &self.prepared.runs[s - 1], session, id);
+                    return true;
+                }
+                n += 1;
+            }
+        }
+        return false;
+    }
+
+    /// The `.meas` statistics over the Monte Carlo trials of each tran, AC
+    /// and DC card, as text or as JSON objects; for a SIGMA_SCALE card's
+    /// analysis, its scaled-sigma report instead (#239); then the `.wcd`
+    /// report (#240). As text, a refused fit fails with its error once
+    /// everything is written.
+    fn writeStatistics(self: *const Problem, out: *std.Io.Writer, json: bool) !void {
+        const measures = self.prepared.deck.measures;
         if (measures.len == 0) return;
-        // Statistics over the Monte Carlo trials of each analysis kind.
         var trials: std.ArrayList(Result) = .empty;
         defer trials.deinit(self.allocator);
+        var refused: ?core.sss.Error = null;
         inline for (.{ .tran, .ac, .dc }) |kind| {
             trials.clearRetainingCapacity();
             try monteTrials(self.allocator, &self.session, kind, &trials);
             for (self.runs) |*run| try monteTrials(self.allocator, &run.session, kind, &trials);
-            if (trials.items.len != 0) try output.printMeasureStatistics(out, measures, kind, trials.items);
+            const scaled = for (self.prepared.sss) |s| {
+                if (s.kind == kind) break s;
+            } else null;
+            if (scaled) |s| {
+                if (try writeSss(self.allocator, out, json, measures, s, trials.items)) |e| refused = refused orelse e;
+            } else if (trials.items.len != 0) {
+                if (json) try output.writeMeasureStatistics(out, measures, kind, trials.items) else try output.printMeasureStatistics(out, measures, kind, trials.items);
+            }
         }
+        if (self.prepared.wcd) |*w| try writeWorstCase(self.allocator, out, json, w, self.worst_case, measures);
+        if (refused) |e| if (!json) return e;
     }
 
     /// With `Options.point.tangent_step`, writes d(card)/d(live parameter)
@@ -1315,6 +1500,25 @@ pub const Problem = struct {
         };
     }
 
+    /// With `.option soa=1` (ngspice `warn=1`), holds every accepted point
+    /// of each completed operating point, DC sweep and transient, the
+    /// variant runs' too, to the deck's model-card limits (`core.Soa`): one
+    /// `soa:` line per instance, limit and excursion, at most `maxwarns` of
+    /// them, then the count of every one; nothing when none happened. An
+    /// excursion runs from the first point past the limit to the first one
+    /// back at or under it, so a point at the limit passes. A limit whose
+    /// terminal a result lacks (left out by `.save`) is counted as skipped.
+    pub fn print_soa(self: *const Problem, out: *std.Io.Writer) !void {
+        const soa = self.prepared.deck.soa;
+        if (soa.limits.len == 0) return;
+        var tally: SoaTally = .{ .gpa = self.allocator, .out = out, .max_warns = soa.max_warns };
+        defer tally.instances.deinit(self.allocator);
+        try tally.session(&self.session);
+        for (self.runs) |*run| try tally.session(&run.session);
+        if (tally.excursions != 0) try out.print("soa: {d} excursions on {d} instances\n", .{ tally.excursions, tally.instances.count() });
+        if (tally.skipped != 0) try out.print("soa: {d} limit checks skipped: a terminal is not saved\n", .{tally.skipped});
+    }
+
     /// Prints to `Options.measures` every `.meas` block whose turn has come
     /// and flushes; the first error stops it for good.
     fn printReady(self: *Problem) void {
@@ -1335,7 +1539,7 @@ pub const Problem = struct {
     /// The optimization summaries, then each session's `.meas` blocks in
     /// request order (`printQueryMeasures`) from `cursor` on; with `wait`,
     /// it stops at the first result still running, else it skips those.
-    fn printMeasuresFrom(self: *const Problem, cursor: *MeasureCursor, out: *std.Io.Writer, err: *std.Io.Writer, wait: bool) !void {
+    fn printMeasuresFrom(self: *Problem, cursor: *MeasureCursor, out: *std.Io.Writer, err: *std.Io.Writer, wait: bool) !void {
         const measures = self.prepared.deck.measures;
         if (!cursor.headed) {
             for (self.optimization, 0..) |*lm, k| try printOptimization(out, lm, &self.prepared.tuner.?, k, measures);
@@ -1351,7 +1555,7 @@ pub const Problem = struct {
             while (cursor.next < session.outputs.items.len) : (cursor.next += 1) {
                 const id = session.outputs.items[cursor.next];
                 if (wait and !(try session.info(id)).status.terminal()) return;
-                try printQueryMeasures(session, id, out, err, measures);
+                try printQueryMeasures(self.allocator, session, id, out, err, if (self.measure_json) |*j| &j.writer else null, measures);
             }
         }
     }
@@ -1389,8 +1593,8 @@ pub const Problem = struct {
     /// trials (`print_measures` reads them at the end), the tangent runs,
     /// and a requested OP that later queries still read.
     fn releaseDelivered(self: *Problem) void {
-        // `.save` and `.stim` read the results after the run.
-        if (!self.session.config.final_plan or self.save_path != null or self.prepared.deck.stims.len != 0) return;
+        // `.save`, `.stim`, `print_soa` and `write_emir_json` read the results after the run.
+        if (!self.session.config.final_plan or self.save_path != null or self.prepared.deck.stims.len != 0 or self.prepared.deck.soa.limits.len != 0 or self.emir) return;
         const outputs = self.session.outputs.items;
         const printed = if (self.prepared.deck.measures.len == 0 or self.measure_cursor.session > 0) outputs.len else self.measure_cursor.next;
         const upto = @min(self.next_output, printed);
@@ -1497,6 +1701,7 @@ pub const Problem = struct {
         @memset(labels, "");
         deck.probes = probes;
         deck.probe_labels = labels;
+        deck.opvars = &.{};
         var session = analysis.session.Session.init(self.workerAllocator(), self.io, &self.prepared.circuit, &deck, self.session.config);
         defer session.deinit();
         var id: [1]QueryId = undefined;
@@ -1507,6 +1712,71 @@ pub const Problem = struct {
         if (m.aged_runs) self.prepared.deck.variants.values = aged.values;
         self.degradation = aged.table;
         try self.delivery.publish(self.io, .{ .title = deck.title, .result = aged.table });
+    }
+
+    /// `.wcd` (#240), once before any query advances: per base point and
+    /// spec, FORM (`core.form`) over the deck's statistical parameters. Each
+    /// batch of points is one session of the nominal queries of the spec's
+    /// analysis, a variant row per point (`WorstCase.rows`). A gradient
+    /// round of DC or transient queries runs only its point and takes the
+    /// neighbours from tangent rows; otherwise each point is a simulation,
+    /// `max_parallel` at a time. Every operating point starts cold, so the
+    /// result is the same at any `max_parallel`. `UnsupportedCard` for a
+    /// spec whose analysis runs no nominal query (a `SWEEP DATA` card).
+    /// ponytail: each round re-simulates the line point it starts from, and
+    /// every spec simulates its own z = 0 round; share them when sims count.
+    fn worstCase(self: *Problem) !void {
+        const w = if (self.prepared.wcd) |*wcd| wcd else return;
+        if (self.worst_case.len != 0) return;
+        const a = self.arena.allocator();
+        const gpa = self.allocator;
+        const deck = &self.prepared.deck;
+        const specs = w.spec.specs;
+        const d = w.keys.len;
+        const runs = try a.alloc(WcdRun, w.bases.len * specs.len);
+        var template: std.ArrayList(Query) = .empty;
+        defer template.deinit(gpa);
+        var values: std.ArrayList(f64) = .empty;
+        defer values.deinit(gpa);
+        var margins: std.ArrayList(f64) = .empty;
+        defer margins.deinit(gpa);
+        for (runs, 0..) |*run, k| {
+            const base = k / specs.len;
+            const spec = specs[k % specs.len];
+            const kind = deck.measures[spec.measure].analysis;
+            const variant: ?u32 = if (w.stepped) @intCast(base) else null;
+            template.clearRetainingCapacity();
+            for (deck.queries) |job| switch (job) {
+                inline else => |o| {
+                    const nominal = if (variant) |v| o.tol.variant == v else o.tol.variant == null;
+                    if (nominal and @as(requests.Kind, job) == kind) try template.append(gpa, job);
+                },
+            };
+            if (template.items.len == 0) {
+                if (!@import("builtin").is_test) std.log.err(".wcd: {s}: no nominal {t} analysis runs the card", .{ deck.measures[spec.measure].name, kind });
+                return error.UnsupportedCard;
+            }
+            const direct = !self.session.config.knobs.no_tangents and for (template.items) |job| {
+                if (!self.tangentable(job)) break false;
+            } else true;
+            run.* = .{ .form = try core.form.Form.init(a, @intCast(d), .{ .maxiter = w.spec.maxiter, .tol = w.spec.tol }), .sims = 0 };
+            const form = &run.form;
+            while (form.points().len != 0) {
+                const points = form.points();
+                const count = points.len / d;
+                const batched = direct and form.batched();
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                try values.resize(gpa, count * deck.measures.len);
+                try self.evaluateRows(try w.rows(arena.allocator(), &self.prepared.circuit, points, base), template.items, batched, &.{}, values.items, null);
+                const sims: u32 = if (batched) 1 else @intCast(count);
+                run.sims += sims;
+                try margins.resize(gpa, count);
+                for (margins.items, 0..) |*g, p| g.* = spec.margin(values.items[p * deck.measures.len + spec.measure]);
+                form.feed(margins.items);
+            }
+        }
+        self.worst_case = runs;
     }
 
     /// Feeds `solver` (`core.lm.Lm` or `core.bisect.Bisect`) the residuals
@@ -1546,23 +1816,45 @@ pub const Problem = struct {
 
     /// Residuals of each point of `points` (the optimized parameters'
     /// values, n per point, on top of `t.bases[base]`) into `out`, m per
-    /// point: the RESULTS cards'
-    /// goal errors over the `template` queries run at that point, NaN where
-    /// a query failed or a card found no value. Every operating point
-    /// starts from `guess` (cold when empty); `first` takes the one row 0's
-    /// first query solved, empty when it has none. With `direct` (a
-    /// batched round of `tangentable` queries) only row 0 runs, and the
-    /// other points' results are its runs' first-order predictions of them
-    /// (`Dc.tangents`, `Tran.tangents`, dev/analysis/optimize.md "Direct
-    /// sensitivities").
+    /// point: the RESULTS cards' goal errors over the `template` queries
+    /// run at that point (`evaluateRows`, which says what `direct`, `guess`
+    /// and `first` do), NaN where a query failed or a card found no value.
     fn evaluatePoints(self: *Problem, t: *frontend.Tuner, template: []const Query, base: usize, points: []const f64, direct: bool, guess: []const f64, out: []f64, first: *std.ArrayList(f64)) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const count = points.len / t.spec.live.len;
         std.debug.assert(!direct or count == t.spec.live.len + 1);
+        const measures = self.prepared.deck.measures;
+        const values = try a.alloc(f64, count * measures.len);
+        try self.evaluateRows(try t.rows(a, &self.prepared.circuit, points, base), template, direct, guess, values, first);
+        const m = t.results.len;
+        for (0..count) |p| for (t.results, out[p * m ..][0..m]) |card, *r| {
+            // Never null: Tuner.init refuses a RESULTS card without GOAL=
+            // (`goalError(0) != null`), and only the goal decides null.
+            r.* = measures[card].goalError(values[p * measures.len + card]).?;
+        };
+    }
+
+    /// Every `.meas` card's value at each row of `rows` into `values`,
+    /// `measures.len` per row: each card over the `template` queries of its
+    /// analysis run at that row, NaN where a query failed or a card found
+    /// no value. Every operating point starts from `guess` (cold when
+    /// empty); `first`, when given, takes the one row 0's first query
+    /// solved, empty when it has none. With `direct` (a batched round of
+    /// `tangentable` queries) only row 0 runs, and the other rows' results
+    /// are its runs' first-order predictions of them (`Dc.tangents`,
+    /// `Tran.tangents`, dev/analysis/optimize.md "Direct sensitivities").
+    fn evaluateRows(self: *Problem, rows: core.Variants, template: []const Query, direct: bool, guess: []const f64, values: []f64, first: ?*std.ArrayList(f64)) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const count = rows.count();
         var deck = self.prepared.deck;
-        deck.variants = try t.rows(a, &self.prepared.circuit, points, base);
+        const cards = deck.measures.len;
+        std.debug.assert(count >= 1);
+        std.debug.assert(values.len == count * cards);
+        deck.variants = rows;
         deck.op_guess = guess;
         const runs = if (direct) 1 else count;
         const tangents = try a.alloc(u32, if (direct) count - 1 else 0);
@@ -1584,11 +1876,12 @@ pub const Problem = struct {
         const ids = try a.alloc(QueryId, jobs.len);
         _ = try session.append(jobs, ids);
         try session.runAll(.{ .max_parallel = self.limits.max_parallel, .quantum = .completion });
-        first.clearRetainingCapacity();
-        if (try session.operatingPoint(ids[0])) |x| try first.appendSlice(self.allocator, x);
-        const values = try a.alloc(f64, deck.measures.len);
-        const m = t.results.len;
-        @memset(out, std.math.nan(f64));
+        if (first) |f| {
+            f.clearRetainingCapacity();
+            if (try session.operatingPoint(ids[0])) |x| try f.appendSlice(self.allocator, x);
+        }
+        const card_values = try a.alloc(f64, cards);
+        @memset(values, std.math.nan(f64));
         for (0..count) |p| for (ids[(if (direct) 0 else p) * template.len ..][0..template.len]) |id| {
             const info = try session.info(id);
             if (info.status != .complete) continue;
@@ -1609,12 +1902,9 @@ pub const Problem = struct {
                     res.data = res.data[p * res.npoints * res.varnames.len ..][0 .. res.npoints * res.varnames.len];
                 }
             }
-            output.measureValues(deck.measures, info.kind, res, values);
-            for (t.results, out[p * m ..][0..m]) |card, *r| {
-                const measure = deck.measures[card];
-                // Never null: Tuner.init refuses a RESULTS card without GOAL=
-                // (`goalError(0) != null`), and only the goal decides null.
-                if (measure.analysis == info.kind) r.* = measure.goalError(values[card]).?;
+            output.measureValues(deck.measures, info.kind, res, card_values);
+            for (deck.measures, card_values, values[p * cards ..][0..cards]) |measure, x, *v| {
+                if (measure.analysis == info.kind) v.* = x;
             }
         };
     }
@@ -1766,6 +2056,111 @@ pub const Problem = struct {
     }
 };
 
+/// `Problem.print_soa`'s running count: the excursions, the instances they
+/// happened on, and the (limit, result) pairs a missing column skipped.
+/// Each excursion prints to `out` while `max_warns` allows, and with `json`
+/// is also a JSON object there, led by `,\n` (`write_measures_json`).
+const SoaTally = struct {
+    gpa: std.mem.Allocator,
+    out: ?*std.Io.Writer = null,
+    json: ?*std.Io.Writer = null,
+    max_warns: u32 = 0,
+    excursions: u64 = 0,
+    instances: std.StringHashMapUnmanaged(void) = .empty,
+    skipped: u64 = 0,
+
+    /// Every SOA limit of `s`'s deck over each of its completed operating
+    /// points, DC sweeps and transients, in request order.
+    fn session(tally: *SoaTally, s: *const analysis.session.Session) !void {
+        for (s.outputs.items) |id| {
+            const info = try s.info(id);
+            if (!soaChecked(info.kind) or info.status != .complete or s.released(id)) continue;
+            try tally.result(s, try s.query(id), info.kind, try s.result(id));
+        }
+    }
+
+    /// Every SOA limit of `s`'s deck over `res`, the result of `job`.
+    fn result(tally: *SoaTally, s: *const analysis.session.Session, job: Query, kind: requests.Kind, res: Result) !void {
+        for (s.deck.soa.limits) |lim| try tally.scan(lim, res, s, job, kind);
+    }
+
+    /// `lim` over every row of `res`; `kind` says what column 0 is: a
+    /// transient's time, a DC sweep's value, nothing for an operating point.
+    fn scan(tally: *SoaTally, lim: core.SoaLimit, res: Result, s: *const analysis.session.Session, job: Query, kind: requests.Kind) !void {
+        const w = res.varnames.len;
+        if (res.data.len != res.npoints * w) {
+            tally.skipped += 1;
+            return;
+        }
+        var cols: [2]?usize = .{ null, null };
+        for (&cols, [2][]const u8{ lim.pos, lim.neg }) |*col, name| if (name.len != 0) {
+            col.* = for (res.varnames, 0..) |v, k| {
+                if (std.mem.eql(u8, v, name)) break k;
+            } else {
+                tally.skipped += 1;
+                return;
+            };
+        };
+        var from: ?f64 = null;
+        var peak: f64 = 0;
+        for (0..res.npoints) |i| {
+            const row = res.data[i * w ..][0..w];
+            const d = (if (cols[0]) |c| row[c] else 0) - (if (cols[1]) |c| row[c] else 0);
+            const v = if (lim.abs) @abs(d) else d;
+            const at = if (kind == .op) 0 else row[0];
+            if (v > lim.limit) {
+                peak = if (from == null) v else @max(peak, v);
+                if (from == null) from = at;
+            } else if (from) |f| {
+                try tally.excursion(lim, peak, f, at, s, job, kind);
+                from = null;
+            }
+        }
+        if (from) |f| try tally.excursion(lim, peak, f, null, s, job, kind);
+    }
+
+    /// Counts one excursion, `from` to `to` (null: past the last row) at
+    /// `peak`, prints it while `max_warns` allows and writes it to `json`.
+    fn excursion(tally: *SoaTally, lim: core.SoaLimit, peak: f64, from: f64, to: ?f64, s: *const analysis.session.Session, job: Query, kind: requests.Kind) !void {
+        tally.excursions += 1;
+        try tally.instances.put(tally.gpa, lim.name, {});
+        const row = variantOf(job);
+        if (tally.json) |j| {
+            const nan = std.math.nan(f64);
+            const windowed = kind != .op;
+            try j.writeAll(",\n    {\"instance\": ");
+            try std.json.Stringify.encodeJsonString(lim.name, .{}, j);
+            try j.print(", \"quantity\": \"{s}\", \"key\": \"{s}\", \"limit\": ", .{ lim.quantity, lim.key });
+            try output.writeJsonNumber(j, lim.limit);
+            try j.writeAll(", \"peak\": ");
+            try output.writeJsonNumber(j, peak);
+            try j.writeAll(", \"from\": ");
+            try output.writeJsonNumber(j, if (windowed) from else nan);
+            try j.writeAll(", \"to\": ");
+            try output.writeJsonNumber(j, if (windowed) (to orelse nan) else nan);
+            try j.print(", \"analysis\": \"{t}\", \"variant\": ", .{kind});
+            try output.writeVariantJson(j, s.deck.variants, row, tempOf(job));
+            try j.writeAll("}");
+        }
+        const out = tally.out orelse return;
+        if (tally.excursions > tally.max_warns) return;
+        const label = if (row) |v| s.deck.variants.labelAt(v) else "";
+        try out.print("soa: {s} {s} = {d:.4} V > {s} {d} V", .{ lim.name, lim.quantity, peak, lim.key, lim.limit });
+        if (kind != .op) {
+            try out.print(" from {e:.3}", .{from});
+            if (to) |t| try out.print(" to {e:.3}", .{t}) else try out.writeAll(" to the end");
+            if (kind == .tran) try out.writeAll(" s");
+        }
+        try out.print(" ({t}{s}{s})\n", .{ kind, if (label.len != 0) " " else "", label });
+    }
+};
+
+/// Whether `.option soa` reads a `kind` result: only these publish the
+/// accepted points.
+fn soaChecked(kind: requests.Kind) bool {
+    return kind == .op or kind == .dc or kind == .tran;
+}
+
 /// The index of the `.meas` card named `name` (case-insensitive), the first
 /// when several share it.
 fn measureIndex(measures: []const core.Measure, name: []const u8) ?u32 {
@@ -1778,6 +2173,84 @@ fn variantOf(job: Query) ?u32 {
     return switch (job) {
         inline else => |o| o.tol.variant,
     };
+}
+
+/// Whether `id` is a completed query with terminal currents and the first
+/// such of its variant after those in `before`.
+// ponytail: quadratic in the outputs; a key set once sweeps reach thousands of points.
+fn emirFirst(session: *const analysis.session.Session, before: []const QueryId, id: QueryId) !bool {
+    if (!try hasEmir(session, id)) return false;
+    const job = try session.query(id);
+    for (before) |b| if (try hasEmir(session, b)) {
+        const other = try session.query(b);
+        if (std.meta.eql(variantOf(other), variantOf(job)) and std.meta.eql(tempOf(other), tempOf(job))) return false;
+    };
+    return true;
+}
+
+/// Whether `id` is a completed, kept transient, `.op` or `.dc` that read
+/// terminal currents.
+fn hasEmir(session: *const analysis.session.Session, id: QueryId) !bool {
+    const info = try session.info(id);
+    const kinds = info.kind == .tran or info.kind == .op or info.kind == .dc;
+    if (!kinds or info.status != .complete or session.released(id)) return false;
+    return (try session.result(id)).emir.terminals.len != 0;
+}
+
+/// `Problem.write_emir_json`'s document for query `id` of `session`, which
+/// runs `prepared`.
+fn writeEmir(out: *std.Io.Writer, deck: []const u8, lib: *const frontend.Library, prepared: *const frontend.Prepared, session: *const analysis.session.Session, id: QueryId) !void {
+    const e = (try session.result(id)).emir;
+    const job = try session.query(id);
+    const d = &prepared.deck;
+    const ckt = &prepared.circuit;
+    try out.writeAll("{\n  \"format\": \"espice-emir/1\",\n  \"deck\": ");
+    try std.json.Stringify.encodeJsonString(deck, .{}, out);
+    try out.print(",\n  \"analysis\": \"{t}\",\n  \"variant\": ", .{@as(requests.Kind, job)});
+    try output.writeVariantJson(out, d.variants, variantOf(job), tempOf(job));
+    try out.writeAll(",\n  \"temp\": ");
+    if (tempOf(job) orelse d.deck_temp) |temp| try output.writeJsonNumber(out, temp) else try out.writeAll("null");
+    // A static point has no window.
+    if (job == .tran) {
+        try out.writeAll(",\n  \"window\": [");
+        try output.writeJsonNumber(out, e.from);
+        try out.writeAll(", ");
+        try output.writeJsonNumber(out, e.to);
+        try out.writeAll("]");
+    } else try out.writeAll(",\n  \"window\": null");
+    try out.writeAll(",\n  \"em_recovery\": ");
+    try output.writeJsonNumber(out, d.em_recovery);
+    // `Wave.emAvg`'s value from the same halves and span; one sample's |i|.
+    const span = e.to - e.from;
+    inline for (.{ false, true }) |sources| {
+        try out.writeAll(if (sources) "\n  ],\n  \"sources\": [" else ",\n  \"terminals\": [");
+        var first = true;
+        for (e.terminals) |term| {
+            const b = ckt.batches[term.batch];
+            const source = std.mem.eql(u8, b.type_name, "vsource") or std.mem.eql(u8, b.type_name, "isource");
+            if (source != sources) continue;
+            try out.writeAll(if (first) "\n    {\"instance\": " else ",\n    {\"instance\": ");
+            first = false;
+            const t = ckt.batch_types[term.batch];
+            try std.json.Stringify.encodeJsonString(d.card_names.get(t, term.instance) orelse b.type_name, .{}, out);
+            if (!sources) {
+                try out.writeAll(", \"model\": ");
+                if (d.card_models.get(t, term.instance)) |m| try std.json.Stringify.encodeJsonString(m, .{}, out) else try out.writeAll("null");
+            }
+            try out.writeAll(", \"terminal\": ");
+            const ports = lib.vtable(t).unknown_names;
+            if (term.port < ports.len) try std.json.Stringify.encodeJsonString(ports[term.port], .{}, out) else try out.print("\"{d}\"", .{term.port});
+            try out.writeAll(", \"net\": ");
+            try std.json.Stringify.encodeJsonString(if (term.row == core.GROUND or term.row >= ckt.n) "0" else ckt.nodeName(term.row), .{}, out);
+            const em_avg = if (span == 0) @abs(term.avg) else (@max(term.pos, term.neg) - d.em_recovery * @min(term.pos, term.neg)) / span;
+            for ([_][]const u8{ "avg", "em_avg", "rms", "peak" }, [_]f64{ term.avg, em_avg, term.rms, term.peak }) |key, v| {
+                try out.print(", \"{s}\": ", .{key});
+                try output.writeJsonNumber(out, v);
+            }
+            try out.writeAll("}");
+        }
+    }
+    try out.writeAll("\n  ]\n}\n");
 }
 
 /// The error query `id` ended with, its prerequisite's for a query that
@@ -1805,6 +2278,109 @@ fn monteTrials(gpa: std.mem.Allocator, session: *const analysis.session.Session,
     }
 }
 
+/// Counts the failures of SIGMA_SCALE card `s` over its completed `trials`
+/// (#239), fits them and writes the report; returns the fit's refusal. A
+/// trial fails when FAIL holds or reads a card without a value. Counted by
+/// subtraction, so a trial with no completed result (no convergence,
+/// cancelled) fails too. ponytail: every trial's result stays until the
+/// end, as plain MONTE's do; reduce each to its `.meas` row on delivery if
+/// large runs need it.
+fn writeSss(gpa: std.mem.Allocator, out: *std.Io.Writer, json: bool, measures: []const core.Measure, s: frontend.Sss, trials: []const Result) !?core.sss.Error {
+    const m = s.monte;
+    const passed = try gpa.alloc(bool, m.n * m.scales.len);
+    defer gpa.free(passed);
+    @memset(passed, false);
+    const values = try gpa.alloc(f64, measures.len);
+    defer gpa.free(values);
+    for (trials) |res| {
+        const at = std.mem.indexOf(u8, res.plotname, "(monte=").? + "(monte=".len;
+        const tail = res.plotname[at..];
+        const trial = std.fmt.parseInt(u64, tail[0 .. std.mem.indexOfNone(u8, tail, "0123456789") orelse tail.len], 10) catch continue;
+        if (s.scaleOf(trial) == null) continue;
+        output.measureValues(measures, s.kind, res, values);
+        passed[@intCast(trial - m.first)] = !try s.fails(gpa, values);
+    }
+    const failures = try gpa.alloc(u64, m.scales.len);
+    defer gpa.free(failures);
+    const each = try gpa.alloc(u64, m.scales.len);
+    defer gpa.free(each);
+    @memset(each, m.n);
+    for (failures, 0..) |*k, j| k.* = m.n - std.mem.count(bool, passed[j * m.n ..][0..m.n], &.{true});
+    const estimate = core.sss.fit(m.scales, each, failures);
+    const report: output.Sss = .{ .fail = m.fail.text, .scales = m.scales, .trials = m.n, .failures = failures, .estimate = estimate };
+    if (json) try output.writeSss(out, s.kind, report) else try output.printSss(out, report);
+    // An error value returned as is would be this function's own error.
+    _ = estimate catch |e| return @as(?core.sss.Error, e);
+    return null;
+}
+
+/// The `.wcd` report (#240), once `worstCase` has run: per base point, a
+/// line per spec with its bound, β_w, the partial yield Φ(β_w), the
+/// gradient rounds, the real simulations and the `TOP` coordinates of the
+/// worst-case point by size, in sigmas. A search that stopped unconverged
+/// says why; its β is the last simulated point's, never a prediction, and
+/// a margin no coordinate moves has none. As JSON, one object per spec and
+/// base point led by `,\n`: `"kind": "wcd"`, `spec`, `bound`, `corner` (the
+/// `.step` label, "" without), `beta` and `yield` (null without β),
+/// `converged`, `status`, `iterations`, `sims`, and `point`, every
+/// coordinate as `{"name", "z"}` in coordinate order (names can repeat).
+fn writeWorstCase(gpa: std.mem.Allocator, out: *std.Io.Writer, json: bool, w: *const frontend.WorstCase, runs: []const Problem.WcdRun, measures: []const core.Measure) !void {
+    const specs = w.spec.specs;
+    const order = try gpa.alloc(u32, w.keys.len);
+    defer gpa.free(order);
+    for (runs, 0..) |*run, k| {
+        const base = w.bases[k / specs.len];
+        const spec = specs[k % specs.len];
+        const f = &run.form;
+        const name = measures[spec.measure].name;
+        const beta: ?f64 = if (f.status == .no_gradient) null else f.beta;
+        const partial = if (beta) |b| core.numerics.normalCdf(b) else std.math.nan(f64);
+        if (json) {
+            try out.writeAll(",\n    {\"kind\": \"wcd\", \"spec\": ");
+            try std.json.Stringify.encodeJsonString(name, .{}, out);
+            try out.writeAll(", \"bound\": ");
+            try std.json.Stringify.encodeJsonString(spec.bound, .{}, out);
+            try out.writeAll(", \"corner\": ");
+            try std.json.Stringify.encodeJsonString(base.label, .{}, out);
+            try out.writeAll(", \"beta\": ");
+            try output.writeJsonNumber(out, beta orelse std.math.nan(f64));
+            try out.writeAll(", \"yield\": ");
+            try output.writeJsonNumber(out, partial);
+            try out.print(", \"converged\": {s}, \"status\": \"{t}\", \"iterations\": {d}, \"sims\": {d}, \"point\": [", .{ if (f.converged()) "true" else "false", f.status, f.iterations, run.sims });
+            for (w.labels, f.z, 0..) |label, z, i| {
+                try out.writeAll(if (i == 0) "{\"name\": " else ", {\"name\": ");
+                try std.json.Stringify.encodeJsonString(label, .{}, out);
+                try out.writeAll(", \"z\": ");
+                try output.writeJsonNumber(out, z);
+                try out.writeAll("}");
+            }
+            try out.writeAll("]}");
+            continue;
+        }
+        // By |z| down, ties in coordinate order.
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sort(u32, order, @as([]const f64, f.z), struct {
+            fn greater(z: []const f64, i: u32, j: u32) bool {
+                return @abs(z[i]) > @abs(z[j]) or (@abs(z[i]) == @abs(z[j]) and i < j);
+            }
+        }.greater);
+        const top = order[0..@min(w.spec.top, order.len)];
+        if (k % specs.len == 0) try out.print("\n  Worst-case distances (.wcd){s}{s}\n  spec            bound        beta_w      yield(Phi)    iters  sims   worst-case point (top {d})\n", .{ if (base.label.len != 0) " at " else "", base.label, top.len });
+        try out.print("  {s:<15} {s:<12} ", .{ name, spec.bound });
+        if (beta) |b| try out.print("{d:<11.4} {d:<13.10} ", .{ b, partial }) else try out.writeAll("-           -             ");
+        try out.print("{d:<6} {d:<6}", .{ f.iterations, run.sims });
+        for (top, 0..) |i, n| try out.print("{s}{s} {s}{d:.2}s", .{ if (n == 0) " " else ", ", w.labels[i], if (f.z[i] >= 0) "+" else "", f.z[i] });
+        try out.writeAll(switch (f.status) {
+            .converged => "\n",
+            .maxiter => "  (not converged: MAXITER reached)\n",
+            .line_search => "  (not converged: no step along the linearized boundary lowered the merit)\n",
+            .no_gradient => "  (no statistical parameter moves this measure)\n",
+            .failed => "  (not converged: a point could not be simulated or measured)\n",
+            .running => unreachable, // `worstCase` runs every search to its end
+        });
+    }
+}
+
 /// Block `k` of query `id`'s result: its own run at 0, else the
 /// prediction at its `k`-th tangent row (`Result.tangents`).
 fn block(session: *const analysis.session.Session, id: QueryId, k: usize) !Result {
@@ -1822,17 +2398,42 @@ fn block(session: *const analysis.session.Session, id: QueryId, k: usize) !Resul
 /// card can read; a transient's own run, not its tangent blocks. A sweep
 /// point's block names its row and label, and prints NaN for each card
 /// without a value, a failed point's for all.
-fn printQueryMeasures(session: *const analysis.session.Session, id: QueryId, out: *std.Io.Writer, err: *std.Io.Writer, measures: []const core.Measure) !void {
+fn printQueryMeasures(gpa: std.mem.Allocator, session: *const analysis.session.Session, id: QueryId, out: *std.Io.Writer, err: *std.Io.Writer, json: ?*std.Io.Writer, measures: []const core.Measure) !void {
     const info = try session.info(id);
     switch (info.kind) {
         .op, .tran, .ac, .dc, .fft, .tran_noise, .dcmatch, .acmatch, .lstb, .phasenoise, .pnoise, .sp => {},
         else => return,
     }
     if (session.released(id)) return;
-    const point: ?output.MeasurePoint = if (variantOf(try session.query(id))) |v| .{ .row = v, .label = session.deck.variants.labels[v] } else null;
+    const job = try session.query(id);
+    const row = variantOf(job);
+    const point: ?output.MeasurePoint = if (row) |v| .{ .row = v, .label = session.deck.variants.labelAt(v) } else null;
+    // The fields every JSON result of the block shares (#235).
+    var head: std.Io.Writer.Allocating = .init(gpa);
+    defer head.deinit();
+    if (json != null) {
+        try head.writer.print("\"analysis\": \"{t}\", \"variant\": ", .{info.kind});
+        try output.writeVariantJson(&head.writer, session.deck.variants, row, tempOf(job));
+    }
+    const sink: ?output.MeasureJson = if (json) |j| .{ .out = j, .head = head.written() } else null;
     if (info.status == .complete) {
-        try output.printMeasures(out, err, measures, info.kind, try block(session, id, 0), point);
-    } else if (point) |p| if (info.status.terminal()) try output.printFailedMeasures(out, measures, info.kind, p);
+        var res = try block(session, id, 0);
+        // `soa_count()` (#238): this result's excursions, when none was skipped.
+        if (session.deck.soa.limits.len != 0 and soaChecked(info.kind)) {
+            var tally: SoaTally = .{ .gpa = gpa };
+            defer tally.instances.deinit(gpa);
+            try tally.result(session, job, info.kind, res);
+            if (tally.skipped == 0) res.soa_count = @floatFromInt(tally.excursions);
+        }
+        try output.printMeasures(out, err, measures, info.kind, res, point, sink);
+    } else if (point) |p| if (info.status.terminal()) try output.printFailedMeasures(out, measures, info.kind, p, sink);
+}
+
+/// The HSPICE `.temp` list entry `job` runs at; null at the deck's.
+fn tempOf(job: Query) ?f64 {
+    return switch (job) {
+        inline else => |o| o.tol.temp_c,
+    };
 }
 
 /// The optimizer's summary, after HSPICE's: one line per accepted
@@ -2007,6 +2608,14 @@ fn raiseJitCache() void {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
     }.setenv;
     _ = setenv("CUDA_CACHE_MAXSIZE", "4294967296", 0);
+}
+
+/// `ESPICE_PARSE_THREADS=N`: N threads scan the device cards of every
+/// deck, however small, and 0 reads every card whole (#230); for A/B runs,
+/// which must give the same bytes. Unset or unparsable keeps the default.
+fn parseFromEnv() frontend.ParseOptions {
+    const v = std.mem.span(getenv("ESPICE_PARSE_THREADS") orelse return .{});
+    return .{ .threads = std.fmt.parseInt(u32, v, 10) catch return .{}, .scan_min = 0 };
 }
 
 /// The developer switches (`analysis.Knobs`), read from the environment once

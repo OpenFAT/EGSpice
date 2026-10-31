@@ -113,6 +113,13 @@ const Row = struct {
     /// The newest dependent and the next older one sharing `dependency`.
     child: QueryId = none,
     sibling: QueryId = none,
+    /// The earlier `.tran` row whose result this `.four`/`.fft` reads in
+    /// place of its own transient (`linkReaders`, #231); `none` for none.
+    reads: QueryId = none,
+    /// The newest row that `reads` this one, and the next older reader of
+    /// the row this one reads, as `child` and `sibling` list dependents.
+    reader: QueryId = none,
+    next_reader: QueryId = none,
     /// A quantum is in flight; `settle` collects it.
     running: bool = false,
     /// A query split into its lanes (`splitLanes`): its lane rows are the
@@ -249,7 +256,11 @@ pub const Session = struct {
 
     /// Adds `jobs`, writing their ids to `ids`, and returns `jobs.len`. Each
     /// non-OP job shares an existing matching OP prerequisite or gets a new
-    /// one. All-or-nothing: every job is validated and deep-copied before any
+    /// one. A `.four` or `.fft` whose transient a plain `.tran` before it in
+    /// the same call runs reads that result instead (`reusable`, #231), so
+    /// it is not ready until that `.tran` ends: `advance` runs the `.tran`
+    /// first, `advanceReady` on the reader alone is `error.QueryNotReady`.
+    /// All-or-nothing: every job is validated and deep-copied before any
     /// row or id is published. Fails with `error.BufferTooSmall` when `ids`
     /// is shorter than `jobs`, a validation error for the first bad job, or
     /// `error.TooManyQueries` past u32 rows.
@@ -321,7 +332,84 @@ pub const Session = struct {
             }
         }
         self.root_readers += roots;
+        self.linkReaders(old_len);
         return jobs.len;
+    }
+
+    /// Points each `.four`/`.fft` row from `from` on at a `.tran` row of
+    /// the same call that runs its transient (`resultSource`), so it reads
+    /// that result instead of integrating again (#231). The `.tran` comes
+    /// first, so `deinit` (newest first) joins a reader before the rows it
+    /// reads die, and the reader joins its component.
+    fn linkReaders(self: *Session, from: usize) void {
+        for (from..self.rows.len) |f| {
+            const kind = self.kindAt(f);
+            if (kind != .four and kind != .fft) continue;
+            const src = self.resultSource(from, f) orelse continue;
+            const rows = self.rows.slice();
+            rows.items(.reads)[f] = @fromBackingInt(@intCast(src));
+            rows.items(.next_reader)[f] = rows.items(.reader)[src];
+            rows.items(.reader)[src] = @fromBackingInt(@intCast(f));
+            rows.items(.component)[f] = rows.items(.component)[src];
+        }
+    }
+
+    /// The row in `from..f` whose result reader row `f` may read
+    /// (`reusable`), or null.
+    /// ponytail: a `uic` reader (no OP row) scans the call's rows; walk a
+    /// per-template list if a huge `uic` sweep ever shows it.
+    fn resultSource(self: *const Session, from: usize, f: usize) ?usize {
+        const dep = self.rows.items(.dependency)[f];
+        if (dep == none) {
+            for (from..f) |t| if (self.reusable(f, t)) return t;
+            return null;
+        }
+        // The same OP row: only its dependents can match.
+        var c = self.rows.items(.child)[@backingInt(dep)];
+        while (c != none) : (c = self.rows.items(.sibling)[@backingInt(c)]) {
+            const t = @backingInt(c);
+            if (t >= from and t < f and self.reusable(f, t)) return t;
+        }
+        return null;
+    }
+
+    /// Whether `.four`/`.fft` row `f` may read `.tran` row `t`'s result,
+    /// bitwise what its own transient would record (#231): on the CPU
+    /// (under `auto` a `.tran` may take the GPU while the reader's run
+    /// stays on the host), the same circuit, variant and OP row (both none
+    /// for `uic`), the same `Sim` options (`sameTransient`), a `.tran`
+    /// that records every probe column with no stream, measures or
+    /// tangents, the reader's nodes among those probes, and no device that
+    /// prints display tasks or calls VPI at each step, whose output for
+    /// the reader's own run would be lost.
+    fn reusable(self: *const Session, f: usize, t: usize) bool {
+        const rows = self.rows.slice();
+        if (self.kindAt(t) != .tran or self.config.backend != .cpu or self.config.gpu_lanes) return false;
+        if (rows.items(.template)[f] != rows.items(.template)[t] or rows.items(.variant)[f] != rows.items(.variant)[t] or
+            rows.items(.dependency)[f] != rows.items(.dependency)[t]) return false;
+        const reader = self.jobs.items[rows.items(.job)[f]];
+        const tran = self.jobs.items[rows.items(.job)[t]].tran;
+        const p = tran.point;
+        if (p.measures_only or p.early_stop or p.abort_after != null or p.tangent_step != 0) return false;
+        if (!sameTransient(reader, tran)) return false;
+        const pos: u32, const neg: u32 = switch (reader) {
+            .four => |o| .{ o.output_node, o.output_neg },
+            .fft => |o| .{ o.out_pos, o.out_neg },
+            else => return false,
+        };
+        const probes = self.deck.probes;
+        if (std.mem.indexOfScalar(u32, probes, pos) == null) return false;
+        if (neg != 0 and std.mem.indexOfScalar(u32, probes, neg) == null) return false;
+        const ckt = self.templateOf(t);
+        if (ckt.vpi != null) return false;
+        for (ckt.batches) |b| if (b.hooks.say != null) return false;
+        return true;
+    }
+
+    /// Whether a `.four`/`.fft` reads query `id`'s result (#231), so its
+    /// rows must stay in memory rather than stream.
+    pub fn resultRead(self: *const Session, id: QueryId) bool {
+        return self.rows.items(.reader)[@backingInt(id)] != none;
     }
 
     /// One appended job: its `jobs` entry, its variant, and its
@@ -518,12 +606,16 @@ pub const Session = struct {
             .all => true,
             .component => |component| self.rows.items(.component)[i] == component,
             .query => |id| @backingInt(id) == i or self.rows.items(.owner)[i] == id or
-                self.rows.items(.dependency)[@backingInt(id)] == @as(QueryId, @fromBackingInt(@intCast(i))),
+                self.rows.items(.dependency)[@backingInt(id)] == @as(QueryId, @fromBackingInt(@intCast(i))) or
+                self.rows.items(.reads)[@backingInt(id)] == @as(QueryId, @fromBackingInt(@intCast(i))),
         };
     }
 
     fn ready(self: *const Session, i: usize) bool {
         if (self.rows.items(.lanes)[i] != 0 or self.effectiveStatus(i).terminal()) return false;
+        // A result reader waits for its `.tran` to end, whatever the outcome.
+        const reads = self.rows.items(.reads)[i];
+        if (reads != none and !self.effectiveStatus(@backingInt(reads)).terminal()) return false;
         const dep = self.rows.items(.dependency)[i];
         return dep == none or self.rows.items(.status)[@backingInt(dep)] == .complete;
     }
@@ -590,6 +682,13 @@ pub const Session = struct {
         );
         if (self.stream) |s| if (@backingInt(s.id) == i) {
             self.rows.items(.executor)[i].?.stream = s.writer;
+        };
+        // A result reader reads its `.tran`'s rows when that run kept them,
+        // else runs its own transient as it would alone (#231).
+        const reads = self.rows.items(.reads)[i];
+        if (reads != none) if (self.rows.items(.executor)[@backingInt(reads)]) |src| {
+            if (self.effectiveStatus(@backingInt(reads)) == .complete and src.stream == null)
+                self.rows.items(.executor)[i].?.source = src;
         };
         self.rows.items(.executor)[i].?.row = @intCast(i);
         if (self.config.timing_in_depth)
@@ -996,6 +1095,13 @@ pub const Session = struct {
             },
             else => {},
         }
+        // The readers of its result, once it ended at all (#231).
+        if (!self.rows.items(.status)[i].terminal()) return;
+        var r = self.rows.items(.reader)[i];
+        while (r != none) : (r = self.rows.items(.next_reader)[@backingInt(r)]) {
+            const j = @backingInt(r);
+            if (self.ready(j) and !self.rows.items(.running)[j]) self.urgent.appendAssumeCapacity(j);
+        }
     }
 
     /// Runs every query to its end through a pool of `limits.max_parallel`.
@@ -1039,6 +1145,13 @@ pub const Session = struct {
         return true;
     }
 
+    /// True when every row is terminal, so no worker reads its copy of the
+    /// deck (`Problem.release_points` then moves the variant table).
+    pub fn idle(self: *Session) bool {
+        self.advanceDone();
+        return self.done_rows == self.rows.len;
+    }
+
     /// Moves `done_rows` and `done_outputs` past the rows and outputs that
     /// have ended; a terminal row stays terminal. O(rows ended since).
     fn advanceDone(self: *Session) void {
@@ -1064,7 +1177,7 @@ pub const Session = struct {
     /// prerequisite OP goes too once no unreleased query reads it, and
     /// leaves the OP index, so a later query gets a new one. A query
     /// already released is left alone. `error.QueryNotReady` while it, or
-    /// a query reading its state, has not ended.
+    /// a query reading its state or result, has not ended.
     pub fn release(self: *Session, id: QueryId) error{ InvalidQuery, QueryNotReady }!void {
         const i = try self.index(id);
         if (self.rows.items(.released)[i]) return;
@@ -1072,6 +1185,11 @@ pub const Session = struct {
         var c = self.rows.items(.child)[i];
         while (c != none) : (c = self.rows.items(.sibling)[@backingInt(c)]) {
             if (!self.rows.items(.released)[@backingInt(c)]) return error.QueryNotReady;
+        }
+        var r = self.rows.items(.reader)[i];
+        while (r != none) : (r = self.rows.items(.next_reader)[@backingInt(r)]) {
+            const j = @backingInt(r);
+            if (!self.effectiveStatus(j).terminal() or self.rows.items(.running)[j]) return error.QueryNotReady;
         }
         if (self.rows.items(.executor)[i]) |worker| worker.destroy();
         self.rows.items(.executor)[i] = null;
@@ -1288,10 +1406,14 @@ pub const Pool = struct {
             if (pool.quantum == .completion) session.gather(i);
             if (session.launch(i, pool.quantum, &pool.signal)) {
                 pool.running.appendAssumeCapacity(.{ .session = session, .row = @intCast(i) });
-            } else if (session.rows.items(.executor)[i]) |leader| {
-                // The batch never started: its peers run on their own.
-                for (leader.peers) |p| session.rows.items(.running)[p.row] = false;
-                leader.peers = &.{};
+            } else {
+                // A failed `.tran`'s result readers run their own.
+                session.followOne(i);
+                if (session.rows.items(.executor)[i]) |leader| {
+                    // The batch never started: its peers run on their own.
+                    for (leader.peers) |p| session.rows.items(.running)[p.row] = false;
+                    leader.peers = &.{};
+                }
             }
         }
     }
@@ -1334,12 +1456,41 @@ fn sameLaneJob(a: requests.Query, b: requests.Query) bool {
     };
 }
 
+/// Whether `reader`'s own transient (a `.four`'s `tran_opts`, an `.fft`'s
+/// `tran`) is `tran`'s, `point` aside, and the two jobs' tolerances agree
+/// (#231). `Sim` reads no `tol.variant`, `tol.temp_c` or `tol.warm_op`;
+/// the job tolerances, which the executor reads, compare instead.
+fn sameTransient(reader: requests.Query, tran: requests.Tran) bool {
+    var own = switch (reader) {
+        .four => |o| o.tran_opts orelse return false,
+        .fft => |o| o.tran,
+        else => return false,
+    };
+    var other = tran;
+    for ([_]*requests.Tran{ &own, &other }) |o| {
+        o.tol.variant = null;
+        o.tol.temp_c = null;
+        o.tol.warm_op = false;
+        o.point = .{};
+    }
+    var reader_tol = switch (reader) {
+        inline else => |o| o.tol,
+    };
+    var tran_tol = tran.tol;
+    reader_tol.variant = null;
+    tran_tol.variant = null;
+    return sameDeep(own, other) and sameDeep(reader_tol, tran_tol);
+}
+
 /// Kinds a lane batch runs: `.op`, `.dc`, `.tran`, `.pss`, the AC family
 /// (`execution.freqLaneKind`), and the lane rows a split `.mc` or `.temp`
 /// became (`splitLanes`).
 fn batchable(job: requests.Query) bool {
     return switch (job) {
-        .op, .dc, .tran, .pss => true,
+        .pss => true,
+        // `--emir` reads each query's own host batches (#237).
+        inline .op, .dc => |o| !o.emir,
+        .tran => |o| !o.point.emir,
         inline .mc, .temp => |o| o.lane != null,
         else => execution.freqLaneKind(job),
     };
@@ -1541,9 +1692,12 @@ fn countParams(allocator: std.mem.Allocator, topology: *const Circuit, comptime 
 /// running it.
 pub fn schemaOf(allocator: std.mem.Allocator, topology: *const Circuit, deck: *const Deck, query: requests.Query) !core.QuerySchema {
     const columns: usize = switch (query) {
-        .op, .dcinc => deck.probes.len,
+        // Device operating-point variables after the probes (`post/opvars.zig`).
+        .op => deck.probes.len + deck.opvars.len,
+        .dc => deck.probes.len + deck.opvars.len + 1,
+        .dcinc => deck.probes.len,
         // HSPICE `.op <time>` publishes the `.op` layout, with no time column.
-        .tran => |o| deck.probes.len + @intFromBool(!o.snapshot),
+        .tran => |o| deck.probes.len + deck.opvars.len + @intFromBool(!o.snapshot),
         .tran_noise => |o| deck.probes.len + 1 + @intFromBool(o.sde),
         .tf => 3,
         .lstb => |o| if (o.margins) 5 else 8,

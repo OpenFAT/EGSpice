@@ -428,6 +428,79 @@ test "an analysis card inside a subcircuit is refused (#165)" {
     _ = try parse(arena.allocator(), "t\n.subckt s a\nr1 a 0 1k\n.ends\nx1 1 s\n.tran 1n 2n\n");
 }
 
+test "SIGMA_SCALE and FAIL (#239): the scales in order, FAIL over the card's own .meas; every other form refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deck = "t\nv1 in 0 1\nr1 in 0 1k\n.meas tran x max v(in)\n{s}\n.meas ac gain find vm(in) at=1\n.meas ac ph find vp(in) at=1\n.end\n";
+    const ok = try parse(a, try a.print(deck, .{".ac dec 10 1 1g sweep monte=20 sigma_scale=2,2.5,3 fail='ph < -2.0944 || !(gain >= 100)'"}));
+    const m = ok.deck.analyses[0].sweep.monte;
+    try std.testing.expectEqual(@as(u32, 20), m.n);
+    try std.testing.expectEqualSlices(f64, &.{ 2, 2.5, 3 }, m.scales);
+    try std.testing.expectEqualStrings("ph < -2.0944 || !(gain >= 100)", m.fail.text);
+    // `ph` and `gain` read cards 2 and 1, the `.meas ac` ones.
+    var reads: std.ArrayList(u32) = .empty;
+    for (m.fail.ops) |op| if (op.code == .live) try reads.append(a, op.a);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, reads.items);
+    for ([_]struct { anyerror, []const u8 }{
+        .{ error.ParseError, ".ac dec 10 1 1g sweep monte=20 sigma_scale=0,2,3 fail='ph < 0'" },
+        .{ error.ParseError, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,2,3 fail='ph < 0'" },
+        .{ error.ParseError, ".ac dec 10 1 1g sweep monte=20 sigma_scale fail='ph < 0'" },
+        .{ error.ParseError, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail=ph" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 fail='ph < 0'" },
+        .{ error.UnsupportedCard, ".op sweep monte=20 sigma_scale=2,3,4 fail='ph < 0'" },
+        .{ error.UnsupportedCard, ".dc monte=20 sigma_scale=2,3,4 fail='ph < 0'" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='x > 0'" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='vm(in) > 0'" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='agauss(0,1,1) > ph'" },
+        .{ error.UnsupportedCard, ".ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='ph < 0'\n.ac dec 10 1 1g sweep monte=5" },
+    }) |c| try std.testing.expectError(c[0], parse(a, try a.print(deck, .{c[1]})));
+    // An HSPICE `.temp` list would run each trial at several temperatures.
+    try std.testing.expectError(error.UnsupportedCard, netlist.parse(a, try a.print(deck, .{".temp 0 50\n.ac dec 10 1 1g sweep monte=20 sigma_scale=2,3,4 fail='ph < 0'"}), .hspice));
+}
+
+test ".wcd (#240): specs name .meas cards with their bounds, options in any order; every other form refused" {
+    // Oracle: the card as written, by hand.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deck = "t\n.param lim=60\nv1 in 0 1\nr1 in 0 1k\n.dc v1 0 1 1\n.meas dc pm find v(in) at=1\n{s}\n.meas dc offs find v(in) at=0\n.end\n";
+    const ok = try parse(a, try a.print(deck, .{".wcd pm '>= lim' maxiter=7 offs '<10m' tol=0.001 top=0"}));
+    const w = ok.deck.wcd.?;
+    try std.testing.expectEqual(@as(usize, 2), w.specs.len);
+    try std.testing.expectEqual(@as(u32, 0), w.specs[0].measure);
+    try std.testing.expect(w.specs[0].above);
+    try std.testing.expectEqual(@as(f64, 60), w.specs[0].limit);
+    try std.testing.expectEqualStrings(">= lim", w.specs[0].bound);
+    try std.testing.expectEqual(@as(u32, 1), w.specs[1].measure);
+    try std.testing.expect(!w.specs[1].above);
+    try std.testing.expectApproxEqRel(@as(f64, 10e-3), w.specs[1].limit, 1e-15);
+    try std.testing.expectEqual(@as(u32, 7), w.maxiter);
+    try std.testing.expectEqual(@as(f64, 0.001), w.tol);
+    try std.testing.expectEqual(@as(u32, 0), w.top);
+    // The margin is at least 0 where the spec passes.
+    try std.testing.expectEqual(@as(f64, 2), w.specs[0].margin(62));
+    try std.testing.expectApproxEqAbs(@as(f64, -1e-3), w.specs[1].margin(11e-3), 1e-15);
+    try std.testing.expect((try parse(a, try a.print(deck, .{"* none"}))).deck.wcd == null);
+    for ([_]struct { anyerror, []const u8 }{
+        .{ error.UnsupportedCard, ".wcd gain '>= 1'" },
+        .{ error.UnsupportedCard, ".wcd pm '>= 1' pm '<= 2'" },
+        .{ error.UnsupportedCard, ".wcd pm '>= 1'\n.wcd offs '<= 1'" },
+        .{ error.ParseError, ".wcd pm '== 1'" },
+        .{ error.ParseError, ".wcd pm 1" },
+        .{ error.ParseError, ".wcd pm" },
+        .{ error.ParseError, ".wcd" },
+        .{ error.ParseError, ".wcd pm '>= 1' maxiter=0" },
+        .{ error.ParseError, ".wcd pm '>= 1' maxiter=2.5" },
+        .{ error.ParseError, ".wcd pm '>= 1' tol=0" },
+        .{ error.ParseError, ".wcd pm '>= 1' top=-1" },
+        .{ error.ParseError, ".wcd pm '>= 1' seed=3" },
+    }) |c| try std.testing.expectError(c[0], parse(a, try a.print(deck, .{c[1]})));
+    // An HSPICE `.temp` list would give each spec several values.
+    try std.testing.expectError(error.UnsupportedCard, netlist.parse(a, try a.print(deck, .{".temp 0 50\n.wcd pm '>= 1'"}), .hspice));
+}
+
 test "a block close with no block open is refused (#162)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
