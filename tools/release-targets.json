@@ -61,7 +61,7 @@
     {
       "name": "macos-arm64",
       "system": "aarch64-darwin",
-      "runner": "macos-14",
+      "runner": "macos-15",
       "target": "aarch64-macos",
       "cpu": "apple_m1",
       "check": ""
