@@ -10,9 +10,10 @@
 //! `current_row`, an optional `solver_execution`, and optional methods
 //! beginSolve, advanceIteration, checkpoint, loadCheck, deviceSolve,
 //! evalFollows, checkConvergence, applyLimits, updateStates, clearLimits and
-//! nodeName, plus `certify: bool` with certifyPoint(hook, x, t, opts), which
-//! `newton` calls on every converged x outside the INITFIX pass, before
-//! staging, when `certify` is true. `hook` provides assemble(sys, x, t),
+//! nodeName, plus `certify: bool` with certifyReserve(), which `newton`
+//! calls on entry, and certifyPoint(hook, x, t, opts), which `newton` calls
+//! on every converged x outside the INITFIX pass, before staging, when
+//! `certify` is true. `hook` provides assemble(sys, x, t),
 //! vals(sys) (the Jacobian in pattern order), diagAt(sys, slot), and
 //! optionally residual(sys, x, t) for a residual-only evaluation.
 //!
@@ -222,6 +223,9 @@ pub fn newtonLanes(
     var out: if (W == 1) void else LaneResult(W) = if (W == 1) {} else .{ .converged = L.none, .singular = L.none, .iterations = @splat(opts.max_iter) };
     var limit: L.V = L.splat(x_plausible);
     if (comptime @hasDecl(S, "beginSolve")) sys.beginSolve();
+    // Before the loop: an allocation failure here returns, where one inside
+    // `finalizeStep` could not.
+    if (W == 1) if (comptime @hasDecl(S, "certify") and S.certify) try sys.certifyReserve();
     const prof = &ws.prof;
 
     while (iter < opts.max_iter) : (iter += 1) {
