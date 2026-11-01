@@ -70,3 +70,35 @@ test "KCL certificate: a converged OP passes its gate, a moved x does not, and t
     try t.expect(fail.gate_f > fail.gate_tol);
     try t.expect(fail.ratio > pass.ratio);
 }
+
+test "KCL certificate: newton returns OutOfMemory at an allocation failure in the certificate scratch" {
+    var lib = try Library.init(t.allocator);
+    defer lib.deinit();
+    var b = try Builder.init(t.allocator, &lib);
+    const out = try b.addNode();
+    const vt = eval.deviceVtable(D, "va_limit_state");
+    const proto = try b.protoOf(try lib.register("va_limit_state", vt, false));
+    const model: D.Model = .{};
+    const instance: D.Instance = .{};
+    const nodes = [_]u32{ out, analysis.GROUND };
+    try vt.proto_add(proto.ctx, t.allocator, @ptrCast(&model), @ptrCast(&instance), &nodes).unwrap();
+    var prepared = try b.compile();
+    defer prepared.deinit();
+    var ckt = try analysis.Circuit.instantiate(&prepared, t.allocator);
+    defer ckt.deinit();
+    try ckt.computeBaseline();
+    var ws = try converger.Workspace.init(t.allocator, ckt.n, ckt.col_ptr, ckt.row_idx, ckt.bbd, .{}, .{});
+    defer ws.deinit(t.allocator);
+    const x = try t.allocator.alloc(f64, ckt.n);
+    defer t.allocator.free(x);
+    @memset(x, 0);
+    ckt.setSimState(.{ .t = 0, .dt = 1, .kind = .dc });
+    // The circuit's own allocations fail from here on; frees pass through.
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    ckt.gpa = failing.allocator();
+    defer ckt.gpa = t.allocator;
+    const r = converger.run(&ckt, &ws, x, 0, .{ .gmin = 0, .max_iter = 100, .init_fix = true }, analysis.EvalHook{});
+    // Under -Dcertify the scratch is the solve's one circuit allocation; the
+    // nightly's allocation-failure suites panicked on it (#53).
+    if (certify.enabled) try t.expectError(error.OutOfMemory, r) else try t.expect((try r).converged);
+}
