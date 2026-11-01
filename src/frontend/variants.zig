@@ -59,6 +59,8 @@ pub const Point = struct {
     /// Monte Carlo trial, whose draws answer the distribution calls and
     /// the `DEV`/`LOT`/`.variation` rows.
     trial: ?Trial = null,
+    /// What the row is (`core.Variants.kinds`).
+    kind: core.Variants.Kind = .step,
 };
 
 /// A card's primary value for one point, by card name.
@@ -121,13 +123,23 @@ pub fn plan(p: *Planner) !Plan {
                 // A rebuilt trial draws from it after `plan` returns.
                 const sampler = try p.scratch.create(Sampler);
                 sampler.* = try .init(p.scratch, deck.config, std.mem.max(u32, m.list));
-                for (m.list) |t| try p.addTrial(sampler, t, t - 1);
+                for (m.list) |t| try p.addTrial(sampler, t, t - 1, 1);
                 if (lanes) span.lanes = .{ .axis = "run", .dc_plot = false };
             } else {
-                const sampler = try p.scratch.create(Sampler);
-                sampler.* = try .init(p.scratch, deck.config, m.n);
-                if (m.n > std.math.maxInt(u32) - m.first + 1) return p.refuse(a.line, "a MONTE trial number past 4294967295");
-                for (0..m.n) |k| try p.addTrial(sampler, m.first + @as(u32, @intCast(k)), @intCast(k));
+                // `SIGMA_SCALE=s1,...` (#239): MONTE trials per scale, each
+                // scale's trial numbers after the last's, so their draws are
+                // independent.
+                const scales: []const f64 = if (m.scales.len != 0) m.scales else &.{1};
+                if (@as(u64, m.n) * scales.len > @as(u64, std.math.maxInt(u32)) - m.first + 1) return p.refuse(a.line, "a MONTE trial number past 4294967295");
+                if (m.scales.len != 0 and deck.alters.len != 0) return p.refuse(a.line, "SIGMA_SCALE together with .alter");
+                for (scales, 0..) |scale, j| {
+                    const sampler = try p.scratch.create(Sampler);
+                    sampler.* = try .init(p.scratch, deck.config, m.n);
+                    // Latin hypercube counts are not binomial: the interval would be wrong.
+                    if (m.scales.len != 0 and sampler.lhs) return p.refuse(a.line, "SIGMA_SCALE with sampling_method=lhs");
+                    const first = m.first + @as(u32, @intCast(j * m.n));
+                    for (0..m.n) |k| try p.addTrial(sampler, first + @as(u32, @intCast(k)), @intCast(k), scale);
+                }
                 if (lanes) span.lanes = .{ .axis = "run", .dc_plot = false };
             },
         }
@@ -154,7 +166,7 @@ pub fn plan(p: *Planner) !Plan {
         if (!own) fanout.global.count = p.count() - fanout.global.first;
     }
     if (p.prefix.len != 0 and p.count() == 0) {
-        try p.closeRow(p.prefix, 0, null);
+        try p.closeRow(p.prefix, 0, null, .alter);
         fanout.global = .{ .first = 0, .count = 1, .nominal = false };
     }
     _ = try nl.setLive(p.scratch, &p.stack, nl.live.nominal, null);
@@ -184,6 +196,7 @@ pub const Planner = struct {
     labels: std.ArrayList([]const u8) = .empty,
     temps: std.ArrayList(?f64) = .empty,
     axes: std.ArrayList(f64) = .empty,
+    kinds: std.ArrayList(core.Variants.Kind) = .empty,
     starts: std.ArrayList(u32) = .empty,
     write_refs: std.ArrayList(u32) = .empty,
     write_values: std.ArrayList(f64) = .empty,
@@ -211,6 +224,8 @@ pub const Planner = struct {
     /// Per parameter, its write's index in the open row, or `none`.
     row_at: []u32 = &.{},
     targets: ?Targets = null,
+    /// The site key of each group the last `siteVariations` returned.
+    site_groups: std.ArrayList(u64) = .empty,
 
     const Targets = struct { starts: []const u32, ords: []const u32, keys: []const u64 };
 
@@ -300,6 +315,7 @@ pub const Planner = struct {
             .starts = try p.sim.dupe(u32, p.starts.items),
             .refs = try p.sim.dupe(u32, p.write_refs.items),
             .values = try p.sim.dupe(f64, p.write_values.items),
+            .kinds = try p.sim.dupe(core.Variants.Kind, p.kinds.items),
         };
     }
 
@@ -326,7 +342,9 @@ pub const Planner = struct {
 
     /// One `.data` row.
     fn addRow(p: *Planner, data: netlist.Data, row: []const f64) !void {
-        try p.add(try p.pointOf(data.columns, data.labels, row));
+        var pt = try p.pointOf(data.columns, data.labels, row);
+        pt.kind = .data;
+        try p.add(pt);
     }
 
     /// The point setting `targets[i]` to `values[i]`, labelled
@@ -350,12 +368,13 @@ pub const Planner = struct {
         return pt;
     }
 
-    fn addTrial(p: *Planner, sampler: *Sampler, trial: u32, index: u32) !void {
+    fn addTrial(p: *Planner, sampler: *Sampler, trial: u32, index: u32, scale: f64) !void {
         try p.add(.{
             .label = try std.fmt.allocPrint(p.scratch, "monte={d}", .{trial}),
             .axis = @floatFromInt(trial),
             .live = p.nl.live.nominal,
-            .trial = .{ .sampler = sampler, .trial = trial, .index = index },
+            .trial = .{ .sampler = sampler, .trial = trial, .index = index, .scale = scale },
+            .kind = .monte,
         });
     }
 
@@ -366,6 +385,7 @@ pub const Planner = struct {
         const label = try std.fmt.allocPrint(p.sim, "alter={d}", .{k});
         const alt = try p.scratch.create(Netlist);
         alt.* = try netlist.parse(p.scratch, text, p.nl.deck.dialect);
+        alt.soa_ratings = p.nl.soa_ratings;
         if (!own and sameCards(p.nl, alt)) {
             var arena = std.heap.ArenaAllocator.init(core.gpa);
             defer arena.deinit();
@@ -373,7 +393,7 @@ pub const Planner = struct {
             defer c.deinit();
             if (sameTopology(p.nominal, &c)) {
                 try p.diff(try collect(arena.allocator(), &c));
-                return p.closeRow(label, @floatFromInt(k), null);
+                return p.closeRow(label, @floatFromInt(k), null, .alter);
             }
         }
         try p.rebuilds.append(p.scratch, .{ .nl = alt, .run = .{ .prefix = label } });
@@ -385,7 +405,7 @@ pub const Planner = struct {
         const label = if (p.prefix.len == 0) try p.sim.dupe(u8, pt.label) else try std.fmt.allocPrint(p.sim, "{s}, {s}", .{ p.prefix, pt.label });
         if (try p.load(pt, label) == .circuit) return p.addRun(label, pt);
         try p.pointWrites(pt);
-        try p.closeRow(label, pt.axis, pt.temp);
+        try p.closeRow(label, pt.axis, pt.temp, pt.kind);
     }
 
     const Load = enum { row, circuit };
@@ -534,11 +554,12 @@ pub const Planner = struct {
         return .{ .refs = refs.items, .slots = slots.items, .values = values.items };
     }
 
-    fn closeRow(p: *Planner, label: []const u8, axis: f64, temp: ?f64) !void {
+    fn closeRow(p: *Planner, label: []const u8, axis: f64, temp: ?f64, kind: core.Variants.Kind) !void {
         for (p.write_refs.items[p.starts.items[p.starts.items.len - 1]..]) |r| p.row_at[r] = netlist.none;
         try p.labels.append(p.scratch, label);
         try p.axes.append(p.scratch, axis);
         try p.temps.append(p.scratch, temp);
+        try p.kinds.append(p.scratch, kind);
         try p.starts.append(p.scratch, @intCast(p.write_refs.items.len));
     }
 
@@ -569,12 +590,11 @@ pub const Planner = struct {
         for (p.nl.deck.variations, 0..) |v, i| {
             for (targets.ords[targets.starts[i]..targets.starts[i + 1]], targets.keys[targets.starts[i]..targets.starts[i + 1]]) |ord, key| {
                 const base = p.current(ord);
-                const u = trial.uniform(key);
                 const spread = try p.spreadOf(v, ord, base);
                 const x = switch (v.dist) {
-                    .gauss => base + spread * normalQuantile(u),
-                    .unif => base + spread * (2 * u - 1),
-                    .limit => base + (if (u < 0.5) -spread else spread),
+                    .gauss => base + spread * trial.normal(key),
+                    .unif => base + spread * (2 * trial.unit(key) - 1),
+                    .limit => base + (if (trial.uniform(key) < 0.5) -spread else spread),
                 };
                 try p.set(ord, x);
             }
@@ -649,7 +669,8 @@ pub const Planner = struct {
     /// mismatch (`agauss` in its model cards). A site that moves no
     /// parameter (sky130's `mc_mm_switch=0`) is no group, and no group at
     /// all is an empty table, never the unit-variance fallback. The live
-    /// values are nominal again on return.
+    /// values are nominal again on return, and `site_groups` holds each
+    /// group's site key.
     pub fn siteVariations(p: *Planner) !core.query.Variations {
         const live = p.nl.live;
         std.debug.assert(live.site_keys.len == live.site_ops.len);
@@ -660,6 +681,7 @@ pub const Planner = struct {
         var params: std.ArrayList(u32) = .empty;
         var steps: std.ArrayList(f64) = .empty;
         try starts.append(p.sim, 0);
+        p.site_groups.clearRetainingCapacity();
         if (p.fast == .untested) p.fast = try p.probeIdentity();
         // The steps are taken from every draw at its nominal, which under
         // `.option seed` is not the circuit's own state.
@@ -711,9 +733,11 @@ pub const Planner = struct {
             const card = names.get(r.type, r.index) orelse "?";
             try labels.append(p.sim, try std.fmt.allocPrint(p.sim, "{s}@{s}", .{ card, r.param_name }));
             try starts.append(p.sim, @intCast(params.items.len));
+            try p.site_groups.append(p.scratch, key);
         };
         _ = try p.nl.setLive(p.scratch, &p.stack, live.nominal, null);
         std.debug.assert(starts.items.len == labels.items.len + 1);
+        std.debug.assert(p.site_groups.items.len == labels.items.len);
         return .{ .labels = labels.items, .starts = starts.items, .params = params.items, .sigmas = steps.items };
     }
 
@@ -891,7 +915,7 @@ pub const Tuner = struct {
         const p = &t.planner;
         p.nominal = nominal;
         p.sim = arena;
-        inline for (.{ &p.labels, &p.temps, &p.axes, &p.write_refs, &p.write_values }) |list| list.clearRetainingCapacity();
+        inline for (.{ &p.labels, &p.temps, &p.axes, &p.kinds, &p.write_refs, &p.write_values }) |list| list.clearRetainingCapacity();
         p.starts.shrinkRetainingCapacity(1);
         const b = t.bases[base];
         const live = try arena.dupe(f64, b.live);
@@ -926,6 +950,115 @@ pub const Tuner = struct {
         out.refs = refs.items;
         out.values = values.items;
         return out;
+    }
+};
+
+/// Turns `.wcd` points in standard-normal space into variant rows (#240):
+/// coordinate i is draw key `keys[i]`, which a `.variation`/`DEV`/`LOT` row
+/// draws under (one per device, or one per model and parameter) or a
+/// distribution site that moves a parameter; z = 0 is every draw at its
+/// nominal, also under `.option seed`. Each point is a fixed-z trial
+/// through `Planner.add`, as `Tuner.rows`' points are. Lives in the parse
+/// arena, with the netlist it re-evaluates.
+pub const WorstCase = struct {
+    planner: Planner,
+    spec: netlist.Wcd,
+    keys: []const u64,
+    /// `<card>@<param>` or `<model>@<param>`, as the mismatch groups.
+    labels: []const []const u8,
+    /// One search per `.step` point, or the nominal one
+    /// (`Planner.basePoints`); `stepped` when they are `.step` points,
+    /// whose queries run variant row b.
+    bases: []const Point,
+    stepped: bool,
+    /// The trial's sampler, which only a `limit` that moves nothing reads.
+    sampler: *Sampler,
+    /// The point `rows` sets, by key.
+    z: std.AutoHashMapUnmanaged(u64, f64) = .empty,
+
+    /// A worst-case search over the planner of the deck's main run.
+    /// Asserts that the deck has a `.wcd`; `UnsupportedCard` with `.alter`
+    /// (each run is its own circuit), without any statistical parameter,
+    /// or when one is a `limit` or a multiplier draw, which no single
+    /// normal coordinate moves smoothly.
+    pub fn init(planner: Planner) !WorstCase {
+        var p = planner;
+        const nl = p.nl;
+        const spec = nl.deck.wcd.?;
+        if (nl.deck.alters.len != 0) return p.refuse(spec.line, ".wcd together with .alter");
+        var keys: std.ArrayList(u64) = .empty;
+        var labels: std.ArrayList([]const u8) = .empty;
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        const targets = try p.variationTargets();
+        const names = try core.query.CardNames.init(p.scratch, p.cards);
+        for (nl.deck.variations, 0..) |v, i| {
+            const lo = targets.starts[i];
+            const hi = targets.starts[i + 1];
+            for (targets.ords[lo..hi], targets.keys[lo..hi]) |ord, key| {
+                if (v.dist == .limit) return p.refuse(spec.line, ".wcd over a limit variation");
+                if ((try seen.getOrPut(p.scratch, key)).found_existing) continue;
+                const r = p.refs.at(ord);
+                try keys.append(p.scratch, key);
+                try labels.append(p.scratch, try std.fmt.allocPrint(p.scratch, "{s}@{s}", .{ if (v.per_device) names.get(r.type, r.index) orelse "?" else v.model, v.param }));
+            }
+        }
+        if (nl.live.site_keys.len != 0) {
+            const groups = try p.siteVariations();
+            var refused: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            try refused.ensureTotalCapacity(p.scratch, @intCast(nl.live.site_keys.len));
+            _ = try nl.setLive(p.scratch, &p.stack, nl.live.nominal, Shapes{ .refused = &refused });
+            _ = try nl.setLive(p.scratch, &p.stack, nl.live.nominal, null);
+            for (groups.labels, p.site_groups.items) |label, site| {
+                if (refused.contains(site)) return p.refuse(spec.line, ".wcd over a limit() or a multiplier draw");
+                // The key `TrialDraw` draws a site's first call under.
+                const key = netlist.siteKey(site, 0);
+                if ((try seen.getOrPut(p.scratch, key)).found_existing) continue;
+                try keys.append(p.scratch, key);
+                try labels.append(p.scratch, label);
+            }
+        }
+        if (keys.items.len == 0) return p.refuse(spec.line, ".wcd with no statistical parameter: no .variation, DEV/LOT or distribution call moves a device");
+        const sampler = try p.scratch.create(Sampler);
+        sampler.* = try .init(p.scratch, nl.deck.config, 1);
+        const bases = try p.basePoints();
+        return .{ .planner = p, .spec = spec, .keys = keys.items, .labels = labels.items, .bases = bases, .stepped = nl.deck.steps.len != 0, .sampler = sampler };
+    }
+
+    /// One row per point of `points` (`keys.len` coordinates each) on top
+    /// of `bases[base]`, allocated in `arena`, as `Tuner.rows` makes them;
+    /// `UnsupportedCard` for a point that changes the topology. `nominal`
+    /// is the prepared circuit the rows write into.
+    pub fn rows(w: *WorstCase, arena: std.mem.Allocator, nominal: *const device.Circuit, points: []const f64, base: usize) !core.Variants {
+        const p = &w.planner;
+        p.nominal = nominal;
+        p.sim = arena;
+        inline for (.{ &p.labels, &p.temps, &p.axes, &p.kinds, &p.write_refs, &p.write_values }) |list| list.clearRetainingCapacity();
+        p.starts.shrinkRetainingCapacity(1);
+        const b = w.bases[base];
+        const d = w.keys.len;
+        std.debug.assert(points.len % d == 0);
+        var at: usize = 0;
+        while (at < points.len) : (at += d) {
+            for (w.keys, points[at..][0..d]) |key, x| try w.z.put(p.scratch, key, x);
+            try p.add(.{ .label = "", .axis = 0, .live = b.live, .temp = b.temp, .cards = b.cards, .trial = .{ .sampler = w.sampler, .trial = 1, .index = 0, .z = &w.z } });
+            if (p.rebuilds.items.len != 0) return p.refuse(w.spec.line, "a .wcd point that changes the topology");
+        }
+        return p.table();
+    }
+};
+
+/// Answers every distribution call with its nominal, and marks each site
+/// whose call is a `limit` or carries a multiplier above 1, as
+/// `TrialDraw` reads them (`WorstCase.init`). `refused` has room for every site.
+const Shapes = struct {
+    refused: *std.AutoHashMapUnmanaged(u64, void),
+
+    /// Asserts that `args` holds at least the nominal value.
+    pub fn sample(self: Shapes, site: u64, f: expr.Fn, args: []const f64) f64 {
+        std.debug.assert(args.len >= 1);
+        const mult_at: usize = if (f == .agauss or f == .gauss) 3 else 2;
+        if (f == .limit or (args.len > mult_at and args[mult_at] >= 2)) self.refused.putAssumeCapacity(site, {});
+        return args[0];
     }
 };
 
@@ -964,15 +1097,22 @@ pub const Tuning = struct {
     templates: std.ArrayList(Template) = .empty,
     /// The template the last row runs on, and later rows diff against.
     template: u32 = 0,
-    /// The deck's variant table with each call's row appended, in the
-    /// session arena (`Planner.sim`); seeded on the first call.
+    /// The deck's variant table with each call's row appended, from row
+    /// `base` (`drop`); seeded on the first call. It lives in the session
+    /// arena (`Planner.sim`) until the first `drop`, then in
+    /// `table_arenas[table_at]`.
     seeded: bool = false,
+    base: u32 = 0,
+    table_arenas: ?[2]std.heap.ArenaAllocator = null,
+    table_at: u1 = 0,
     labels: std.ArrayList([]const u8) = .empty,
     temps: std.ArrayList(?f64) = .empty,
     axes: std.ArrayList(f64) = .empty,
     starts: std.ArrayList(u32) = .empty,
     refs: std.ArrayList(u32) = .empty,
     write_values: std.ArrayList(f64) = .empty,
+    /// The deck's rows' kinds; the rows a call appends read `.step`.
+    kinds: []const core.Variants.Kind = &.{},
 
     /// What one call changed: the whole variant table, whose last row is
     /// the call's, the template that row runs on (0 for the nominal
@@ -1037,12 +1177,13 @@ pub const Tuning = struct {
         return t;
     }
 
-    /// Frees the templates and the planner. The variant table stays with
-    /// the session arena.
+    /// Frees the templates, the planner and the variant table's arenas;
+    /// a table never dropped stays with the session arena.
     pub fn deinit(t: *Tuning) void {
         for (t.templates.items) |tm| tm.deinit(t.gpa);
         t.templates.deinit(t.gpa);
         for (&t.arenas) |*a| a.deinit();
+        if (t.table_arenas) |*arenas| for (arenas) |*a| a.deinit();
     }
 
     /// Re-opens the planner over template `k`, with the netlist at the
@@ -1129,8 +1270,8 @@ pub const Tuning = struct {
     /// Seeds the table and makes room for one more row, so `closeRow`
     /// cannot fail.
     fn reserveRow(t: *Tuning, current: core.Variants) !void {
-        const sim = t.planner.sim;
         try t.seed(current);
+        const sim = t.tableAllocator();
         try t.labels.ensureUnusedCapacity(sim, 1);
         try t.temps.ensureUnusedCapacity(sim, 1);
         try t.axes.ensureUnusedCapacity(sim, 1);
@@ -1148,6 +1289,7 @@ pub const Tuning = struct {
     /// Copies the deck's table on the first row appended.
     fn seed(t: *Tuning, current: core.Variants) !void {
         if (t.seeded) return;
+        std.debug.assert(current.base == 0);
         const p = &t.planner;
         try t.labels.appendSlice(p.sim, current.labels);
         try t.temps.appendSlice(p.sim, current.temp_c);
@@ -1155,18 +1297,68 @@ pub const Tuning = struct {
         try t.starts.appendSlice(p.sim, if (current.starts.len == 0) &.{0} else current.starts);
         try t.refs.appendSlice(p.sim, current.refs);
         try t.write_values.appendSlice(p.sim, current.values);
+        t.kinds = current.kinds;
         t.seeded = true;
     }
 
     fn table(t: *const Tuning) core.Variants {
         return .{
+            .base = t.base,
             .labels = t.labels.items,
             .temp_c = t.temps.items,
             .axis = t.axes.items,
             .starts = t.starts.items,
             .refs = t.refs.items,
             .values = t.write_values.items,
+            .kinds = t.kinds,
         };
+    }
+
+    fn tableAllocator(t: *Tuning) std.mem.Allocator {
+        return if (t.table_arenas) |*arenas| arenas[t.table_at].allocator() else t.planner.sim;
+    }
+
+    /// Drops the rows below `below`, which nothing reads again, and returns
+    /// the table: the rows kept move to a fresh arena of `gpa` (the same
+    /// allocator on every call) and the old one is freed, so no copy of the
+    /// table taken before this call may be read after it. All-or-nothing.
+    /// Asserts that `below` lies past `base` and within the table.
+    pub fn drop(t: *Tuning, gpa: std.mem.Allocator, below: u32) !core.Variants {
+        std.debug.assert(t.seeded and t.base < below and below <= t.base + t.labels.items.len);
+        // Until the first drop succeeds the table stays in the session arena,
+        // which an arena of its own must never be asked to resize or free.
+        const first = t.table_arenas == null;
+        if (first) t.table_arenas = .{ .init(gpa), .init(gpa) };
+        errdefer if (first) {
+            t.table_arenas = null;
+        };
+        const arenas = &t.table_arenas.?;
+        const next = &arenas[~t.table_at];
+        errdefer _ = next.reset(.free_all);
+        const a = next.allocator();
+        const k = below - t.base;
+        const lo = t.starts.items[k];
+        const labels = try a.alloc([]const u8, t.labels.items.len - k);
+        for (labels, t.labels.items[k..]) |*dst, src| dst.* = try a.dupe(u8, src);
+        const starts = try a.dupe(u32, t.starts.items[k..]);
+        for (starts) |*st| st.* -= lo;
+        const temps = try a.dupe(?f64, t.temps.items[k..]);
+        const axes = try a.dupe(f64, t.axes.items[k..]);
+        const refs = try a.dupe(u32, t.refs.items[lo..]);
+        const values = try a.dupe(f64, t.write_values.items[lo..]);
+        t.labels = .fromOwnedSlice(labels);
+        t.temps = .fromOwnedSlice(temps);
+        t.axes = .fromOwnedSlice(axes);
+        t.starts = .fromOwnedSlice(starts);
+        t.refs = .fromOwnedSlice(refs);
+        t.write_values = .fromOwnedSlice(values);
+        // The deck's kinds live in the planner's arena; appended rows have none.
+        t.kinds = t.kinds[@min(k, t.kinds.len)..];
+        // Before the first drop the old rows stay in the session arena.
+        _ = arenas[t.table_at].reset(.free_all);
+        t.table_at = ~t.table_at;
+        t.base = below;
+        return t.table();
     }
 
     /// `set` once `t.next` holds the point's values.
@@ -1175,7 +1367,7 @@ pub const Tuning = struct {
         const p = &t.planner;
         const nl = p.nl;
         var label: std.ArrayList(u8) = .empty;
-        for (nl.tunable, 0..) |k, i| try label.print(p.sim, "{s}{s}={d}", .{ if (i == 0) "" else ", ", nl.live.names[k], t.next[k] });
+        for (nl.tunable, 0..) |k, i| try label.print(t.tableAllocator(), "{s}{s}={d}", .{ if (i == 0) "" else ", ", nl.live.names[k], t.next[k] });
         if (t.planned != t.template) try t.open(t.template, nominal);
         // `nominal` is the Problem's own circuit; the one the planner opened
         // over in `init` was moved into it since.
@@ -1221,8 +1413,8 @@ pub const Tuning = struct {
             if (try p.load(pt, label.items) != .row) return p.refuse(label.items, "a parameter value that changes the topology");
         }
         try p.pointWrites(pt);
-        try t.refs.appendSlice(p.sim, p.write_refs.items);
-        try t.write_values.appendSlice(p.sim, p.write_values.items);
+        try t.refs.appendSlice(t.tableAllocator(), p.write_refs.items);
+        try t.write_values.appendSlice(t.tableAllocator(), p.write_values.items);
         t.template = t.planned;
         t.closeRow(label.items);
         @memcpy(t.values, t.next);
@@ -1561,6 +1753,49 @@ pub fn drawOnce(scratch: std.mem.Allocator, nl: *Netlist) !void {
     _ = try nl.setLive(scratch, &stack, nl.live.nominal, TrialDraw{ .trial = .{ .sampler = &sampler, .trial = 1, .index = 0 } });
 }
 
+/// A `SWEEP MONTE=n SIGMA_SCALE=... FAIL=...` card (#239): trial
+/// `first + j*n + k` of its run drew at `scales[j]`.
+pub const Sss = struct {
+    /// The analysis whose `.meas` cards FAIL reads.
+    kind: core.query.Kind,
+    /// Its `n`, `first`, `scales` and compiled `fail`.
+    monte: netlist.Monte,
+
+    /// The scale row of HSPICE trial `trial`; null for a trial the card
+    /// did not plan.
+    pub fn scaleOf(s: Sss, trial: u64) ?usize {
+        if (trial < s.monte.first) return null;
+        const j = (trial - s.monte.first) / s.monte.n;
+        if (j >= s.monte.scales.len) return null;
+        const row: usize = @intCast(j);
+        return row;
+    }
+
+    /// Whether the trial whose `.meas` values are `values` (parallel to
+    /// the deck's cards) fails: a card FAIL reads has no value, or FAIL
+    /// is NaN or nonzero. Fails only with `OutOfMemory`, in `gpa`.
+    pub fn fails(s: Sss, gpa: std.mem.Allocator, values: []const f64) !bool {
+        const f = s.monte.fail;
+        for (f.ops) |op| if (op.code == .live and !std.math.isFinite(values[op.a])) return true;
+        var stack: std.ArrayList(expr.Val) = .empty;
+        defer stack.deinit(gpa);
+        // NaN != 0 too.
+        return (try expr.eval(gpa, &stack, f.ops, f.consts, values, null)) != 0;
+    }
+};
+
+/// The deck's SIGMA_SCALE cards, their slices copied into `arena`.
+pub fn sssCards(arena: std.mem.Allocator, deck: netlist.Deck) ![]const Sss {
+    var out: std.ArrayList(Sss) = .empty;
+    for (deck.analyses) |a| if (a.sweep == .monte and a.sweep.monte.scales.len != 0) {
+        var m = a.sweep.monte;
+        m.scales = try arena.dupe(f64, m.scales);
+        m.fail = .{ .text = try arena.dupe(u8, m.fail.text), .ops = try arena.dupe(expr.Op, m.fail.ops), .consts = try arena.dupe(f64, m.fail.consts) };
+        try out.append(arena, .{ .kind = a.kind, .monte = m });
+    };
+    return out.items;
+}
+
 /// Holds every distribution call at its nominal except those at `site`,
 /// which sit one sigma above it: a uniform's half range over sqrt(3), a
 /// `limit`'s whole range (`Planner.siteVariations`).
@@ -1592,9 +1827,30 @@ pub const Trial = struct {
     trial: u32,
     /// Position within the sweep; picks the Latin hypercube stratum.
     index: u32,
+    /// `SIGMA_SCALE` (#239): every draw's sigma times this.
+    scale: f64 = 1,
+    /// `.wcd` (#240): each site's standard normal coordinate, fixed; a site
+    /// it lacks sits at 0, its nominal. The sampler then answers only a
+    /// `limit`, which `WorstCase` refuses wherever it moves a parameter.
+    z: ?*const std.AutoHashMapUnmanaged(u64, f64) = null,
 
     fn uniform(t: Trial, site: u64) f64 {
         return t.sampler.uniform(site, t.trial, t.index);
+    }
+
+    /// The standard normal coordinate of `site` times the sigma scale; at
+    /// scale 1 the bits of `normalQuantile(uniform)`. Under `z`, its entry.
+    fn normal(t: Trial, site: u64) f64 {
+        if (t.z) |z| return z.get(site) orelse 0;
+        return t.scale * core.numerics.normalQuantile(t.uniform(site));
+    }
+
+    /// The uniform of `site` through the scaled normal, Φ(s·Φ⁻¹(u)): the
+    /// scale acts in the standard-normal space, so a uniform's mass moves
+    /// to its edges. At scale 1 it is `uniform`, bit for bit. Under `z`,
+    /// Φ of its entry (Rosenblatt's map).
+    fn unit(t: Trial, site: u64) f64 {
+        return if (t.scale == 1 and t.z == null) t.uniform(site) else core.numerics.normalCdf(t.normal(site));
     }
 };
 
@@ -1624,44 +1880,18 @@ const TrialDraw = struct {
         };
         var best: f64 = 0;
         for (0..mult) |m| {
-            const u = self.trial.uniform(netlist.siteKey(site, m));
+            const key = netlist.siteKey(site, m);
+            // A `limit` is two points either side: no sigma scale moves it.
             const d = switch (f) {
-                .agauss, .gauss => scale * normalQuantile(u),
-                .limit => if (u < 0.5) -scale else scale,
-                else => scale * (2 * u - 1),
+                .agauss, .gauss => scale * self.trial.normal(key),
+                .limit => if (self.trial.uniform(key) < 0.5) -scale else scale,
+                else => scale * (2 * self.trial.unit(key) - 1),
             };
             if (m == 0 or @abs(d) > @abs(best)) best = d;
         }
         return nom + best;
     }
 };
-
-/// The standard normal quantile Φ⁻¹(u), u in (0, 1): Acklam's rational
-/// approximation, relative error below 1.2e-9. At 0 or 1 it returns NaN,
-/// so callers draw from the open interval.
-fn normalQuantile(u: f64) f64 {
-    const a = [_]f64{ -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00 };
-    const b = [_]f64{ -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01 };
-    const c = [_]f64{ -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00 };
-    const d = [_]f64{ 7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00 };
-    const low = 0.02425;
-    if (u < low or u > 1 - low) {
-        const q = @sqrt(-2 * @log(if (u < low) u else 1 - u));
-        const x = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
-            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
-        return if (u < low) x else -x;
-    }
-    const q = u - 0.5;
-    const r = q * q;
-    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
-        (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
-}
-
-test "normal quantile: symmetric, and the 97.5% point is 1.96" {
-    try std.testing.expectApproxEqAbs(@as(f64, 0), normalQuantile(0.5), 1e-12);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.959963984540054), normalQuantile(0.975), 1e-8);
-    try std.testing.expectApproxEqAbs(-normalQuantile(0.01), normalQuantile(0.99), 1e-12);
-}
 
 test "Sampler.init reads seed and sampling method, and a wild seed saturates" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1703,14 +1933,28 @@ test "TrialDraw keeps the largest deviation of a multiplier's draws" {
     try std.testing.expectEqual(@as(f64, 3), draw.sample(9, .agauss, &.{3}));
 }
 
-test "normal quantile is monotone across the tail seam" {
-    var prev = normalQuantile(1e-12);
-    for ([_]f64{ 1e-6, 0.02, 0.02425, 0.0243, 0.3, 0.5, 0.7, 0.97575, 0.98, 1 - 1e-12 }) |u| {
-        const x = normalQuantile(u);
-        try std.testing.expect(x > prev);
-        prev = x;
+test "TrialDraw at sigma scale 1 is the unscaled draw's bits; at s, s times its normal coordinate (#239)" {
+    // Oracle: the draw written out from the sampler's uniform, as it was
+    // before the scale existed, and Φ(s·Φ⁻¹(u)) for a uniform.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var sampler = try Sampler.init(arena.allocator(), &.{}, 1);
+    const q = core.numerics.normalQuantile;
+    const u = sampler.uniform(netlist.siteKey(5, 0), 1, 0);
+    for ([_]f64{ 1, 3 }) |s| {
+        const draw: TrialDraw = .{ .trial = .{ .sampler = &sampler, .trial = 1, .index = 0, .scale = s } };
+        const gauss = draw.sample(5, .agauss, &.{ 0, 0.5, 2 });
+        const unif = draw.sample(5, .aunif, &.{ 0, 0.5 });
+        if (s == 1) {
+            try std.testing.expectEqual(@as(u64, @bitCast(0.25 * q(u))), @as(u64, @bitCast(gauss)));
+            try std.testing.expectEqual(@as(u64, @bitCast(0.5 * (2 * u - 1))), @as(u64, @bitCast(unif)));
+        } else {
+            try std.testing.expectApproxEqRel(s * 0.25 * q(u), gauss, 1e-14);
+            try std.testing.expectApproxEqRel(0.5 * (2 * core.numerics.normalCdf(s * q(u)) - 1), unif, 1e-14);
+        }
+        // A two-point `limit` does not move with the scale.
+        try std.testing.expectEqual(@as(f64, if (u < 0.5) 1.5 else 2.5), draw.sample(5, .limit, &.{ 2, 0.5 }));
     }
-    try std.testing.expect(std.math.isNan(normalQuantile(0)));
 }
 
 test crossesZero {

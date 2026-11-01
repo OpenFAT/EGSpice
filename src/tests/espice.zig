@@ -5,9 +5,11 @@
 //! alone, live `set_params` against a fresh parse, a `.data` sweep against
 //! the points API, the CPU against the GPU lanes), `checkAllAllocationFailures`
 //! for leaks, closed forms (4kTR noise, dividers, the B-source deck's own
-//! algebra), and the named error each misuse must get.
+//! algebra), the printed `.meas` text for its JSON (#235), and the named
+//! error each misuse must get.
 const std = @import("std");
 const api = @import("espice");
+const core = @import("core");
 const t = std.testing;
 const deck = "query fixture\nV1 in 0 dc 1 ac 1\nR1 in out 1k\nC1 out 0 1n\n.ac dec 80 1 100k\n.tran 1n 10n uic\n.end\n";
 
@@ -769,6 +771,225 @@ test "an R reading v() is ngspice's B source: pow() takes |x|, tc divides, m mul
     try t.expectApproxEqRel(@as(f64, -0.5 * 2 / (1017.28 * 1.035178)), i, 1e-12);
 }
 
+/// `source`, read as the deck at `origin`, run as the CLI runs it: a final
+/// plan with `auto_point`, which streams, trims and releases every
+/// waveform no reader claims. The caller deinits it.
+fn soaRun(source: []const u8, origin: []const u8) !*api.Problem {
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = origin } },
+        .backend = .{ .final_plan = true },
+        .auto_point = true,
+    });
+    errdefer p.deinit();
+    try p.run_all();
+    return p;
+}
+
+/// What `print_soa` writes once `source` runs (`soaRun`). The caller
+/// frees it.
+fn soaText(source: []const u8) ![]u8 {
+    return soaTextAt(source, "soa.cir");
+}
+
+/// `soaText` of the deck at `origin`.
+fn soaTextAt(source: []const u8, origin: []const u8) ![]u8 {
+    const p = try soaRun(source, origin);
+    defer p.deinit();
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    try p.print_soa(&text.writer);
+    return text.toOwnedSlice();
+}
+
+test ".option soa: a gate held exactly at vgs_max reports nothing, 1 mV past it one excursion (#238)" {
+    // Oracle: the limit is the solved v(g) itself, read off the same deck,
+    // so the point sits on the limit to the bit; vgs_max binds to no model
+    // field, so moving it moves no voltage.
+    const body = "soa\nV1 d 0 1\nV2 g 0 2\nM1 d g 0 0 nm\n.model nm nmos level=1 vgs_max={e}\n{s}.op\n.end\n";
+    var buf: [256]u8 = undefined;
+    const vg = try opValue(try std.fmt.bufPrint(&buf, body, .{ @as(f64, 9), "" }), "v(g)");
+    const cases = [_]struct { f64, []const u8, usize }{
+        .{ vg, ".option soa=1\n", 0 },
+        .{ vg - 1e-3, ".option soa=1\n", 2 }, // the excursion, then the count
+        .{ vg - 1e-3, ".option warn=1\n", 2 }, // ngspice's spelling
+        .{ vg - 1e-3, "", 0 }, // no check asked for
+    };
+    for (cases) |c| {
+        const text = try soaText(try std.fmt.bufPrint(&buf, body, .{ c[0], c[1] }));
+        defer t.allocator.free(text);
+        try t.expectEqual(c[2], std.mem.count(u8, text, "\n"));
+        if (c[2] == 0) continue;
+        try t.expect(std.mem.startsWith(u8, text, "soa: "));
+        try t.expect(std.mem.indexOf(u8, text, " vgs = ") != null and std.mem.indexOf(u8, text, " > vgs_max ") != null);
+        try t.expect(std.mem.endsWith(u8, text, " (op)\nsoa: 1 excursions on 1 instances\n"));
+    }
+}
+
+test ".option soa: a ramp crossing vgs_max twice is two excursions; maxwarns prints one, counts both (#238)" {
+    // Oracle: v(g) is V2's PWL, past 1 V on (0.5u, 1.5u) and (2.5u, 3.5u)
+    // only. A window opens at the first accepted point past 1 V and closes
+    // at the first back under it, so within a step (at most tstep, 10 ns)
+    // after each crossing.
+    const text = try soaText("soa ramp\nV1 d 0 1\nV2 g 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)\nM1 d g 0 0 nm\n" ++
+        ".model nm nmos level=1 vgs_max=1\n.option soa=1 maxwarns=1\n.tran 10n 4u\n.end\n");
+    defer t.allocator.free(text);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    const first = lines.next().?;
+    try t.expect(std.mem.endsWith(u8, first, " s (tran)"));
+    var words = std.mem.tokenizeScalar(u8, first[std.mem.indexOf(u8, first, " from ").?..], ' ');
+    _ = words.next(); // from
+    const from = try std.fmt.parseFloat(f64, words.next().?);
+    _ = words.next(); // to
+    const to = try std.fmt.parseFloat(f64, words.next().?);
+    try t.expect(from >= 0.5e-6 and from <= 0.52e-6);
+    try t.expect(to >= 1.5e-6 and to <= 1.52e-6);
+    try t.expectEqualStrings("soa: 2 excursions on 1 instances", lines.next().?);
+    try t.expectEqualStrings("", lines.rest());
+}
+
+test ".option soa: a BSIM4 drain ramp crossing vds_max twice reports ngspice 45's windows (#238)" {
+    // Oracle: ngspice 45 (nixpkgs) on this deck, 2026-10-27,
+    // `ngspice -n -b -r reference.raw soa.sp`: 1006 "Instance: m1 ... has
+    // exceeded Vds_max=1.5" warnings in two runs of 503 accepted points,
+    // from 7.5028e-07 and 2.7505e-06 s, each closed by the next accepted
+    // time, 1.2505e-06 and 3.2505e-06 s. ngspice's MOS1 ignores vds_max, so
+    // the card is BSIM4. Either simulator's edge lies within one step
+    // (tmax, 1 ns) after the crossing; the suite keeps no SOA oracle, as no
+    // dialect defines its output.
+    const text = try soaText("soa vds_max ramp\n.option warn=1 maxwarns=100000\nV1 d 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)\nV2 g 0 1\n" ++
+        "M1 d g 0 0 nm\n.model nm nmos level=54 vds_max=1.5\n.tran 1n 4u 0 1n\n.end\n");
+    defer t.allocator.free(text);
+    const ngspice = [_][2]f64{ .{ 7.5028e-07, 1.2505e-06 }, .{ 2.7505e-06, 3.2505e-06 } };
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    for (ngspice) |window| {
+        const line = lines.next().?;
+        try t.expect(std.mem.startsWith(u8, line, "soa: m1 vds = ") and std.mem.endsWith(u8, line, " s (tran)"));
+        var words = std.mem.tokenizeScalar(u8, line[std.mem.indexOf(u8, line, " from ").?..], ' ');
+        _ = words.next(); // from
+        try t.expectApproxEqAbs(window[0], try std.fmt.parseFloat(f64, words.next().?), 1e-9);
+        _ = words.next(); // to
+        try t.expectApproxEqAbs(window[1], try std.fmt.parseFloat(f64, words.next().?), 1e-9);
+    }
+    try t.expectEqualStrings("soa: 2 excursions on 1 instances", lines.next().?);
+}
+
+test ".option soa: BJT vce_max, diode bv_max, R and C bv_max held at the limit report nothing, 1 mV past it one excursion (#238)" {
+    // Oracle: as for vgs_max, each limit is the solved terminal voltage of
+    // the same deck checked against a limit far above it, and no SOA key
+    // binds to a model field. The diode's bv_max holds its reverse voltage
+    // v(k) - v(a), here v(k) with the anode grounded.
+    const cases = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "soa q\nV1 c 0 2\nV2 b 0 0.6\nQ1 c b 0 qn\n.model qn npn vce_max={e}\n.option soa=1\n.op\n.end\n", "v(c)", "soa: q1 vce = " },
+        .{ "soa d\nV1 k 0 3\nD1 0 k dm\n.model dm d bv_max={e}\n.option soa=1\n.op\n.end\n", "v(k)", "soa: d1 vr = " },
+        .{ "soa r\nV1 a 0 1.5\nR1 a 0 1k rm\n.model rm r bv_max={e}\n.option soa=1\n.op\n.end\n", "v(a)", "soa: r1 v = " },
+        .{ "soa c\nV1 a 0 2.5\nC1 a 0 1p cm\n.model cm c bv_max={e}\n.option soa=1\n.op\n.end\n", "v(a)", "soa: c1 v = " },
+    };
+    var buf: [256]u8 = undefined;
+    // Inline: each deck is a format string.
+    inline for (cases) |c| {
+        const v = try opValue(try std.fmt.bufPrint(&buf, c[0], .{@as(f64, 1e3)}), c[1]);
+        const at = try soaText(try std.fmt.bufPrint(&buf, c[0], .{v}));
+        defer t.allocator.free(at);
+        try t.expectEqualStrings("", at);
+        const over = try soaText(try std.fmt.bufPrint(&buf, c[0], .{v - 1e-3}));
+        defer t.allocator.free(over);
+        try t.expect(std.mem.startsWith(u8, over, c[2]));
+        try t.expect(std.mem.endsWith(u8, over, " (op)\nsoa: 1 excursions on 1 instances\n"));
+        try t.expectEqual(@as(usize, 2), std.mem.count(u8, over, "\n"));
+    }
+}
+
+test ".option soa: a DC sweep's excursion is windowed by sweep values; at the limit nothing (#238)" {
+    // Oracle: V2 sweeps v(g) over 0, 0.5, ..., 2 V. Held to the solved v(g)
+    // at 2 V no point exceeds it; 1 mV under that, the last point alone
+    // does: one excursion from 2 to the end of the sweep.
+    const body = "soa dc\nV1 d 0 1\nV2 g 0 0\nM1 d g 0 0 nm\n.model nm nmos level=1 vgs_max={e}\n.option soa=1\n.dc V2 0 2 0.5\n.end\n";
+    var buf: [256]u8 = undefined;
+    const p = try create(try std.fmt.bufPrint(&buf, body, .{@as(f64, 1e3)}));
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .dc));
+    try t.expectEqual(@as(usize, 5), r.npoints);
+    const vg = r.data[(r.npoints - 1) * r.varnames.len + try columnIndex(r, "v(g)")];
+    const at = try soaText(try std.fmt.bufPrint(&buf, body, .{vg}));
+    defer t.allocator.free(at);
+    try t.expectEqualStrings("", at);
+    const over = try soaText(try std.fmt.bufPrint(&buf, body, .{vg - 1e-3}));
+    defer t.allocator.free(over);
+    try t.expect(std.mem.startsWith(u8, over, "soa: m1 vgs = "));
+    try t.expect(std.mem.endsWith(u8, over, " from 2.000e0 to the end (dc)\nsoa: 1 excursions on 1 instances\n"));
+}
+
+test ".option soa: under .step only the point past the limit reports, labelled with its point (#238)" {
+    // Oracle: v(g) is the stepped vg. The limit is the solved v(g) of the
+    // deck at vg=2, so the vg=1 point is under it and the vg=2 point at it,
+    // or 1 mV past it.
+    const body = "soa step\n.param vg=2\nV1 d 0 1\nV2 g 0 {{vg}}\nM1 d g 0 0 nm\n.model nm nmos level=1 vgs_max={e}\n.option soa=1\n{s}.op\n.end\n";
+    var buf: [256]u8 = undefined;
+    const vg = try opValue(try std.fmt.bufPrint(&buf, body, .{ @as(f64, 1e3), "" }), "v(g)");
+    const at = try soaText(try std.fmt.bufPrint(&buf, body, .{ vg, ".step param vg list 1 2\n" }));
+    defer t.allocator.free(at);
+    try t.expectEqualStrings("", at);
+    const over = try soaText(try std.fmt.bufPrint(&buf, body, .{ vg - 1e-3, ".step param vg list 1 2\n" }));
+    defer t.allocator.free(over);
+    try t.expect(std.mem.startsWith(u8, over, "soa: m1 vgs = "));
+    try t.expect(std.mem.endsWith(u8, over, " (op vg=2)\nsoa: 1 excursions on 1 instances\n"));
+}
+
+test ".option soalimits: models whose cards state no limit take the file's, by the longest name prefix; a card's own are never shadowed (#238)" {
+    // Oracle: v(g) = 2 V and v(d) = 1 V at every MOSFET (V2, V1). The file
+    // rates `nch` at vgs_max 1.5 and `nch_a` at vds_max 0.5. M1 (nch_a)
+    // takes the longer name's vds_max only, M3 (nch_c) the shorter's
+    // vgs_max, and M2's card states vds_max=5, so no file limit reaches it.
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const origin = try std.fmt.allocPrint(t.allocator, ".zig-cache/tmp/{s}/soa.cir", .{tmp.sub_path});
+    defer t.allocator.free(origin);
+    const body = "soa file\nV1 d 0 1\nV2 g 0 2\nM1 d g 0 0 nch_a\nM2 d g 0 0 nch_b\nM3 d g 0 0 nch_c\n" ++
+        ".model nch_a nmos level=1\n.model nch_b nmos level=1 vds_max=5\n.model nch_c nmos level=1\n.option soa=1 soalimits=\"limits.json\"\n.op\n.end\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "limits.json", .data = "{\"nch\": {\"vgs_max\": 1.5}, \"nch_a\": {\"vds_max\": 0.5}}" });
+    const text = try soaTextAt(body, origin);
+    defer t.allocator.free(text);
+    try t.expectEqualStrings("soa: m1 vds = 1.0000 V > vds_max 0.5 V (op)\nsoa: m3 vgs = 2.0000 V > vgs_max 1.5 V (op)\nsoa: 2 excursions on 2 instances\n", text);
+    // The trust boundary: each file below refuses the deck, a missing one
+    // with its file error.
+    const refused = [_][]const u8{
+        "not json",
+        "{\"nch\": {\"vgs_mx\": 1.5}}", // no SOA limit
+        "{\"nch\": {\"vgs_max\": \"nan\"}}", // no finite number
+        "{\"nch\": {\"vgs_max\": 1e999}}",
+        "{\"nch\": {\"vgs_max\": 1}, \"nch\": {\"vds_max\": 1}}", // the name twice
+        "[1.5]",
+    };
+    for (refused) |json| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "limits.json", .data = json });
+        try t.expectError(error.InvalidSoaLimits, api.Problem.init(t.allocator, io, .{ .source = .{ .bytes = .{ .data = body, .origin = origin } } }));
+    }
+    try tmp.dir.deleteFile(io, "limits.json");
+    try t.expectError(error.FileNotFound, api.Problem.init(t.allocator, io, .{ .source = .{ .bytes = .{ .data = body, .origin = origin } } }));
+}
+
+test ".meas param='soa_count()' is its result's excursion count: the ramp crossing twice counts 2 (#238)" {
+    // Oracle: the ramp of the maxwarns test, past vgs_max on two windows
+    // only, and print_soa's own count of the same run.
+    const p = try soaRun("soa ramp\nV1 d 0 1\nV2 g 0 pwl(0 0 1u 2 2u 0 3u 2 4u 0)\nM1 d g 0 0 nm\n" ++
+        ".model nm nmos level=1 vgs_max=1\n.option soa=1\n.meas tran soa_n param='soa_count()'\n.tran 10n 4u\n.end\n", "soa.cir");
+    defer p.deinit();
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var errors: std.Io.Writer.Allocating = .init(t.allocator);
+    defer errors.deinit();
+    try p.print_measures(&text.writer, &errors.writer);
+    const line = text.written()[std.mem.indexOf(u8, text.written(), "soa_n").?..];
+    var fields = std.mem.tokenizeAny(u8, line["soa_n".len..], " =\n");
+    try t.expectEqual(@as(f64, 2), try std.fmt.parseFloat(f64, fields.next().?));
+    var soa: std.Io.Writer.Allocating = .init(t.allocator);
+    defer soa.deinit();
+    try p.print_soa(&soa.writer);
+    try t.expect(std.mem.endsWith(u8, soa.written(), "soa: 2 excursions on 1 instances\n"));
+}
+
 test "Monte Carlo: a B source reads the trial's draw of a sampled .param, as a resistor does (#133)" {
     // Analytic oracle from the deck itself: within a trial v(out) = g and
     // v(c) = 1/(1+g), so v(out) = 1/v(c) - 1.
@@ -802,8 +1023,229 @@ test "Monte Carlo: a B source reads the trial's draw of a sampled .param, as a r
 
 /// Column `name` of `r`'s first point.
 fn column(r: api.Result, name: []const u8) !f64 {
-    for (r.varnames, 0..) |v, i| if (std.mem.eql(u8, v, name)) return r.data[i];
+    return r.data[try columnIndex(r, name)];
+}
+
+/// The index of column `name` of `r`.
+fn columnIndex(r: api.Result, name: []const u8) !usize {
+    for (r.varnames, 0..) |v, i| if (std.mem.eql(u8, v, name)) return i;
     return error.MissingColumn;
+}
+
+/// Runs the `.dc` of `text` and checks that at each point `@m1[id]` is the
+/// 0 V ammeter `vm`'s current, and at each inner point that `slope` is that
+/// current's central difference over the swept value.
+fn expectOpvarsAsAmmeter(text: []const u8, slope: []const u8) !void {
+    const p = try create(text);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .dc));
+    const w = r.varnames.len;
+    const im = try columnIndex(r, "i(vm)");
+    const id = try columnIndex(r, "@m1[id]");
+    const s = try columnIndex(r, slope);
+    try t.expect(r.npoints >= 3);
+    for (0..r.npoints) |k| {
+        const row = r.data[k * w ..][0..w];
+        try t.expectApproxEqRel(row[im], row[id], 1e-6);
+        if (k == 0 or k + 1 == r.npoints) continue;
+        const prev = r.data[(k - 1) * w ..][0..w];
+        const next = r.data[(k + 1) * w ..][0..w];
+        try t.expectApproxEqRel((next[im] - prev[im]) / (next[0] - prev[0]), row[s], 1e-6);
+    }
+}
+
+test "@m1[id] along a .dc is the 0 V ammeter's current, @m1[gm] and @m1[gds] its central differences (#236)" {
+    // Oracles: KCL at the drain, which the ammeter's branch current meets
+    // apart from the device's own evaluation, and level 1's saturated square
+    // law, quadratic in V_GS and linear in V_DS, where a central difference
+    // is exact.
+    const body = "opvar\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n.save i(vm) @m1[id] @m1[gm] @m1[gds]\n{s}\n.end\n";
+    var buf: [512]u8 = undefined;
+    try expectOpvarsAsAmmeter(try std.fmt.bufPrint(&buf, body, .{".dc vg 0.8 1.6 0.1"}), "@m1[gm]");
+    try expectOpvarsAsAmmeter(try std.fmt.bufPrint(&buf, body, .{".dc vd 0.8 1.6 0.1"}), "@m1[gds]");
+}
+
+test "a Verilog-A model's own desc and units variables are @n1[...] vectors with their hand values (#236)" {
+    // Oracles: va_opvars's own equations by hand at V_GS = 1.2 V (ids =
+    // k (V_GS - vt)^2 = 4.9e-5 A, gm = 2 k (V_GS - vt) = 1.4e-4 S, vth = vt,
+    // region 2, vgs the gate source's 1.2 V), and the 0 V ammeter's
+    // current, which KCL makes ids.
+    const body = "va opvars\n.hdl \"opvars.assets/va_opvars.va\"\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nn1 d g 0 va_opvars\n.save {s}\n.op\n.end\n";
+    var buf: [512]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, body, .{"i(vm) @n1[ids] @n1[gm] @n1[vth] @n1[region] @n1[vgs]"});
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = text, .origin = "src/tests/opvars.cir" } } });
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .op));
+    try t.expectApproxEqRel(@as(f64, 4.9e-5), try column(r, "@n1[ids]"), 1e-12);
+    try t.expectApproxEqRel(try column(r, "i(vm)"), try column(r, "@n1[ids]"), 1e-6);
+    try t.expectApproxEqRel(@as(f64, 1.4e-4), try column(r, "@n1[gm]"), 1e-12);
+    try t.expectEqual(@as(f64, 0.5), try column(r, "@n1[vth]"));
+    try t.expectEqual(@as(f64, 2), try column(r, "@n1[region]"));
+    // `units` alone makes `vgs` one (LRM 3.2.1).
+    // V(g) - V(s) of two solved nodes: 1 ulp from 1.2.
+    try t.expectApproxEqRel(@as(f64, 1.2), try column(r, "@n1[vgs]"), 1e-15);
+    // `vov` has neither `desc` nor `units`, and an N card has no terminal quantities.
+    var other: [512]u8 = undefined;
+    for ([_][]const u8{ "@n1[vov]", "@n1[gds]" }) |name| {
+        const refused = try std.fmt.bufPrint(&other, body, .{name});
+        try t.expectError(error.UnsupportedCard, api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = refused, .origin = "src/tests/opvars.cir" } } }));
+    }
+}
+
+test "an operating-point variable no MOSFET of the deck has refuses the deck (#236)" {
+    // Before #236 `.save` dropped these silently.
+    for ([_][]const u8{ "@m1[nonexistent]", "@m9[gm]", "@r1[gm]", "@m1gm" }) |name| {
+        var buf: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "opvar\nv1 d 0 1\nr1 d g 1k\nm1 d g 0 0 nm\n.model nm nmos level=1\n.save {s}\n.op\n.end\n", .{name});
+        try t.expectError(error.UnsupportedCard, create(text));
+    }
+}
+
+/// Level 1's saturated gm at the opvars decks' bias (W/L = 2, VTO = 0.5,
+/// KP = 1e-4, LAMBDA = 0.02, V_DS = 1.8 V): KP W/L (V_GS - VTO)(1 + LAMBDA
+/// V_DS), linear in V_GS, so a `find ... at=` between sweep points is exact.
+fn squareLawGm(vgs: f64) f64 {
+    return 1e-4 * 2 * (vgs - 0.5) * (1 + 0.02 * 1.8);
+}
+
+/// Runs `text` in `dialect` and returns its `.meas` cards gm1 (at the OP)
+/// and gm2 (along the .dc).
+fn opvarMeasures(text: []const u8, dialect: api.Dialect) ![2]f64 {
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = text, .origin = "opvars.cir" } }, .dialect = dialect });
+    defer p.deinit();
+    try p.run_all();
+    const first = for (0..p.query_count()) |i| {
+        const id: api.QueryId = @fromBackingInt(@intCast(i));
+        if ((try p.query_info(id)).requested) break id;
+    } else return error.MissingQuery;
+    var out: [2]f64 = undefined;
+    var reasons: [1]api.Problem.Reason = undefined;
+    try p.point_measures(first, &.{ "gm1", "gm2" }, &out, &reasons);
+    try t.expectEqual(api.Problem.Reason.ok, reasons[0]);
+    return out;
+}
+
+test ".meas reads @m1[gm], HSPICE's lx7(x1.mn1) and their columns at the OP and along a .dc (#236)" {
+    // Oracle: `squareLawGm` by hand at V_GS = 1.2 V (the OP) and 1.4 V,
+    // inside the three-point sweep `find ... at=` interpolates over.
+    const ngspice = "opvars meas\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n" ++
+        ".op\n.dc vg 1.2 1.6 0.2\n.meas op gm1 find @m1[gm]\n.meas dc gm2 find @m1[gm] at=1.4\n.end\n";
+    // A subcircuit's device, named by its path; `.probe` saves without
+    // narrowing what else is written.
+    const hspice = "opvars meas\nvd dd 0 1.8\nvm dd d 0\nvg g 0 1.2\nx1 d g 0 cell\n.subckt cell d g s\nmn1 d g s s nm w=2u l=1u\n.ends\n" ++
+        ".model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n.probe dc lx7(x1.mn1)\n.op\n.dc vg 1.2 1.6 0.2\n.meas op gm1 find lx7(x1.mn1)\n.meas dc gm2 find lx7(x1.mn1) at=1.4\n.end\n";
+    for ([_][]const u8{ ngspice, hspice }, [_]api.Dialect{ .ngspice, .hspice }) |text, dialect| {
+        const gm = try opvarMeasures(text, dialect);
+        try t.expectApproxEqRel(squareLawGm(1.2), gm[0], 1e-9);
+        try t.expectApproxEqRel(squareLawGm(1.4), gm[1], 1e-9);
+    }
+    // Level 1 has no `vth` of its own (lv9), lx5 is not mapped, and x9 is
+    // no instance.
+    for ([_][]const u8{ "lv9(x1.mn1)", "lx5(x1.mn1)", "lx7(x9.mn1)" }) |name| {
+        var buf: [512]u8 = undefined;
+        const refused = try std.fmt.bufPrint(&buf, "{s}.meas op vt find {s}\n.end\n", .{ hspice[0 .. hspice.len - 5], name });
+        try t.expectError(error.UnsupportedCard, api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = refused, .origin = "opvars.cir" } }, .dialect = .hspice }));
+    }
+}
+
+test "Spectre's save nm1:gm and HSPICE's .probe op are columns with the square law's values (#236)" {
+    // Oracle: `squareLawGm` by hand at each sweep point. `nm1`'s name does
+    // not carry its letter; its master makes it a MOSFET.
+    const spectre_deck =
+        \\// opvars spectre
+        \\vd (dd 0) vsource dc=1.8
+        \\vm (dd d) vsource dc=0
+        \\vg (g 0) vsource dc=1.2
+        \\nm1 (d g 0 0) nm w=2u l=1u
+        \\model nm mos1 type=n vto=0.5 kp=1e-4 lambda=0.02
+        \\save d nm1:gm nm1:d
+        \\sw dc dev=vg start=1.2 stop=1.6 step=0.2
+        \\
+    ;
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = spectre_deck, .origin = "opvars.scs" } }, .dialect = .spectre });
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .dc));
+    const gm = try columnIndex(r, "nm1:gm");
+    try t.expectEqual(@as(usize, 3), r.npoints);
+    for (0..r.npoints) |k| {
+        const row = r.data[k * r.varnames.len ..][0..r.varnames.len];
+        try t.expectApproxEqRel(squareLawGm(row[0]), row[gm], 1e-9);
+    }
+    // `.probe op`: every variable as @<card>[<variable>], without the
+    // `ids` alias; a resistor has none.
+    const probe_deck = "opvars probe op\nvd d 0 1.8\nvg g 0 1.2\nr1 g 0 1k\nm1 d g 0 0 nm w=2u l=1u\n.model nm nmos level=1 vto=0.5 kp=1e-4 lambda=0.02\n.probe op\n.op\n.end\n";
+    const probed = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = probe_deck, .origin = "probe.sp" } }, .dialect = .hspice });
+    defer probed.deinit();
+    try probed.run_all();
+    const op = try probed.result(try find(probed, .op));
+    try t.expectApproxEqRel(squareLawGm(1.2), try column(op, "@m1[gm]"), 1e-9);
+    // V(g) - V(s) of two solved nodes: 1 ulp from 1.2.
+    try t.expectApproxEqRel(@as(f64, 1.2), try column(op, "@m1[vgs]"), 1e-15);
+    try t.expectError(error.MissingColumn, column(op, "@m1[ids]"));
+    try t.expectError(error.MissingColumn, column(op, "@r1[id]"));
+}
+
+test "a saturated level-1 pfet's @m1[id], is, vgs and vds are positive in ngspice's frame; cgg and ft its overlaps' (#236)" {
+    // Oracles: level 1's square law by hand at V_SG = 1.2 V, V_SD = 1.8 V
+    // (W/L = 2, |VTO| = 0.5, KP = 1e-4, LAMBDA = 0.02): |I_D| = KP/2 W/L
+    // (V_SG - |VTO|)^2 (1 + LAMBDA V_SD) = 5.0764e-5 A, gm = 1.4504e-4 S;
+    // ngspice's MOS1 and BSIM4 report type × the drain current and
+    // voltages, so id and vgs are positive, as is i(vm), which KCL at the
+    // drain makes id apart from the device's evaluation. With no TOX there
+    // is no Meyer charge, so cgg = (CGSO + CGDO) W = 4e-16 F and ft =
+    // gm / (2π cgg). 1e-6 on the currents: the drain junction's gmin
+    // carries 1.8e-12 A.
+    const text = "pfet opvar\nvs ss 0 1.8\nvg g 0 0.6\nvm d 0 0\nm1 d g ss ss pm w=2u l=1u\n.model pm pmos level=1 vto=-0.5 kp=1e-4 lambda=0.02 cgso=1e-10 cgdo=1e-10\n" ++
+        ".save i(vm) @m1[id] @m1[is] @m1[gm] @m1[vgs] @m1[vds] @m1[cgg] @m1[ft]\n.op\n.end\n";
+    const p = try create(text);
+    defer p.deinit();
+    try p.run_all();
+    const r = try p.result(try find(p, .op));
+    const gm: f64 = 1e-4 * 2 * 0.7 * (1 + 0.02 * 1.8);
+    try t.expectApproxEqRel(0.5 * 0.7 * gm, try column(r, "@m1[id]"), 1e-6);
+    try t.expectApproxEqRel(try column(r, "i(vm)"), try column(r, "@m1[id]"), 1e-6);
+    try t.expectApproxEqRel(-(try column(r, "@m1[id]")), try column(r, "@m1[is]"), 1e-6);
+    try t.expectApproxEqRel(gm, try column(r, "@m1[gm]"), 1e-9);
+    try t.expectApproxEqRel(@as(f64, 1.2), try column(r, "@m1[vgs]"), 1e-12);
+    try t.expectApproxEqRel(@as(f64, 1.8), try column(r, "@m1[vds]"), 1e-12);
+    try t.expectApproxEqRel(@as(f64, 4e-16), try column(r, "@m1[cgg]"), 1e-12);
+    try t.expectApproxEqRel(gm / (2 * std.math.pi * 4e-16), try column(r, "@m1[ft]"), 1e-9);
+}
+
+test "BSIM4's own @m[cgg] is its intrinsic dQg/dVg, without the overlap ft keeps (#236)" {
+    // Oracles, at both polarities: with every overlap and fringe zero the
+    // gate charge is the intrinsic one alone, so the model's cgg (its
+    // ddx) equals the terminal Cgg the eval's charge Jacobian gives, read
+    // back as gm / (2π ft). A metamorphic relation then: CGSO = CGDO = 1e-10
+    // F/m adds 2 CGSO W = 2e-15 F of linear overlap (CGSL = CGDL = 0) to
+    // the terminal Cgg and leaves the DC point and the intrinsic cgg alone,
+    // as ngspice's BSIM4cggb. And KCL at each drain: id is type × the
+    // current into it, the drain source's current with ngspice's sign.
+    const body = "bsim4 cgg\nvdn dn 0 1\nvgn gn 0 1.2\nvdp dp 0 -1\nvgp gp 0 -1.2\nmn dn gn 0 0 nm l=1u w=10u\nmp dp gp 0 0 pm l=1u w=10u\n" ++
+        ".model nm nmos(level=54 cf=0 cgbo=0 cgso={s} cgdo={s})\n.model pm pmos(level=54 cf=0 cgbo=0 cgso={s} cgdo={s})\n" ++
+        ".save i(vdn) i(vdp) @mn[id] @mn[cgg] @mn[gm] @mn[ft] @mp[id] @mp[cgg] @mp[gm] @mp[ft]\n.op\n.end\n";
+    var intrinsic: [2]f64 = undefined;
+    for ([_][]const u8{ "0", "1e-10" }, [_]f64{ 0, 2e-15 }, 0..) |cgso, overlap, k| {
+        var buf: [512]u8 = undefined;
+        const p = try create(try std.fmt.bufPrint(&buf, body, .{ cgso, cgso, cgso, cgso }));
+        defer p.deinit();
+        try p.run_all();
+        const r = try p.result(try find(p, .op));
+        try t.expectApproxEqRel(-(try column(r, "i(vdn)")), try column(r, "@mn[id]"), 1e-6);
+        try t.expectApproxEqRel(try column(r, "i(vdp)"), try column(r, "@mp[id]"), 1e-6);
+        for ([_][]const u8{ "mn", "mp" }, &intrinsic) |dev, *own| {
+            var names: [3][32]u8 = undefined;
+            const cgg = try column(r, try std.fmt.bufPrint(&names[0], "@{s}[cgg]", .{dev}));
+            const gm = try column(r, try std.fmt.bufPrint(&names[1], "@{s}[gm]", .{dev}));
+            const ft = try column(r, try std.fmt.bufPrint(&names[2], "@{s}[ft]", .{dev}));
+            try t.expect(cgg > 0);
+            try t.expectApproxEqRel(cgg + overlap, gm / (2 * std.math.pi * ft), 1e-9);
+            if (k == 0) own.* = cgg else try t.expectApproxEqRel(own.*, cgg, 1e-12);
+        }
+    }
 }
 
 /// Creates `body` at `values[0]` with `name` live, then for each later
@@ -1553,6 +1995,686 @@ test "Options.measures: run_all prints each point's .meas block as it ends, the 
     }
 }
 
+/// Runs `source` as `espice --measures` does, each `.meas` block printed to
+/// `text` as its point ends, then writes the JSON document to `json`.
+fn measuresJson(source: api.Source, dialect: api.Dialect, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
+    var errors: std.Io.Writer.Allocating = .init(t.allocator);
+    defer errors.deinit();
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = dialect, .max_parallel = 4, .measures = .{ .out = &text.writer, .err = &errors.writer }, .measures_json = true });
+    defer p.deinit();
+    try p.run_all();
+    try p.print_measures(&text.writer, &errors.writer);
+    try p.write_measures_json(&json.writer, "deck.sp");
+}
+
+/// `json` parsed and checked against `text`, which the oracle is: each
+/// value line of a `.meas` block is the next result, with its name and,
+/// to the printed digits, its value; a `NaN` line is a null result with an
+/// error. Holds for a deck whose cards fail only at sweep points, which
+/// print a line for the failure.
+fn expectSameResults(text: []const u8, json: []const u8) !std.json.Parsed(std.json.Value) {
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    errdefer parsed.deinit();
+    try t.expectEqualStrings("espice-measures/1", parsed.value.object.get("format").?.string);
+    const results = parsed.value.object.get("results").?.array.items;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var k: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "Monte Carlo statistics") != null) break;
+        if (std.mem.indexOf(u8, line, "Measurements for") != null) continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const r = results[k].object;
+        k += 1;
+        try t.expectEqualStrings(std.mem.trim(u8, line[0..eq], " "), r.get("name").?.string);
+        var fields = std.mem.tokenizeScalar(u8, line[eq + 1 ..], ' ');
+        const printed = fields.next().?;
+        if (std.mem.eql(u8, printed, "NaN")) {
+            try t.expect(r.get("value").? == .null);
+            try t.expect(r.get("error").? == .string);
+        } else try t.expectApproxEqRel(try std.fmt.parseFloat(f64, printed), jsonFloat(r.get("value").?), 1e-5);
+    }
+    try t.expect(k > 0);
+    try t.expectEqual(results.len, k);
+    return parsed;
+}
+
+/// A parsed JSON number as an f64; NaN for anything else.
+fn jsonFloat(v: std.json.Value) f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => std.math.nan(f64), // else: null and the non-numbers have no value
+    };
+}
+
+/// The result objects of a parsed `write_measures_json` document.
+fn jsonResults(parsed: std.json.Parsed(std.json.Value)) []const std.json.Value {
+    return parsed.value.object.get("results").?.array.items;
+}
+
+test "--measures (#235): a .step deck's JSON is its printed .meas lines, each labelled with its point, streamed or printed at the end" {
+    const source: api.Source = .{ .file = "docs/examples/step_param.sp" };
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(source, .ngspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    const results = jsonResults(parsed);
+    try t.expectEqual(@as(usize, 3), results.len);
+    // Oracle: the deck's `.step param rval list 1k 2k 4k`, exactly.
+    for (results, [_]f64{ 1e3, 2e3, 4e3 }) |r, rval| {
+        try t.expectEqualStrings("ac", r.object.get("analysis").?.string);
+        const variant = r.object.get("variant").?.object;
+        try t.expectEqualStrings("step", variant.get("kind").?.string);
+        try t.expectEqual(rval, jsonFloat(variant.get("params").?.object.get("rval").?));
+    }
+    // Printed at the end instead, twice: the same document, nothing doubled.
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .measures_json = true });
+    defer p.deinit();
+    try p.run_all();
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    for (0..2) |_| try p.print_measures(&sink.writer, &sink.writer);
+    var again: std.Io.Writer.Allocating = .init(t.allocator);
+    defer again.deinit();
+    try p.write_measures_json(&again.writer, "deck.sp");
+    try t.expectEqualStrings(json.written(), again.written());
+}
+
+test "--measures (#238): each SOA excursion is an object with its instance, limit, peak, window and variant; soa_count() per point" {
+    // Oracle: V2 sweeps v(g) over 0..2 V at v(d) = vd. vgs passes 1.5 V at
+    // the 2 V point alone, at both steps; vds = 2 V passes 1.5 V at every
+    // point of the vd=2 step only. So 1 excursion at vd=1, 2 at vd=2, each
+    // open at the sweep's end.
+    const source: api.Source = .{ .bytes = .{ .data = "soa json\n.param vd=1\nV1 d 0 {vd}\nV2 g 0 0\nM1 d g 0 0 nm\n" ++
+        ".model nm nmos level=1 vgs_max=1.5 vds_max=1.5\n.option soa=1\n.step param vd list 1 2\n.dc V2 0 2 0.5\n" ++
+        ".meas dc n param='soa_count()'\n.end\n", .origin = "soa.cir" } };
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(source, .ngspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    const results = jsonResults(parsed);
+    try t.expectEqual(@as(usize, 2), results.len);
+    for (results, [_]f64{ 1, 2 }) |r, n| try t.expectEqual(n, jsonFloat(r.object.get("value").?));
+    const soa = parsed.value.object.get("soa").?.array.items;
+    try t.expectEqual(@as(usize, 3), soa.len);
+    const want = [_]struct { []const u8, f64, f64 }{ .{ "vgs", 1, 2 }, .{ "vgs", 2, 2 }, .{ "vds", 2, 0 } };
+    for (soa, want) |e, w| {
+        const o = e.object;
+        try t.expectEqualStrings("m1", o.get("instance").?.string);
+        try t.expectEqualStrings(w[0], o.get("quantity").?.string);
+        try t.expectEqual(@as(f64, 1.5), jsonFloat(o.get("limit").?));
+        try t.expectApproxEqAbs(@as(f64, 2), jsonFloat(o.get("peak").?), 1e-9);
+        try t.expectEqual(w[2], jsonFloat(o.get("from").?));
+        try t.expect(o.get("to").? == .null);
+        try t.expectEqualStrings("dc", o.get("analysis").?.string);
+        try t.expectEqual(w[1], jsonFloat(o.get("variant").?.object.get("params").?.object.get("vd").?));
+    }
+}
+
+test "--measures (#235): an .alter deck labels the nominal run and the altered one" {
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(.{ .file = "docs/examples/hspice_alter.sp" }, .hspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    const results = jsonResults(parsed);
+    try t.expectEqual(@as(usize, 2), results.len);
+    var nominal: f64 = std.math.nan(f64);
+    var altered: f64 = std.math.nan(f64);
+    for (results) |r| {
+        const variant = r.object.get("variant").?.object;
+        const kind = variant.get("kind").?.string;
+        if (std.mem.eql(u8, kind, "nominal")) {
+            nominal = jsonFloat(r.object.get("value").?);
+        } else {
+            try t.expectEqualStrings("alter", kind);
+            try t.expectEqual(@as(f64, 1), jsonFloat(variant.get("index").?));
+            altered = jsonFloat(r.object.get("value").?);
+        }
+    }
+    // Analytic: t50 = RC ln 2 past a 10 ps edge, and the .alter doubles R.
+    try t.expectApproxEqRel(2.0, (altered - 5e-12) / (nominal - 5e-12), 1e-2);
+}
+
+test "--measures (#235): Monte Carlo trials are labelled by trial, and the statistics are the results'" {
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(.{ .file = "docs/examples/monte_tran.sp" }, .hspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    var seen: [51]bool = @splat(false);
+    var sum: f64 = 0;
+    var trials: usize = 0;
+    for (jsonResults(parsed)) |r| {
+        const variant = r.object.get("variant").?.object;
+        if (std.mem.eql(u8, variant.get("kind").?.string, "nominal")) continue;
+        try t.expectEqualStrings("monte", variant.get("kind").?.string);
+        const trial: usize = @intFromFloat(jsonFloat(variant.get("trial").?));
+        try t.expect(trial >= 1 and trial <= 50 and !seen[trial]);
+        seen[trial] = true;
+        sum += jsonFloat(r.object.get("value").?);
+        trials += 1;
+    }
+    try t.expectEqual(@as(usize, 50), trials);
+    const stats = parsed.value.object.get("statistics").?.array.items;
+    try t.expectEqual(@as(usize, 1), stats.len);
+    const s = stats[0].object;
+    try t.expectEqualStrings("tc", s.get("name").?.string);
+    try t.expectEqual(@as(f64, 50), jsonFloat(s.get("n").?));
+    try t.expectEqual(@as(f64, 0), jsonFloat(s.get("failed").?));
+    // Oracle: the plain mean of the trials' own results (Welford is
+    // another summation order), and RC ln 2 = 693 ns within the 3 % spread.
+    try t.expectApproxEqRel(sum / 50, jsonFloat(s.get("mean").?), 1e-12);
+    try t.expectApproxEqRel(1e-6 * @log(2.0), jsonFloat(s.get("mean").?), 2e-2);
+}
+
+/// A margin linear in two unit Gaussians: v(out) = 0.6 z1 + 0.8 z2 is
+/// N(0, s²) at sigma scale s, so `m > b` fails with probability Q(b/s).
+/// The sweep has two points: `find ... at=` needs an interval.
+const sss_linear = "sss linear\n.param z1=agauss(0,1,1) z2=agauss(0,1,1)\nv1 in 0 1\nr0 in 0 1k\nb1 out 0 v=0.6*z1+0.8*z2\nr1 out 0 1k\n.dc v1 1 2 1 sweep monte={d} sigma_scale={s} fail='m > {d}'\n.meas dc m find v(out) {s}\n.end\n";
+
+/// Runs `source` at `max_parallel`, printing its `.meas` text into `text`
+/// and its `--measures` JSON into `json`; returns `print_measures`' error
+/// after both are written.
+fn sssRun(source: []const u8, max_parallel: u16, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
+    var errors: std.Io.Writer.Allocating = .init(t.allocator);
+    defer errors.deinit();
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = .{ .bytes = .{ .data = source, .origin = "sss.cir" } }, .max_parallel = max_parallel, .measures_json = true });
+    defer p.deinit();
+    try p.run_all();
+    const printed = p.print_measures(&text.writer, &errors.writer);
+    try p.write_measures_json(&json.writer, "sss.cir");
+    return printed;
+}
+
+/// The `"kind": "sss"` object of a parsed `write_measures_json` document.
+fn sssObject(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
+    for (parsed.value.object.get("statistics").?.array.items) |s| if (std.mem.eql(u8, s.object.get("kind").?.string, "sss")) return s.object;
+    return error.NoSssObject;
+}
+
+test "SIGMA_SCALE (#239): a margin linear in Gaussians fails Q(b/s) per scale and extrapolates to Q(5) and Q(6), at any --jobs" {
+    // Oracle: the closed form Q. Each scale's count lies within 5 binomial
+    // sigmas of n·Q(b/s) (the draws scale), and the 95 % interval at s = 1
+    // holds Q(b). It is statistical only: at 1000 trials per scale its
+    // half-width (a factor of hundreds) dwarfs the model's own error at
+    // s = 1 (ln P about 0.2 low on this margin), which far more trials would
+    // expose (#239 design, risk 1).
+    for ([_]struct { f64, []const u8, []const f64, []const u16 }{
+        .{ 5, "2.5,3,3.5,4,4.5", &.{ 2.5, 3, 3.5, 4, 4.5 }, &.{ 1, 4 } },
+        .{ 6, "3,3.5,4,4.5,5", &.{ 3, 3.5, 4, 4.5, 5 }, &.{4} },
+    }) |c| {
+        const src = try std.fmt.allocPrint(t.allocator, sss_linear, .{ 1000, c[1], c[0], "at=1" });
+        defer t.allocator.free(src);
+        var first: ?[]u8 = null;
+        defer if (first) |f| t.allocator.free(f);
+        for (c[3]) |jobs| {
+            var text: std.Io.Writer.Allocating = .init(t.allocator);
+            defer text.deinit();
+            var json: std.Io.Writer.Allocating = .init(t.allocator);
+            defer json.deinit();
+            try sssRun(src, jobs, &text, &json);
+            // The same deck and seed print the same bytes at any --jobs.
+            if (first) |f| try t.expectEqualStrings(f, text.written()) else first = try t.allocator.dupe(u8, text.written());
+            try t.expect(std.mem.indexOf(u8, text.written(), "Scaled-sigma sampling: FAIL = m > ") != null);
+            try t.expect(std.mem.indexOf(u8, text.written(), "Monte Carlo statistics") == null);
+            const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+            defer parsed.deinit();
+            const s = try sssObject(parsed);
+            try t.expectEqual(@as(f64, 1000), jsonFloat(s.get("trials").?));
+            for (c[2], s.get("failures").?.array.items) |scale, k| {
+                const p = core.numerics.normalTail(c[0] / scale);
+                try t.expect(@abs(jsonFloat(k) - 1000 * p) <= 5 * @sqrt(1000 * p * (1 - p)));
+            }
+            const truth = core.numerics.normalTail(c[0]);
+            try t.expect(jsonFloat(s.get("lo").?) <= truth and truth <= jsonFloat(s.get("hi").?));
+        }
+    }
+}
+
+test "SIGMA_SCALE (#239): a trial whose FAIL card has no value fails, and a fit without three informative scales is refused" {
+    // `at=3` lies outside the sweep 1..2: `m` has no value in any trial,
+    // so every trial fails, and no scale has a pass to fit.
+    const src = try std.fmt.allocPrint(t.allocator, sss_linear, .{ 10, "1,2,3", 100, "at=3" });
+    defer t.allocator.free(src);
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try t.expectError(error.TooFewScales, sssRun(src, 2, &text, &json));
+    try t.expect(std.mem.indexOf(u8, text.written(), "refused: fewer than three scales") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+    defer parsed.deinit();
+    const s = try sssObject(parsed);
+    for (s.get("failures").?.array.items) |k| try t.expectEqual(@as(f64, 10), jsonFloat(k));
+    try t.expectEqualStrings("TooFewScales", s.get("error").?.string);
+    try t.expect(s.get("p").? == .null);
+}
+
+/// A margin linear in two unit Gaussians: v(out) = 1 + 0.6 z1 + 0.8 z2,
+/// read by `{s}` (`.dc` or `.tran`) at `{s}`. `m <= 6` passes nominally
+/// and fails 5 sigmas out; `m2 >= 6` is its mirror, failing nominally.
+const wcd_linear = "wcd linear\n.param z1=agauss(0,1,1) z2=agauss(0,1,1)\nv1 in 0 1\nr0 in 0 1k\nv2 out 0 {{1+0.6*z1+0.8*z2}}\nr1 out 0 1k\n{s}\n.meas {s} m find v(out) at={s}\n.meas {s} m2 find v(out) at={s}\n.wcd m '<= 6' m2 '>= 6'\n.end\n";
+
+/// Runs `source` in `dialect` at `max_parallel`, printing its `.meas`
+/// text into `text` and its `--measures` JSON into `json`.
+fn wcdRun(source: api.Source, dialect: api.Dialect, max_parallel: u16, text: *std.Io.Writer.Allocating, json: *std.Io.Writer.Allocating) !void {
+    var errors: std.Io.Writer.Allocating = .init(t.allocator);
+    defer errors.deinit();
+    const p = try api.Problem.init(t.allocator, t.io, .{ .source = source, .dialect = dialect, .max_parallel = max_parallel, .measures_json = true });
+    defer p.deinit();
+    try p.run_all();
+    try p.print_measures(&text.writer, &errors.writer);
+    try p.write_measures_json(&json.writer, "wcd.cir");
+}
+
+/// The `"kind": "wcd"` object of spec `spec` in a parsed
+/// `write_measures_json` document.
+fn wcdObject(parsed: std.json.Parsed(std.json.Value), spec: []const u8) !std.json.ObjectMap {
+    for (parsed.value.object.get("statistics").?.array.items) |s| {
+        if (std.mem.eql(u8, s.object.get("kind").?.string, "wcd") and std.mem.eql(u8, s.object.get("spec").?.string, spec)) return s.object;
+    }
+    return error.NoWcdObject;
+}
+
+test ".wcd (#240): a margin linear in Gaussians gives the closed-form beta, signed, by tangent rows (.dc) and by a finite-difference batch (.tran uic), at any --jobs" {
+    // Oracle: the closed form. 1 + 0.6 z1 + 0.8 z2 reaches 6 at distance
+    // (6 - 1)/‖(0.6, 0.8)‖ = 5, at z* = (3, 4). The full step lands on the
+    // plane, so each search takes 2 gradient rounds and 1 line point: 3
+    // simulations with tangent rows, 2·(1 + 2) + 1 = 7 without. The two
+    // routes are a metamorphic pair: the same beta to TOL.
+    const tol = 0.01;
+    var betas: [2]f64 = undefined;
+    for ([_][3][]const u8{ .{ ".dc v1 1 2 1", "dc", "1" }, .{ ".tran 1n 2n uic", "tran", "1n" } }, [_]f64{ 3, 7 }, &betas) |c, sims, *beta| {
+        const src = try std.fmt.allocPrint(t.allocator, wcd_linear, .{ c[0], c[1], c[2], c[1], c[2] });
+        defer t.allocator.free(src);
+        var first: ?[]u8 = null;
+        defer if (first) |f| t.allocator.free(f);
+        for ([_]u16{ 1, 8 }) |jobs| {
+            var text: std.Io.Writer.Allocating = .init(t.allocator);
+            defer text.deinit();
+            var json: std.Io.Writer.Allocating = .init(t.allocator);
+            defer json.deinit();
+            try wcdRun(.{ .bytes = .{ .data = src, .origin = "wcd.cir" } }, .ngspice, jobs, &text, &json);
+            // Every operating point starts cold: the same bytes at any --jobs.
+            if (first) |f| try t.expectEqualStrings(f, text.written()) else first = try t.allocator.dupe(u8, text.written());
+            try t.expect(std.mem.indexOf(u8, text.written(), "Worst-case distances (.wcd)") != null);
+            const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+            defer parsed.deinit();
+            for ([_][]const u8{ "m", "m2" }, [_]f64{ 5, -5 }) |spec, want| {
+                const o = try wcdObject(parsed, spec);
+                try t.expect(o.get("converged").?.bool);
+                try t.expectApproxEqAbs(want, jsonFloat(o.get("beta").?), tol);
+                try t.expectEqual(@as(f64, 2), jsonFloat(o.get("iterations").?));
+                try t.expectEqual(sims, jsonFloat(o.get("sims").?));
+                // Both specs share the boundary, so the same point, z1 first.
+                const point = o.get("point").?.array.items;
+                try t.expectEqual(@as(usize, 2), point.len);
+                try t.expectApproxEqAbs(@as(f64, 3), jsonFloat(point[0].object.get("z").?), tol);
+                try t.expectApproxEqAbs(@as(f64, 4), jsonFloat(point[1].object.get("z").?), tol);
+            }
+            beta.* = jsonFloat((try wcdObject(parsed, "m")).get("beta").?);
+        }
+    }
+    try t.expectApproxEqAbs(betas[0], betas[1], tol);
+}
+
+test ".wcd (#240): the 5T OTA's output offset spec has the beta .dcmatch's sigma gives, within 2 %" {
+    // Oracle: `.dcmatch` (adjoint sensitivities at the operating point, an
+    // independent route): to first order the offset is Gaussian with sigma
+    // total_3sigma/3, so beta = (limit - v(out))/sigma. FORM finds the true
+    // boundary; the square-law pair and mirror bend it by well under 2 %
+    // at a few millivolts of vto shift.
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try wcdRun(.{ .file = "docs/examples/wcd_ota.sp" }, .hspice, 4, &text, &json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json.written(), .{});
+    defer parsed.deinit();
+    var vo: f64 = std.math.nan(f64);
+    var s3: f64 = std.math.nan(f64);
+    for (jsonResults(parsed)) |r| {
+        const name = r.object.get("name").?.string;
+        if (std.mem.eql(u8, name, "vo")) vo = jsonFloat(r.object.get("value").?);
+        if (std.mem.eql(u8, name, "s3")) s3 = jsonFloat(r.object.get("value").?);
+    }
+    try t.expect(s3 > 0);
+    const sigma = s3 / 3;
+    for ([_][]const u8{ "vo", "vo2" }, [_]f64{ (0.91 - vo) / sigma, (vo - 0.89) / sigma }) |spec, want| {
+        const o = try wcdObject(parsed, spec);
+        try t.expect(o.get("converged").?.bool);
+        try t.expect(want > 1);
+        try t.expectApproxEqRel(want, jsonFloat(o.get("beta").?), 0.02);
+    }
+}
+
+test "--measures (#235): SWEEP DATA rows carry their columns, and a failed WHEN is null with its error" {
+    var swept: std.ArrayList(u8) = .empty;
+    defer swept.deinit(t.allocator);
+    const rows = [_][2]f64{ .{ 1e3, 0.5e-12 }, .{ 2e3, 0.5e-12 }, .{ 4e3, 1e-12 }, .{ 1e6, 1e-12 } };
+    try swept.appendSlice(t.allocator, points_body ++ ".data pts rv cv\n");
+    for (rows) |row| try swept.print(t.allocator, "+ {e} {e}\n", .{ row[0], row[1] });
+    // The last row's RC = 1 us never reaches 0.5 V in 40 ns.
+    try swept.appendSlice(t.allocator, ".enddata\n.tran 10p 40n sweep data=pts\n.meas tran tw when v(out)=0.5 rise=1\n" ++ points_meas);
+    var text: std.Io.Writer.Allocating = .init(t.allocator);
+    defer text.deinit();
+    var json: std.Io.Writer.Allocating = .init(t.allocator);
+    defer json.deinit();
+    try measuresJson(.{ .bytes = .{ .data = swept.items, .origin = "data.sp" } }, .hspice, &text, &json);
+    const parsed = try expectSameResults(text.written(), json.written());
+    defer parsed.deinit();
+    const results = jsonResults(parsed);
+    // Three cards per row: tw, tpd, e.
+    try t.expectEqual(@as(usize, rows.len * 3), results.len);
+    for (results, 0..) |r, k| {
+        const variant = r.object.get("variant").?.object;
+        try t.expectEqualStrings("data", variant.get("kind").?.string);
+        // Oracle: the row's own values, bit for bit.
+        const params = variant.get("params").?.object;
+        try t.expectEqual(rows[k / 3][0], jsonFloat(params.get("rv").?));
+        try t.expectEqual(rows[k / 3][1], jsonFloat(params.get("cv").?));
+    }
+    const tw = results[(rows.len - 1) * 3].object;
+    try t.expectEqualStrings("tw", tw.get("name").?.string);
+    try t.expect(tw.get("value").? == .null);
+    try t.expectEqualStrings("out of interval", tw.get("error").?.string);
+    try t.expect(results[(rows.len - 2) * 3].object.get("value").? != .null);
+}
+
+/// What `espice --emir` writes for a deck (#237): every `write_emir_json`
+/// document, and the `--measures` document of the same run.
+const EmirRun = struct {
+    docs: std.ArrayList([]u8) = .empty,
+    meas: std.Io.Writer.Allocating,
+
+    fn deinit(r: *EmirRun) void {
+        for (r.docs.items) |d| t.allocator.free(d);
+        r.docs.deinit(t.allocator);
+        r.meas.deinit();
+    }
+};
+
+fn emirRun(source: []const u8, jobs: u16, window: [2]f64) !EmirRun {
+    var r: EmirRun = .{ .meas = .init(t.allocator) };
+    errdefer r.deinit();
+    const p = try api.Problem.init(t.allocator, t.io, .{
+        .source = .{ .bytes = .{ .data = source, .origin = "emir.sp" } },
+        .max_parallel = jobs,
+        .point = .{ .emir = true, .emir_window = window },
+        .measures_json = true,
+    });
+    defer p.deinit();
+    try p.run_all();
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    try p.print_measures(&sink.writer, &sink.writer);
+    try p.write_measures_json(&r.meas.writer, "emir.sp");
+    while (true) {
+        var doc: std.Io.Writer.Allocating = .init(t.allocator);
+        defer doc.deinit();
+        if (!try p.write_emir_json(&doc.writer, "emir.sp", r.docs.items.len)) break;
+        try r.docs.ensureUnusedCapacity(t.allocator, 1);
+        r.docs.appendAssumeCapacity(try t.allocator.dupe(u8, doc.written()));
+    }
+    return r;
+}
+
+/// Field `key` of a terminal or source object, as an f64.
+fn emirField(v: std.json.Value, key: []const u8) f64 {
+    return jsonFloat(v.object.get(key).?);
+}
+
+test "--emir (#237): a divider's terminal currents are Ohm's law, positive into the terminal, and each net's sum to zero" {
+    var r = try emirRun("emir divider\nV1 in 0 dc 3\nR1 in mid 1k\nR2 mid 0 2k\nC1 mid 0 1p\n.tran 1n 50n\n.end\n", 1, .{ 0, 0 });
+    defer r.deinit();
+    try t.expectEqual(@as(usize, 1), r.docs.items.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+    defer parsed.deinit();
+    const doc = parsed.value.object;
+    try t.expectEqualStrings("espice-emir/1", doc.get("format").?.string);
+    try t.expectEqualStrings("nominal", doc.get("variant").?.object.get("kind").?.string);
+    const terms = doc.get("terminals").?.array.items;
+    try t.expectEqual(@as(usize, 6), terms.len);
+    const sources = doc.get("sources").?.array.items;
+    // V1's p, then its n at ground.
+    try t.expectEqual(@as(usize, 2), sources.len);
+    try t.expect(std.ascii.eqlIgnoreCase("in", sources[0].object.get("net").?.string));
+    // Oracle: 3 V over 1k + 2k is 1 mA, into each resistor's p and out of
+    // its n, none through the capacitor at DC; V1's p delivers it.
+    try t.expectApproxEqAbs(@as(f64, -1e-3), emirField(sources[0], "avg"), 1e-12);
+    var at_in = emirField(sources[0], "avg");
+    var at_mid: f64 = 0;
+    for (terms) |term| {
+        const o = term.object;
+        const want: f64 = if (std.ascii.eqlIgnoreCase("c1", o.get("instance").?.string)) 0 else if (std.mem.eql(u8, "p", o.get("terminal").?.string)) 1e-3 else -1e-3;
+        try t.expectApproxEqAbs(want, emirField(term, "avg"), 1e-12);
+        for ([_][]const u8{ "em_avg", "rms", "peak" }) |key| try t.expectApproxEqAbs(@abs(want), emirField(term, key), 1e-12);
+        const net = o.get("net").?.string;
+        if (std.ascii.eqlIgnoreCase("in", net)) at_in += emirField(term, "avg");
+        if (std.ascii.eqlIgnoreCase("mid", net)) at_mid += emirField(term, "avg");
+    }
+    // Oracle: Kirchhoff at both internal nets, within abstol.
+    try t.expectApproxEqAbs(@as(f64, 0), at_in, 1e-12);
+    try t.expectApproxEqAbs(@as(f64, 0), at_mid, 1e-12);
+}
+
+test "--emir (#237): a sine through a resistor has rms = peak/sqrt(2), and its EM_AVG is .meas EM_AVG's over the same window" {
+    const source = "emir sine\n.option em_recovery=0\nv1 in 0 sin(0 1 1meg)\nr1 in 0 1k\n.tran 1n 10u\n.meas tran emv em_avg i(v1) from=2u to=8u\n.end\n";
+    var r = try emirRun(source, 1, .{ 2e-6, 8e-6 });
+    defer r.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+    defer parsed.deinit();
+    const doc = parsed.value.object;
+    try t.expectEqual(@as(f64, 0), jsonFloat(doc.get("em_recovery").?));
+    // The window's samples: the first at or past 2 us, the last at or
+    // before 8 us, a step (at most TSTEP) from each.
+    const window = doc.get("window").?.array.items;
+    try t.expect(jsonFloat(window[0]) >= 2e-6 and jsonFloat(window[0]) <= 2e-6 + 1e-9);
+    try t.expect(jsonFloat(window[1]) <= 8e-6 and jsonFloat(window[1]) >= 8e-6 - 1e-9);
+    const v1 = doc.get("sources").?.array.items[0];
+    const meas = try std.json.parseFromSlice(std.json.Value, t.allocator, r.meas.written(), .{});
+    defer meas.deinit();
+    const emv = jsonResults(meas)[0].object;
+    try t.expectEqualStrings("emv", emv.get("name").?.string);
+    // Oracle: `.meas EM_AVG` of the same branch, window and em_recovery.
+    try t.expectApproxEqRel(jsonFloat(emv.get("value").?), emirField(v1, "em_avg"), 1e-12);
+    const terms = doc.get("terminals").?.array.items;
+    try t.expectEqual(@as(usize, 2), terms.len);
+    const p = for (terms) |term| {
+        if (std.mem.eql(u8, "p", term.object.get("terminal").?.string)) break term;
+    } else return error.TestUnexpectedResult;
+    // Oracle: a 1 mA sine over six whole periods: RMS 1/sqrt(2) of the
+    // peak, mean 0, and with em_recovery = 0 EM_AVG the mean of one
+    // half-wave, 1/pi mA.
+    try t.expectApproxEqRel(@as(f64, 1e-3), emirField(p, "peak"), 1e-4);
+    try t.expectApproxEqRel(emirField(p, "peak") / @sqrt(2.0), emirField(p, "rms"), 2e-3);
+    try t.expectApproxEqRel(@as(f64, 1e-3 / std.math.pi), emirField(p, "em_avg"), 2e-3);
+    try t.expectApproxEqAbs(@as(f64, 0), emirField(p, "avg"), 5e-9);
+    // Oracle: Kirchhoff at `in`, the source's and the resistor's.
+    try t.expectApproxEqAbs(@as(f64, 0), emirField(p, "avg") + emirField(v1, "avg"), 1e-12);
+    try t.expectApproxEqRel(emirField(p, "em_avg"), emirField(v1, "em_avg"), 1e-9);
+}
+
+test "--emir (#237): each .step point writes its own document under its label, byte-identical at any --jobs" {
+    const source = "emir step\n.param rv=1k\nV1 in 0 dc 2\nR1 in 0 {rv}\n.tran 1n 20n\n.step param rv list 1k 4k\n.end\n";
+    var one = try emirRun(source, 1, .{ 0, 0 });
+    defer one.deinit();
+    try t.expectEqual(@as(usize, 2), one.docs.items.len);
+    for (one.docs.items, [_]f64{ 1e3, 4e3 }) |text, rv| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, text, .{});
+        defer parsed.deinit();
+        const variant = parsed.value.object.get("variant").?.object;
+        try t.expectEqualStrings("step", variant.get("kind").?.string);
+        // Oracle: the deck's own `.step` values, bit for bit, and Ohm's law
+        // at each.
+        try t.expectEqual(rv, jsonFloat(variant.get("params").?.object.get("rv").?));
+        for (parsed.value.object.get("terminals").?.array.items) |term| {
+            const sign: f64 = if (std.mem.eql(u8, "p", term.object.get("terminal").?.string)) 1 else -1;
+            try t.expectApproxEqRel(sign * 2 / rv, emirField(term, "avg"), 1e-9);
+        }
+    }
+    // Oracle: the one-job run, byte for byte.
+    var four = try emirRun(source, 4, .{ 0, 0 });
+    defer four.deinit();
+    try t.expectEqual(one.docs.items.len, four.docs.items.len);
+    for (one.docs.items, four.docs.items) |a, b| try t.expectEqualStrings(a, b);
+}
+
+/// Oracle: Kirchhoff. At every net but ground, the `avg` of every terminal
+/// and source entry there sums to 0 within `tol`.
+fn expectKcl(doc: std.json.ObjectMap, tol: f64) !void {
+    var sums: std.StringArrayHashMapUnmanaged(f64) = .empty;
+    defer sums.deinit(t.allocator);
+    for ([_][]const u8{ "terminals", "sources" }) |key| for (doc.get(key).?.array.items) |entry| {
+        const net = entry.object.get("net").?.string;
+        if (std.mem.eql(u8, "0", net)) continue;
+        const sum = try sums.getOrPut(t.allocator, net);
+        if (!sum.found_existing) sum.value_ptr.* = 0;
+        sum.value_ptr.* += emirField(entry, "avg");
+    };
+    try t.expect(sums.count() != 0);
+    for (sums.values()) |v| try t.expectApproxEqAbs(@as(f64, 0), v, tol);
+}
+
+test "--emir (#237): without a .tran, the .op or the .dc's first point: every statistic |i|, the sign in avg, both terminals of each source" {
+    // V2 is a floating 0 V ammeter: Kirchhoff at mid2 needs its n terminal.
+    for ([_][]const u8{
+        "emir op\nV1 in 0 dc 3\nR1 in mid 1k\nV2 mid mid2 dc 0\nR2 mid2 0 2k\n.op\n.end\n",
+        // The sweep's first point, 3 V, not the 5 V operating point.
+        "emir dc\nV1 in 0 dc 5\nR1 in mid 1k\nV2 mid mid2 dc 0\nR2 mid2 0 2k\n.dc v1 3 4 1\n.end\n",
+    }, [_][]const u8{ "op", "dc" }) |source, kind| {
+        var r = try emirRun(source, 1, .{ 0, 0 });
+        defer r.deinit();
+        try t.expectEqual(@as(usize, 1), r.docs.items.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+        defer parsed.deinit();
+        const doc = parsed.value.object;
+        try t.expectEqualStrings(kind, doc.get("analysis").?.string);
+        try t.expect(doc.get("window").? == .null);
+        try t.expectEqual(@as(usize, 4), doc.get("terminals").?.array.items.len);
+        try t.expectEqual(@as(usize, 4), doc.get("sources").?.array.items.len);
+        for ([_][]const u8{ "terminals", "sources" }) |key| for (doc.get(key).?.array.items) |entry| {
+            const o = entry.object;
+            // Oracle: Ohm's law, 3 V over 3k: 1 mA into each resistor's p
+            // and V2's p, out of V1's p, which delivers it.
+            const into = std.mem.eql(u8, "p", o.get("terminal").?.string) != std.ascii.eqlIgnoreCase("v1", o.get("instance").?.string);
+            const avg = emirField(entry, "avg");
+            try t.expectApproxEqAbs(@as(f64, if (into) 1e-3 else -1e-3), avg, 1e-12);
+            // Oracle: the issue's static point, avg = em_avg = rms = peak = |i|.
+            for ([_][]const u8{ "em_avg", "rms", "peak" }) |stat| try t.expectEqual(@abs(avg), emirField(entry, stat));
+        };
+        try expectKcl(doc, 1e-12);
+    }
+}
+
+test "--emir (#237): a CMOS inverter driving C: the load's EM_AVG is C·V·f, so is the supply's mean, and the peak is the PMOS saturation current at the edge" {
+    // mn, with a drain resistance, is the first card and the only mos1
+    // instance not fully collapsed; a batch that narrows partitions its
+    // fully collapsed instances first, freezing mp before mn, and each
+    // terminal must still carry its own card's name, nets and model.
+    // tox=0 drops the Meyer capacitances and lambda is 0, so the load
+    // takes all the charge and a saturated PMOS a flat current.
+    const source =
+        \\emir inverter
+        \\.option em_recovery=0
+        \\vdd vdd 0 dc 1.8
+        \\vin in 0 pulse(0 1.8 1n 10p 10p 49.99n 100n)
+        \\mn out in 0 0 nmod w=5u l=1u
+        \\mp out in vdd vdd pmod w=10u l=1u
+        \\c1 out 0 1p
+        \\.model nmod nmos level=1 vto=0.7 kp=1e-4 tox=0 rd=10
+        \\.model pmod pmos level=1 vto=-0.7 kp=1e-4 tox=0
+        \\.tran 0.1n 301n
+        \\.end
+        \\
+    ;
+    // Three whole periods, from and to a settled output.
+    var r = try emirRun(source, 1, .{ 0.5e-9, 300.5e-9 });
+    defer r.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, r.docs.items[0], .{});
+    defer parsed.deinit();
+    const doc = parsed.value.object;
+    const window = doc.get("window").?.array.items;
+    const span = jsonFloat(window[1]) - jsonFloat(window[0]);
+    const c: f64 = 1e-12;
+    const vdd: f64 = 1.8;
+    var load: ?std.json.Value = null;
+    var mos: usize = 0;
+    for (doc.get("terminals").?.array.items) |term| {
+        const o = term.object;
+        const name = o.get("instance").?.string;
+        const port = o.get("terminal").?.string;
+        const net = o.get("net").?.string;
+        if (std.ascii.eqlIgnoreCase("c1", name)) {
+            try t.expect(o.get("model").? == .null);
+            if (std.mem.eql(u8, "p", port)) load = term;
+            continue;
+        }
+        // Oracle: the netlist's own cards.
+        const p_side = std.ascii.eqlIgnoreCase("mp", name);
+        try t.expect(p_side or std.ascii.eqlIgnoreCase("mn", name));
+        try t.expect(std.ascii.eqlIgnoreCase(if (p_side) "pmod" else "nmod", o.get("model").?.string));
+        const want: []const u8 = if (std.mem.eql(u8, "d", port)) "out" else if (std.mem.eql(u8, "g", port)) "in" else if (p_side) "vdd" else "0";
+        try t.expect(std.ascii.eqlIgnoreCase(want, net));
+        mos += 1;
+    }
+    try t.expectEqual(@as(usize, 8), mos);
+    const cap = load orelse return error.TestUnexpectedResult;
+    // Oracle: each charging edge moves C·Vdd into the load and each
+    // discharge takes it back, so with em_recovery = 0 its EM_AVG over three
+    // periods is 3·C·Vdd / span, C·V·f, within the integration's error; its
+    // mean is 0.
+    try t.expectApproxEqRel(3 * c * vdd / span, emirField(cap, "em_avg"), 5e-3);
+    try t.expectApproxEqAbs(@as(f64, 0), emirField(cap, "avg"), 1e-2 * c * vdd / 100e-9);
+    // Oracle: the input falls to 0 with the output still low, so the PMOS
+    // charges the load at its saturation current kp/2·W/L·(Vdd - |vto|)²
+    // until the output passes |vto|; the weaker NMOS discharges at half that.
+    try t.expectApproxEqRel(0.5 * 1e-4 * 10 * (vdd - 0.7) * (vdd - 0.7), emirField(cap, "peak"), 1e-3);
+    // Oracle: the supply delivers the load's charge, C·V·f, plus the
+    // crowbar charge of 10 ps edges (under 0.1 %).
+    const supply = for (doc.get("sources").?.array.items) |src| {
+        const o = src.object;
+        if (std.ascii.eqlIgnoreCase("vdd", o.get("instance").?.string) and std.mem.eql(u8, "p", o.get("terminal").?.string)) break src;
+    } else return error.TestUnexpectedResult;
+    try t.expectApproxEqRel(-3 * c * vdd / span, emirField(supply, "avg"), 1e-2);
+    try expectKcl(doc, 1e-9);
+}
+
+test "--emir (#237): a Spectre analysis's emirfile, or emirformat alone, turns it on and names the file" {
+    for ([_][]const u8{
+        "// emir spectre\nV1 (in 0) vsource dc=3\nR1 (in 0) resistor r=1k\ntran1 tran stop=10n emirfile=\"hot.emir\"\n",
+        "// emir spectre\nV1 (in 0) vsource dc=3\nR1 (in 0) resistor r=1k\nop1 dc emirformat=ascii\n",
+    }, [_][]const u8{ "hot.emir", "emir.emir.json" }, [_][]const u8{ "tran", "op" }) |source, file, kind| {
+        const p = try api.Problem.init(t.allocator, t.io, .{
+            .source = .{ .bytes = .{ .data = source, .origin = "emir.scs" } },
+            .dialect = .spectre,
+        });
+        defer p.deinit();
+        try t.expectEqualStrings(file, p.emir_file() orelse return error.TestUnexpectedResult);
+        try p.run_all();
+        var text: std.Io.Writer.Allocating = .init(t.allocator);
+        defer text.deinit();
+        try t.expect(try p.write_emir_json(&text.writer, "emir.scs", 0));
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, text.written(), .{});
+        defer parsed.deinit();
+        try t.expectEqualStrings(kind, parsed.value.object.get("analysis").?.string);
+        // Oracle: Ohm's law, 3 mA into R1's p.
+        for (parsed.value.object.get("terminals").?.array.items) |term| {
+            const sign: f64 = if (std.mem.eql(u8, "p", term.object.get("terminal").?.string)) 1 else -1;
+            try t.expectApproxEqAbs(sign * 3e-3, emirField(term, "avg"), 1e-12);
+        }
+    }
+}
+
 test "Options.point.tangent_step with live parameters: the deck's own transient prints the tangents append_points gives" {
     const source =
         \\deck tangents
@@ -1644,19 +2766,28 @@ test "release_points: a Problem run batch after batch keeps a few KB per release
     var live: [30]isize = undefined;
     var values: [rows.len]f64 = undefined;
     var why: [rows.len]api.Problem.Reason = undefined;
-    for (&live) |*l| {
+    var batch0: [rows.len]f64 = undefined;
+    for (&live, 0..) |*l, b| {
         const first = try p.append_points(&rows, rows.len, .{ .measures_only = true, .early_stop = true });
         try p.run_all();
         try p.point_measures(first, &.{"tpd"}, &values, &why);
+        // The same points every batch: a batch whose rows came after
+        // earlier ones were dropped runs at its own values (1% apart).
+        if (b == 0) batch0 = values else for (batch0, values) |want, got| try t.expectApproxEqRel(want, got, 1e-6);
         try p.release_points(first, rows.len);
         l.* = counting.live.load(.monotonic);
     }
     const per_point = @divTrunc(live[live.len - 1] - live[9], 20 * rows.len);
     std.debug.print("release_points: {d} B live after batch 10, {d} B after 30, {d} B per point\n", .{ live[9], live[live.len - 1], per_point });
-    // Its two query rows, the copied query and its variant row, with the
-    // slack of the tables' doubling; an unreleased point keeps its circuit
-    // and waveform, tens of KB.
-    try t.expect(per_point < 4096);
+    // Every point's variant row went with it.
+    const table = p.prepared.deck.variants;
+    try t.expectEqual(@as(u32, live.len * rows.len), table.count());
+    try t.expectEqual(table.count(), table.base);
+    // Its two query rows, with the slack of the tables' doubling: 469 B
+    // measured (ReleaseSafe, x86_64, 2026-10-27; 904-949 B before #225
+    // freed the variant row). An unreleased point keeps its circuit and
+    // waveform, tens of KB.
+    try t.expect(per_point < 520);
     // The query workers' share of that, as the Problem counts it.
     const mem = p.queryMemory();
     try t.expect(mem.peak > 0 and mem.live <= mem.peak and mem.live <= @as(usize, @intCast(live[live.len - 1])));

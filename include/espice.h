@@ -352,8 +352,8 @@ espice_status espice_copy_point_tangents(espice_problem *, uint32_t first_id,
  * size. Their query ids stay valid and keep their status; copying their
  * results, measures or tangents then gives RESULT_UNAVAILABLE. A point
  * already released is left alone. Each point still keeps about a hundred
- * bytes per query and its parameter row until espice_destroy. Errors as
- * espice_copy_point_measures. */
+ * bytes per query until espice_destroy; its parameter row is freed at a
+ * release made while no query runs. Errors as espice_copy_point_measures. */
 espice_status espice_release_points(espice_problem *, uint32_t first_id, size_t count);
 /* The most points the executor runs together as one lane batch on this
  * problem's backend: 1 without lanes, the CPU lane width under ESPICE_LANES,

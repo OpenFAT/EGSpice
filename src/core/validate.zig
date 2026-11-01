@@ -342,25 +342,27 @@ pub fn validate(query: requests.Query, n: u32) !void {
 
 /// `validate`, plus the checks that need the deck: `error.InvalidQueryOptions`
 /// when the query's `tol.variant`, an `.mc` variant range or a `.dc` tangent
-/// row or a `.tran` one lies past `deck.variants`, and `error.DcSweepSourceNotFound` when a
-/// `.dc` sweep names a card the deck does not have. Asserts that a non-empty
-/// `deck.variants` has one `starts` entry more than rows.
+/// row or a `.tran` one lies past `deck.variants` or among its dropped rows,
+/// and `error.DcSweepSourceNotFound` when a `.dc` sweep names a card the deck
+/// does not have. Asserts that a non-empty `deck.variants` has one `starts`
+/// entry more than rows.
 pub fn validateDeck(query: requests.Query, n: u32, deck: *const Deck) !void {
     try validate(query, n);
+    const rows = deck.variants;
     const variant = switch (query) {
         inline else => |o| o.tol.variant,
     };
-    if (variant) |v| if (v >= deck.variants.count()) return error.InvalidQueryOptions;
+    if (variant) |v| if (v < rows.base or v >= rows.count()) return error.InvalidQueryOptions;
     if (query == .mc) {
         const r = query.mc.variants;
-        if (@as(u64, r.first) + r.count > deck.variants.count()) return error.InvalidQueryOptions;
+        if ((r.count != 0 and r.first < rows.base) or @as(u64, r.first) + r.count > rows.count()) return error.InvalidQueryOptions;
     }
     if (query == .dc) {
         try dcTargetExists(query.dc.target, deck);
         if (query.dc.target2) |t2| try dcTargetExists(t2, deck);
-        for (query.dc.tangents) |row| if (row >= deck.variants.count()) return error.InvalidQueryOptions;
+        for (query.dc.tangents) |row| if (row < rows.base or row >= rows.count()) return error.InvalidQueryOptions;
     }
-    if (query == .tran) for (query.tran.tangents) |row| if (row >= deck.variants.count()) return error.InvalidQueryOptions;
+    if (query == .tran) for (query.tran.tangents) |row| if (row < rows.base or row >= rows.count()) return error.InvalidQueryOptions;
 }
 
 /// The same (type, ordinal) lookup `dc.run` does, made before anything is

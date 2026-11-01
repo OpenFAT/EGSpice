@@ -287,7 +287,7 @@ jobs:
 
   # The formula the release attached, installed through a local tap on macOS
   # and checked by `brew test` (a divider solved to its analytic value). With a
-  # HOMEBREW_TAP_TOKEN secret (a token that can push to OmarSiwy/homebrew-espice)
+  # HOMEBREW_TAP_TOKEN secret (a token that can push to OpenFAT/homebrew-espice)
   # it is pushed to the tap. After VerA's publish.yaml.
   homebrew:
     needs: [plan, publish]
@@ -306,11 +306,11 @@ jobs:
           brew install espice/local/espice
           brew test espice/local/espice
           espice --version
-      - name: Push to OmarSiwy/homebrew-espice
+      - name: Push to OpenFAT/homebrew-espice
         if: env.TAP_TOKEN != ''
         run: |
           set -euo pipefail
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/OmarSiwy/homebrew-espice.git" tap
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/OpenFAT/homebrew-espice.git" tap
           mkdir -p tap/Formula && cp espice.rb tap/Formula/espice.rb
           cd tap
           git config user.name 'github-actions[bot]'

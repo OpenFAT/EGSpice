@@ -16,6 +16,10 @@ const Job = requests.Query;
 pub const Library = device.Library;
 /// HSPICE `OPTIMIZE=`: the optimizer's point-to-rows adapter (variants.zig).
 pub const Tuner = variants.Tuner;
+/// A SIGMA_SCALE card, for counting its trials' failures (#239).
+pub const Sss = variants.Sss;
+/// `.wcd`: FORM's points to variant rows (#240, variants.zig).
+pub const WorstCase = variants.WorstCase;
 const Ic = core.Ic;
 const GROUND = core.GROUND;
 
@@ -38,6 +42,11 @@ pub const Prepared = struct {
     /// (`prepare`'s `live`); null without any. It borrows the parse arena,
     /// which must then outlive the Prepared.
     tuning: ?*variants.Tuning = null,
+    /// The deck's SIGMA_SCALE cards (#239), in the session arena.
+    sss: []const variants.Sss = &.{},
+    /// The deck's `.wcd` (#240), on the main run only. It borrows the parse
+    /// arena, which must then outlive the Prepared.
+    wcd: ?variants.WorstCase = null,
 
     /// Releases this run's circuit and every nested run's, and the tuning's
     /// templates. The deck slices stay with the session arena. Leaves
@@ -53,6 +62,9 @@ const NO_NODE = analyses.NO_NODE;
 
 /// The netlist syntax a deck is read in: ngspice, HSPICE or Spectre.
 pub const Dialect = netlist.Dialect;
+
+/// How `prepare` reads device cards (#230).
+pub const ParseOptions = netlist.ParseOptions;
 
 /// Where a deck comes from.
 pub const Source = union(enum) {
@@ -191,9 +203,11 @@ test "detectDialect: no false positive over the corpus" {
 /// when `live` is not empty. Spectre input expands its `include`s
 /// (`source.expandSpectre`) and nothing else: it splits no `.alter` runs
 /// and reads no data files. Fails with `UnknownParameter` for a `live`
-/// name no global `.param` defines, and with the file error of an
-/// unreadable deck, include or data file.
-pub fn prepare(io: std.Io, session: std.mem.Allocator, input: Source, dialect: Dialect, live: []const []const u8) !netlist.Netlist {
+/// name no global `.param` defines, with the file error of an
+/// unreadable deck, include, data or `soalimits` file, and with
+/// `InvalidSoaLimits` for a `soalimits` file `soaRatings` refuses. `parse`
+/// says how the device cards are read; every choice gives the same netlist.
+pub fn prepare(io: std.Io, session: std.mem.Allocator, input: Source, dialect: Dialect, live: []const []const u8, parse: ParseOptions) !netlist.Netlist {
     const origin = switch (input) {
         .file => |path| path,
         .bytes => |bytes| bytes.origin,
@@ -203,15 +217,48 @@ pub fn prepare(io: std.Io, session: std.mem.Allocator, input: Source, dialect: D
         .bytes => |bytes| try session.dupe(u8, bytes.data),
     };
     if (dialect == .spectre) {
-        return netlist.parseLive(session, try netlist.source.expandSpectre(io, session, origin, raw), dialect, live);
+        return netlist.parseLive(session, try netlist.source.expandSpectre(io, session, origin, raw), dialect, live, parse);
     }
     const runs = try netlist.source.splitAlters(session, raw);
-    var nl = try netlist.parseLive(session, try netlist.source.expand(io, std.heap.page_allocator, session, origin, runs[0]), dialect, live);
+    var nl = try netlist.parseLive(session, try netlist.source.expand(io, std.heap.page_allocator, session, origin, runs[0]), dialect, live, parse);
     const alters = try session.alloc([]const u8, runs.len - 1);
     for (alters, runs[1..]) |*text, run| text.* = try netlist.source.expand(io, std.heap.page_allocator, session, origin, run);
     nl.deck.alters = alters;
     nl.files = try loadData(io, session, nl.deck.foreign, origin);
+    nl.soa_ratings = try soaRatings(io, session, origin, nl.deck.soa_file);
     return nl;
+}
+
+/// The `.options soalimits=` file at `path` (relative to the deck at
+/// `origin`; none when empty), checked here, at the trust boundary: one
+/// JSON object of model name or name prefix to an object of `soa_keys`
+/// limits, each a finite number (#238). `InvalidSoaLimits`, logged with
+/// the file, for anything else: bad JSON, a repeated name, an unknown key,
+/// a value that is no finite number.
+fn soaRatings(io: std.Io, session: std.mem.Allocator, origin: []const u8, path: []const u8) ![]const netlist.SoaRating {
+    if (path.len == 0) return &.{};
+    const file = try deckRelative(session, origin, path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, file, session, .limited(1 << 24)) catch |err| {
+        if (!@import("builtin").is_test) std.log.err("netlist: cannot read soalimits file {s}: {s}", .{ file, @errorName(err) });
+        return err;
+    };
+    const Limits = std.json.ArrayHashMap(f64);
+    const models = std.json.parseFromSliceLeaky(std.json.ArrayHashMap(Limits), session, bytes, .{}) catch |err| {
+        if (!@import("builtin").is_test) std.log.err("netlist: soalimits file {s}: {s}", .{ file, @errorName(err) });
+        return error.InvalidSoaLimits;
+    };
+    var out: std.ArrayList(netlist.SoaRating) = .empty;
+    for (models.map.keys(), models.map.values()) |model, limits| for (limits.map.keys(), limits.map.values()) |key, limit| {
+        const known = for (soa_keys) |k| {
+            if (std.mem.eql(u8, k.key, key)) break true;
+        } else false;
+        if (!known or !std.math.isFinite(limit)) {
+            if (!@import("builtin").is_test) std.log.err("netlist: soalimits file {s}: {s}: {s} is {s}", .{ file, model, key, if (known) "no finite number" else "no SOA limit" });
+            return error.InvalidSoaLimits;
+        }
+        try out.append(session, .{ .model = model, .key = key, .limit = limit });
+    };
+    return out.items;
 }
 
 /// Reads every data file the deck names, relative to the deck's directory.
@@ -304,7 +351,8 @@ fn ErrorOf(comptime f: anytype) type {
 }
 
 /// `build` for one run of the deck in `nl`, which must outlive the result
-/// when the deck has an HSPICE optimization (`Prepared.tuner` borrows it).
+/// when the deck has an HSPICE optimization or a `.wcd` (`Prepared.tuner`
+/// and `Prepared.wcd` borrow it).
 /// A `run.point` sets `nl`'s live values first; they are nominal again
 /// when a run with rebuilt points returns.
 fn buildRun(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_arena: std.mem.Allocator, nl: *netlist.Netlist, run: variants.Run) BuildError!Prepared {
@@ -354,11 +402,12 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
     for (cards) |*c| {
         c.name = try sim_arena.dupe(u8, c.name);
     }
-    const card_names = try requests.CardNames.init(sim_arena, cards);
     var perm: ?[]const u32 = null;
     var circuit = try b.compilePerm(&perm);
     compiled_ok = true;
     errdefer circuit.deinit();
+    try frozenIndices(parse_arena, cards, &circuit);
+    const card_names = try requests.CardNames.init(sim_arena, cards);
 
     var out = try nb.publish(sim_arena, &circuit, perm);
     if (nl.deck.saves.len > 0) try keepSaved(parse_arena, &out.probes, &out.probe_labels, nl.deck.saves);
@@ -411,9 +460,11 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         if (nl.deck.optimize != null) tuner = try variants.Tuner.init(planner);
         break :blk planned;
     } else .{};
+    // A planner of its own: the plan's left the live values nominal.
+    const wcd = if (nl.deck.wcd != null and run.point == null and run.prefix.len == 0) try variants.WorstCase.init(try variants.Planner.init(lib, sim_arena, parse_arena, nl, &circuit, cards, "")) else null;
     const tuning = if (nl.tunable.len != 0 and run.point == null and run.prefix.len == 0) try variants.Tuning.init(core.gpa, lib, sim_arena, parse_arena, nl, &circuit, cards) else null;
     errdefer if (tuning) |t| t.deinit();
-    if (plan.variants.refs.len != 0 or tuning != null) try circuit.countParams();
+    if (plan.variants.refs.len != 0 or tuning != null or wcd != null) try circuit.countParams();
     card_opts.sample = nl.deck.sample;
     card_opts.card_names = card_names;
     const queries = try analyses.queries(sim_arena, cards_rows, circuit.n, false, out.bindings, cards, card_opts, plan.fanout);
@@ -423,7 +474,8 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
         if (!@import("builtin").is_test) std.log.err("netlist: .mosra needs a .tran to stress the devices: {s}", .{nl.deck.mosra.?.line});
         return error.UnsupportedCard;
     };
-    return .{ .rebuilds = plan.rebuilds, .prepared = .{ .circuit = circuit, .tuner = tuner, .tuning = tuning, .deck = .{
+    const ov = try opVars(sim_arena, parse_arena, lib, &circuit, cards, out.probes, out.probe_labels, nl, queries);
+    return .{ .rebuilds = plan.rebuilds, .prepared = .{ .circuit = circuit, .tuner = tuner, .tuning = tuning, .wcd = wcd, .sss = try variants.sssCards(sim_arena, nl.deck), .deck = .{
         .probes = out.probes,
         .probe_labels = out.probe_labels,
         .source_node = out.source_node,
@@ -452,7 +504,250 @@ fn buildOne(lib: *const device.Library, sim_arena: std.mem.Allocator, parse_aren
             break :blk own;
         } else null,
         .stims = try stims(sim_arena, nl.deck.stims),
+        .soa = if (deck_opts.soa) .{ .max_warns = deck_opts.max_warns, .limits = try soaLimits(sim_arena, nl, &nb, &circuit) } else .{},
+        .opvars = ov.vars,
+        .opvar_probes = ov.probes,
+        .opvar_labels = ov.labels,
+        .emir_ports = try portCounts(sim_arena, lib, &circuit),
+        .em_recovery = deck_opts.em_recovery,
+        .card_models = try cardModels(sim_arena, parse_arena, nl, cards),
+        .emir_file = if (nl.deck.emir_file) |f| try sim_arena.dupe(u8, f) else null,
     } } };
+}
+
+/// The device operating-point variables (`@m1[gm]`, #236) the deck's
+/// `.save`, `.probe` and `.meas` cards name, and what records them:
+/// `probes` and `labels`, then each named instance's rows, unlabeled. A
+/// variable is the model's own (VerA `op_vars`) or, for a MOSFET, a
+/// terminal quantity (`core.OpVar.Quantity`). A name that is neither, or no
+/// `OpVarName` of a device in the deck, is `UnsupportedCard`, logged with
+/// the variables there are. So is one under a `.dc` that sweeps the
+/// temperature or a device of its type: the instance would be evaluated at
+/// the sweep's last state. HSPICE's `.probe op` adds every variable of
+/// every device (`probeAll`).
+// ponytail: `.probe op` is a column per variable per device at every point
+// of every .op, .dc and .tran; narrow it to the .op if a large circuit's
+// transient runs out of memory.
+fn opVars(
+    sim_arena: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    lib: *const device.Library,
+    circuit: *const device.Circuit,
+    cards: []const requests.CardRef,
+    probes: []const u32,
+    labels: []const []const u8,
+    nl: *const netlist.Netlist,
+    queries: []const Job,
+) !struct { vars: []const core.OpVar, probes: []const u32, labels: []const []const u8 } {
+    const dialect = nl.deck.dialect;
+    var names: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (nl.deck.opvar_saves) |s| try names.put(scratch, s, {});
+    for (nl.deck.measures) |m| for ([_]core.MeasureClause{ m.first, m.second }) |c| {
+        for ([_][]const u8{ c.vec, c.vec2 }) |v| if (netlist.isOpVar(dialect, v)) try names.put(scratch, v, {});
+        for ([_][]const core.MeasureOp{ c.ops, c.ops2 }) |ops| for (ops) |op| if (op == .vector and netlist.isOpVar(dialect, op.vector)) {
+            try names.put(scratch, op.vector, {});
+        };
+    };
+    if (names.count() == 0 and !nl.deck.probe_op) return .{ .vars = &.{}, .probes = &.{}, .labels = &.{} };
+    // The terminal quantities are a MOSFET's (d, g, s, b), whose letter a
+    // Spectre card's name need not carry; each maps to whether its card
+    // is p-type, as `.mosra` reads it.
+    // ponytail: the card kind only; a `type=-1` on an nmos or Verilog-A
+    // module card reads as n-type. Read the bound model's polarity if a
+    // deck spells it that way.
+    var mosfets: std.StringHashMapUnmanaged(bool) = .empty;
+    for (nl.bucket('m')) |e| {
+        const d = nl.device(e);
+        try mosfets.put(scratch, d.name, if (d.model) |m| std.ascii.eqlIgnoreCase(m.kind, "pmos") else false);
+    }
+    var list: std.ArrayList(core.OpVar) = .empty;
+    for (names.keys()) |name| try list.append(sim_arena, try opVar(sim_arena, lib, circuit, cards, &mosfets, name));
+    if (nl.deck.probe_op) for (cards) |ref| try probeAll(sim_arena, lib, circuit, ref, mosfets.get(ref.name), &names, &list);
+    const vars = list.items;
+    var rows: std.ArrayList(u32) = .empty;
+    try rows.appendSlice(sim_arena, probes);
+    var row_labels: std.ArrayList([]const u8) = .empty;
+    try row_labels.appendSlice(sim_arena, labels);
+    for (vars) |v| {
+        const b = circuit.batches[v.batch];
+        for (b.hooks.scatter_tapes(b.ctx).rows[@as(usize, v.index) * b.n_u ..][0..b.n_u]) |row| {
+            // A ground unknown's row is `n`.
+            if (row >= circuit.n or std.mem.indexOfScalar(u32, rows.items[probes.len..], row) != null) continue;
+            try rows.append(sim_arena, row);
+            try row_labels.append(sim_arena, "");
+        }
+    }
+    for (queries) |q| if (q == .dc) for ([_]?requests.Dc.SweepTarget{ q.dc.target, q.dc.target2 }) |target| {
+        const swept = target orelse continue;
+        for (vars) |v| if (swept == .temp or swept.device.type == circuit.batch_types[v.batch]) {
+            if (!@import("builtin").is_test) std.log.err("netlist: {s} along a .dc that sweeps the temperature or a device of its type is not supported (#236)", .{v.label});
+            return error.UnsupportedCard;
+        };
+    };
+    return .{ .vars = vars, .probes = rows.items, .labels = row_labels.items };
+}
+
+/// `core.OpVar.Quantity`'s names, for the error that lists them.
+const opvar_names = blk: {
+    var s: []const u8 = "";
+    for (@typeInfo(core.OpVar.Quantity).@"enum".field_names) |n| s = s ++ " " ++ n;
+    break :blk s[1..];
+};
+
+/// HSPICE's MOSFET element templates [HSPICE Reference Manual: Elements
+/// and Device Models, "MOSFET Output Templates"]: `lx<N>`/`lv<N>` to the
+/// variable it reads. Another number refuses.
+// ponytail: lx19/lx20 (HSPICE's ∂Qg/∂Vd and ∂Qg/∂Vs, -cgd and -cgs) need a
+// sign this table cannot carry; add one if a deck reads them.
+const hspice_templates = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "lx1", "vbs" }, .{ "lx2", "vgs" }, .{ "lx3", "vds" },  .{ "lx4", "id" },
+    .{ "lx7", "gm" },  .{ "lx8", "gds" }, .{ "lx9", "gmbs" }, .{ "lx18", "cgg" },
+    .{ "lv9", "vth" }, .{ "lv10", "vdsat" },
+});
+
+/// A device operating-point variable's name, split: ngspice
+/// `@<card>[<variable>]`, Spectre `<device>:<variable>`, or HSPICE
+/// `lx<N>(<device>)`/`lv<N>(<device>)` through `hspice_templates`. A
+/// `<device>` (`path`) is the deck's own name (`x1.mn1`), which the card's
+/// flattened name leads with its letter (`m.x1.mn1`).
+const OpVarName = struct {
+    device: []const u8,
+    variable: []const u8,
+    path: bool,
+
+    /// Null for a name of none of these forms.
+    fn of(name: []const u8) ?OpVarName {
+        if (name.len != 0 and name[0] == '@') {
+            const open = std.mem.indexOfScalar(u8, name, '[') orelse return null;
+            if (open < 2 or name[name.len - 1] != ']') return null;
+            return .{ .device = name[1..open], .variable = name[open + 1 .. name.len - 1], .path = false };
+        }
+        if (std.mem.indexOfScalar(u8, name, ':')) |colon| {
+            if (colon == 0 or colon + 1 == name.len) return null;
+            return .{ .device = name[0..colon], .variable = name[colon + 1 ..], .path = true };
+        }
+        const open = std.mem.indexOfScalar(u8, name, '(') orelse return null;
+        if (open + 2 >= name.len or name[name.len - 1] != ')') return null;
+        const variable = hspice_templates.get(name[0..open]) orelse return null;
+        return .{ .device = name[open + 1 .. name.len - 1], .variable = variable, .path = true };
+    }
+
+    /// Whether `card`, a flattened card name, is the device `n` names.
+    fn matches(n: OpVarName, card: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(card, n.device)) return true;
+        return n.path and card.len == n.device.len + 2 and card[1] == '.' and std.ascii.eqlIgnoreCase(card[2..], n.device);
+    }
+};
+
+/// `name`, an `OpVarName`, resolved to its instance; `mosfets` maps the
+/// MOSFETs' card names to whether each is p-type. See `opVars` for the
+/// refusals.
+fn opVar(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, cards: []const requests.CardRef, mosfets: *const std.StringHashMapUnmanaged(bool), name: []const u8) !core.OpVar {
+    const split = OpVarName.of(name) orelse {
+        if (!@import("builtin").is_test) std.log.err("netlist: {s}: a device operating-point variable is @<device>[<variable>], <device>:<variable>, or lx1-lx4, lx7-lx9, lx18, lv9 or lv10 (<device>)", .{name});
+        return error.UnsupportedCard;
+    };
+    const ref = for (cards) |c| {
+        if (split.matches(c.name)) break c;
+    } else {
+        if (!@import("builtin").is_test) std.log.err("netlist: {s}: no device {s}", .{ name, split.device });
+        return error.UnsupportedCard;
+    };
+    return opVarOf(arena, lib, circuit, ref, mosfets.get(ref.name), name, split.variable);
+}
+
+/// `variable` of instance `ref`, published as `label`; `pmos_card` is null
+/// unless its card is a MOSFET's, and then whether it is p-type.
+fn opVarOf(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, ref: requests.CardRef, pmos_card: ?bool, label: []const u8, variable: []const u8) !core.OpVar {
+    const batch = std.mem.indexOfScalar(core.DeviceType, circuit.batch_types, ref.type).?;
+    const hooks = circuit.batches[batch].hooks;
+    const ports = lib.vtable(ref.type).num_ports;
+    const mosfet = pmos_card != null and ports >= 3;
+    if (hooks.local_eval == null) return refuseOpVar(arena, label, ref.name, variable, &.{}, false);
+    var v: core.OpVar = .{ .label = try arena.dupe(u8, label), .batch = @intCast(batch), .index = ref.index, .ports = ports, .pmos = pmos_card orelse false };
+    // The model's own variable first: BSIM-CMG's `ids` is its own.
+    for (hooks.op_vars, 0..) |own, k| {
+        if (std.ascii.eqlIgnoreCase(own, variable)) {
+            v.own = @intCast(k);
+            break;
+        }
+    } else {
+        const terminal = if (mosfet) std.meta.stringToEnum(core.OpVar.Quantity, variable) else null;
+        v.quantity = terminal orelse return refuseOpVar(arena, label, ref.name, variable, hooks.op_vars, mosfet);
+    }
+    return v;
+}
+
+/// Appends to `list` every operating-point variable of instance `ref`
+/// that `names` does not hold, as `@<card>[<variable>]` (HSPICE `.probe
+/// op`): the model's own, then for a MOSFET (`pmos_card`, as `opVarOf`
+/// reads it) the terminal quantities it does not shadow, without the
+/// alias `ids` and, with three terminals, the bulk ones.
+fn probeAll(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit, ref: requests.CardRef, pmos_card: ?bool, names: *const std.StringArrayHashMapUnmanaged(void), list: *std.ArrayList(core.OpVar)) !void {
+    const hooks = circuit.batches[std.mem.indexOfScalar(core.DeviceType, circuit.batch_types, ref.type).?].hooks;
+    if (hooks.local_eval == null) return;
+    const ports = lib.vtable(ref.type).num_ports;
+    const bulk = [_]core.OpVar.Quantity{ .ib, .gmbs, .cgb, .vbs };
+    var all: std.ArrayList([]const u8) = .empty;
+    try all.appendSlice(arena, hooks.op_vars);
+    if (pmos_card != null and ports >= 3) for (std.enums.values(core.OpVar.Quantity)) |q| {
+        if (q == .ids or (ports == 3 and std.mem.indexOfScalar(core.OpVar.Quantity, &bulk, q) != null)) continue;
+        for (hooks.op_vars) |own| {
+            if (std.ascii.eqlIgnoreCase(own, @tagName(q))) break;
+        } else try all.append(arena, @tagName(q));
+    };
+    for (all.items) |variable| {
+        const label = try arena.print("@{s}[{s}]", .{ ref.name, variable });
+        if (names.contains(std.ascii.lowerString(label, label))) continue;
+        try list.append(arena, try opVarOf(arena, lib, circuit, ref, pmos_card, label, variable));
+    }
+}
+
+/// Logs that `card` has no variable `variable`, listing the model's own
+/// variables `own` and, for a MOSFET, the terminal ones; `UnsupportedCard`.
+fn refuseOpVar(arena: std.mem.Allocator, name: []const u8, card: []const u8, variable: []const u8, own: []const []const u8, mosfet: bool) error{ OutOfMemory, UnsupportedCard } {
+    if (!@import("builtin").is_test) {
+        const listed = std.mem.join(arena, " ", own) catch return error.OutOfMemory;
+        const sep = if (listed.len != 0 and mosfet) " " else "";
+        std.log.err("netlist: {s}: {s} has no variable '{s}'; its variables are: {s}{s}{s}", .{ name, card, variable, listed, sep, if (mosfet) opvar_names else "" });
+    }
+    return error.UnsupportedCard;
+}
+
+/// Renumbers each card's `index` from its add ordinal to its instance's
+/// place in the frozen batch, which a mixed batch partitions
+/// (`Hooks.original_ids`): the index every tape, hook and `ParamRef` reads.
+fn frozenIndices(scratch: std.mem.Allocator, cards: []requests.CardRef, circuit: *const device.Circuit) !void {
+    for (circuit.batches, circuit.batch_types) |b, t| {
+        const ids: []const u32 = if (b.hooks.original_ids) |original| original(b.ctx) else &.{};
+        if (ids.len == 0) continue;
+        std.debug.assert(ids.len == b.count);
+        const at = try scratch.alloc(u32, ids.len);
+        for (ids, 0..) |id, k| at[id] = @intCast(k);
+        for (cards) |*c| if (c.type == t) {
+            c.index = at[c.index];
+        };
+    }
+}
+
+/// `Deck.card_models`: the `.model` card each card names, by its name, for
+/// `--emir` (#237). A binned card's is its bin's.
+fn cardModels(sim_arena: std.mem.Allocator, scratch: std.mem.Allocator, nl: *const netlist.Netlist, cards: []const requests.CardRef) !requests.CardNames {
+    var by_name: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (nl.order) |e| {
+        const dev = nl.device(e);
+        if (dev.model) |m| try by_name.put(scratch, dev.name, m.name);
+    }
+    var named: std.ArrayList(requests.CardRef) = .empty;
+    for (cards) |c| if (by_name.get(c.name)) |m| try named.append(scratch, .{ .type = c.type, .index = c.index, .name = try sim_arena.dupe(u8, m) });
+    return requests.CardNames.init(sim_arena, named.items);
+}
+
+/// `Deck.emir_ports`: each batch's port count, from its type's vtable.
+fn portCounts(arena: std.mem.Allocator, lib: *const device.Library, circuit: *const device.Circuit) ![]const u32 {
+    const ports = try arena.alloc(u32, circuit.batch_types.len);
+    for (ports, circuit.batch_types) |*p, t| p.* = lib.vtable(t).num_ports;
+    return ports;
 }
 
 /// `.stim` cards with their strings copied out of the parse arena.
@@ -482,6 +777,75 @@ fn nodeRows(arena: std.mem.Allocator, nb: *const builder.NetBuilder, items: []co
         try out.append(arena, .{ .node = row, .value = item.value });
     }
     return out.items;
+}
+
+/// A model-card SOA limit (ngspice's names) of card letter `card`: held
+/// across terminals `pos` and `neg`, by magnitude unless `abs` is false.
+const SoaKey = struct { card: u8, key: []const u8, quantity: []const u8, pos: u8, neg: u8, abs: bool = true };
+
+/// MOS pins d g s b, BJT c b e, diode a k; a diode's `bv_max` holds the
+/// reverse voltage v(k) - v(a), as ngspice's diosoachk.c does.
+const soa_keys = [_]SoaKey{
+    .{ .card = 'm', .key = "vgs_max", .quantity = "vgs", .pos = 1, .neg = 2 },
+    .{ .card = 'm', .key = "vgd_max", .quantity = "vgd", .pos = 1, .neg = 0 },
+    .{ .card = 'm', .key = "vgb_max", .quantity = "vgb", .pos = 1, .neg = 3 },
+    .{ .card = 'm', .key = "vds_max", .quantity = "vds", .pos = 0, .neg = 2 },
+    .{ .card = 'm', .key = "vbs_max", .quantity = "vbs", .pos = 3, .neg = 2 },
+    .{ .card = 'm', .key = "vbd_max", .quantity = "vbd", .pos = 3, .neg = 0 },
+    .{ .card = 'q', .key = "vbe_max", .quantity = "vbe", .pos = 1, .neg = 2 },
+    .{ .card = 'q', .key = "vbc_max", .quantity = "vbc", .pos = 1, .neg = 0 },
+    .{ .card = 'q', .key = "vce_max", .quantity = "vce", .pos = 0, .neg = 2 },
+    .{ .card = 'd', .key = "bv_max", .quantity = "vr", .pos = 1, .neg = 0, .abs = false },
+    .{ .card = 'r', .key = "bv_max", .quantity = "v", .pos = 0, .neg = 1 },
+    .{ .card = 'c', .key = "bv_max", .quantity = "v", .pos = 0, .neg = 1 },
+};
+
+/// One `core.SoaLimit` per `soa_keys` limit the model card of an M, Q, D,
+/// R or C card states, each terminal named by its result column as
+/// `NetBuilder.publish` labels it. A model card that states none takes
+/// the `soalimits` file's limits for the longest name that is its own or
+/// a prefix of it (`Netlist.soa_ratings`), so a card value is never
+/// shadowed. A limit that is no number, or names a terminal the card does
+/// not connect, is skipped.
+fn soaLimits(arena: std.mem.Allocator, nl: *const netlist.Netlist, nb: *const builder.NetBuilder, circuit: *const device.Circuit) ![]const core.SoaLimit {
+    var out: std.ArrayList(core.SoaLimit) = .empty;
+    for ("mqdrc") |card| for (nl.bucket(card)) |e| {
+        const d = nl.device(e);
+        const m = d.model orelse continue;
+        const stated = for (soa_keys) |k| {
+            if (k.card == card and cardValue(m.kv, k.key) != null) break true;
+        } else false;
+        // ponytail: a scan of the file's rows per device; a map by model
+        // name when a kit's file holds thousands.
+        var rated: ?[]const u8 = null;
+        if (!stated) for (nl.soa_ratings) |r| {
+            if (std.ascii.startsWithIgnoreCase(m.name, r.model) and (rated == null or r.model.len > rated.?.len)) rated = r.model;
+        };
+        for (soa_keys) |k| {
+            if (k.card != card or @max(k.pos, k.neg) >= d.pins.len) continue;
+            const value: ?f64 = if (rated) |model| rating(nl.soa_ratings, model, k.key) else if (cardValue(m.kv, k.key)) |v| v.number() else null;
+            const limit = value orelse continue;
+            var columns: [2][]const u8 = undefined;
+            for (&columns, [2]u8{ k.pos, k.neg }) |*column, pin| {
+                const row = nb.frozenRow(d.pins[pin].index());
+                column.* = if (row == NO_NODE or row == GROUND) "" else try std.mem.concat(arena, u8, &.{ "v(", circuit.nodeName(row), ")" });
+            }
+            try out.append(arena, .{ .name = try arena.dupe(u8, d.name), .quantity = k.quantity, .key = k.key, .limit = limit, .pos = columns[0], .neg = columns[1], .abs = k.abs });
+        }
+    };
+    return out.items;
+}
+
+/// The value model-card pairs `kv` give `key`; null when they give none.
+fn cardValue(kv: []const netlist.Kv, key: []const u8) ?netlist.Value {
+    for (kv) |item| if (std.mem.eql(u8, item.key, key)) return item.value;
+    return null;
+}
+
+/// The `soalimits` file's `key` limit for `model`; null when it gives none.
+fn rating(ratings: []const netlist.SoaRating, model: []const u8, key: []const u8) ?f64 {
+    for (ratings) |r| if (std.mem.eql(u8, r.model, model) and std.mem.eql(u8, r.key, key)) return r.limit;
+    return null;
 }
 
 /// `.meas` cards with their strings copied out of the parse arena.

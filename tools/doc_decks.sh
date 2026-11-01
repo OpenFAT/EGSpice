@@ -39,5 +39,24 @@ while IFS= read -r page; do
   done
 done < <(find docs -name '*.md' | sort)
 
+# A deck read through a pipe or FIFO prints what the file prints (#234): the
+# dialect check once drained the pipe and the run saw an empty deck.
+# stdout and stderr both count; each run's deck path is replaced by DECK.
+for deck in measure.sp spectre_rc.scs; do
+  total=$((total + 1))
+  each() { (cd docs/examples && timeout 60 "$exe" --backend cpu "$1" <"$deck" 2>&1 | sed "s|$1|DECK|g"); }
+  each "$deck" >"$work/file.out"
+  each /dev/stdin >"$work/pipe.out"
+  rm -f "$work/fifo" && mkfifo "$work/fifo"
+  cat "docs/examples/$deck" >"$work/fifo" &
+  each "$work/fifo" >"$work/fifo.out"
+  wait
+  if ! grep -q devices "$work/file.out" || ! cmp -s "$work/file.out" "$work/pipe.out" || ! cmp -s "$work/file.out" "$work/fifo.out"; then
+    fail=$((fail + 1))
+    echo "FAIL $deck through a pipe or FIFO"
+    diff "$work/file.out" "$work/pipe.out" | head -5
+  fi
+done
+
 echo "doc decks: $((total - fail)) of $total run"
 [ "$fail" -eq 0 ]

@@ -238,6 +238,117 @@ test "a MONTE run whose trial numbers pass u32 is refused, not wrapped" {
     try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), past));
 }
 
+test "SIGMA_SCALE plans MONTE trials per scale, numbered on from FIRSTRUN; LHS, .alter and numbers past u32 are refused (#239)" {
+    var sa = std.heap.ArenaAllocator.init(t.allocator);
+    defer sa.deinit();
+    var pa = std.heap.ArenaAllocator.init(t.allocator);
+    defer pa.deinit();
+    var lib = try device.Library.init(t.allocator);
+    defer lib.deinit();
+    const deck =
+        \\sigma scale
+        \\.param g=agauss(1, 0.1, 1)
+        \\v1 in 0 1
+        \\r1 in 0 '1k*g'
+        \\{s}
+        \\.tran 1n 10n sweep monte=3 firstrun={s} sigma_scale=1,2 fail='m > 1'
+        \\.meas tran m max v(in)
+        \\.end
+    ;
+    const ok = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{ "", "5" }), .hspice);
+    var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), ok);
+    defer prepared.deinit();
+    try t.expectEqual(@as(u32, 6), prepared.deck.variants.count());
+    for (prepared.deck.variants.labels, 5..) |label, trial| try t.expectEqualStrings(try std.fmt.allocPrint(pa.allocator(), "monte={d}", .{trial}), label);
+    try t.expectEqual(@as(usize, 1), prepared.sss.len);
+    const s = prepared.sss[0];
+    try t.expectEqual(@as(?usize, null), s.scaleOf(4));
+    try t.expectEqual(@as(?usize, 0), s.scaleOf(7));
+    try t.expectEqual(@as(?usize, 1), s.scaleOf(8));
+    try t.expectEqual(@as(?usize, null), s.scaleOf(11));
+    // Six trials from 4294967291 pass u32; three would not.
+    for ([_]struct { []const u8, []const u8, bool }{
+        .{ ".option sampling_method=lhs", "1", false },
+        .{ "", "1", true },
+        .{ "", "4294967291", false },
+    }) |c| {
+        var refused = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{ c[0], c[1] }), .hspice);
+        // `frontend.prepare` splits the `.alter` runs off the text.
+        if (c[2]) refused.deck.alters = &.{"alter\nr1 in 0 2k\n.end\n"};
+        try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), refused));
+    }
+}
+
+test ".wcd (#240): a coordinate per local-variation device, global-variation model and moving site; a point writes nominal + sigma·z; limit, multiplier, .alter and no parameter refused" {
+    // Oracle: the deck's draws written out by hand at z: m1's vto
+    // 0.5 + 2m·z, r1's 1meg·(1 + 0.1·z).
+    var sa = std.heap.ArenaAllocator.init(t.allocator);
+    defer sa.deinit();
+    var pa = std.heap.ArenaAllocator.init(t.allocator);
+    defer pa.deinit();
+    var lib = try device.Library.init(t.allocator);
+    defer lib.deinit();
+    const ok = try netlist.parse(pa.allocator(),
+        \\wcd coordinates
+        \\.param g=agauss(1, 0.1, 1) unused=agauss(0, 1, 1)
+        \\.model nch nmos level=1 vto=0.5 kp=100u
+        \\i1 0 a 10u
+        \\i2 0 b 10u
+        \\m1 a a 0 0 nch w=1u l=1u
+        \\m2 b b 0 0 nch w=1u l=1u
+        \\r1 a 0 '1meg*g'
+        \\.variation
+        \\.local_variation
+        \\nmos nch vto=2m
+        \\.end_local_variation
+        \\.global_variation
+        \\nmos nch kp=1%
+        \\.end_global_variation
+        \\.end_variation
+        \\.dc i1 10u 20u 10u
+        \\.meas dc m find v(a) at=10u
+        \\.wcd m '<= 1'
+        \\.end
+    , .hspice);
+    var prepared = try input.build(&lib, sa.allocator(), pa.allocator(), ok);
+    defer prepared.deinit();
+    const w = &prepared.wcd.?;
+    try t.expectEqual(@as(usize, 4), w.keys.len);
+    for ([_][]const u8{ "m1@vto", "m2@vto", "nch@kp", "r1@r" }, w.labels) |want, got| try t.expectEqualStrings(want, got);
+    try t.expectEqual(@as(usize, 1), w.bases.len);
+    try t.expect(!w.stepped);
+    const moved = try w.rows(sa.allocator(), &prepared.circuit, &.{ 1, 0, 0, 2 }, 0);
+    try t.expectEqual(@as(u32, 1), moved.count());
+    const values = moved.writes(0)[1];
+    for ([_]f64{ 0.502, 1.2e6 }) |want| {
+        const hit = for (values) |x| {
+            if (@abs(x - want) <= 1e-12 * want) break true;
+        } else false;
+        try t.expect(hit);
+    }
+    const deck =
+        \\wcd refusals
+        \\.param g={s}
+        \\v1 in 0 1
+        \\r1 in 0 '1k*g'
+        \\.dc v1 0 1 1
+        \\.meas dc m find v(in) at=1
+        \\.wcd m '<= 2'
+        \\.end
+    ;
+    for ([_]struct { []const u8, bool }{
+        .{ "limit(1, 0.1)", false },
+        .{ "agauss(1, 0.1, 1, 3)", false },
+        .{ "1", false },
+        .{ "agauss(1, 0.1, 1)", true },
+    }) |c| {
+        var refused = try netlist.parse(pa.allocator(), try std.fmt.allocPrint(pa.allocator(), deck, .{c[0]}), .hspice);
+        // `frontend.prepare` splits the `.alter` runs off the text.
+        if (c[1]) refused.deck.alters = &.{"alter\nr1 in 0 2k\n.end\n"};
+        try t.expectError(error.UnsupportedCard, input.build(&lib, sa.allocator(), pa.allocator(), refused));
+    }
+}
+
 test "a MONTE sweep draws a distribution written in a .model card per trial (#100)" {
     var sa = std.heap.ArenaAllocator.init(t.allocator);
     defer sa.deinit();

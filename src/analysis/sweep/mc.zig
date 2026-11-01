@@ -158,7 +158,7 @@ pub fn publish(ctx: *const root.RunCtx, opts: Options, first: usize, probe_rows:
         for (results, 0..) |r, t| {
             if (!r.converged) continue;
             const row = data[k * ncols ..][0..ncols];
-            row[0] = if (variants) ctx.variants.axis[opts.variants.first + first + t] else @floatFromInt(k);
+            row[0] = if (variants) ctx.variants.axisAt(@intCast(opts.variants.first + first + t)) else @floatFromInt(k);
             @memcpy(row[1..], probe_rows[t * np ..][0..np]);
             k += 1;
         }

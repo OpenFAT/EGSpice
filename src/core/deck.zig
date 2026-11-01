@@ -70,8 +70,12 @@ pub const AcOverride = struct {
 /// `refs[i]` (an index into the circuit's `collectParams` list) for every
 /// `i` in `starts[v]..starts[v + 1]`, then runs at `temp_c[v]` when that is
 /// set. A query runs variant `Tolerances.variant`; the rows are SoA and
-/// `starts` has one entry more than `labels`.
+/// `starts` has one entry more than `labels`. Rows below `base` were
+/// dropped (`Tuning.drop`): the columns start at row `base`, and nothing
+/// reads a dropped row, so read rows through `count`, `writes`,
+/// `labelAt`, `tempAt` and `axisAt`.
 pub const Variants = struct {
+    base: u32 = 0,
     /// Plot-name suffix without parentheses: `p=1.5`, `alter=2`, `monte=3`.
     labels: []const []const u8 = &.{},
     /// Circuit temperature in °C, or null for the deck's.
@@ -82,25 +86,61 @@ pub const Variants = struct {
     starts: []const u32 = &.{},
     refs: []const u32 = &.{},
     values: []const f64 = &.{},
+    /// What made each row, parallel to `labels` as far as it reaches; a
+    /// row past its end (a live point a caller appended) reads `.step`.
+    kinds: []const Kind = &.{},
 
-    /// Number of variants (rows). Asserts that a non-empty table has one
-    /// `starts` entry more than rows.
+    /// A `.step` or card `SWEEP` point, a `SWEEP DATA` row, a Monte Carlo
+    /// trial, an `.alter` run.
+    pub const Kind = enum { step, data, monte, alter };
+
+    /// Number of variants (rows), dropped ones included. Asserts that a
+    /// non-empty table has one `starts` entry more than rows.
     pub fn count(self: Variants) u32 {
         if (self.labels.len != 0) assert(self.starts.len == self.labels.len + 1);
-        return @intCast(self.labels.len);
+        return self.base + @as(u32, @intCast(self.labels.len));
     }
 
     /// The parameter writes of variant `v`: `.{ refs, values }`, slices of
-    /// the table's own columns. Asserts that `starts` holds row `v`, that
-    /// `refs` and `values` have equal lengths, and that the row's range is
-    /// not reversed.
+    /// the table's own columns. Asserts that `v` was not dropped, that
+    /// `starts` holds row `v`, that `refs` and `values` have equal lengths,
+    /// and that the row's range is not reversed.
     pub fn writes(self: Variants, v: u32) struct { []const u32, []const f64 } {
-        assert(v + 1 < self.starts.len);
+        const r = self.row(v);
+        assert(r + 1 < self.starts.len);
         assert(self.refs.len == self.values.len);
-        const lo = self.starts[v];
-        const hi = self.starts[v + 1];
+        const lo = self.starts[r];
+        const hi = self.starts[r + 1];
         assert(lo <= hi);
         return .{ self.refs[lo..hi], self.values[lo..hi] };
+    }
+
+    /// Variant `v`'s label. Asserts that it was not dropped.
+    pub fn labelAt(self: Variants, v: u32) []const u8 {
+        return self.labels[self.row(v)];
+    }
+
+    /// Variant `v`'s temperature. Asserts that it was not dropped.
+    pub fn tempAt(self: Variants, v: u32) ?f64 {
+        return self.temp_c[self.row(v)];
+    }
+
+    /// Variant `v`'s axis value. Asserts that it was not dropped.
+    pub fn axisAt(self: Variants, v: u32) f64 {
+        return self.axis[self.row(v)];
+    }
+
+    /// What made variant `v`; a row past `kinds` reads `.step`. Asserts
+    /// that it was not dropped.
+    pub fn kindAt(self: Variants, v: u32) Kind {
+        const r = self.row(v);
+        return if (r < self.kinds.len) self.kinds[r] else .step;
+    }
+
+    /// Where variant `v` sits in the columns. Asserts that it was not dropped.
+    fn row(self: Variants, v: u32) u32 {
+        assert(v >= self.base);
+        return v - self.base;
     }
 };
 
@@ -171,6 +211,32 @@ pub const MosraModel = struct {
     /// Mobility loss per volt of each mechanism's ΔVth: mulu0 = 1/(1 + Σ mu·Δ).
     titmu: f64 = 0,
     hcimu: f64 = 0,
+};
+
+/// `.option soa=1` (ngspice `warn=1`): the model-card limits every accepted
+/// point of an operating point, DC sweep and transient is held to.
+pub const Soa = struct {
+    /// `maxwarns`: the most excursion lines printed; every one is counted.
+    /// ngspice's default.
+    max_warns: u32 = 5,
+    limits: []const SoaLimit = &.{},
+};
+
+/// One model-card limit of one instance: |v(pos) - v(neg)|, or the signed
+/// difference where `abs` is false (a diode's reverse voltage), may reach
+/// `limit` but not exceed it.
+pub const SoaLimit = struct {
+    /// Card name of the instance.
+    name: []const u8,
+    /// What is held: `vds`, a diode's `vr`, a resistor's or capacitor's `v`.
+    quantity: []const u8,
+    /// The model-card key that set `limit` (`vds_max`).
+    key: []const u8,
+    limit: f64,
+    /// Result columns of the two terminals (`v(x1.d)`); empty is ground.
+    pos: []const u8,
+    neg: []const u8,
+    abs: bool = true,
 };
 
 /// Source bindings kept from construction so later analysis directives can
@@ -254,6 +320,57 @@ pub const Deck = struct {
     mosra: ?Mosra = null,
     /// HSPICE `.stim` cards, in deck order.
     stims: []const Stim = &.{},
+    /// The safe-operating-area check; no limits without `.option soa=1`.
+    soa: Soa = .{},
+    /// Device operating-point variables the deck saves or measures, one
+    /// column each after the probes of an `.op`, `.dc` or `.tran` result.
+    opvars: []const OpVar = &.{},
+    /// `probes`, then the rows of every instance `opvars` reads: what those
+    /// analyses record before `analysis.opvars` turns the extra columns
+    /// into the `opvars` columns. `opvar_labels` is parallel to it. Empty
+    /// without `opvars`.
+    opvar_probes: []const u32 = &.{},
+    opvar_labels: []const []const u8 = &.{},
+    /// Each batch's port count, parallel to the circuit's batches: the
+    /// instance unknowns `--emir` reads a current at (#237).
+    emir_ports: []const u32 = &.{},
+    /// `.option em_recovery`, as `.meas EM_AVG` reads it; 1 when unset.
+    em_recovery: f64 = 1,
+    /// Each card's `.model` card name, laid out as `card_names`; none for
+    /// a card without one (#237).
+    card_models: requests.CardNames = .empty,
+    /// `.options emirfile=` (a Spectre analysis's `emirfile`/`emirformat`):
+    /// write `--emir` to this file, `""` for `<deck stem>.emir.json` (#237).
+    emir_file: ?[]const u8 = null,
+};
+
+/// One device operating-point variable (ngspice `@m1[gm]`, #236) of
+/// instance `index` of circuit batch `batch`, a device with `ports`
+/// terminals, published as `label`: the model's own variable `own`, or else
+/// the terminal `quantity`.
+pub const OpVar = struct {
+    label: []const u8,
+    batch: u32,
+    index: u32,
+    ports: u32,
+    /// Index into the batch's `Hooks.op_vars`; null for a terminal quantity.
+    own: ?u32 = null,
+    quantity: Quantity = .id,
+    /// Whether the card is p-type (`pmos`), which flips the sign of its
+    /// terminal currents and voltages.
+    pmos: bool = false,
+
+    /// A MOSFET's terminal quantities, after ngspice's names, from its
+    /// static currents and charges with its internal nodes eliminated
+    /// (`analysis.opvars`). Terminals are d, g, s, b. Currents and
+    /// voltages are in ngspice's frame, type × the current into the
+    /// terminal and type × the voltage (type +1 n, -1 p), so a saturated
+    /// pfet's `id` and `vgs` are positive, as ngspice's MOS1 and BSIM4
+    /// report them; `c<x><y>` is -∂Q_x/∂V_y, `cgg` is ∂Q_g/∂V_g, overlap
+    /// included; `ft` is gm / (2π cgg) of that terminal `cgg` even where
+    /// the model's own `cgg` shadows it. `ids` is BSIM-CMG's name for `id`.
+    /// A model's own variable of the same name wins.
+    pub const Quantity = enum(u8) { id, ids, ig, is, ib, gm, gds, gmbs, cgg, cgd, cgs, cgb, ft, vgs, vds, vbs };
 };
 
 /// What a `.meas` card computes, after ngspice com_measure2.c, plus the
@@ -294,8 +411,10 @@ pub const Check = struct {
 
 /// One postfix op of a `PARAM=` measure or a `par('expr')` waveform: a
 /// constant, the result of the `measure`-th card, a result vector by label
-/// (`v(out)`, `i(v1)`; waveforms only), or an arithmetic operator.
-pub const MeasureOp = union(enum) { num: f64, measure: u32, vector: []const u8, neg, add, sub, mul, div, pow };
+/// (`v(out)`, `i(v1)`; waveforms only), `soa_count()` (the SOA excursions
+/// of the result a PARAM card reads, `Result.soa_count`, #238), or an
+/// arithmetic operator.
+pub const MeasureOp = union(enum) { num: f64, measure: u32, vector: []const u8, soa_count, neg, add, sub, mul, div, pow };
 
 /// A clause value HSPICE lets name earlier `.meas` results (`FROM=t10`,
 /// `TD='tr+1n'`): `expr` is evaluated over them before the clause runs and
@@ -416,6 +535,15 @@ test "Variants slice each row's writes out of the shared columns" {
     // A row may write nothing and only move the temperature or the axis.
     try t.expectEqual(@as(usize, 0), v.writes(2)[0].len);
     try t.expectEqual(@as(u32, 0), (Variants{}).count());
+    // The same rows 1 and 2 after row 0 is dropped: absolute numbers still
+    // reach them.
+    const kept: Variants = .{ .base = 1, .labels = v.labels[1..], .temp_c = v.temp_c[1..], .axis = v.axis[1..], .starts = &.{ 0, 2, 2 }, .refs = v.refs[1..], .values = v.values[1..] };
+    try t.expectEqual(@as(u32, 3), kept.count());
+    try t.expectEqualSlices(u32, row1[0], kept.writes(1)[0]);
+    try t.expectEqualSlices(f64, row1[1], kept.writes(1)[1]);
+    try t.expectEqualStrings("p=3", kept.labelAt(2));
+    try t.expectEqual(@as(?f64, 50), kept.tempAt(1));
+    try t.expectEqual(@as(f64, 3), kept.axisAt(2));
 }
 
 test "goalError weighs the miss against the goal, floored at MINVAL, and is zero while a bound holds" {

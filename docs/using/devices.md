@@ -5,10 +5,10 @@ ESPice's own sources live in
 [`models/`](https://github.com/OpenFAT/EGSpice/tree/main/models). Third-party
 compact models (PSP, JUNCAP2, BSIM-IMG, BSIM-CMG, BSIM-BULK, BSIM-SOI,
 L-UTSOI, HiSIM, HICUM, Mextram, ASM-HEMT, ASM-ESD, MVSG, DIODE_CMC, R2/R3_CMC,
-MOSVAR) are built from their upstream release exactly as published:
-`build.zig.zon` lists each release's download link and hash. Releases from
-si2's registration form, whose links expire, are mirrored byte for byte on
-[ESPice's `models-si2-2026-10` release](https://github.com/OpenFAT/EGSpice/releases/tag/models-si2-2026-10).
+MOSVAR) are vendored there too, one file per model with each release's
+`` `include ``d files inlined, so a build needs no download;
+[`models/LICENSES.md`](https://github.com/OpenFAT/EGSpice/blob/main/models/LICENSES.md)
+names each model's release and licence.
 Everything is compiled into the simulator at build time, so a built-in model
 and a model you load yourself run through the same code.
 

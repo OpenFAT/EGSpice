@@ -1,5 +1,6 @@
 //! What an analysis publishes: the shape known up front and the finished payload.
 //! Plain data; cites nothing beyond ESPice's own analysis/output contract.
+const std = @import("std");
 const Kind = @import("query.zig").Kind;
 
 /// What a query will publish, known before it runs: enough for an output
@@ -44,6 +45,41 @@ pub const Result = struct {
     /// `data`'s shape per row, on the same times, each the first-order
     /// prediction of the run at that row. Empty without them.
     tangents: []const f64 = &.{},
+    /// A transient's device terminal currents under `PointOptions.emir`
+    /// (#237); no terminals without it.
+    emir: Emir = .{},
+    /// The excursions `.option soa` found over this result's rows (#238),
+    /// which a `.meas` PARAM `soa_count()` reads; NaN where none was
+    /// counted (no limit, or a result the check does not read).
+    soa_count: f64 = std.math.nan(f64),
+};
+
+/// `--emir` (#237): the window a transient's terminal currents were read
+/// over and their statistics there (analysis/tran/emir.zig).
+pub const Emir = struct {
+    /// The window's first and last sample times; NaN without a sample.
+    from: f64 = std.math.nan(f64),
+    to: f64 = std.math.nan(f64),
+    terminals: []const EmirTerminal = &.{},
+};
+
+/// One device terminal's current over `Emir`'s window, positive into the
+/// terminal.
+pub const EmirTerminal = struct {
+    /// Index of its batch in the circuit, of its instance in the batch and
+    /// of the port among the device's ports; the circuit row of its net.
+    batch: u32,
+    instance: u32,
+    port: u32,
+    row: u32,
+    /// Amperes: the signed mean, the RMS and the largest |i|.
+    avg: f64,
+    rms: f64,
+    peak: f64,
+    /// Ampere-seconds: the integrals of max(i, 0) and max(-i, 0), the
+    /// halves `.meas EM_AVG` weighs with `.option em_recovery`.
+    pos: f64,
+    neg: f64,
 };
 
 /// A `.meas` card measured as its run went: each of its passes over the

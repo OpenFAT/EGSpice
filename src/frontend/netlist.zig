@@ -153,8 +153,20 @@ pub const StepTarget = union(enum) {
 pub const Step = struct { target: StepTarget, values: []const f64 };
 
 /// HSPICE `MONTE=n [FIRSTRUN=k]`: trials `first..first + n - 1`; or
-/// `MONTE=list(a b:c ...)` [CR .DC]: exactly the trials in `list`.
-pub const Monte = struct { n: u32, first: u32 = 1, list: []const u32 = &.{} };
+/// `MONTE=list(a b:c ...)` [CR .DC]: exactly the trials in `list`. ESPice's
+/// `SIGMA_SCALE=s1,... FAIL='expr'` (#239) runs n trials at each scale.
+pub const Monte = struct {
+    n: u32,
+    first: u32 = 1,
+    list: []const u32 = &.{},
+    /// Each scale's draws have every sigma times it; empty for plain MONTE.
+    scales: []const f64 = &.{},
+    fail: Fail = .{},
+};
+
+/// A SIGMA_SCALE run's `FAIL=` test over its analysis's `.meas` cards:
+/// `ops` in postfix, each `.live` operand a card's index in `Deck.measures`.
+pub const Fail = struct { text: []const u8 = "", ops: []const expr.Op = &.{}, consts: []const f64 = &.{} };
 
 /// An HSPICE sweep on one analysis card: the card runs once per point.
 /// On a `.dc` card with no sweep of its own (`.dc DATA=d`, `.dc MONTE=n`)
@@ -188,6 +200,36 @@ pub const Optimize = struct {
     /// ESPice's fifth argument (#95): the grid each value stays on; 0 when
     /// not given.
     grid: []const f64,
+};
+
+/// ESPice `.wcd m1 'op L1' m2 'op L2' ... [MAXITER=n] [TOL=x] [TOP=n]`
+/// (#240): each `.meas` card with its bound is a spec, whose worst-case
+/// distance FORM finds over the statistical parameters (`core.form`).
+pub const Wcd = struct {
+    specs: []const WcdSpec,
+    maxiter: u32 = 20,
+    tol: f64 = 0.01,
+    /// The coordinates the report names per spec.
+    top: u32 = 5,
+    /// The card as written, for diagnostics.
+    line: []const u8 = "",
+};
+
+/// One `.wcd` spec: card `measure` (its index in `Deck.measures`) passes
+/// while its value is at least (`above`) or at most `limit`; `>` and `<`
+/// mean the same for a continuous measure.
+pub const WcdSpec = struct {
+    measure: u32,
+    above: bool,
+    limit: f64,
+    /// The bound as written, `>= 60`.
+    bound: []const u8,
+
+    /// The signed margin of `value`: at least 0 where the spec passes,
+    /// NaN when `value` is.
+    pub fn margin(s: WcdSpec, value: f64) f64 {
+        return if (s.above) value - s.limit else s.limit - value;
+    }
 };
 
 /// An inline `.data` table: one target per column, `values` row-major.
@@ -353,6 +395,10 @@ const data_file_keys = std.StaticStringMap(void).initComptime(.{
 /// A `ForeignKind.data` file's contents, read by `prepare`.
 pub const DataFile = struct { path: []const u8, bytes: []const u8 };
 
+/// One limit of the `.options soalimits=` file (#238): SOA key `key`
+/// (`vds_max`) at `limit` for every model named `model` or starting with it.
+pub const SoaRating = struct { model: []const u8, key: []const u8, limit: f64 };
+
 /// Deck data: everything that is not circuit topology.
 pub const Deck = struct {
     /// The first line as written, original case.
@@ -366,10 +412,22 @@ pub const Deck = struct {
     /// `.save` outputs as lowercased `v(net)`/`i(name)` labels. Empty: save
     /// everything, as with no `.save` card or a `.save all`.
     saves: []const []const u8,
+    /// `.save` device operating-point variables (`@m1[gm]`, #236), and
+    /// HSPICE's `.probe lx7(m1)` and Spectre's `save m1:gm` ones (`isOpVar`),
+    /// lowercased, `.save all` or not.
+    opvar_saves: []const []const u8 = &.{},
+    /// HSPICE `.probe op`: every device's operating-point variables.
+    probe_op: bool = false,
     foreign: []const Foreign,
     /// `.options vpi="app.so"` paths as written (relative to the deck): VPI
     /// applications to load (LRM 12.33, #197).
     vpi_apps: []const []const u8 = &.{},
+    /// `.options soalimits="file.json"` as written (relative to the deck),
+    /// the last one given; empty without one (#238).
+    soa_file: []const u8 = "",
+    /// `.options emirfile="file"` as written, `""` for the default name:
+    /// `--emir` to that file (#237).
+    emir_file: ?[]const u8 = null,
     /// `.meas` cards; their strings borrow the parse arena.
     measures: []const core.Measure,
     /// `.step` cards in deck order; the last varies fastest.
@@ -378,6 +436,8 @@ pub const Deck = struct {
     variations: []const Variation = &.{},
     /// The optimization of the deck's one `SWEEP OPTIMIZE=` card.
     optimize: ?Optimize = null,
+    /// The deck's one `.wcd` card (#240).
+    wcd: ?Wcd = null,
     /// Each `.alter` run's full source, cumulative, expanded; set by
     /// `prepare`.
     alters: []const []const u8 = &.{},
@@ -446,6 +506,8 @@ pub const Netlist = struct {
     tunable: []const u32 = &.{},
     /// The `ForeignKind.data` files, as `prepare` read them.
     files: []const DataFile = &.{},
+    /// The `.options soalimits=` file's limits, as `prepare` read them.
+    soa_ratings: []const SoaRating = &.{},
 
     /// A card as the builder reads it.
     pub const View = struct {
@@ -629,6 +691,19 @@ fn nameKey(owner: u64, name: []const u8) u64 {
     return siteKey(owner, std.hash.Wyhash.hash(0, name));
 }
 
+/// Whether output name `name`, lowercased, is a device operating-point
+/// variable as `dialect` spells one (#236): ngspice's `@m1[gm]` in any,
+/// HSPICE's `lx7(m1)` and `lv9(m1)` element templates, Spectre's `m1:gm`.
+/// `prepare` resolves it or refuses the deck.
+pub fn isOpVar(dialect: Dialect, name: []const u8) bool {
+    if (name.len != 0 and name[0] == '@') return true;
+    return switch (dialect) {
+        .ngspice => false,
+        .hspice => name.len > 3 and name[0] == 'l' and (name[1] == 'x' or name[1] == 'v') and std.ascii.isDigit(name[2]) and name[name.len - 1] == ')',
+        .spectre => std.mem.indexOfScalar(u8, name, ':') != null and std.mem.indexOfScalar(u8, name, '(') == null,
+    };
+}
+
 /// True for a name that is ground in `dialect`: only `0` in Spectre, where
 /// `gnd` is ground only when `global` names it first (spectre-syntax.md §7).
 pub fn isGround(dialect: Dialect, name: []const u8) bool {
@@ -652,7 +727,7 @@ pub fn nameIndex(names: []const []const u8, target: []const u8) ?usize {
 
 /// `ignored`: a card that only shapes printed output, which ESPice writes
 /// in full anyway.
-const Card = union(enum) { end, ends, subckt, param, func, model, include, osdi_include, pre_osdi, verilog, control, endc, options, ic, nodeset, global, connect, save, store, sample, meas, ignored, mosra, appendmodel, step, data, enddata, variation, end_variation, analysis: Kind, cond: CondCard };
+const Card = union(enum) { end, ends, subckt, param, func, model, include, osdi_include, pre_osdi, verilog, control, endc, options, ic, nodeset, global, connect, save, store, sample, meas, ignored, mosra, appendmodel, step, data, enddata, variation, end_variation, wcd, analysis: Kind, cond: CondCard };
 
 const CondCard = enum { @"if", elseif, @"else", endif };
 
@@ -727,9 +802,9 @@ const cards = std.StaticStringMap(Card).initComptime(.{
     .{ "unprotect", .ignored },      .{ "prot", .ignored },              .{ "unprot", .ignored },
 });
 
-/// Sweep and variation cards (frontend/variants.zig).
+/// Sweep and variation cards (frontend/variants.zig), and `.wcd` (#240).
 const variant_cards = std.StaticStringMap(Card).initComptime(.{
-    .{ "step", .step }, .{ "data", .data }, .{ "enddata", .enddata }, .{ "variation", .variation }, .{ "end_variation", .end_variation },
+    .{ "step", .step }, .{ "data", .data }, .{ "enddata", .enddata }, .{ "variation", .variation }, .{ "end_variation", .end_variation }, .{ "wcd", .wcd },
 });
 
 /// A behavioural E/F/G/H form, named by the word in the first control-node
@@ -816,18 +891,35 @@ fn cardOf(head: []const u8) ?Card {
 /// an arena: nothing is freed piecewise. Fails per `Error`; partial
 /// results stay in the arena.
 pub fn parse(arena: Allocator, src: []const u8, dialect: Dialect) Error!Netlist {
-    return parseLive(arena, src, dialect, &.{}) catch |err| switch (err) {
+    return parseWith(arena, src, dialect, .{});
+}
+
+/// How a parse reads its device cards. Every choice gives the same netlist,
+/// byte for byte.
+pub const ParseOptions = struct {
+    /// Threads that scan the top-level device cards' fields before the
+    /// cards are read in line order (#230); null takes the CPU count, at
+    /// most 16. 0 scans nothing: every card is read whole.
+    threads: ?u32 = null,
+    /// Fewest top-level device cards the scan runs for; a smaller deck
+    /// reads every card whole.
+    scan_min: u32 = 16 * 1024,
+};
+
+/// `parse`, reading device cards per `opts`.
+pub fn parseWith(arena: Allocator, src: []const u8, dialect: Dialect, opts: ParseOptions) Error!Netlist {
+    return parseLive(arena, src, dialect, &.{}, opts) catch |err| switch (err) {
         error.UnknownParameter => unreachable,
         else => |e| return e,
     };
 }
 
-/// `parse`, with the global `.param` names in `live` kept live as a
+/// `parseWith`, with the global `.param` names in `live` kept live as a
 /// swept name is (`Netlist.tunable`), so a later `setLive` can move them.
 /// `UnknownParameter` for a name no global `.param` defines.
-pub fn parseLive(arena: Allocator, src: []const u8, dialect: Dialect, live: []const []const u8) (Error || error{UnknownParameter})!Netlist {
+pub fn parseLive(arena: Allocator, src: []const u8, dialect: Dialect, live: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist {
     return switch (dialect) {
-        inline else => |d| Reader(lines.Syntax(d)).run(arena, src, d, live),
+        inline else => |d| Reader(lines.Syntax(d)).run(arena, src, d, live, opts),
     };
 }
 
@@ -937,6 +1029,30 @@ const Frame = struct {
     models_mark: u32 = 0,
 };
 
+/// A subcircuit body card as `readDevice` first read it, for the instances
+/// after (#229), or a top-level card as `scan` read it (#230): what the
+/// line's text alone decides, which is the same under every frame. A name,
+/// an expression and a model are frame-dependent and are re-read from their
+/// position in card order, so every scope lookup runs as it would have.
+const Replay = struct {
+    nodes: []const []const u8,
+    /// The model or subcircuit word, null on a fixed-pin card without one.
+    model: ?[]const u8,
+    fields: []const ReplayField,
+};
+
+/// A value field past the nodes and model, in card order.
+const ReplayField = struct {
+    /// A `key=value` field's key, or a positional value's first token.
+    word: []const u8,
+    keyed: bool,
+    /// A keyed literal's value (`literalValue`), or a scanned positional
+    /// literal's (`valueAt`'s `parseNum`); null re-reads from `pos`.
+    num: ?f64,
+    /// Just past the `=`, or past `word` for a positional.
+    pos: usize,
+};
+
 /// A subcircuit's port names to their first position.
 const PortIndex = std.StringHashMapUnmanaged(u32);
 
@@ -948,6 +1064,9 @@ const port_scan_max = 16;
 /// Nested `.subckt` definitions past this depth are refused; ngspice's
 /// syntax check warns past 10 (ngspice-syntax.md §4.1).
 const subckt_depth_max = 16;
+
+/// Most threads `scanCards` runs, each with its own arena.
+const scan_threads_max = 16;
 
 const Subckt = struct {
     name: []const u8,
@@ -1090,6 +1209,8 @@ fn Reader(comptime S: type) type {
         ic_cards: std.ArrayList([]const Value) = .empty,
         nodeset_cards: std.ArrayList([]const Value) = .empty,
         meas_lines: std.ArrayList([]const u8) = .empty,
+        /// The `.wcd` card, read once the `.meas` cards it names are.
+        wcd_line: ?[]const u8 = null,
         /// `.global` names: one net at every subcircuit level.
         global_nets: std.StringHashMapUnmanaged(void) = .empty,
         /// Per `lines` row, the device letter `spectre.translate` gave a
@@ -1101,6 +1222,8 @@ fn Reader(comptime S: type) type {
         /// The formals of the user functions `subst` is inside, innermost last.
         bindings: std.ArrayList(Binding) = .empty,
         saves: std.ArrayList([]const u8) = .empty,
+        opvar_saves: std.ArrayList([]const u8) = .empty,
+        probe_op: bool = false,
         save_all: bool = false,
         save_op: ?core.SaveOp = null,
         stims: std.ArrayList(core.Stim) = .empty,
@@ -1109,6 +1232,8 @@ fn Reader(comptime S: type) type {
         appendmodels: std.ArrayList(AppendModel) = .empty,
         foreign: std.ArrayList(Foreign) = .empty,
         vpi_apps: std.ArrayList([]const u8) = .empty,
+        soa_file: []const u8 = "",
+        emir_file: ?[]const u8 = null,
         measures: std.ArrayList(core.Measure) = .empty,
         instances: u32 = 1,
         /// `.data` and `.variation` blocks: first and one-past-last line.
@@ -1137,6 +1262,7 @@ fn Reader(comptime S: type) type {
         /// `Deck.draw_seed`.
         draw_seed: bool = false,
         optimize: ?Optimize = null,
+        wcd: ?Wcd = null,
         site_ops: std.ArrayList(u32) = .empty,
         site_keys: std.ArrayList(u64) = .empty,
         /// Key of the text whose distribution calls are being emitted, and
@@ -1148,6 +1274,10 @@ fn Reader(comptime S: type) type {
         pins: std.ArrayList(VertexId) = .empty,
         positional: std.ArrayList(Value) = .empty,
         card_kv: std.ArrayList(Kv) = .empty,
+        /// Per `lines` row, the body card's `Replay` once one instance read
+        /// it, or the top-level card's `scanCards` read; sized by
+        /// `scanCards` or on the first `expand`.
+        replays: []?*const Replay = &.{},
         scratch: expr.Scratch = .{},
         /// Parameter and function texts compiled once each (`compiledText`).
         compiled_texts: std.StringHashMapUnmanaged(*const expr.Scratch) = .empty,
@@ -1171,7 +1301,7 @@ fn Reader(comptime S: type) type {
             return r;
         }
 
-        fn run(arena: Allocator, src: []const u8, dialect: Dialect, live_params: []const []const u8) (Error || error{UnknownParameter})!Netlist {
+        fn run(arena: Allocator, src: []const u8, dialect: Dialect, live_params: []const []const u8, opts: ParseOptions) (Error || error{UnknownParameter})!Netlist {
             var line_hint: usize = undefined;
             const text: []const u8 = if (S.fold_case) blk: {
                 const buf = try arena.alloc(u8, src.len);
@@ -1252,7 +1382,8 @@ fn Reader(comptime S: type) type {
             // (#100). ngspice draws agauss/gauss/unif/aunif on every run, and
             // a seed makes that one reproducible sample. `.dcmatch`,
             // `.acmatch` and `.dcsens` without a `.variation` block read the
-            // mismatch off the calls (`variants.Planner.siteVariations`).
+            // mismatch off the calls (`variants.Planner.siteVariations`), as
+            // `.wcd` (#240) does.
             // ponytail: a top-level `.param` read in walk 1 stays nominal;
             // the PDK distributions sit in model cards and subcircuit params.
             var monte_card = false;
@@ -1261,6 +1392,7 @@ fn Reader(comptime S: type) type {
             for (directive_lines.items) |i| {
                 const line = r.lines.items[i];
                 seed = seed or seedOption(line);
+                mismatch = mismatch or isWcd(line);
                 const kind = analysisOf(line) orelse continue;
                 monte_card = monte_card or setsKey(line, "monte");
                 mismatch = mismatch or kind == .dcmatch or kind == .acmatch or kind == .dcsens;
@@ -1305,11 +1437,16 @@ fn Reader(comptime S: type) type {
             };
             try r.binOptions();
 
-            for (top_devices.items) |i| try r.readDevice(r.lines.items[i], r.kindOf(i), &top);
+            var scan_arenas: [scan_threads_max]std.heap.ArenaAllocator = undefined;
+            const scanned = try r.scanCards(top_devices.items, opts, &scan_arenas);
+            defer for (scan_arenas[0..scanned]) |s| s.deinit();
+            for (top_devices.items) |i| try r.readDevice(r.lines.items[i], r.kindOf(i), &top, if (scanned > 0) i else null);
             // The passes below read no one card.
             r.card = "";
             try r.shunts();
             try r.readMeasures();
+            try r.compileFails();
+            if (r.wcd_line) |line| r.wcd = try r.readWcd(line);
             var live = try r.resolveLive();
             live.conds = try r.liveConds();
             const scale = try r.arena.alloc(f64, live.slots.len);
@@ -1358,13 +1495,18 @@ fn Reader(comptime S: type) type {
                     .ic = try nodeValues(arena, r.ic_cards.items, nets),
                     .nodeset = try nodeValues(arena, r.nodeset_cards.items, nets),
                     .saves = if (r.save_all) &.{} else r.saves.items,
+                    .opvar_saves = r.opvar_saves.items,
+                    .probe_op = r.probe_op,
                     .foreign = r.foreign.items,
                     .vpi_apps = r.vpi_apps.items,
+                    .soa_file = r.soa_file,
+                    .emir_file = r.emir_file,
                     .measures = r.measures.items,
                     .steps = r.steps.items,
                     .data = r.data.items,
                     .variations = r.variations.items,
                     .optimize = r.optimize,
+                    .wcd = r.wcd,
                     .save_op = r.save_op,
                     .stims = r.stims.items,
                     .sample = r.sample,
@@ -2020,19 +2162,44 @@ fn Reader(comptime S: type) type {
             return args.items;
         }
 
-        /// A `.options` card that sets `vpi=` (ESPice's, #197): each
-        /// `vpi="app.so"` names a VPI application (LRM 12.33) for `vpi_apps`,
-        /// path case kept; the card's other options read as any `.options`.
-        fn readVpiOptions(r: *R, line: []const u8) Error!void {
+        /// Cuts `fail='expr'` (quoted or braced) out of analysis card
+        /// `line` and points `f`, past the card, at what is left; returns
+        /// the expression's text, "" when no field is `fail=`.
+        fn cutFail(r: *R, line: []const u8, f: *F) Error![]const u8 {
+            var g = f.*;
+            while (g.next()) |t| {
+                if (!std.mem.eql(u8, t, "fail") or !g.takeEq()) continue;
+                const v = g.next() orelse return r.failed(line, error.ParseError);
+                if (!F.isQuote(v[0]) and !(v[0] == '{' and v[v.len - 1] == '}')) return r.failed(line, error.ParseError);
+                const start = @intFromPtr(t.ptr) - @intFromPtr(line.ptr);
+                const end = @intFromPtr(v.ptr) - @intFromPtr(line.ptr) + v.len;
+                f.* = F.init(try std.mem.concat(r.arena, u8, &.{ line[0..start], " ", line[end..] }));
+                _ = f.next(); // the card
+                return F.body(v);
+            }
+            return "";
+        }
+
+        /// A `.options` card that names a file, path case kept: each
+        /// `vpi="app.so"` (ESPice's, #197) a VPI application (LRM 12.33) for
+        /// `vpi_apps`, `soalimits="file.json"` (#238) the SOA limits for
+        /// `soa_file`, `emirfile="f"` (#237) the `--emir` file. The card's
+        /// other options read as any `.options`.
+        fn readFileOptions(r: *R, line: []const u8) Error!void {
             var f = F.init(line);
             _ = f.next(); // the card
             var rest: std.ArrayList(u8) = .empty;
             try rest.appendSlice(r.arena, ".options");
             while (f.next()) |t| {
-                if (std.mem.eql(u8, t, "vpi")) {
+                if (std.mem.eql(u8, t, "vpi") or std.mem.eql(u8, t, "soalimits") or std.mem.eql(u8, t, "emirfile")) {
                     const eq = f.next() orelse return r.failed(line, error.ParseError);
                     if (eq[0] != '=') return r.failed(line, error.ParseError);
-                    try r.vpi_apps.append(r.arena, r.pathOf(&f) catch |err| return r.failed(line, err));
+                    const path = r.pathOf(&f) catch |err| return r.failed(line, err);
+                    switch (t[0]) {
+                        'v' => try r.vpi_apps.append(r.arena, path),
+                        's' => r.soa_file = path,
+                        else => r.emir_file = path,
+                    }
                     continue;
                 }
                 try rest.append(r.arena, ' ');
@@ -2051,6 +2218,13 @@ fn Reader(comptime S: type) type {
             return c == .step;
         }
 
+        /// True for a `.wcd` directive line.
+        fn isWcd(line: []const u8) bool {
+            var f = F.init(line);
+            const c = cardOf(f.next().?[1..]) orelse return false;
+            return c == .wcd;
+        }
+
         fn readDirective(r: *R, line: []const u8) Error!void {
             r.card = line;
             var f = F.init(line);
@@ -2059,13 +2233,24 @@ fn Reader(comptime S: type) type {
             // takes the last one.
             if (card != null and card.? == .meas) return r.meas_lines.append(r.arena, line);
             const c = card orelse return r.unsupported(line, "unsupported card");
-            if (c == .ignored) return;
+            if (c == .wcd) {
+                if (r.wcd_line != null) return r.unsupported(line, "a second .wcd card");
+                r.wcd_line = line;
+                return;
+            }
+            if (c == .ignored) {
+                if (r.dialect != .ngspice and std.ascii.startsWithIgnoreCase(line, ".probe")) try r.readProbe(line);
+                return;
+            }
             if (c == .save and r.dialect == .hspice) return r.readSaveOp(line, &f);
             // HSPICE `.store` checkpoints the process on a wall-clock
             // schedule for an OS-level restore [CR .STORE]; the results do not
             // depend on it.
             if (c == .store) return std.log.warn("netlist: .store: checkpoints are not written; the run is not restartable", .{});
-            if (c == .options and setsKey(line, "vpi")) return r.readVpiOptions(line);
+            if (c == .options and (setsKey(line, "vpi") or setsKey(line, "soalimits") or setsKey(line, "emirfile"))) return r.readFileOptions(line);
+            // `FAIL='expr'` keeps its text: `readArgs` would fold it before
+            // the `.meas` cards it names are read.
+            const fail = if (c == .analysis and setsKey(line, "fail")) try r.cutFail(line, &f) else "";
             const args = r.readArgs(&f) catch |err| return r.failed(line, err);
             switch (c) {
                 .step => try r.steps.append(r.arena, r.readStep(args) catch |err| return r.failed(line, err)),
@@ -2073,7 +2258,15 @@ fn Reader(comptime S: type) type {
                     // HSPICE's `.temp t1 t2 ...` lists run temperatures; ngspice's
                     // three-number form is a sweep.
                     const temp_list = kind == .temp and args.len > 1 and r.dialect == .hspice;
-                    const swept = r.readSweep(kind, args) catch |err| return r.failed(line, err);
+                    var swept = r.readSweep(kind, args) catch |err| return r.failed(line, err);
+                    const scaled = swept.sweep == .monte and swept.sweep.monte.scales.len != 0;
+                    if (scaled != (fail.len != 0)) return r.unsupported(line, "SIGMA_SCALE= without FAIL=, or FAIL= without SIGMA_SCALE=");
+                    if (scaled) {
+                        if (kind != .tran and kind != .ac and kind != .dc) return r.unsupported(line, "SIGMA_SCALE on a card other than .tran, .ac or .dc");
+                        // The lane ensemble (`.dc MONTE=n`) measures no trial.
+                        if (kind == .dc and swept.args.len == 0) return r.unsupported(line, "SIGMA_SCALE on a .dc with no sweep of its own");
+                        swept.sweep.monte.fail.text = fail;
+                    }
                     if (!temp_list) try appendAnalysis(r.arena, &r.analyses, .{ .kind = kind, .args = swept.args, .sweep = swept.sweep, .line = r.written(line), .dialect = r.dialect, .sn = isSn(line) });
                     if (kind == .temp and (args.len == 1 or temp_list)) try r.config.append(r.arena, .{ .temp = true, .args = args, .line = r.written(line) });
                 },
@@ -2112,10 +2305,32 @@ fn Reader(comptime S: type) type {
                     },
                     .name => |n| if (std.ascii.eqlIgnoreCase(n, "all")) {
                         r.save_all = true;
+                    } else if (n[0] == '@') {
+                        // A device operating-point variable (`@m1[gm]`, #236);
+                        // `prepare` resolves it or refuses the deck.
+                        const label = try r.arena.dupe(u8, n);
+                        try r.opvar_saves.append(r.arena, std.ascii.lowerString(label, label));
+                        // Holds `saves` non-empty, so the probes narrow.
+                        try r.saves.append(r.arena, label);
                     },
                     else => {},
                 },
                 else => {},
+            }
+        }
+
+        /// HSPICE `.probe` [CR .PROBE], and Spectre's `save` as spectre.zig
+        /// rewrites it: `op` saves every device's operating-point variables
+        /// and an `isOpVar` name that one (#236). Every other output is
+        /// written anyway, as HSPICE does without `.option probe`.
+        fn readProbe(r: *R, line: []const u8) Error!void {
+            var it = std.mem.tokenizeAny(u8, line, " \t,");
+            _ = it.next(); // the card
+            while (it.next()) |t| {
+                const name = try std.ascii.allocLowerString(r.arena, t);
+                if (std.mem.eql(u8, name, "op")) {
+                    r.probe_op = true;
+                } else if (isOpVar(r.dialect, name)) try r.opvar_saves.append(r.arena, name);
             }
         }
 
@@ -2344,9 +2559,25 @@ fn Reader(comptime S: type) type {
                     break :blk .{ .monte = .{ .n = @intCast(list.len), .list = list } };
                 }
                 var m: Monte = .{ .n = try positiveCount(tail, 1) };
-                if (tail.len == 4 and tail[2] == .name and std.mem.eql(u8, tail[2].name, "firstrun")) {
-                    m.first = try positiveCount(tail, 3);
-                } else if (tail.len != 2) return error.ParseError;
+                var k: usize = 2;
+                while (k < tail.len) {
+                    if (tail[k] != .name) return error.ParseError;
+                    if (std.mem.eql(u8, tail[k].name, "firstrun")) {
+                        m.first = try positiveCount(tail, k + 1);
+                        k += 2;
+                    } else if (std.mem.eql(u8, tail[k].name, "sigma_scale") and m.scales.len == 0) {
+                        // `SIGMA_SCALE=2,2.5,3`: the numbers up to the next name.
+                        var scales: std.ArrayList(f64) = .empty;
+                        k += 1;
+                        while (k < tail.len and tail[k] == .num) : (k += 1) {
+                            const s = tail[k].num;
+                            if (!(s > 0 and s < std.math.inf(f64)) or std.mem.indexOfScalar(f64, scales.items, s) != null) return error.ParseError;
+                            try scales.append(r.arena, s);
+                        }
+                        if (scales.items.len == 0) return error.ParseError;
+                        m.scales = scales.items;
+                    } else return error.ParseError;
+                }
                 r.monte = true;
                 break :blk .{ .monte = m };
             } else blk: {
@@ -2825,16 +3056,7 @@ fn Reader(comptime S: type) type {
             // HSPICE reads a brace as a name byte, so `{...}` is a word there
             // and goes to the bare-value rules (#203).
             if ((rest[0] == '{' and !F.isWord(rest)) or rest[0] == '\'') return r.readValue(f, frame, true, geometry);
-            // A lone number literal (`w=0.5u`) needs no compile; nor does
-            // ngspice's `r=10%3`, which it reads as 10 (`junkNumber`, #200).
-            if (std.ascii.isDigit(rest[0]) or rest[0] == '.') {
-                const save = f.pos;
-                const w = f.next().?;
-                const lone = expr.numberLen(w) == w.len or (r.dialect == .ngspice and junkNumber(w));
-                if (lone and !expr.isOperator(f.nextByte() orelse ' '))
-                    return .{ .num = S.parseNum(w) orelse return error.ParseError };
-                f.pos = save;
-            }
+            if (try r.literalValue(f)) |n| return .{ .num = n };
             const mark = r.scratch.mark();
             defer r.scratch.reset(mark);
             const start = f.pos;
@@ -2844,6 +3066,21 @@ fn Reader(comptime S: type) type {
             if (ops.len == 1 and ops[0].code == .num) return .{ .num = r.scratch.consts.items[ops[0].a] };
             if (ops.len == 1 and ops[0].code == .ident) return r.nameValue(r.scratch.names.items[ops[0].a], frame, geometry);
             return r.fold(mark.ops, frame, geometry);
+        }
+
+        /// The value after `key=` when it is a lone number literal (`w=0.5u`),
+        /// which needs no compile, or ngspice's `r=10%3`, read as 10
+        /// (`junkNumber`, #200): `f` moves past it. Null, `f` unmoved, for
+        /// anything else. The line's text alone decides it, never a scope.
+        fn literalValue(r: *const R, f: *F) Error!?f64 {
+            const rest = f.rest();
+            if (rest.len == 0 or !(std.ascii.isDigit(rest[0]) or rest[0] == '.')) return null;
+            const save = f.pos;
+            const w = f.next().?;
+            const lone = expr.numberLen(w) == w.len or (r.dialect == .ngspice and junkNumber(w));
+            if (lone and !expr.isOperator(f.nextByte() orelse ' ')) return S.parseNum(w) orelse return error.ParseError;
+            f.pos = save;
+            return null;
         }
 
         /// Whether ngspice reads field `w` as one number token whose rest it
@@ -2874,14 +3111,18 @@ fn Reader(comptime S: type) type {
         /// read, as do X cards and dot cards. tests/frontend/lower.zig
         /// `element` refuses the same fields.
         fn refuseOperatorField(r: *R, line: []const u8, t: []const u8) Error!void {
-            if (!F.isWord(t)) return;
+            if (r.operatorLed(t)) return r.unsupported(line, "an operator where a name or value belongs");
+        }
+
+        /// Whether `refuseOperatorField` refuses field `t`.
+        fn operatorLed(r: *const R, t: []const u8) bool {
+            if (!F.isWord(t)) return false;
             const leads: []const u8 = switch (r.dialect) {
                 .ngspice => "%\\*/^|&?",
                 .hspice => "%\\",
                 .spectre => "",
             };
-            if (std.mem.indexOfScalar(u8, leads, t[0]) == null) return;
-            return r.unsupported(line, "an operator where a name or value belongs");
+            return std.mem.indexOfScalar(u8, leads, t[0]) != null;
         }
 
         /// A bare name: substituted when a scope defines it.
@@ -2892,6 +3133,84 @@ fn Reader(comptime S: type) type {
             try r.scratch.names.append(r.arena, name);
             try r.scratch.ops.append(r.arena, .{ .code = .ident, .a = @intCast(mark.names) });
             return r.fold(mark.ops, frame, geometry);
+        }
+
+        /// Compiles each SIGMA_SCALE card's FAIL now that every `.meas`
+        /// card is read: a name reads that card's value (`.live`, its index
+        /// in `measures`). A name of no card of the analysis, a probe, a
+        /// distribution or an unknown function is refused, as is a second
+        /// MONTE card of the analysis (its trials would count too).
+        fn compileFails(r: *R) Error!void {
+            for (r.analyses.items, 0..) |*a, i| {
+                if (a.sweep != .monte or a.sweep.monte.scales.len == 0) continue;
+                for (r.analyses.items, 0..) |b, j| if (j != i and b.kind == a.kind and b.sweep == .monte)
+                    return r.unsupported(a.line, "SIGMA_SCALE beside another MONTE card of its analysis");
+                // ponytail: one result per trial; a `.temp` list would give several.
+                for (r.config.items) |c| if (c.temp and c.args.len > 1) return r.unsupported(a.line, "SIGMA_SCALE with a .temp list");
+                const fail = &a.sweep.monte.fail;
+                const mark = r.scratch.mark();
+                defer r.scratch.reset(mark);
+                expr.compileAll(S, r.arena, &r.scratch, fail.text) catch |err| return r.failed(a.line, err);
+                const ops = try r.arena.dupe(expr.Op, r.scratch.ops.items[mark.ops..]);
+                const names = r.scratch.names.items;
+                for (ops) |*op| switch (op.code) {
+                    .ident => op.* = .{ .code = .live, .a = for (r.measures.items, 0..) |m, k| {
+                        if (m.analysis == a.kind and std.mem.eql(u8, m.name, names[op.a])) break @intCast(k);
+                    } else return r.unsupported(a.line, "FAIL names no .meas card of its analysis") },
+                    .vprobe, .iprobe, .ucall => return r.unsupported(a.line, "FAIL reads its analysis's .meas cards, not vectors or unknown functions"),
+                    .call => if (expr.isDistribution(@fromBackingInt(@intCast(op.a)))) return r.unsupported(a.line, "a distribution in FAIL"),
+                    else => {}, // else: numbers, arithmetic, comparisons, logic and math calls
+                };
+                fail.ops = ops;
+                fail.consts = try r.arena.dupe(f64, r.scratch.consts.items);
+            }
+        }
+
+        /// The `.wcd` card `line` (#240), now that every `.meas` card is
+        /// read: `name 'op number'` pairs, op one of `>=`, `>`, `<=`, `<`
+        /// and the number as a `.meas` value, then `MAXITER=`, `TOL=` and
+        /// `TOP=`. Refuses a name of no `.meas` card, a card named twice,
+        /// SWEEP OPTIMIZE (whose variant table it would share) and an
+        /// HSPICE `.temp` list (one value per spec and point).
+        fn readWcd(r: *R, line: []const u8) Error!Wcd {
+            r.card = line;
+            if (r.optimize != null) return r.unsupported(line, ".wcd together with SWEEP OPTIMIZE");
+            for (r.config.items) |c| if (c.temp and c.args.len > 1) return r.unsupported(line, ".wcd with a .temp list");
+            var w: Wcd = .{ .specs = &.{}, .line = r.written(line) };
+            var specs: std.ArrayList(WcdSpec) = .empty;
+            var f = F.init(line);
+            _ = f.next(); // the card
+            while (f.next()) |t| {
+                if (!F.isWord(t)) return r.failed(line, error.ParseError);
+                if (f.takeEq()) {
+                    const v = S.parseNum(f.next() orelse return r.failed(line, error.ParseError)) orelse return r.failed(line, error.ParseError);
+                    const count = v >= 1 and v <= 1e6 and v == @floor(v);
+                    if (std.mem.eql(u8, t, "maxiter") and count) {
+                        w.maxiter = @intFromFloat(v);
+                    } else if (std.mem.eql(u8, t, "top") and (count or v == 0)) {
+                        w.top = @intFromFloat(v);
+                    } else if (std.mem.eql(u8, t, "tol") and v > 0 and v < std.math.inf(f64)) {
+                        w.tol = v;
+                    } else return r.failed(line, error.ParseError);
+                    continue;
+                }
+                const card: u32 = for (r.measures.items, 0..) |m, k| {
+                    if (std.mem.eql(u8, m.name, t)) break @intCast(k);
+                } else return r.unsupported(line, "a .wcd spec that names no .meas card");
+                for (specs.items) |s| if (s.measure == card) return r.unsupported(line, "a .meas card named twice in .wcd");
+                const q = f.next() orelse return r.failed(line, error.ParseError);
+                if (!F.isQuote(q[0]) and q[0] != '{') return r.failed(line, error.ParseError);
+                const rel = std.mem.trim(u8, F.body(q), " \t");
+                const above = rel.len != 0 and rel[0] == '>';
+                if (!above and !(rel.len != 0 and rel[0] == '<')) return r.failed(line, error.ParseError);
+                const op_len: usize = if (rel.len > 1 and rel[1] == '=') 2 else 1;
+                const limit = r.measureValue(std.mem.trim(u8, rel[op_len..], " \t")) catch |err| return r.failed(line, err);
+                if (!std.math.isFinite(limit)) return r.failed(line, error.ParseError);
+                try specs.append(r.arena, .{ .measure = card, .above = above, .limit = limit, .bound = rel });
+            }
+            if (specs.items.len == 0) return r.failed(line, error.ParseError);
+            w.specs = specs.items;
+            return w;
         }
 
         /// Parses the `.meas` cards in deck order. ngspice reports a bad one
@@ -3097,7 +3416,8 @@ fn Reader(comptime S: type) type {
 
         /// A `PARAM=` or `par()` measure expression in postfix: names of
         /// earlier `.meas` cards read their results, global parameters fold
-        /// to numbers, `v(a[,b])` and `i(x)` read result vectors. Arithmetic
+        /// to numbers, `v(a[,b])` and `i(x)` read result vectors, and
+        /// `soa_count()` the result's SOA excursions (#238). Arithmetic
         /// only; anything else is a ParseError. The ops live in the arena.
         pub fn measureExpr(r: *R, text: []const u8) Error![]const core.MeasureOp {
             const body = if (text.len > 0 and (text[0] == '{' or F.isQuote(text[0]))) F.body(text) else text;
@@ -3128,6 +3448,7 @@ fn Reader(comptime S: type) type {
                 .mul => .mul,
                 .div => .div,
                 .pow => .pow,
+                .ucall => if (op.b == 0 and std.ascii.eqlIgnoreCase(names[op.a], "soa_count")) .soa_count else return error.ParseError,
                 else => return error.ParseError,
             });
             return out.items;
@@ -3490,7 +3811,10 @@ fn Reader(comptime S: type) type {
 
         /// Reads device card `line`; `kind` is its letter when its name does
         /// not carry it (`kindOf`), else 0.
-        fn readDevice(r: *R, line: []const u8, kind: u8, frame: *const Frame) Error!void {
+        /// `row` is its `lines` row when it is a subcircuit body card (the
+        /// first read keeps a `Replay` there and later instances read it)
+        /// or a top-level card `scanCards` scanned (it reads that `Replay`).
+        fn readDevice(r: *R, line: []const u8, kind: u8, frame: *const Frame, row: ?usize) Error!void {
             r.card = line;
             const arena = r.arena;
             const port_card = r.dialect == .hspice and std.ascii.toLower(line[0]) == 'p';
@@ -3506,12 +3830,13 @@ fn Reader(comptime S: type) type {
             // for `.lin` (`P1 in 0 port=1 z0=50`). A Spectre card's letter
             // is its master's, kept beside it.
             const letter = if (port_card) 'v' else if (kind != 0) kind else std.ascii.toLower(head[0]);
+            if (row) |i| if (r.replays[i]) |rp| return r.replay(rp, line, head, letter, frame);
             // HSPICE reads these letters as IBIS buffers and lumped lines,
             // neither of which is built.
             if (r.dialect == .hspice and std.mem.indexOfScalar(u8, "bu", letter) != null)
                 return r.unsupported(line, "unsupported HSPICE element");
             if (r.dialect == .hspice and (letter == 's' or letter == 'w')) return r.readDataElement(head, letter, &f, frame);
-            if (letter == 'r' and r.dialect == .ngspice) if (try r.behaviouralResistor(line)) |b| return r.readDevice(b, 0, frame);
+            if (letter == 'r' and r.dialect == .ngspice) if (try r.behaviouralResistor(line)) |b| return r.readDevice(b, 0, frame, null);
             if (std.mem.indexOfScalar(u8, "efgh", letter) != null) {
                 var probe = f;
                 _ = probe.next();
@@ -3530,7 +3855,7 @@ fn Reader(comptime S: type) type {
                             if (u.len > buf.len or (behavioural.get(std.ascii.lowerString(&buf, u)) orelse .refused) != .kind) break;
                             _ = probe.next();
                         }
-                        return r.readDevice(try std.mem.concat(r.arena, u8, &.{ line[0..at], " ", probe.line[probe.pos..] }), letter, frame);
+                        return r.readDevice(try std.mem.concat(r.arena, u8, &.{ line[0..at], " ", probe.line[probe.pos..] }), letter, frame, null);
                     }
                     // HSPICE: VCR and VCCAP are G-element forms only (#75).
                     if ((form == .vcr or form == .vccap) and letter != 'g') return r.unsupported(line, "VCR or VCCAP on a card other than G");
@@ -3541,57 +3866,28 @@ fn Reader(comptime S: type) type {
             r.positional.clearRetainingCapacity();
             r.card_kv.clearRetainingCapacity();
             var kv_text: std.ArrayList([]const u8) = .empty;
+            // An X card expands, an HSPICE P card reads a rewritten line and
+            // a top-level card is read once: none replays.
+            // ponytail: a positional literal (`R1 a b 1k`) is re-read too.
+            const slot: ?usize = if (port_card or letter == 'x' or frame.sub == null) null else row;
+            var fields: std.ArrayList(ReplayField) = .empty;
 
-            if ((f.nextByte() orelse return error.ParseError) == '(') {
-                _ = f.next();
-                while (true) {
-                    const t = f.next() orelse return error.ParseError;
-                    if (t[0] == ')') break;
-                    if (t[0] == ',') continue;
-                    if (!F.isWord(t)) return error.ParseError;
-                    try r.nodes.append(arena, t);
-                }
-                const model = f.next() orelse return error.ParseError;
-                if (!F.isWord(model)) return error.ParseError;
+            const model_word = try r.cardNodes(arena, &f, letter, port_card, &r.nodes);
+            if (model_word) |model| {
                 if (letter != 'x') try r.refuseOperatorField(line, model);
                 try r.positional.append(arena, try r.nameValue(model, frame, false));
-            } else if (fixedPins(letter)) |fixed| {
-                const count = if (port_card and mixedPort(f)) 3 else fixed;
-                try r.nodes.ensureUnusedCapacity(arena, count);
-                for (0..count) |_| {
-                    const t = f.next() orelse return error.ParseError;
-                    if (!F.isWord(t)) return error.ParseError;
-                    r.nodes.appendAssumeCapacity(t);
+            } else if (letter == 'b') {
+                const out = f.next() orelse return error.ParseError;
+                const eq = f.next() orelse return error.ParseError;
+                if (!F.isWord(out) or eq[0] != '=') return error.ParseError;
+                try r.card_kv.append(arena, .{ .key = out, .value = try r.exprValue(try r.exprRest(&f), frame, false) });
+                // A braced expression may be followed by instance
+                // parameters (`i={...} tc1=1m reciproctc=1`).
+                while (f.next()) |t| {
+                    if (!F.isWord(t) or !f.takeEq()) return error.ParseError;
+                    try r.card_kv.append(arena, .{ .key = t, .value = try r.kvValue(&f, frame, false) });
                 }
-                if (letter == 'b') {
-                    const out = f.next() orelse return error.ParseError;
-                    const eq = f.next() orelse return error.ParseError;
-                    if (!F.isWord(out) or eq[0] != '=') return error.ParseError;
-                    try r.card_kv.append(arena, .{ .key = out, .value = try r.exprValue(try r.exprRest(&f), frame, false) });
-                    // A braced expression may be followed by instance
-                    // parameters (`i={...} tc1=1m reciproctc=1`).
-                    while (f.next()) |t| {
-                        if (!F.isWord(t) or !f.takeEq()) return error.ParseError;
-                        try r.card_kv.append(arena, .{ .key = t, .value = try r.kvValue(&f, frame, false) });
-                    }
-                    return r.commit(head, letter, frame);
-                }
-            } else {
-                // Variable-terminal cards end their word list with the model/subcircuit name.
-                while (true) {
-                    const save = f.pos;
-                    const t = f.next() orelse break;
-                    if (!F.isWord(t) or f.takeEq()) {
-                        f.pos = save;
-                        break;
-                    }
-                    try r.nodes.append(arena, t);
-                }
-                // ngspice reads `X1 a b sub params: p=1` (numparam's subcircuit call).
-                if (letter == 'x' and r.dialect == .ngspice and r.nodes.items.len > 0 and std.mem.eql(u8, r.nodes.items[r.nodes.items.len - 1], "params:")) _ = r.nodes.pop();
-                const model = r.nodes.pop() orelse return error.ParseError;
-                if (letter != 'x') try r.refuseOperatorField(line, model);
-                try r.positional.append(arena, try r.nameValue(model, frame, false));
+                return r.commit(head, letter, frame);
             }
 
             // A third node makes a mixed-mode (balanced) port, not built.
@@ -3599,23 +3895,214 @@ fn Reader(comptime S: type) type {
                 var probe = f;
                 if (probe.next()) |t| if (F.isWord(t) and !probe.takeEq()) return r.unsupported(line, "mixed-mode P element");
             }
-            while (f.next()) |t| {
-                if (t[0] == ',') {
-                    continue;
-                } else if (F.isWord(t) and f.takeEq()) {
-                    const start = f.pos;
-                    try r.card_kv.append(arena, .{ .key = t, .value = try r.kvValue(&f, frame, false) });
-                    if (letter == 'x') try kv_text.append(arena, std.mem.trim(u8, f.line[start..f.pos], " \t"));
-                } else {
-                    if (letter != 'x') try r.refuseOperatorField(line, t);
-                    try r.positional.append(arena, try r.valueAt(t, &f, frame, true, false));
-                }
-            }
+            try readFields(false, r, arena, line, letter, &f, frame, if (slot != null) &fields else null, &kv_text);
             if (letter == 'x') return r.expand(head, frame, kv_text.items);
+            if (slot) |i| {
+                const rp = try arena.create(Replay);
+                rp.* = .{ .nodes = try arena.dupe([]const u8, r.nodes.items), .model = model_word, .fields = fields.items };
+                r.replays[i] = rp;
+            }
             // A D card's third node is its thermal node `tj` when a model
             // name follows it (ngspice-syntax.md §3.2, #121).
             if (letter == 'q' or letter == 'm' or letter == 'd') try r.splitTerminals();
             return r.commit(head, letter, frame);
+        }
+
+        /// Reads card `line` from the `Replay` its first read or `scan` kept: the
+        /// nodes and literals reused, every other field re-read under `frame`
+        /// in card order, then split and committed as `readDevice` does.
+        fn replay(r: *R, rp: *const Replay, line: []const u8, head: []const u8, letter: u8, frame: *const Frame) Error!void {
+            const arena = r.arena;
+            r.nodes.clearRetainingCapacity();
+            r.positional.clearRetainingCapacity();
+            r.card_kv.clearRetainingCapacity();
+            try r.nodes.appendSlice(arena, rp.nodes);
+            if (rp.model) |m| try r.positional.append(arena, try r.nameValue(m, frame, false));
+            var f = F.init(line);
+            for (rp.fields) |field| {
+                f.pos = field.pos;
+                const value: Value = if (field.num) |n| .{ .num = n } else if (field.keyed) try r.kvValue(&f, frame, false) else try r.valueAt(field.word, &f, frame, true, false);
+                if (field.keyed) try r.card_kv.append(arena, .{ .key = field.word, .value = value }) else try r.positional.append(arena, value);
+            }
+            if (letter == 'q' or letter == 'm' or letter == 'd') try r.splitTerminals();
+            return r.commit(head, letter, frame);
+        }
+
+        /// A card's nodes into `nodes`, `f` just past its head, and the
+        /// model or subcircuit word after them: the `(`-listed nodes and
+        /// the word after the `)`, the fixed pins and null, or the words
+        /// before the first value. Reads only the line (#230).
+        fn cardNodes(r: *const R, a: Allocator, f: *F, letter: u8, port_card: bool, nodes: *std.ArrayList([]const u8)) Error!?[]const u8 {
+            if ((f.nextByte() orelse return error.ParseError) == '(') {
+                _ = f.next();
+                while (true) {
+                    const t = f.next() orelse return error.ParseError;
+                    if (t[0] == ')') break;
+                    if (t[0] == ',') continue;
+                    if (!F.isWord(t)) return error.ParseError;
+                    try nodes.append(a, t);
+                }
+                const model = f.next() orelse return error.ParseError;
+                if (!F.isWord(model)) return error.ParseError;
+                return model;
+            }
+            if (fixedPins(letter)) |fixed| {
+                const count = if (port_card and mixedPort(f.*)) 3 else fixed;
+                try nodes.ensureUnusedCapacity(a, count);
+                for (0..count) |_| {
+                    const t = f.next() orelse return error.ParseError;
+                    if (!F.isWord(t)) return error.ParseError;
+                    nodes.appendAssumeCapacity(t);
+                }
+                return null;
+            }
+            // Variable-terminal cards end their word list with the model/subcircuit name.
+            while (true) {
+                const save = f.pos;
+                const t = f.next() orelse break;
+                if (!F.isWord(t) or f.takeEq()) {
+                    f.pos = save;
+                    break;
+                }
+                try nodes.append(a, t);
+            }
+            // ngspice reads `X1 a b sub params: p=1` (numparam's subcircuit call).
+            if (letter == 'x' and r.dialect == .ngspice and nodes.items.len > 0 and std.mem.eql(u8, nodes.items[nodes.items.len - 1], "params:")) _ = nodes.pop();
+            return nodes.pop() orelse return error.ParseError;
+        }
+
+        /// The value fields after a card's nodes and model, in card order,
+        /// each noted in `fields` when it is not null. Not `pure`, each value
+        /// is read into `positional` or `card_kv` as it comes, and an X
+        /// card's value texts into `kv_text`. `pure` reads only the line,
+        /// so threads may share `r` (#230): a literal is kept in `fields`,
+        /// and a field whose read would fold, allocate a group or refuse is
+        /// `error.Fallback`, for `readDevice` to read the card whole.
+        fn readFields(
+            comptime pure: bool,
+            r: if (pure) *const R else *R,
+            a: Allocator,
+            line: []const u8,
+            letter: u8,
+            f: *F,
+            frame: if (pure) void else *const Frame,
+            fields: ?*std.ArrayList(ReplayField),
+            kv_text: if (pure) void else *std.ArrayList([]const u8),
+        ) (if (pure) error{ OutOfMemory, Fallback } else Error)!void {
+            while (f.next()) |t| {
+                if (t[0] == ',') continue;
+                if (F.isWord(t) and f.takeEq()) {
+                    const start = f.pos;
+                    if (pure) {
+                        const n = (r.literalValue(f) catch return error.Fallback) orelse return error.Fallback;
+                        try fields.?.append(a, .{ .word = t, .keyed = true, .num = n, .pos = start });
+                    } else {
+                        try r.card_kv.append(a, .{ .key = t, .value = try r.kvValue(f, frame, false) });
+                        if (letter == 'x') try kv_text.append(a, std.mem.trim(u8, f.line[start..f.pos], " \t"));
+                        if (fields) |list| {
+                            // `kvValue` read it as a literal exactly when this does.
+                            var probe = f.*;
+                            probe.pos = start;
+                            try list.append(a, .{ .word = t, .keyed = true, .num = try r.literalValue(&probe), .pos = start });
+                        }
+                    }
+                } else {
+                    const at = f.pos;
+                    if (pure) {
+                        // `valueAt` reads a word as a number or a name, and
+                        // a brace or quote as an expression `replay` folds;
+                        // a `name(` group allocates.
+                        const bare = F.isWord(t);
+                        if (r.operatorLed(t) or (bare and f.nextByte() == '(') or (!bare and t[0] != '{' and !F.isQuote(t[0]))) return error.Fallback;
+                        try fields.?.append(a, .{ .word = t, .keyed = false, .num = if (bare) S.parseNum(t) else null, .pos = at });
+                    } else {
+                        if (letter != 'x') try r.refuseOperatorField(line, t);
+                        try r.positional.append(a, try r.valueAt(t, f, frame, true, false));
+                        if (fields) |list| try list.append(a, .{ .word = t, .keyed = false, .num = null, .pos = at });
+                    }
+                }
+            }
+        }
+
+        /// Top-level card `row` read as far as its text alone decides: the
+        /// `Replay` that `readDevice` reads it from in line order, to the
+        /// result a whole read gives. Null for a card whose read takes
+        /// another path, would refuse it, or holds a field `readFields`
+        /// cannot scan; `readDevice` reads that one whole.
+        /// Reads only the dialect, the lines and their letters, fixed before
+        /// any device is read, so threads may share `r` (#230). `nodes`
+        /// and `fields` are scratch.
+        fn scan(r: *const R, a: Allocator, row: usize, nodes: *std.ArrayList([]const u8), fields: *std.ArrayList(ReplayField)) ?*const Replay {
+            const line = r.lines.items[row];
+            // `readDevice` reads an HSPICE P card from a rewritten line.
+            if (r.dialect == .hspice and std.ascii.toLower(line[0]) == 'p') return null;
+            var f = F.init(line);
+            const head = f.next() orelse return null;
+            if (!F.isWord(head) or !std.ascii.isAlphabetic(head[0])) return null;
+            const kind = r.kindOf(row);
+            const letter = if (kind != 0) kind else std.ascii.toLower(head[0]);
+            // The letters `readDevice` reads apart from the plain path, and
+            // an ngspice R card that may be a B source (`behaviouralResistor`
+            // tests a part of the line).
+            if (std.mem.indexOfScalar(u8, "bxefgh", letter) != null) return null;
+            if (r.dialect == .hspice and std.mem.indexOfScalar(u8, "usw", letter) != null) return null;
+            if (letter == 'r' and r.dialect == .ngspice and bTransformationWanted(line)) return null;
+            nodes.clearRetainingCapacity();
+            fields.clearRetainingCapacity();
+            const model = r.cardNodes(a, &f, letter, false, nodes) catch return null;
+            if (model) |m| if (r.operatorLed(m)) return null;
+            readFields(true, r, a, line, letter, &f, {}, fields, {}) catch return null;
+            const rp = a.create(Replay) catch return null;
+            rp.* = .{
+                .nodes = a.dupe([]const u8, nodes.items) catch return null,
+                .model = model,
+                .fields = a.dupe(ReplayField, fields.items) catch return null,
+            };
+            return rp;
+        }
+
+        /// Scans top-level cards `rows` into `replays` before any is read
+        /// (#230), on `opts.threads` threads, each over a contiguous run of
+        /// `rows` with its own arena in `arenas`. A record depends only on
+        /// its line, and `readDevice` still reads every card in line order,
+        /// so every id and row comes out as without the scan. Returns the
+        /// arenas begun, which the caller ends once the cards are read; 0
+        /// when it scans nothing.
+        fn scanCards(r: *R, rows: []const u32, opts: ParseOptions, arenas: *[scan_threads_max]std.heap.ArenaAllocator) Error!usize {
+            if (rows.len == 0 or rows.len < opts.scan_min) return 0;
+            const want: usize = opts.threads orelse (std.Thread.getCpuCount() catch 1);
+            if (want == 0) return 0;
+            if (r.replays.len == 0) {
+                r.replays = try r.arena.alloc(?*const Replay, r.lines.items.len);
+                @memset(r.replays, null);
+            }
+            const k: usize = if (@import("builtin").single_threaded) 1 else @min(want, scan_threads_max, rows.len);
+            std.debug.assert(k >= 1);
+            std.debug.assert(k <= rows.len);
+            for (arenas[0..k]) |*s| s.* = .init(core.gpa);
+            const per = (rows.len + k - 1) / k;
+            var threads: [scan_threads_max - 1]std.Thread = undefined;
+            var spawned: usize = 0;
+            if (!@import("builtin").single_threaded) while (spawned + 1 < k) : (spawned += 1) {
+                const lo = @min((spawned + 1) * per, rows.len);
+                const hi = @min(lo + per, rows.len);
+                threads[spawned] = std.Thread.spawn(.{}, scanRun, .{ @as(*const R, r), &arenas[spawned + 1], rows[lo..hi], r.replays }) catch break;
+            };
+            // The calling thread scans the first run, then any run whose
+            // thread failed to start.
+            for (0..k) |j| if (j == 0 or j > spawned) {
+                const lo = @min(j * per, rows.len);
+                scanRun(r, &arenas[0], rows[lo..@min(lo + per, rows.len)], r.replays);
+            };
+            for (threads[0..spawned]) |t| t.join();
+            return k;
+        }
+
+        /// `scan` of each row in `part` into `out`, allocating from `s`.
+        fn scanRun(r: *const R, s: *std.heap.ArenaAllocator, part: []const u32, out: []?*const Replay) void {
+            var nodes: std.ArrayList([]const u8) = .empty;
+            var fields: std.ArrayList(ReplayField) = .empty;
+            for (part) |i| out[i] = r.scan(s.allocator(), i, &nodes, &fields);
         }
 
         /// An E/F/G/H card in a behavioural form, `f` just past the name. Value,
@@ -4046,6 +4533,10 @@ fn Reader(comptime S: type) type {
                 .models_mark = @intCast(r.instance_models.items.len),
             };
             defer r.instance_models.shrinkRetainingCapacity(child.models_mark);
+            if (r.replays.len == 0) {
+                r.replays = try arena.alloc(?*const Replay, r.lines.items.len);
+                @memset(r.replays, null);
+            }
             // Models first, as ngspice reads every `.model` before any
             // device: the ones under a branch this instance keeps.
             const locals = r.local_models.items[sub.models_lo..sub.models_hi];
@@ -4072,7 +4563,7 @@ fn Reader(comptime S: type) type {
             var nested: u32 = 0;
             for (r.lines.items[sub.first..sub.end], sub.first..) |line, i| {
                 if (line[0] != '.') {
-                    if (nested == 0 and branches.active()) try r.readDevice(line, r.kindOf(i), &child);
+                    if (nested == 0 and branches.active()) try r.readDevice(line, r.kindOf(i), &child, i);
                     continue;
                 }
                 if (!sub.has_cond and !sub.has_nested) continue;

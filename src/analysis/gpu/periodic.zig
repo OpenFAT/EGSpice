@@ -257,7 +257,7 @@ pub fn Engine(comptime backend: gompute.Backend) type {
             try self.upload(.g, g);
             try self.upload(.c, c);
             for (fs, self.factors) |f, *held| {
-                if (f.heldTape() == null) {
+                if (f.heldTape() == null and f.complexHeldTape() == null) {
                     if (f.held_id.items.len != (self.shape.nf + 1) / 2)
                         return error.UnsupportedPeriodicPreconditioner;
                     if (held.*) |*h| h.deinit();

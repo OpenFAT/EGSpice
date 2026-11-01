@@ -44,13 +44,20 @@ fn modeOf(analysis: Kind) passes.Mode {
 /// which names its `.meas` block.
 pub const Point = struct { row: u32, label: []const u8 };
 
+/// Where `print` also writes each result line as a JSON object (#235),
+/// each led by `,\n`: `head` holds the fields between its name and its
+/// value, `"analysis": ..., "variant": ...`.
+pub const Json = struct { out: *Writer, head: []const u8 };
+
 /// Writes every card in `measures` that targets `analysis`, evaluated over
 /// `result`, under ngspice's heading. Writes nothing when none targets it.
 /// A card that names a missing vector or whose event never happens writes
 /// ngspice's error line to `err` and no value; at a sweep `point`, which
 /// the heading names, it also writes `name = NaN`. A PARAM card reads NaN
-/// for any card past the 256th.
-pub fn print(out: *Writer, err: *Writer, measures: []const core.Measure, analysis: Kind, result: core.Result, point: ?Point) Writer.Error!void {
+/// for any card past the 256th. With `json`, each line is also a JSON
+/// result there, in the same order, and a failed card a `null` one with
+/// its error.
+pub fn print(out: *Writer, err: *Writer, measures: []const core.Measure, analysis: Kind, result: core.Result, point: ?Point, json: ?Json) Writer.Error!void {
     // As ngspice's measure.c, PARAM cards read every other card's result,
     // so those are evaluated first; each card still prints in deck order.
     // ponytail: a fixed table; cards past the 256th read as NaN to a PARAM.
@@ -62,11 +69,16 @@ pub fn print(out: *Writer, err: *Writer, measures: []const core.Measure, analysi
     // conversion. A card whose text overflows the buffer is evaluated again.
     var text_buf: [16 * 1024]u8 = undefined;
     var used: usize = 0;
+    var json_buf: [16 * 1024]u8 = undefined;
+    var json_used: usize = 0;
     var kept: [256]?Kept = @splat(null);
     for (measures, 0..) |m, i| {
         if (!targets(m, analysis, result) or m.func == .param or i >= values.len) continue;
         var w: Writer = .fixed(text_buf[used..]);
-        const r = evaluate(&w, m, cardWave(result, analysis, &values, i, &done));
+        var jw: Writer = .fixed(json_buf[json_used..]);
+        var wave = cardWave(result, analysis, &values, i, &done);
+        if (json) |j| wave.json = .{ .out = &jw, .head = j.head };
+        const r = evaluate(&w, m, wave);
         if (r == error.WriteFailed) {
             // Out of buffer: the value as before, through a discarding writer.
             var discard_buf: [64]u8 = undefined;
@@ -75,8 +87,9 @@ pub fn print(out: *Writer, err: *Writer, measures: []const core.Measure, analysi
             continue;
         }
         values[i] = r catch nan;
-        kept[i] = .{ .text = text_buf[used..][0..w.end], .err = if (r) |_| null else |e| e };
+        kept[i] = .{ .text = text_buf[used..][0..w.end], .json = json_buf[json_used..][0..jw.end], .err = if (r) |_| null else |e| e };
         used += w.end;
+        json_used += jw.end;
     }
     var headed = false;
     for (measures, 0..) |m, i| {
@@ -84,19 +97,26 @@ pub fn print(out: *Writer, err: *Writer, measures: []const core.Measure, analysi
         if (!headed) try writeHeading(out, analysis, point);
         headed = true;
         const fresh = if (i < kept.len) kept[i] == null else true;
-        const replay: EvalError!f64 = if (fresh) evaluate(out, m, cardWave(result, analysis, &values, i, &done)) else blk: {
+        const replay: EvalError!f64 = if (fresh) blk: {
+            var wave = cardWave(result, analysis, &values, i, &done);
+            wave.json = json;
+            break :blk evaluate(out, m, wave);
+        } else blk: {
             const k = kept[i].?;
             try out.writeAll(k.text);
+            if (json) |j| try j.out.writeAll(k.json);
             break :blk if (k.err) |e| e else values[i];
         };
         const value = replay catch |e| switch (e) {
             error.WriteFailed => return error.WriteFailed,
             error.NoSuchVector => blk: {
                 try err.print("\nError: measure  {s} : no such vector\n", .{m.name});
+                if (json) |j| try writeResult(j, m.name, nan, .{}, "no such vector");
                 break :blk nan;
             },
             error.OutOfInterval => blk: {
                 try err.print("\nError: measure  {s} : out of interval\n", .{m.name});
+                if (json) |j| try writeResult(j, m.name, nan, .{}, "out of interval");
                 break :blk nan;
             },
         };
@@ -105,19 +125,95 @@ pub fn print(out: *Writer, err: *Writer, measures: []const core.Measure, analysi
     }
 }
 
-/// A card's text and error from `print`'s first pass.
-const Kept = struct { text: []const u8, err: ?EvalError };
+/// A card's text, JSON and error from `print`'s first pass.
+const Kept = struct { text: []const u8, json: []const u8, err: ?EvalError };
 
 /// `print` for a sweep point whose `analysis` failed: its heading and
-/// `name = NaN` for every card of that analysis.
-pub fn printFailed(out: *Writer, measures: []const core.Measure, analysis: Kind, point: Point) Writer.Error!void {
+/// `name = NaN` for every card of that analysis, and with `json` a `null`
+/// result for each.
+pub fn printFailed(out: *Writer, measures: []const core.Measure, analysis: Kind, point: Point, json: ?Json) Writer.Error!void {
     var headed = false;
     for (measures) |m| {
         if (m.analysis != analysis) continue;
         if (!headed) try writeHeading(out, analysis, point);
         headed = true;
         try out.print("{s:<20}=  NaN\n", .{m.name});
+        if (json) |j| try writeResult(j, m.name, nan, .{}, "analysis failed");
     }
+}
+
+/// A result line's window and position, as its text prints them.
+const Extra = struct { from: ?f64 = null, to: ?f64 = null, at: ?f64 = null };
+
+/// One JSON result led by `,\n`: `value` (null when not finite), the
+/// `extra` fields its line prints, and `failure` as `error`.
+fn writeResult(j: Json, name: []const u8, value: f64, extra: Extra, failure: ?[]const u8) Writer.Error!void {
+    try j.out.writeAll(",\n    {\"name\": ");
+    try std.json.Stringify.encodeJsonString(name, .{}, j.out);
+    try j.out.print(", {s}, \"value\": ", .{j.head});
+    try writeNumber(j.out, value);
+    inline for (.{ "from", "to", "at" }) |field| if (@field(extra, field)) |x| {
+        try j.out.writeAll(", \"" ++ field ++ "\": ");
+        try writeNumber(j.out, x);
+    };
+    if (failure) |f| {
+        try j.out.writeAll(", \"error\": ");
+        try std.json.Stringify.encodeJsonString(f, .{}, j.out);
+    }
+    try j.out.writeAll("}");
+}
+
+/// `x` as the shortest JSON number that reads back as the same f64 (the
+/// shorter of Ryu's decimal and scientific forms); `null` when not finite.
+pub fn writeNumber(out: *Writer, x: f64) Writer.Error!void {
+    if (!std.math.isFinite(x)) return out.writeAll("null");
+    var dec: [std.fmt.float.bufferSize(.decimal, f64)]u8 = undefined;
+    var exp: [std.fmt.float.min_buffer_size]u8 = undefined;
+    // Both buffers hold every finite f64.
+    const d = std.fmt.float.render(&dec, x, .{ .mode = .decimal }) catch unreachable;
+    const e = std.fmt.float.render(&exp, x, .{ .mode = .scientific }) catch unreachable;
+    try out.writeAll(if (e.len < d.len) e else d);
+}
+
+/// The JSON `variant` object of a result from row `row` of `variants`
+/// (null: the nominal circuit) at `temp_c`, an HSPICE `.temp` list entry
+/// (#235): `{"kind": "nominal"}`, or `"temp"` for a nominal run at a
+/// `.temp` entry; a step or data row's `params`, an `.alter` row's
+/// `index`, a Monte Carlo row's `trial`. A row of an `.alter` run of
+/// another kind adds `alter`, a `.temp` entry adds `temp`. The values read
+/// back from the row's label, which prints each shortest (`{d}`), so they
+/// are the row's own f64s.
+pub fn writeVariant(out: *Writer, variants: core.Variants, row: ?u32, temp_c: ?f64) Writer.Error!void {
+    if (row) |v| {
+        const kind = variants.kindAt(v);
+        try out.print("{{\"kind\": \"{t}\"", .{kind});
+        var params = false;
+        var pairs = std.mem.splitSequence(u8, variants.labelAt(v), ", ");
+        while (pairs.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            const name = pair[0..eq];
+            const text = pair[eq + 1 ..];
+            // `alter=k` and `monte=t` print integers; `optimize=` names
+            // the optimization, no coordinate of the point.
+            if (std.mem.eql(u8, name, "alter")) {
+                try out.print(", \"{s}\": {s}", .{ if (kind == .alter) "index" else "alter", text });
+            } else if (std.mem.eql(u8, name, "monte")) {
+                try out.print(", \"trial\": {s}", .{text});
+            } else if (!std.mem.eql(u8, name, "optimize")) {
+                try out.writeAll(if (params) ", " else ", \"params\": {");
+                params = true;
+                try std.json.Stringify.encodeJsonString(name, .{}, out);
+                try out.writeAll(": ");
+                try writeNumber(out, std.fmt.parseFloat(f64, text) catch nan);
+            }
+        }
+        if (params) try out.writeAll("}");
+    } else try out.writeAll(if (temp_c == null) "{\"kind\": \"nominal\"" else "{\"kind\": \"temp\"");
+    if (temp_c) |t| {
+        try out.writeAll(", \"temp\": ");
+        try writeNumber(out, t);
+    }
+    try out.writeAll("}");
 }
 
 /// ngspice's block heading, naming the sweep point when there is one.
@@ -481,7 +577,7 @@ pub const Stream = struct {
         if (col.ops.len > passes.Program.max) return null;
         for (col.ops, p.ops[0..col.ops.len]) |op, *o| o.* = switch (op) {
             .num => |x| .{ .code = .num, .num = x },
-            .measure => .{ .code = .nan },
+            .measure, .soa_count => .{ .code = .nan },
             .vector => |name| blk: {
                 // `Sample.leaf`'s column: every name resolved when the
                 // waveform was made.
@@ -720,11 +816,109 @@ fn targets(m: core.Measure, analysis: Kind, result: core.Result) bool {
 /// leaves that trial out. Cards past the 256th are not reported.
 /// O(cards * trials * samples).
 pub fn printStatistics(out: *Writer, measures: []const core.Measure, analysis: Kind, trials: []const core.Result) Writer.Error!void {
+    var acc: [256]Acc = @splat(.{});
+    const cards = statistics(measures, analysis, trials, &acc);
+    var heading = false;
+    for (cards, acc[0..cards.len]) |m, a| {
+        if (a.n == 0) continue;
+        if (!heading) {
+            heading = true;
+            try out.print("\n  Monte Carlo statistics over {d} trials\n\n", .{trials.len});
+        }
+        try out.print("mean({s}) = {f}\nsigma({s}) = {f}\nmin({s}) = {f}\nmax({s}) = {f}\n", .{ m.name, sci(a.mean, 6), m.name, sci(a.sigma(), 6), m.name, sci(a.lo, 6), m.name, sci(a.hi, 6) });
+    }
+}
+
+/// `printStatistics` as JSON objects, each led by `,\n` (#235): the
+/// card, `analysis`, `"kind": "monte"`, the trial count `n`, the trials it
+/// `failed` in, and mean, sigma, min and max (null when every trial
+/// failed). Every card of `analysis` is written.
+pub fn writeStatistics(out: *Writer, measures: []const core.Measure, analysis: Kind, trials: []const core.Result) Writer.Error!void {
+    var acc: [256]Acc = @splat(.{});
+    const cards = statistics(measures, analysis, trials, &acc);
+    for (cards, acc[0..cards.len]) |m, a| {
+        if (m.analysis != analysis) continue;
+        try out.writeAll(",\n    {\"name\": ");
+        try std.json.Stringify.encodeJsonString(m.name, .{}, out);
+        try out.print(", \"analysis\": \"{t}\", \"kind\": \"monte\", \"n\": {d}, \"failed\": {d}", .{ analysis, trials.len, trials.len - @as(usize, @intFromFloat(a.n)) });
+        const names = [_][]const u8{ "mean", "sigma", "min", "max" };
+        for (names, [_]f64{ a.mean, a.sigma(), a.lo, a.hi }) |field, x| {
+            try out.print(", \"{s}\": ", .{field});
+            try writeNumber(out, if (a.n != 0) x else nan);
+        }
+        try out.writeAll("}");
+    }
+}
+
+/// A SIGMA_SCALE run's counts and fit (#239): `failures[j]` of `trials`
+/// failed at `scales[j]`.
+pub const Sss = struct {
+    /// FAIL as written.
+    fail: []const u8,
+    scales: []const f64,
+    trials: u64,
+    failures: []const u64,
+    estimate: core.sss.Error!core.sss.Estimate,
+};
+
+/// The scaled-sigma table, then P_f(1) with its 95 % interval and its
+/// equivalent sigma, or the refusal naming the scales the fit could not
+/// use (none or all of their trials failed).
+pub fn printSss(out: *Writer, s: Sss) Writer.Error!void {
+    try out.print("\n  Scaled-sigma sampling: FAIL = {s}\n  scale   trials  failures\n", .{s.fail});
+    for (s.scales, s.failures) |scale, k| try out.print("  {d:<6}  {d:<6}  {d}\n", .{ scale, s.trials, k });
+    const e = s.estimate catch |err| {
+        if (err == error.Singular) return out.writeAll("  refused: the scales cannot tell the three fit parameters apart\n");
+        try out.writeAll("  refused: fewer than three scales with some, but not all, trials failing; left out:");
+        for (s.scales, s.failures) |scale, k| if (k == 0 or k == s.trials) try out.print(" {d} ({d} failures)", .{ scale, k });
+        return out.writeAll("\n");
+    };
+    const iv = e.interval();
+    try out.print("  P_f(1) = {f}  [{f}, {f}]  ({d:.2} sigma)\n", .{ sci(e.p(), 1), sci(iv[0], 1), sci(iv[1], 1), core.sss.sigmaOf(e.p()) });
+}
+
+/// `printSss` as one JSON object led by `,\n` (#235): `"kind": "sss"`,
+/// `analysis`, `fail`, `trials`, `scales`, `failures`, then `p`, `lo`,
+/// `hi` and `sigma`, null with an `error` when the fit is refused.
+pub fn writeSss(out: *Writer, analysis: Kind, s: Sss) Writer.Error!void {
+    try out.print(",\n    {{\"kind\": \"sss\", \"analysis\": \"{t}\", \"fail\": ", .{analysis});
+    try std.json.Stringify.encodeJsonString(s.fail, .{}, out);
+    try out.print(", \"trials\": {d}, \"scales\": [", .{s.trials});
+    for (s.scales, 0..) |x, j| {
+        if (j != 0) try out.writeAll(", ");
+        try writeNumber(out, x);
+    }
+    try out.writeAll("], \"failures\": [");
+    for (s.failures, 0..) |k, j| try out.print("{s}{d}", .{ if (j == 0) "" else ", ", k });
+    try out.writeAll("]");
+    const e = s.estimate catch |err| return out.print(", \"p\": null, \"lo\": null, \"hi\": null, \"sigma\": null, \"error\": \"{t}\"}}", .{err});
+    const iv = e.interval();
+    for ([_][]const u8{ "p", "lo", "hi", "sigma" }, [_]f64{ e.p(), iv[0], iv[1], core.sss.sigmaOf(e.p()) }) |field, x| {
+        try out.print(", \"{s}\": ", .{field});
+        try writeNumber(out, x);
+    }
+    try out.writeAll("}");
+}
+
+/// A card's Welford accumulator over the trials; every field moves together.
+const Acc = struct {
+    n: f64 = 0,
+    mean: f64 = 0,
+    m2: f64 = 0,
+    lo: f64 = std.math.inf(f64),
+    hi: f64 = -std.math.inf(f64),
+
+    /// With Bessel's correction; 0 for one sample.
+    fn sigma(a: Acc) f64 {
+        return if (a.n > 1) @sqrt(a.m2 / (a.n - 1)) else 0;
+    }
+};
+
+/// Accumulates each card of `analysis` over `trials` into `acc`; returns
+/// the cards `acc` covers, the first 256.
+fn statistics(measures: []const core.Measure, analysis: Kind, trials: []const core.Result, acc: *[256]Acc) []const core.Measure {
     var discard_buf: [64]u8 = undefined;
     var discard = quiet(&discard_buf);
-    // Welford accumulators, one per card; every field moves together.
-    const Acc = struct { n: f64 = 0, mean: f64 = 0, m2: f64 = 0, lo: f64 = std.math.inf(f64), hi: f64 = -std.math.inf(f64) };
-    var acc: [256]Acc = @splat(.{});
     const cards = measures[0..@min(measures.len, acc.len)];
     for (trials) |result| {
         // One pass in deck order: a card reads only the cards before it (a
@@ -745,16 +939,7 @@ pub fn printStatistics(out: *Writer, measures: []const core.Measure, analysis: K
             a.hi = @max(a.hi, x);
         }
     }
-    var heading = false;
-    for (cards, acc[0..cards.len]) |m, a| {
-        if (a.n == 0) continue;
-        if (!heading) {
-            heading = true;
-            try out.print("\n  Monte Carlo statistics over {d} trials\n\n", .{trials.len});
-        }
-        const sigma = if (a.n > 1) @sqrt(a.m2 / (a.n - 1)) else 0;
-        try out.print("mean({s}) = {f}\nsigma({s}) = {f}\nmin({s}) = {f}\nmax({s}) = {f}\n", .{ m.name, sci(a.mean, 6), m.name, sci(sigma, 6), m.name, sci(a.lo, 6), m.name, sci(a.hi, 6) });
-    }
+    return cards;
 }
 
 const EvalError = Writer.Error || error{ NoSuchVector, OutOfInterval };
@@ -770,6 +955,7 @@ fn evaluate(out: *Writer, m: core.Measure, w: Wave) EvalError!f64 {
             if (b.td_trig) b.td = trig;
             const targ = try defined(if (b.at == core.measure_no_at) try w.when(b) else b.at);
             try out.print("{s:<20}=  {f} targ=  {f} trig=  {f}\n", .{ m.name, sci(targ - trig, 6), sci(targ, 6), sci(trig, 6) });
+            try w.record(m.name, targ - trig, .{});
             return targ - trig;
         },
         .find, .deriv => {
@@ -778,72 +964,87 @@ fn evaluate(out: *Writer, m: core.Measure, w: Wave) EvalError!f64 {
                 if (w.len() != 1) return error.OutOfInterval;
                 const v = try defined((try w.waveform(a.vec, a.ops, a.vectype)).get(0));
                 try out.print("{s:<20}=  {f}\n", .{ m.name, sci(v, 6) });
+                try w.record(m.name, v, .{});
                 return v;
             }
             const at = if (a.at == core.measure_no_at) try defined(try w.when(b)) else a.at;
             const v = try defined(if (m.func == .find) try w.valueAt(a, at) else try w.slopeAt(a, at));
             try out.print("{s:<20}=  {f}\n", .{ m.name, sci(v, 6) });
+            try w.record(m.name, v, .{});
             return v;
         },
         .when => {
             const v = try defined(try w.when(a));
             try out.print("{s:<20}=   {f}\n", .{ m.name, sci(v, 5) });
+            try w.record(m.name, v, .{});
             return v;
         },
         .rms, .integ => {
             const r = try w.rmsInteg(a, m.func == .rms);
             try out.print("{s:<20}=   {f} from=  {f} to=  {f}\n", .{ m.name, sci(try defined(r.value), 5), sci(r.from, 5), sci(r.to, 5) });
+            try w.record(m.name, r.value, .{ .from = r.from, .to = r.to });
             return r.value;
         },
         .jitter => {
             const j = try w.jitter(a);
             try out.print("{s:<20}=  {f} pp=  {f} period=  {f} edges=  {d}\n", .{ m.name, sci(j.rms, 6), sci(j.pp, 6), sci(j.period, 6), j.edges });
+            try w.record(m.name, j.rms, .{});
             return j.rms;
         },
         .em_avg => {
             const r = try w.emAvg(a);
             try out.print("{s:<20}=  {f} from=  {f} to=  {f}\n", .{ m.name, sci(try defined(r.value), 6), sci(r.from, 6), sci(r.to, 6) });
+            try w.record(m.name, r.value, .{ .from = r.from, .to = r.to });
             return r.value;
         },
         .avg => {
             const r = try w.extremum(a, .avg);
-            try out.print("{s:<20}=  {f} from=  {f} to=  {f}\n", .{ m.name, sci(try defined(r.value), 6), sci(if (a.at == core.measure_no_at) a.from else a.at, 6), sci(r.at, 6) });
+            const from = if (a.at == core.measure_no_at) a.from else a.at;
+            try out.print("{s:<20}=  {f} from=  {f} to=  {f}\n", .{ m.name, sci(try defined(r.value), 6), sci(from, 6), sci(r.at, 6) });
+            try w.record(m.name, r.value, .{ .from = from, .to = r.at });
             return r.value;
         },
         .min, .max => {
             const r = try w.extremum(a, if (m.func == .min) .min else .max);
             try out.print("{s:<20}=  {f} at=  {f}\n", .{ m.name, sci(try defined(r.value), 6), sci(r.at, 6) });
+            try w.record(m.name, r.value, .{ .at = r.at });
             return r.value;
         },
         .min_at, .max_at => {
             const r = try w.extremum(a, if (m.func == .min_at) .min else .max);
             try out.print("{s:<20}=  {f} with=  {f}\n", .{ m.name, sci(try defined(r.at), 6), sci(r.value, 6) });
+            try w.record(m.name, r.at, .{});
             return r.at;
         },
         .pp => {
             const lo = try defined((try w.extremum(a, .min)).value);
             const hi = try defined((try w.extremum(a, .max)).value);
             try out.print("{s:<20}=  {f} from=  {f} to=  {f}\n", .{ m.name, sci(hi - lo, 6), sci(a.from, 6), sci(a.to, 6) });
+            try w.record(m.name, hi - lo, .{ .from = a.from, .to = a.to });
             return hi - lo;
         },
         .param => {
-            const v = try defined(paramValue(m.expr, w.values));
+            const v = try defined(paramValue(m.expr, w.values, w.result.soa_count));
             try out.print("{s:<20}=  {f}\n", .{ m.name, sci(v, 5) });
+            try w.record(m.name, v, .{});
             return v;
         },
         .err, .err1, .err2, .err3 => {
             const v = try defined(try w.relError(a, m.func));
             try out.print("{s:<20}=  {f}\n", .{ m.name, sci(v, 6) });
+            try w.record(m.name, v, .{});
             return v;
         },
         .thd, .snr, .sndr, .enob, .sfdr => {
             const v = try defined(fftFigure(try w.column(a.vec, 'm'), w.scale(), w.len(), a, m.func));
             try out.print("{s:<20}=  {f}\n", .{ m.name, sci(v, 6) });
+            try w.record(m.name, v, .{});
             return v;
         },
         .check_slew, .check_forbid, .check_require, .check_level, .dout => {
             const n = try w.violations(out, m.name, a, b, m.func, m.check);
             try out.print("{s:<20}=  {d}\n", .{ m.name, n });
+            try w.record(m.name, @floatFromInt(n), .{});
             return @floatFromInt(n);
         },
     }
@@ -923,7 +1124,7 @@ fn crossing(x0: f64, y0: f64, x1: f64, y1: f64, level: f64) f64 {
 fn resolve(c: Clause, values: []const f64) !Clause {
     var r = c;
     for (c.refs) |ref| {
-        const v = try defined(paramValue(ref.expr, values));
+        const v = try defined(paramValue(ref.expr, values, nan));
         switch (ref.field) {
             .val => r.val = v,
             .td => r.td = v,
@@ -1032,30 +1233,33 @@ fn fftFigure(mag: Column, freq: Column, n: usize, c: Clause, func: core.MeasureF
     };
 }
 
-/// Folds a PARAM card's postfix over the results in `values`; NaN when a
-/// result it reads is missing or it reads a vector.
-fn paramValue(ops: []const core.MeasureOp, values: []const f64) f64 {
+/// Folds a PARAM card's postfix over the results in `values`, `soa_count()`
+/// reading `soa`; NaN when a result it reads is missing or it reads a
+/// vector.
+fn paramValue(ops: []const core.MeasureOp, values: []const f64, soa: f64) f64 {
     return fold(ops, struct {
         values: []const f64,
+        soa: f64,
         fn leaf(s: @This(), op: core.MeasureOp, _: usize) f64 {
             return switch (op) {
                 .num => |x| x,
                 .measure => |k| if (k < s.values.len) s.values[k] else nan,
+                .soa_count => s.soa,
                 .vector, .neg, .add, .sub, .mul, .div, .pow => nan,
             };
         }
-    }{ .values = values });
+    }{ .values = values, .soa = soa });
 }
 
-/// Folds measure postfix; `leaves.leaf(op, v)` values each `num`, `measure`
-/// and `vector` op, `v` counting the vector ops before it. NaN on a stack
+/// Folds measure postfix; `leaves.leaf(op, v)` values each `num`, `measure`,
+/// `soa_count` and `vector` op, `v` counting the vector ops before it. NaN on a stack
 /// overflow or underflow, or a malformed tail.
 fn fold(ops: []const core.MeasureOp, leaves: anytype) f64 {
     var stack: [32]f64 = undefined;
     var n: usize = 0;
     var vectors: usize = 0;
     for (ops) |op| switch (op) {
-        .num, .measure, .vector => {
+        .num, .measure, .vector, .soa_count => {
             if (n == stack.len) return nan;
             stack[n] = leaves.leaf(op, vectors);
             vectors += @intFromBool(op == .vector);
@@ -1076,7 +1280,7 @@ fn fold(ops: []const core.MeasureOp, leaves: anytype) f64 {
                 .mul => x.* * b,
                 .div => x.* / b,
                 .pow => std.math.pow(f64, x.*, b),
-                .num, .measure, .vector, .neg => unreachable,
+                .num, .measure, .vector, .soa_count, .neg => unreachable,
             };
         },
     };
@@ -1138,7 +1342,7 @@ const Sample = struct {
                 const c: Column = .{ .data = p.data, .stride = p.stride, .offset = k * @as(usize, if (p.complex) 2 else 1), .complex = p.complex, .vectype = p.vectype };
                 break :blk c.get(s.i);
             },
-            .measure => nan,
+            .measure, .soa_count => nan,
             .neg, .add, .sub, .mul, .div, .pow => unreachable,
         };
     }
@@ -1163,6 +1367,13 @@ const Wave = struct {
     values: []const f64 = &.{},
     /// What the card found while its run went, read in place of `result`.
     done: ?*Done = null,
+    /// Where `evaluate` also writes each line as a JSON result.
+    json: ?Json = null,
+
+    /// Writes card `name`'s line to `json` too, when set.
+    fn record(w: Wave, name: []const u8, value: f64, extra: Extra) Writer.Error!void {
+        if (w.json) |j| try writeResult(j, name, value, extra, null);
+    }
 
     /// Sample count; 0 for a result whose rows streamed to a file.
     fn len(w: Wave) usize {
@@ -1422,8 +1633,9 @@ const Wave = struct {
     }
 };
 
-/// Area under max(v, 0) over one linear segment from `v0` to `v1`, `dx` wide.
-fn positiveArea(v0: f64, v1: f64, dx: f64) f64 {
+/// Area under max(v, 0) over one linear segment from `v0` to `v1`, `dx`
+/// wide; `--emir` folds its EM_AVG halves with it too (#237).
+pub fn positiveArea(v0: f64, v1: f64, dx: f64) f64 {
     if (v0 >= 0 and v1 >= 0) return 0.5 * (v0 + v1) * dx;
     if (v0 <= 0 and v1 <= 0) return 0;
     const hi = @max(v0, v1);
@@ -1736,7 +1948,7 @@ test "measurements match ngspice on a sampled ramp" {
     var err_buf: [256]u8 = undefined;
     var out: Writer = .fixed(&out_buf);
     var err: Writer = .fixed(&err_buf);
-    try print(&out, &err, &cards, .tran, result, null);
+    try print(&out, &err, &cards, .tran, result, null, null);
     // Rise 1 of v(a) happens in the first interval, where ngspice only
     // initialises its counters: it is measured on the next one, by
     // extrapolating that segment (exact here, as v(a) is a line).
@@ -1756,6 +1968,106 @@ test "measurements match ngspice on a sampled ramp" {
     try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "gone") != null);
 }
 
+test "print's JSON results: each printed line in order, the ramp's exact values, a failed card null with its error (#235)" {
+    const a = std.testing.allocator;
+    const cards = [_]core.Measure{
+        .{ .analysis = .tran, .name = "d", .func = .trig_targ, .first = .{ .vec = "v(a)", .val = 0.5, .rise = 1 }, .second = .{ .vec = "b", .val = 1.5, .fall = 1 } },
+        .{ .analysis = .tran, .name = "i", .func = .integ, .first = .{ .vec = "v(a)" } },
+        .{ .analysis = .tran, .name = "mx", .func = .max, .first = .{ .vec = "v(a)", .to = 3 } },
+        .{ .analysis = .tran, .name = "c", .func = .find, .cont = true, .first = .{ .vec = "v(a)", .at = 1.5 } },
+        .{ .analysis = .tran, .name = "p", .func = .param, .first = .{}, .expr = &.{ .{ .measure = 0 }, .{ .num = 2 }, .mul } },
+        .{ .analysis = .tran, .name = "gone", .func = .when, .first = .{ .vec = "v(a)", .val = 9 } },
+    };
+    var text: Writer.Allocating = .init(a);
+    defer text.deinit();
+    var json: Writer.Allocating = .init(a);
+    defer json.deinit();
+    try print(&text.writer, &text.writer, &cards, .tran, ramp, null, .{ .out = &json.writer, .head = "\"analysis\": \"tran\"" });
+    const doc = try std.fmt.allocPrint(a, "[{s}]", .{json.written()[1..]});
+    defer a.free(doc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, doc, .{});
+    defer parsed.deinit();
+    const results = parsed.value.array.items;
+    // Oracle: the text, whose `%e` digits `sci` matches C's, line for line.
+    var lines = std.mem.splitScalar(u8, text.written(), '\n');
+    var k: usize = 0;
+    while (lines.next()) |text_line| {
+        const eq = std.mem.indexOfScalar(u8, text_line, '=') orelse continue;
+        if (std.mem.startsWith(u8, text_line, "Error")) continue;
+        const r = results[k].object;
+        k += 1;
+        try std.testing.expectEqualStrings(std.mem.trim(u8, text_line[0..eq], " "), r.get("name").?.string);
+        var fields = std.mem.tokenizeScalar(u8, text_line[eq + 1 ..], ' ');
+        try std.testing.expectApproxEqRel(try std.fmt.parseFloat(f64, fields.next().?), jsonFloat(r.get("value").?), 1e-5);
+    }
+    try std.testing.expectEqual(@as(usize, 5), k);
+    // Analytic oracle: v(a) = t, so the integral over 0..4 is 8 and the
+    // maximum to t = 3 is 3 at 3, in full f64.
+    try std.testing.expectEqual(@as(f64, 8), jsonFloat(results[1].object.get("value").?));
+    try std.testing.expectEqual(@as(f64, 4), jsonFloat(results[1].object.get("to").?));
+    try std.testing.expectEqual(@as(f64, 3), jsonFloat(results[2].object.get("at").?));
+    try std.testing.expectEqualStrings("c[1]", results[3].object.get("name").?.string);
+    const gone = results[5].object;
+    try std.testing.expectEqualStrings("gone", gone.get("name").?.string);
+    try std.testing.expect(gone.get("value").? == .null);
+    try std.testing.expectEqualStrings("out of interval", gone.get("error").?.string);
+    try std.testing.expectEqual(@as(usize, 6), results.len);
+}
+
+/// A parsed JSON number as an f64; NaN for anything else.
+fn jsonFloat(v: std.json.Value) f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => nan, // else: null and the non-numbers have no value
+    };
+}
+
+test writeNumber {
+    var buf: [64]u8 = undefined;
+    // The shorter form wins: decimal for 144.242, scientific for 1000.
+    for ([_]struct { f64, []const u8 }{
+        .{ 144.242, "144.242" },
+        .{ 9e-6, "9e-6" },
+        .{ 30304900, "30304900" },
+        .{ 1000, "1e3" },
+        .{ 1e300, "1e300" },
+        .{ std.math.nan(f64), "null" },
+        .{ -std.math.inf(f64), "null" },
+    }) |case| {
+        var w: Writer = .fixed(&buf);
+        try writeNumber(&w, case[0]);
+        try std.testing.expectEqualStrings(case[1], w.buffered());
+    }
+    // Oracle: the text reads back as the same f64, bit for bit.
+    for ([_]f64{ 9.999999999999999e-06, 0.1 + 0.2, 5e-324, std.math.floatMax(f64), -2.5e-17, 0.000627185 }) |x| {
+        var w: Writer = .fixed(&buf);
+        try writeNumber(&w, x);
+        try std.testing.expectEqual(@as(u64, @bitCast(x)), @as(u64, @bitCast(try std.fmt.parseFloat(f64, w.buffered()))));
+    }
+}
+
+test writeVariant {
+    const v: core.Variants = .{
+        .labels = &.{ "ib=0.000009999999999999999, w=2", "rv=1000", "monte=17", "alter=2", "alter=1, monte=3" },
+        .kinds = &.{ .step, .data, .monte, .alter, .monte },
+    };
+    var buf: [256]u8 = undefined;
+    for ([_]struct { ?u32, ?f64, []const u8 }{
+        .{ null, null, "{\"kind\": \"nominal\"}" },
+        .{ null, 85, "{\"kind\": \"temp\", \"temp\": 85}" },
+        .{ 0, null, "{\"kind\": \"step\", \"params\": {\"ib\": 9.999999999999999e-6, \"w\": 2}}" },
+        .{ 1, null, "{\"kind\": \"data\", \"params\": {\"rv\": 1e3}}" },
+        .{ 2, null, "{\"kind\": \"monte\", \"trial\": 17}" },
+        .{ 3, null, "{\"kind\": \"alter\", \"index\": 2}" },
+        .{ 4, -40, "{\"kind\": \"monte\", \"alter\": 1, \"trial\": 3, \"temp\": -40}" },
+    }) |case| {
+        var w: Writer = .fixed(&buf);
+        try writeVariant(&w, v, case[0], case[1]);
+        try std.testing.expectEqualStrings(case[2], w.buffered());
+    }
+}
+
 /// v(a) = t and v(b) = 4 - t on t = 0..4, sampled every 1.
 const ramp: core.Result = .{ .plotname = "t", .varnames = &.{ "time", "v(a)", "v(b)" }, .is_complex = false, .npoints = 5, .data = &.{ 0, 0, 4, 1, 1, 3, 2, 2, 2, 3, 3, 1, 4, 4, 0 } };
 
@@ -1769,7 +2081,7 @@ test "a _CONT FIND or DERIV at a fixed AT= has one event and prints one line" {
     try std.testing.expectEqualSlices(f64, &.{ 1.5, -1 }, &values);
     var buf: [256]u8 = undefined;
     var out: Writer = .fixed(&buf);
-    try print(&out, &out, &cards, .tran, ramp, null);
+    try print(&out, &out, &cards, .tran, ramp, null, null);
     try std.testing.expectEqualStrings(
         \\
         \\  Measurements for Transient Analysis
@@ -1814,7 +2126,7 @@ test "every function over a result with no samples reads NaN or zero, never pani
             .avg, .min, .max, .min_at, .max_at, .pp, .check_slew, .check_forbid, .check_require, .check_level, .dout => try std.testing.expectEqual(0, v),
             else => try std.testing.expect(std.math.isNan(v)), // else: every other function has no value over no samples
         };
-        try print(&sink.writer, &sink.writer, &cards, .tran, result, null);
+        try print(&sink.writer, &sink.writer, &cards, .tran, result, null, null);
         var out: [3]f64 = undefined;
         try sample(.{ .vec = "v(a)" }, result, &.{ -1, 0, 9 }, &out);
         for (out) |v| try std.testing.expect(std.math.isNan(v));
@@ -1895,13 +2207,13 @@ test "par() waveforms resolve their vectors, past the cached eight too" {
 }
 
 test "malformed PARAM postfix reads NaN" {
-    try std.testing.expect(std.math.isNan(paramValue(&.{.add}, &.{})));
-    try std.testing.expect(std.math.isNan(paramValue(&.{.neg}, &.{})));
-    try std.testing.expect(std.math.isNan(paramValue(&.{ .{ .num = 1 }, .{ .num = 2 } }, &.{})));
-    try std.testing.expect(std.math.isNan(paramValue(&.{.{ .measure = 7 }}, &.{1})));
+    try std.testing.expect(std.math.isNan(paramValue(&.{.add}, &.{}, nan)));
+    try std.testing.expect(std.math.isNan(paramValue(&.{.neg}, &.{}, nan)));
+    try std.testing.expect(std.math.isNan(paramValue(&.{ .{ .num = 1 }, .{ .num = 2 } }, &.{}, nan)));
+    try std.testing.expect(std.math.isNan(paramValue(&.{.{ .measure = 7 }}, &.{1}, nan)));
     const deep: [33]core.MeasureOp = @splat(.{ .num = 1 });
-    try std.testing.expect(std.math.isNan(paramValue(&deep, &.{})));
-    try std.testing.expectEqual(-6, paramValue(&.{ .{ .num = 2 }, .{ .measure = 0 }, .pow, .neg, .{ .num = 2 }, .sub }, &.{2}));
+    try std.testing.expect(std.math.isNan(paramValue(&deep, &.{}, nan)));
+    try std.testing.expectEqual(-6, paramValue(&.{ .{ .num = 2 }, .{ .measure = 0 }, .pow, .neg, .{ .num = 2 }, .sub }, &.{2}, nan));
 }
 
 test "crossings, windows, NaN samples and a single point match ngspice 45" {
@@ -1992,7 +2304,7 @@ test "crossings, windows, NaN samples and a single point match ngspice 45" {
         var buf: [2048]u8 = undefined;
         var out: Writer = .fixed(&buf);
         var sink: Writer.Discarding = .init(&.{});
-        try print(&out, &sink.writer, case[1], .tran, case[0], null);
+        try print(&out, &sink.writer, case[1], .tran, case[0], null, null);
         const heading = "\n  Measurements for Transient Analysis\n\n";
         try std.testing.expectEqualStrings(heading, out.buffered()[0..heading.len]);
         try std.testing.expectEqualStrings(case[2], out.buffered()[heading.len..]);
@@ -2078,7 +2390,7 @@ fn expectStreamed(cards: []const core.Measure, early: bool) !usize {
     evaluateAll(cards, .tran, full, want);
     var want_text: Writer.Allocating = .init(gpa);
     defer want_text.deinit();
-    try print(&want_text.writer, &want_text.writer, cards, .tran, full, null);
+    try print(&want_text.writer, &want_text.writer, cards, .tran, full, null, null);
     var keep: [3]bool = undefined;
     markColumns(cards, names, &keep, true);
     var recorded: std.ArrayList([]const u8) = .empty;
@@ -2102,7 +2414,7 @@ fn expectStreamed(cards: []const core.Measure, early: bool) !usize {
     evaluateAll(cards, .tran, streamed, got);
     var got_text: Writer.Allocating = .init(gpa);
     defer got_text.deinit();
-    try print(&got_text.writer, &got_text.writer, cards, .tran, streamed, null);
+    try print(&got_text.writer, &got_text.writer, cards, .tran, streamed, null, null);
     errdefer std.debug.print("early {}: {d} rows, columns {any}\n{s}\n", .{ early, n, keep, got_text.written() });
     try std.testing.expectEqualSlices(u64, @ptrCast(want), @ptrCast(got));
     try std.testing.expectEqualStrings(want_text.written(), got_text.written());

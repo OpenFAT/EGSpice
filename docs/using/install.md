@@ -26,11 +26,11 @@ it prints at the end, on `PATH` or in `ZIG`.
 ## Homebrew
 
 ```sh
-brew install OmarSiwy/espice/espice
+brew install OpenFAT/espice/espice
 ```
 
 Each release attaches `espice.rb`, which the release workflow installs and
-`brew test`s on macOS, then pushes to the `OmarSiwy/homebrew-espice` tap once
+`brew test`s on macOS, then pushes to the `OpenFAT/homebrew-espice` tap once
 that repository and its token are set up. Runtime `.hdl` needs the Zig named
 in `brew info espice`, on `PATH` or in `ZIG`.
 

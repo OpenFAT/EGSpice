@@ -283,6 +283,10 @@ pub const Op = struct {
     /// waveform sources evaluate at t = 0 instead of at their DC value. The
     /// engine sets it when the deck has a transient-family query.
     tran_op: bool = false,
+    /// Read every device terminal's current at the point into
+    /// `Result.emir` (`--emir` on a deck with no `.tran`, #237). Such an OP
+    /// joins no lane batch: it reads its own host batches.
+    emir: bool = false,
 };
 
 /// DC sweep of a source, a card parameter or the temperature (`.dc`), one
@@ -311,6 +315,9 @@ pub const Dc = struct {
     /// the sweep's own: the probes moved by -J⁻¹ (F(x, row) - F(x)) at each
     /// point, on the factorization at that point's solution.
     tangents: []const u32 = &.{},
+    /// Read every device terminal's current at the sweep's first point into
+    /// `Result.emir`, as `Op.emir` reads the OP's (#237).
+    emir: bool = false,
 
     /// The device parameter, or the temperature, a `.dc` sweep drives.
     pub const SweepTarget = union(enum) {
@@ -695,6 +702,15 @@ pub const PointOptions = struct {
     /// prediction of the point with that parameter moved by this times
     /// its magnitude (`Tran.tangents`), for d(measure)/d(parameter).
     tangent_step: f64 = 0,
+    /// Read every device terminal's current at each accepted point of the
+    /// transient into `Result.emir` (`--emir`, #237). It needs the whole
+    /// run, so `Problem` drops `early_stop`, and the host batches, so such
+    /// a transient joins no lane batch and wants the CPU backend (the CLI
+    /// forces it): under a GPU context the host batches are not current.
+    emir: bool = false,
+    /// `emir`'s window in seconds, read as `.meas` FROM=/TO= read theirs:
+    /// `to` 0 runs to the end.
+    emir_window: [2]f64 = .{ 0, 0 },
 };
 
 /// Transient noise: a transient with sampled noise sources, or the noise

@@ -201,6 +201,27 @@ pub const ScatterTapes = struct {
     rows: []const u32,
 };
 
+/// One instance's evaluation in its own `n_u` unknowns (`Hooks.local_eval`),
+/// `$mfactor` applied. The caller sizes every slice: `n_u`, or `n_u * n_u`
+/// row-major for the partials.
+pub const LocalEval = struct {
+    /// Each unknown's value as the instance reads it from x.
+    x: []f64,
+    /// Static current and charge into each unknown's row, in `rhs` and
+    /// `q_vec`'s sign: the current flowing from the node into the device.
+    f: []f64,
+    q: []f64,
+    /// ∂f/∂x and ∂q/∂x.
+    g: []f64,
+    c: []f64,
+    /// The unknown each one collapses into (`DeviceVtable.collapse`), itself
+    /// when it stays its own node.
+    root: []u32,
+    /// `Hooks.op_vars.len` values, the model's own (VerA `opVars`), without
+    /// `$mfactor`.
+    vars: []f64 = &.{},
+};
+
 /// Stable identity of a captured LTE charge: the original staged instance
 /// index (before collapsed-batch partitioning), generated charge-site index,
 /// and current circuit rows of its local unknowns. The rows are borrowed.
@@ -413,6 +434,11 @@ pub const Hooks = struct {
     /// device has no display tasks; the built-ins are generated without
     /// them, so it is host-only.
     say: ?*const fn (*anyopaque, x: []const f64, index: u32, name: []const u8, w: *std.Io.Writer) void = null,
+    /// Evaluates instance `index` alone at x, unlimited, in its own
+    /// unknowns, into `out`: what a device operating-point variable reads
+    /// (`@m1[gm]`, #236). Runs on a copy of the Instance, so the batch's
+    /// state is untouched. Reads the host Instance copy.
+    local_eval: ?*const fn (*anyopaque, x: []const f64, index: u32, out: LocalEval) void = null,
     /// Charge per instance and LTE site (`ddt()` sites not marked
     /// `vera_lte = 0`) from the last eval, instance-major. Lets the transient
     /// run its LTE per charge state, as ngspice's CKTterr does, instead of
@@ -420,6 +446,10 @@ pub const Hooks = struct {
     q_tape: ?*const fn (*anyopaque) []const f64 = null,
     /// Maps a batch-local charge tape index without evaluating the device.
     charge_identity: ?*const fn (*anyopaque, usize) ChargeIdentity = null,
+    /// Per frozen instance, the add ordinal it was staged at: a mixed batch
+    /// partitions its fully collapsed instances to the front at the freeze.
+    /// Empty when the order is the add order.
+    original_ids: ?*const fn (*anyopaque) []const u32 = null,
     derivative_counts: ?*const fn (*anyopaque) DerivativeCounts = null,
     /// Restamps `q_vec` and `q_tape` for instances `[first, last)` at x,
     /// leaving the other planes alone. Null when the device has no `q`.
@@ -462,6 +492,10 @@ pub const Hooks = struct {
     /// instance, in that order (LRM §4.6.4 `name` argument; "" when absent).
     /// Its length is the per-instance generator count.
     noise_names: []const []const u8 = &.{},
+    /// The model's own operating-point variables (VerA `op_vars`: the
+    /// module-scope variables with a `desc`), whose values `local_eval`
+    /// writes into `LocalEval.vars` in this order.
+    op_vars: []const []const u8 = &.{},
     /// Appends the global CSC slot of every frequency-dependent small-signal
     /// entry (VerA `ac_dyn_slots`: §4.5.7 absdelay, §4.5.11 laplace, §4.5.12
     /// zi), instance-major. A ground entry reads as the trash slot. Under
@@ -722,7 +756,12 @@ pub const GpuPayload = struct {
 //     `update_done`, the limit and state passes split over threads;
 //     `GpuPayload.brk`, the source breakpoint caches device step control
 //     starts from; `set_bypass`, the opt-in latency bypass.
-pub const abi_version: u32 = 36;
+// 37: `Hooks.local_eval` and `LocalEval`, one instance in its own unknowns,
+//     and `Hooks.op_vars` with `LocalEval.vars`, VerA's `op_vars`/`opVars`,
+//     for device operating-point variables (#236).
+// 38: `Hooks.original_ids`, a partitioned batch's add order, so a card
+//     names its frozen instance (#237).
+pub const abi_version: u32 = 38;
 
 /// A device type's construction entry points, exported by each device object
 /// and by runtime-loaded `.so` devices.
@@ -803,7 +842,7 @@ pub fn layoutHash() u64 {
             DeviceResult(Batch), DeviceResult(Proto), Param,
             SimState,            StatusHit,           std.Io.Writer,
             GpuPayload,          ScatterTapes,        contract.Systf,
-            contract.SystfHost,
+            contract.SystfHost,  LocalEval,
         }) |T| h = hashType(h, T);
         h = mix(h, abi_version);
         break :blk h;
