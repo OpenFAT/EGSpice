@@ -4,6 +4,7 @@ Newest first.
 
 ## Unreleased
 
+- A cold operating point whose gmin stepping crawls (its step factor under 1.122 for 20 solves in a row) moves on to source stepping: the `.op` of a 100k-transistor BSIM4 chain converges in 14:07 with a 2.8 GiB peak RSS, where it was still crawling the gmin ladder when killed at 32 min (#218).
 - `.wcd m1 '>= L1' m2 '<= L2' ...` finds each spec's worst-case distance β_w over the statistical parameters `SWEEP MONTE` draws, by FORM (iHL-RF, tangent rows for `.dc` and `.tran`), and reports it with Φ(β_w), the iterations, the simulations and the worst-case point; an unconverged search says so and never prints a guess; `--measures` writes it as `"kind": "wcd"` (#240).
 - `.four` and `.fft` read the deck's `.tran` result instead of integrating the same transient again, where that run keeps its waveform with the same options and operating point (CPU backend); the values are bit for bit the same (#231).
 - `--emir=FILE` writes each device terminal's and independent source's average, EM_AVG, RMS and peak current over the deck's first `.tran` (or `--emir-window=T1:T2`), else its `.op`/`.dc` point, as JSON with each instance's `.model` name, one file per `.step`/`.alter`/sweep variant; a Spectre analysis's `emirformat`/`emirfile` sets it (#237).

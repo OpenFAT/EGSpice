@@ -193,9 +193,12 @@ fn afterPlain(
         // The Newton budget each step gets: NIiter's floor of 100 over itl2.
         const budget = converger.optionsFromTolerances(options.tol, options.tol.itl2).max_iter;
         var solves: u32 = 0;
+        const steps = try gpa.alloc(GminStep, max_ladder_solves);
+        defer gpa.free(steps);
         // ngspice has no step cap: the factor floor ends the rung. This one
         // only bounds a pathological ladder.
         while (solves < max_ladder_solves) : (solves += 1) {
+            const tried = gmin_val;
             ckt.setHomotopy(gmin_val, 1.0);
             try ckt.computeBaseline();
             var refused = false;
@@ -240,6 +243,12 @@ fn afterPlain(
                 factor = if (refused) @sqrt(factor) else @sqrt(@sqrt(factor));
                 gmin_val = good_gmin / factor;
                 if (have_good) @memcpy(x, x_good) else coldStart(ckt, x);
+            }
+            steps[solves] = .{ .gmin = tried, .converged = r.converged };
+            if (gminStalled(steps[0 .. solves + 1], options.tol.gmin_start, gmin_val)) {
+                if (ws.knobs.opdbg)
+                    std.debug.print("ladder: gmin stalled at {e:.3} solve={d}\n", .{ good_gmin, solves });
+                break; // to source stepping, which cold-starts
             }
         }
         ckt.setHomotopy(gtarget, 1.0); // rung 3 rebuilds the baseline
@@ -331,6 +340,39 @@ fn afterPlain(
 /// its step floor); 100 ended chain_bsim4_100k's gmin stepping at 1.35e-6
 /// while every step still converged.
 const max_ladder_solves = 1000;
+
+/// Solves in a row a gmin descent may keep its factor under
+/// `stall_factor` (a decade per `stall_solves` solves) before it is stalled
+/// and source stepping takes over. ngspice's dynamic_gmin has no such exit:
+/// its factor floor ends only a failing descent, and steps that converge in
+/// the dead band of `gminFactor` freeze a small factor (chain_bsim4_100k:
+/// about 1.004, some 5,800 steps to 1e-12). A descent that recovers speeds
+/// its factor up past `stall_factor` within a few easy steps
+/// (scaling_inverter_chain_4k: 13 slow solves). Leaving departs from ngspice.
+const stall_solves = 20;
+const stall_factor = std.math.pow(f64, 10.0, 1.0 / @as(f64, stall_solves));
+
+/// One solve of a gmin descent: the gmin tried, and whether Newton
+/// converged there.
+pub const GminStep = struct { gmin: f64, converged: bool };
+
+/// True when a descent from `start` (the ladder's gmin_start) that tried
+/// `steps` and tries `next` now has kept its factor under `stall_factor`
+/// for its last `stall_solves` solves. The factor after a solve is the last
+/// good gmin over the gmin tried next, so a `ZP_OPDBG` log replays it.
+pub fn gminStalled(steps: []const GminStep, start: f64, next: f64) bool {
+    std.debug.assert(start >= 0 and next >= 0);
+    std.debug.assert(steps.len <= max_ladder_solves);
+    if (steps.len < stall_solves) return false;
+    var good = start;
+    for (steps, 0..) |s, i| {
+        if (s.converged) good = s.gmin;
+        if (i < steps.len - stall_solves) continue;
+        const following = if (i + 1 < steps.len) steps[i + 1].gmin else next;
+        if (good / following >= stall_factor) return false;
+    }
+    return true;
+}
 
 /// The next gmin step factor after a step that converged in `iterations`
 /// of a Newton `budget` (cktop.c:207-222): an easy step (a quarter of the
