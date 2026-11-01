@@ -238,21 +238,30 @@ pub const kcl_cert = struct {
         return pt;
     }
 
+    /// Sizes `ckt.cert.scratch` for `check`. `newton` calls it, through
+    /// `Circuit.certifyReserve`, on entry under `-Dcertify`, where an
+    /// allocation failure still returns to its caller.
+    pub fn reserve(ckt: anytype) error{OutOfMemory}!void {
+        comptime std.debug.assert(enabled);
+        const tally = &ckt.cert;
+        const need = scratchLen(ckt);
+        if (tally.scratch.len == need) return;
+        ckt.gpa.free(tally.scratch);
+        tally.scratch = &.{};
+        tally.scratch = try ckt.gpa.alloc(f64, need);
+        std.debug.assert(tally.scratch.len == need);
+    }
+
     /// `measure`, then panics when a row is over the converger's gate, and
     /// records the ratio in `ckt.cert`. `newton` calls it, through
     /// `Circuit.certifyPoint`, on every converged x it stages under
     /// `-Dcertify`, after every gate and before `updateStates` stages the
     /// point: a device whose eval reads its staged history would otherwise see
-    /// x twice. Sizes `ckt.cert.scratch` on first use and panics if that
-    /// allocation fails.
+    /// x twice. Asserts that `reserve` sized `ckt.cert.scratch`.
     pub fn check(ckt: anytype, hook: anytype, x: []const f64, t: f64, opts: converger.Options) void {
         comptime std.debug.assert(enabled);
         const tally = &ckt.cert;
-        const need = scratchLen(ckt);
-        if (tally.scratch.len != need) {
-            ckt.gpa.free(tally.scratch);
-            tally.scratch = ckt.gpa.alloc(f64, need) catch @panic("certify: out of memory");
-        }
+        std.debug.assert(tally.scratch.len == scratchLen(ckt));
         const pt = measure(ckt, hook, x, t, opts, tally.scratch);
         if (pt.gate_row) |row| std.debug.panic(
             "certify: row {d} ({s}) |F| = {e:.3} exceeds the converger's gate {e:.3} at {s} t={e:.6}, x = {e:.6}",
@@ -455,6 +464,12 @@ pub const Circuit = struct {
 
     /// `newton` calls `certifyPoint` on every converged x it stages when true.
     pub const certify = kcl_cert.enabled;
+
+    /// Sizes the certificate's scratch (`kcl_cert.reserve`). Only `newton`
+    /// calls it, on entry, and only under `-Dcertify`.
+    pub fn certifyReserve(self: *Circuit) error{OutOfMemory}!void {
+        return kcl_cert.reserve(self);
+    }
 
     /// Certifies the converged `x` (analysis/certify.zig). Only `newton`
     /// calls it, and only under `-Dcertify`.

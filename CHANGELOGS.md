@@ -29,6 +29,7 @@ Newest first.
 - VerA v0.20.0 and Gompute 1.5.0.
 - GPU lane batches also size their waves to each device's free memory, so a batch too large for the card runs in smaller waves instead of on the CPU (#217).
 - Releases attach `.deb`, `.rpm` and Arch packages (`espice`; `espice-cuda` for NVIDIA GPUs; `espice-hip` with a build per AMD GPU target, picked at start), an AUR `PKGBUILD` (`espice-bin`) and a Homebrew formula; `tools/install.sh` installs a release from `sources.json` with a checked, cached download; `nix run .#latest` and `.#"<version>"` install release binaries.
+- `nint(-0.5)` is -0, as in ngspice: `{1/nint(-0.5)}` folded to +inf instead of -inf.
 - Removed: the `ESPICE_LINEAR_CACHE` variable, the `-Dbsim4-narrow` build option and the `test-gpu-*` build steps (`test-gpu` runs the corpus on CUDA).
 
 ## 0.3.0 (2026-10-20)
