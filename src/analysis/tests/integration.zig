@@ -9,19 +9,20 @@ const Library = @import("device").Library;
 const eval = @import("device_eval");
 const converger = @import("solver").converger;
 const D = @import("limiter_device");
+const Crawl = @import("crawl_device");
 const models = @import("models");
 const t = std.testing;
 const GROUND = analysis.GROUND;
 
-/// One `va_limit_state` instance from a fresh node to ground, registered in
-/// `lib`. exp(V) = exp(2) puts its root at V = 2.
-fn limiter(lib: *Library) !@import("device").Circuit {
+/// One instance of generated device `Dev` (VerA module `name`) from a fresh
+/// node to ground, registered in `lib`.
+fn single(comptime Dev: type, comptime name: []const u8, lib: *Library) !@import("device").Circuit {
     var b = try Builder.init(t.allocator, lib);
     const out = try b.addNode();
-    const vt = eval.deviceVtable(D, "va_limit_state");
-    const proto = try b.protoOf(try lib.register("va_limit_state", vt, false));
-    const model: D.Model = .{};
-    const instance: D.Instance = .{};
+    const vt = eval.deviceVtable(Dev, name);
+    const proto = try b.protoOf(try lib.register(name, vt, false));
+    const model: Dev.Model = .{};
+    const instance: Dev.Instance = .{};
     const nodes = [_]u32{ out, GROUND };
     try vt.proto_add(proto.ctx, t.allocator, @ptrCast(&model), @ptrCast(&instance), &nodes).unwrap();
     return b.compile();
@@ -31,7 +32,7 @@ test "generated limiter: failed trial rollback and retry match an untried circui
     inline for (.{ converger.newton, converger.jfnk }) |solve| {
         var lib = try Library.init(t.allocator);
         defer lib.deinit();
-        var prepared = try limiter(&lib);
+        var prepared = try single(D, "va_limit_state", &lib);
         defer prepared.deinit();
         var tried = try analysis.Circuit.instantiate(&prepared, t.allocator);
         defer tried.deinit();
@@ -88,6 +89,84 @@ test "gminFactor: thresholds are the Newton budget's quarters" {
     // Capped at 10, floored at 1.00005.
     try t.expectEqual(@as(f64, 10), gminFactor(9, 1, 100));
     try t.expectEqual(@as(f64, 1.00005), gminFactor(1.00001, 99, 100));
+}
+
+test "gminStalled: of the recorded descents only chain_bsim4_100k's stalls, at solve 29" {
+    // Oracle: the descents the engine logged (gmin_ladders.txt, with its
+    // provenance) and what each did on main: chain_bsim4_100k crawled at a
+    // factor near 1.01 past 30 min; scaling_inverter_chain_4k recovered
+    // after 13 slow solves and reached 1e-12 in 36; the corpus descents
+    // reached 1e-12 or wedged. Solve 29 is where a Python replay of the
+    // same log first sees 20 slow solves in a row.
+    const op = @import("../dc/op.zig");
+    var steps: [64]op.GminStep = undefined;
+    var name: []const u8 = "";
+    var n: usize = 0;
+    var seen: std.ArrayList(u8) = .empty;
+    defer seen.deinit(t.allocator);
+    var wrong: std.ArrayList(u8) = .empty; // every mismatch, not just the first
+    defer wrong.deinit(t.allocator);
+    var lines = std.mem.splitScalar(u8, @embedFile("integration.assets/gmin_ladders.txt") ++ "== end\n", '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "== ")) {
+            if (n != 0) {
+                var stall: ?usize = null;
+                for (0..n - 1) |k| {
+                    if (op.gminStalled(steps[0 .. k + 1], 1e-2, steps[k + 1].gmin)) {
+                        stall = k;
+                        break;
+                    }
+                }
+                const want: ?usize = if (std.mem.eql(u8, name, "chain_bsim4_100k")) 29 else null;
+                if (stall != want) try wrong.print(t.allocator, "{s}: stalled at {?d}, want {?d}\n", .{ name, stall, want });
+                try seen.appendSlice(t.allocator, name);
+                try seen.append(t.allocator, ',');
+            }
+            name = line[3..];
+            n = 0;
+        } else if (std.mem.startsWith(u8, line, "ladder: gmin=")) {
+            var fields = std.mem.tokenizeAny(u8, line["ladder: gmin=".len..], " =");
+            const gmin = try std.fmt.parseFloat(f64, fields.next().?);
+            _ = fields.next(); // "conv"
+            steps[n] = .{ .gmin = gmin, .converged = std.mem.eql(u8, fields.next().?, "true") };
+            n += 1;
+        }
+    }
+    try t.expectEqualStrings("", wrong.items);
+    try t.expectEqualStrings("chain_bsim4_100k,stress/scaling_inverter_chain_4k," ++
+        "ac/kinduc_k_exact #1,ac/kinduc_k_exact #2,convergence/bench_mos_latch_ladder," ++
+        "convergence/diode_bad_nodeset_positive,convergence/negative_feedback_1000000000," ++
+        "dc/diode_area_sidewall,regression/mos1_bulk_forward_series_r," ++
+        "regression/ota_buffer_large_step,regression/ota_buffer_large_step_0p88," ++
+        "sp/bench_sp_lc_lowpass #1,sp/bench_sp_lc_lowpass #2,sp/inductor #1,sp/inductor #2," ++
+        "stress/scaling_inverter_chain_256,tran/bench_ngspice_mosamp,", seen.items);
+}
+
+test "op: a gmin descent frozen at a small factor leaves for source stepping (#218)" {
+    // Oracle: va_gmin_crawl's analytic root, V = 10 at the deck's gmin and
+    // full sources, and the KCL residual atan(V - 10) there. Cost: frozen at
+    // 1.009, the descent needs 2,500 steps to 1e-12, so it runs into
+    // max_ladder_solves before source stepping (43,005 iterations in all);
+    // leaving after 20 slow solves costs 2,185.
+    var lib = try Library.init(t.allocator);
+    defer lib.deinit();
+    var prepared = try single(Crawl, "va_gmin_crawl", &lib);
+    defer prepared.deinit();
+    var ckt = try analysis.Circuit.instantiate(&prepared, t.allocator);
+    defer ckt.deinit();
+    const x = try t.allocator.alloc(f64, ckt.n);
+    defer t.allocator.free(x);
+    const r = try @import("../dc/op.zig").solve(&ckt, x, .{}, &.{}, &.{});
+    try t.expect(r.converged);
+    try t.expect(r.iterations <= 5_000);
+    // Newton stops a step short of the root; atan's cubic convergence puts
+    // that step under 1e-6 V (2.7e-7 measured), where dI/dV = 1 S.
+    var at_root = false;
+    for (x) |xi| at_root = at_root or @abs(xi - 10.0) <= 1e-6;
+    try t.expect(at_root);
+    ckt.clearLimits();
+    ckt.eval(x, 0);
+    for (ckt.rhs[0..ckt.n]) |ri| try t.expect(@abs(ri) <= 1e-6);
 }
 
 test "jfnk vs newton: divider OP agrees to 1e-9" {
@@ -172,7 +251,7 @@ test "generated limiter: a cold OP converges where F(x) = 0, not at the limited 
     // stale previous value; the published x then solved F(lim(x)) = 0.
     var lib = try Library.init(t.allocator);
     defer lib.deinit();
-    var prepared = try limiter(&lib);
+    var prepared = try single(D, "va_limit_state", &lib);
     defer prepared.deinit();
     var ckt = try analysis.Circuit.instantiate(&prepared, t.allocator);
     defer ckt.deinit();
