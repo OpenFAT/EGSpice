@@ -225,6 +225,10 @@ pub fn build(b: *Build) void {
     limiter_gen.addArgs(&.{ "--emit-zig", "--allow=W0650", "-o" });
     const limiter_source = limiter_gen.addOutputFileArg2("va_limit_state.zig", .{});
     limiter_gen.addFileArg(b.path("tests/conformance/tests/netlist/hdl/veriloga_limit.assets/va_limit_state.va"));
+    const crawl_gen = b.addRunArtifact(vera_exe);
+    crawl_gen.addArgs(&.{ "--emit-zig", "--allow=W0650", "-o" });
+    const crawl_source = crawl_gen.addOutputFileArg2("va_gmin_crawl.zig", .{});
+    crawl_gen.addFileArg(b.path("src/analysis/tests/integration.assets/va_gmin_crawl.va"));
 
     // A separate object on purpose: error ordinals differ between compilations.
     const error_object_mod = M.make(b.path("src/device/tests/device_errors_object.zig"), &.{
@@ -251,6 +255,7 @@ pub fn build(b: *Build) void {
         t.run(g.analysis, &.{
             .{ .name = "builder", .module = g.builder },
             .{ .name = "limiter_device", .module = M.make(limiter_source, &.{contract}) },
+            .{ .name = "crawl_device", .module = M.make(crawl_source, &.{contract}) },
             contract,
             .{ .name = "models", .module = g.models },
             .{ .name = "device_eval", .module = g.eval },
